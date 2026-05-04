@@ -160,6 +160,9 @@ pub const SealOptions = struct {
     /// Spin / key_phase bits — Phase 5 always uses 0.
     spin_bit: bool = false,
     key_phase: bool = false,
+    /// When set, use draft-ietf-quic-multipath-21 §2.4's
+    /// path-ID-aware nonce for 1-RTT packet protection.
+    multipath_path_id: ?u32 = null,
 };
 
 /// Build a fully-protected 1-RTT packet into `dst`. Returns the
@@ -220,14 +223,25 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
         break :blk staged_buf[0..pt_len];
     };
 
-    const ct_len = try protection.aeadSeal(
-        &aead,
-        &opts.keys.iv,
-        opts.pn,
-        dst[0..hdr_len],
-        pt_slice,
-        dst[hdr_len..],
-    );
+    const ct_len = if (opts.multipath_path_id) |path_id|
+        try protection.aeadSealForPath(
+            &aead,
+            &opts.keys.iv,
+            path_id,
+            opts.pn,
+            dst[0..hdr_len],
+            pt_slice,
+            dst[hdr_len..],
+        )
+    else
+        try protection.aeadSeal(
+            &aead,
+            &opts.keys.iv,
+            opts.pn,
+            dst[0..hdr_len],
+            pt_slice,
+            dst[hdr_len..],
+        );
 
     // Header-protect.
     const total_len = hdr_len + ct_len;
@@ -261,6 +275,9 @@ pub const OpenOptions = struct {
     /// Highest PN we've ever decoded in this PN space (for
     /// truncated-PN reconstruction). 0 if none.
     largest_received: u64 = 0,
+    /// When set, use draft-ietf-quic-multipath-21 §2.4's
+    /// path-ID-aware nonce for 1-RTT packet protection.
+    multipath_path_id: ?u32 = null,
 };
 
 pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult {
@@ -304,14 +321,25 @@ pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult
     aad_buf[0] = first;
     @memcpy(aad_buf[1..pn_offset], src[1..pn_offset]);
     @memcpy(aad_buf[pn_offset..hdr_len], pn_bytes[0..pn_len]);
-    const pt_len = try protection.aeadOpen(
-        &aead,
-        &opts.keys.iv,
-        full_pn,
-        aad_buf[0..hdr_len],
-        src[hdr_len..],
-        pt_dst,
-    );
+    const pt_len = if (opts.multipath_path_id) |path_id|
+        try protection.aeadOpenForPath(
+            &aead,
+            &opts.keys.iv,
+            path_id,
+            full_pn,
+            aad_buf[0..hdr_len],
+            src[hdr_len..],
+            pt_dst,
+        )
+    else
+        try protection.aeadOpen(
+            &aead,
+            &opts.keys.iv,
+            full_pn,
+            aad_buf[0..hdr_len],
+            src[hdr_len..],
+            pt_dst,
+        );
 
     return .{ .pn = full_pn, .key_phase = key_phase, .payload = pt_dst[0..pt_len] };
 }
@@ -398,6 +426,52 @@ test "seal1Rtt + open1Rtt round-trip" {
     try testing.expectEqual(false, opened.key_phase);
     try testing.expectEqualSlices(u8, payload, opened.payload);
     try testing.expectEqualSlices(u8, protected[0..len], packet[0..len]);
+}
+
+test "seal1Rtt + open1Rtt use draft-21 path id in multipath nonce" {
+    const secret = fromHex(
+        "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea",
+    );
+    const keys = try derivePacketKeys(.aes128_gcm_sha256, &secret);
+    const dcid: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const payload = "path-id-bound 1-RTT bytes";
+    var packet: [256]u8 = undefined;
+
+    const len = try seal1Rtt(&packet, .{
+        .dcid = &dcid,
+        .pn = 42,
+        .largest_acked = 10,
+        .payload = payload,
+        .keys = &keys,
+        .multipath_path_id = 3,
+    });
+
+    var pt_buf: [256]u8 = undefined;
+    try testing.expectError(
+        boringssl.crypto.aead.Error.Auth,
+        open1Rtt(&pt_buf, packet[0..len], .{
+            .dcid_len = dcid.len,
+            .keys = &keys,
+            .largest_received = 41,
+        }),
+    );
+    try testing.expectError(
+        boringssl.crypto.aead.Error.Auth,
+        open1Rtt(&pt_buf, packet[0..len], .{
+            .dcid_len = dcid.len,
+            .keys = &keys,
+            .largest_received = 41,
+            .multipath_path_id = 4,
+        }),
+    );
+    const opened = try open1Rtt(&pt_buf, packet[0..len], .{
+        .dcid_len = dcid.len,
+        .keys = &keys,
+        .largest_received = 41,
+        .multipath_path_id = 3,
+    });
+    try testing.expectEqual(@as(u64, 42), opened.pn);
+    try testing.expectEqualSlices(u8, payload, opened.payload);
 }
 
 test "seal1Rtt: tampered ciphertext fails AEAD on open" {

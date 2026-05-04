@@ -7,9 +7,10 @@ using [`boringssl-zig`](../boringssl-zig) for TLS 1.3 and AEAD/HKDF crypto.
 QUIC v1 handshakes, streams, DATAGRAMs, RESET_STREAM, CID issuance,
 PATH_CHALLENGE/PATH_RESPONSE, timer-driven loss/PTO recovery with
 NewReno feedback, path-aware `PathSet` recovery ownership, and
-go-quic-peer single-path + path-switch smoke tests. See
-[INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification
-log and remaining production gaps.
+draft-21 multipath nonce/CID routing checks. go-quic-peer single-path
+and path-switch smoke tests are maintained as interop gates. See
+[INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification log
+and remaining production gaps.
 
 ```sh
 mise install

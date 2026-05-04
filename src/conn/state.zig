@@ -66,6 +66,7 @@ pub const Error = error{
     StreamNotFound,
     PnSpaceExhausted,
     PeerDcidNotSet,
+    PathLimitExceeded,
 } || boringssl.tls.Error ||
     short_packet_mod.Error ||
     long_packet_mod.Error ||
@@ -286,6 +287,7 @@ pub const Connection = struct {
     /// initial path and owns Application PN/ACK/sent/RTT/congestion.
     paths: PathSet = .{},
     multipath_enabled: bool = false,
+    local_max_path_id: u32 = 0,
     peer_max_path_id: u32 = 0,
     peer_paths_blocked_at: ?u32 = null,
     peer_path_cids_blocked_path_id: ?u32 = null,
@@ -400,6 +402,9 @@ pub const Connection = struct {
     /// stash is just bookkeeping (and a place where a peer's
     /// `active_connection_id_limit` violation would surface).
     peer_cids: std.ArrayList(IssuedCid) = .empty,
+    /// Locally-issued connection IDs, keyed by path, used to map
+    /// incoming short-header DCIDs back to draft multipath path IDs.
+    local_cids: std.ArrayList(IssuedCid) = .empty,
     /// CONNECTION_CLOSE we've queued (typically from `close()`); the
     /// next outgoing packet at the highest available encryption
     /// level emits it.
@@ -507,6 +512,7 @@ pub const Connection = struct {
             list.deinit(self.allocator);
         }
         self.peer_cids.deinit(self.allocator);
+        self.local_cids.deinit(self.allocator);
         self.pending_stop_sending.deinit(self.allocator);
         self.pending_max_stream_data.deinit(self.allocator);
         self.pending_new_connection_ids.deinit(self.allocator);
@@ -525,6 +531,12 @@ pub const Connection = struct {
         var buf: [1024]u8 = undefined;
         const n = try params.encode(&buf);
         self.local_transport_params = params;
+        if (params.initial_max_path_id) |max_path_id| {
+            self.local_max_path_id = max_path_id;
+            self.multipath_enabled = true;
+        } else {
+            self.local_max_path_id = 0;
+        }
         try self.inner.setQuicTransportParams(buf[0..n]);
     }
 
@@ -542,6 +554,10 @@ pub const Connection = struct {
         const blob = self.inner.peerQuicTransportParams() orelse return null;
         const params = try transport_params_mod.Params.decode(blob);
         self.cached_peer_transport_params = params;
+        if (params.initial_max_path_id) |max_path_id| {
+            self.peer_max_path_id = max_path_id;
+            self.multipath_enabled = true;
+        }
         return params;
     }
 
@@ -704,12 +720,108 @@ pub const Connection = struct {
         self.local_scid = ConnectionId.fromSlice(cid);
         self.primaryPath().path.local_cid = self.local_scid;
         self.local_scid_set = true;
+        try self.rememberLocalCid(0, 0, 0, self.local_scid, @splat(0));
     }
 
     /// Length of the local SCID — also the length of the DCID the
     /// peer puts on incoming short-header packets.
     pub fn localDcidLen(self: *const Connection) u8 {
         return self.local_scid.len;
+    }
+
+    fn rememberLocalCid(
+        self: *Connection,
+        path_id: u32,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        cid: ConnectionId,
+        stateless_reset_token: [16]u8,
+    ) Error!void {
+        if (cid.len == 0) return;
+        if (retire_prior_to > sequence_number) {
+            self.close(true, transport_error_protocol_violation, "invalid retire_prior_to");
+            return;
+        }
+        for (self.local_cids.items) |*item| {
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                item.retire_prior_to = retire_prior_to;
+                item.cid = cid;
+                item.stateless_reset_token = stateless_reset_token;
+                return;
+            }
+        }
+        self.retireLocalCidsPriorTo(path_id, retire_prior_to);
+        try self.local_cids.append(self.allocator, .{
+            .path_id = path_id,
+            .sequence_number = sequence_number,
+            .retire_prior_to = retire_prior_to,
+            .cid = cid,
+            .stateless_reset_token = stateless_reset_token,
+        });
+        if (self.paths.get(path_id)) |path| {
+            if (path.path.local_cid.len == 0 or sequence_number == 0) {
+                path.path.local_cid = cid;
+                if (path_id == 0) self.local_scid = cid;
+            }
+        }
+    }
+
+    fn retireLocalCidsPriorTo(
+        self: *Connection,
+        path_id: u32,
+        retire_prior_to: u64,
+    ) void {
+        var i: usize = 0;
+        while (i < self.local_cids.items.len) {
+            const item = self.local_cids.items[i];
+            if (item.path_id == path_id and item.sequence_number < retire_prior_to) {
+                _ = self.local_cids.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        self.promoteLocalCidForPath(path_id);
+    }
+
+    fn promoteLocalCidForPath(self: *Connection, path_id: u32) void {
+        const path = self.paths.get(path_id) orelse return;
+        path.path.local_cid = .{};
+        for (self.local_cids.items) |item| {
+            if (item.path_id == path_id) {
+                path.path.local_cid = item.cid;
+                if (path_id == 0) self.local_scid = item.cid;
+                return;
+            }
+        }
+    }
+
+    fn retireLocalCid(self: *Connection, path_id: u32, sequence_number: u64) void {
+        var removed_cid: ?ConnectionId = null;
+        var i: usize = 0;
+        while (i < self.local_cids.items.len) {
+            const item = self.local_cids.items[i];
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                removed_cid = item.cid;
+                _ = self.local_cids.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        const cid = removed_cid orelse return;
+        const path = self.paths.get(path_id) orelse return;
+        if (ConnectionId.eql(path.path.local_cid, cid)) {
+            self.promoteLocalCidForPath(path_id);
+        }
+    }
+
+    fn nextLocalCidSequence(self: *const Connection, path_id: u32) u64 {
+        var next: u64 = 0;
+        for (self.local_cids.items) |item| {
+            if (item.path_id == path_id and item.sequence_number >= next) {
+                next = item.sequence_number + 1;
+            }
+        }
+        return next;
     }
 
     /// Server-side helper: peek the unprotected DCID + SCID out of
@@ -923,11 +1035,13 @@ pub const Connection = struct {
         stateless_reset_token: [16]u8,
     ) Error!void {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
+        const local_cid = ConnectionId.fromSlice(cid);
         for (self.pending_new_connection_ids.items) |item| {
             if (item.sequence_number == sequence_number) return;
         }
         var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
         @memcpy(connection_id.bytes[0..cid.len], cid);
+        try self.rememberLocalCid(0, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
         try self.pending_new_connection_ids.append(self.allocator, .{
             .sequence_number = sequence_number,
             .retire_prior_to = retire_prior_to,
@@ -966,6 +1080,13 @@ pub const Connection = struct {
         return self.multipath_enabled;
     }
 
+    pub fn multipathNegotiated(self: *const Connection) bool {
+        if (!self.multipath_enabled) return false;
+        if (self.local_transport_params.initial_max_path_id == null) return false;
+        const peer_params = self.cached_peer_transport_params orelse return false;
+        return peer_params.initial_max_path_id != null;
+    }
+
     /// Register a new application path. Full draft-21 frame exchange is
     /// still staged behind this, but the path already owns independent
     /// Application PN, sent, RTT, congestion, validation, and PTO state.
@@ -976,7 +1097,11 @@ pub const Connection = struct {
         local_cid: ConnectionId,
         peer_cid: ConnectionId,
     ) Error!u32 {
-        return try self.paths.openPath(
+        if (self.multipathNegotiated() and self.paths.next_path_id > self.peer_max_path_id) {
+            self.queuePathsBlocked(self.peer_max_path_id);
+            return Error.PathLimitExceeded;
+        }
+        const path_id = try self.paths.openPath(
             self.allocator,
             peer_addr,
             local_addr,
@@ -984,6 +1109,8 @@ pub const Connection = struct {
             peer_cid,
             .{ .max_datagram_size = self.mtu },
         );
+        try self.rememberLocalCid(path_id, 0, 0, local_cid, @splat(0));
+        return path_id;
     }
 
     pub fn setActivePath(self: *Connection, path_id: u32) bool {
@@ -992,6 +1119,7 @@ pub const Connection = struct {
 
     pub fn abandonPath(self: *Connection, path_id: u32) bool {
         if (!self.paths.abandon(path_id)) return false;
+        self.retirePeerCidsForPath(path_id);
         self.queuePathAbandon(path_id, 0) catch return false;
         return true;
     }
@@ -1079,11 +1207,13 @@ pub const Connection = struct {
         stateless_reset_token: [16]u8,
     ) Error!void {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
+        const local_cid = ConnectionId.fromSlice(cid);
         for (self.pending_path_new_connection_ids.items) |item| {
             if (item.path_id == path_id and item.sequence_number == sequence_number) return;
         }
         var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
         @memcpy(connection_id.bytes[0..cid.len], cid);
+        try self.rememberLocalCid(path_id, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
         try self.pending_path_new_connection_ids.append(self.allocator, .{
             .path_id = path_id,
             .sequence_number = sequence_number,
@@ -1108,6 +1238,9 @@ pub const Connection = struct {
     }
 
     pub fn queueMaxPathId(self: *Connection, maximum_path_id: u32) void {
+        if (maximum_path_id > self.local_max_path_id) {
+            self.local_max_path_id = maximum_path_id;
+        }
         if (self.pending_max_path_id == null or maximum_path_id > self.pending_max_path_id.?) {
             self.pending_max_path_id = maximum_path_id;
         }
@@ -1218,6 +1351,32 @@ pub const Connection = struct {
             return self.activePath().id;
         }
         return self.activePath().id;
+    }
+
+    fn incomingShortPath(self: *Connection, bytes: []const u8) ?*PathState {
+        if (bytes.len < 1) return null;
+        var best: ?*PathState = null;
+        var best_len: u8 = 0;
+        for (self.local_cids.items) |item| {
+            const cid = item.cid.slice();
+            if (cid.len == 0) continue;
+            if (bytes.len < 1 + cid.len) continue;
+            if (!std.mem.eql(u8, bytes[1 .. 1 + cid.len], cid)) continue;
+            if (cid.len > best_len) {
+                if (self.paths.get(item.path_id)) |path| {
+                    best = path;
+                    best_len = @intCast(cid.len);
+                }
+            }
+        }
+        if (best != null) return best;
+        for (self.paths.paths.items) |*p| {
+            const cid = p.path.local_cid.slice();
+            if (cid.len == 0) continue;
+            if (bytes.len < 1 + cid.len) continue;
+            if (std.mem.eql(u8, bytes[1 .. 1 + cid.len], cid)) return p;
+        }
+        return best;
     }
 
     fn connPnIdx(lvl: EncryptionLevel) ?usize {
@@ -1787,6 +1946,7 @@ pub const Connection = struct {
                     .payload = pl_buf[0..pl_pos],
                     .keys = &keys,
                     .key_phase = self.app_write_key_phase,
+                    .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
                 }),
                 .early_data => unreachable,
             };
@@ -2147,6 +2307,7 @@ pub const Connection = struct {
                 .payload = pl_buf[0..pl_pos],
                 .keys = &keys,
                 .key_phase = self.app_write_key_phase,
+                .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
             }),
             .early_data => unreachable,
         };
@@ -2411,15 +2572,19 @@ pub const Connection = struct {
     ) Error!usize {
         const r_keys_opt = try self.packetKeys(.application, .read);
         const r_keys = r_keys_opt orelse return bytes.len;
-        const app_path = self.pathForId(self.current_incoming_path_id);
+        const app_path = self.incomingShortPath(bytes) orelse
+            self.pathForId(self.current_incoming_path_id);
+        self.current_incoming_path_id = app_path.id;
         const app_pn_space = &app_path.app_pn_space;
         const largest_received = if (app_pn_space.received.largest) |l| l else 0;
+        const multipath_path_id: ?u32 = if (self.multipathNegotiated()) app_path.id else null;
 
         var pt_buf: [max_recv_plaintext]u8 = undefined;
         const opened = short_packet_mod.open1Rtt(&pt_buf, bytes, .{
-            .dcid_len = self.localDcidLen(),
+            .dcid_len = app_path.path.local_cid.len,
             .keys = &r_keys,
             .largest_received = largest_received,
+            .multipath_path_id = multipath_path_id,
         }) catch |e| switch (e) {
             // RFC 9000 §5.2: a packet that fails authentication is
             // silently dropped without affecting the rest of the
@@ -2430,9 +2595,10 @@ pub const Connection = struct {
                 const update = (try self.nextApplicationKeyUpdate(.read)) orelse
                     return bytes.len;
                 const retried = short_packet_mod.open1Rtt(&pt_buf, bytes, .{
-                    .dcid_len = self.localDcidLen(),
+                    .dcid_len = app_path.path.local_cid.len,
                     .keys = &update.keys,
                     .largest_received = largest_received,
+                    .multipath_path_id = multipath_path_id,
                 }) catch |retry_e| switch (retry_e) {
                     boringssl.crypto.aead.Error.Auth => return bytes.len,
                     else => return retry_e,
@@ -2556,6 +2722,15 @@ pub const Connection = struct {
                 self.close(true, transport_error_protocol_violation, "multipath frame outside 1-RTT");
                 return;
             }
+            if (lvl == .application and isMultipathFrame(f) and !self.multipathNegotiated()) {
+                self.close(true, transport_error_protocol_violation, "multipath frame without negotiation");
+                return;
+            }
+            if (lvl == .application and isMultipathFrame(f) and
+                !self.validateIncomingMultipathFrame(f))
+            {
+                return;
+            }
             switch (f) {
                 .padding, .ping, .handshake_done => {},
                 .ack => |a| try self.handleAckAtLevel(lvl, a, now_us),
@@ -2582,7 +2757,8 @@ pub const Connection = struct {
                     self.closed = true;
                     self.draining_deadline_us = now_us + self.drainingDurationUs();
                 },
-                .retire_connection_id, .max_data, .max_stream_data, .max_streams, .data_blocked, .stream_data_blocked, .streams_blocked, .new_token => {},
+                .retire_connection_id => |rc| self.handleRetireConnectionId(rc),
+                .max_data, .max_stream_data, .max_streams, .data_blocked, .stream_data_blocked, .streams_blocked, .new_token => {},
             }
         }
         if (debugFrames() != null) {
@@ -2606,17 +2782,175 @@ pub const Connection = struct {
         };
     }
 
+    fn tokenEql(a: [16]u8, b: [16]u8) bool {
+        return std.mem.eql(u8, a[0..], b[0..]);
+    }
+
+    fn pathIdAllowedByLocalLimit(self: *Connection, path_id: u32) bool {
+        if (path_id <= self.local_max_path_id) return true;
+        self.close(true, transport_error_protocol_violation, "multipath path id exceeds local limit");
+        return false;
+    }
+
+    fn validateIncomingMultipathFrame(self: *Connection, f: frame_types.Frame) bool {
+        return switch (f) {
+            .path_ack => |pa| self.pathIdAllowedByLocalLimit(pa.path_id),
+            .path_abandon => |pa| self.pathIdAllowedByLocalLimit(pa.path_id),
+            .path_status_backup => |ps| self.pathIdAllowedByLocalLimit(ps.path_id),
+            .path_status_available => |ps| self.pathIdAllowedByLocalLimit(ps.path_id),
+            .path_new_connection_id => |nc| self.pathIdAllowedByLocalLimit(nc.path_id),
+            .path_retire_connection_id => |rc| self.pathIdAllowedByLocalLimit(rc.path_id),
+            .paths_blocked => |pb| self.pathIdAllowedByLocalLimit(pb.maximum_path_id),
+            .path_cids_blocked => |pcb| blk: {
+                if (!self.pathIdAllowedByLocalLimit(pcb.path_id)) break :blk false;
+                const next = self.nextLocalCidSequence(pcb.path_id);
+                if (pcb.next_sequence_number > next) {
+                    self.close(true, transport_error_protocol_violation, "path cids blocked skips local cid sequence");
+                    break :blk false;
+                }
+                break :blk true;
+            },
+            .max_path_id => |mp| blk: {
+                if (self.cached_peer_transport_params) |params| {
+                    if (params.initial_max_path_id) |initial_max_path_id| {
+                        if (mp.maximum_path_id < initial_max_path_id) {
+                            self.close(true, transport_error_protocol_violation, "max path id below peer initial limit");
+                            break :blk false;
+                        }
+                    }
+                }
+                break :blk true;
+            },
+            else => true,
+        };
+    }
+
+    fn peerCidActiveCountForPath(self: *const Connection, path_id: u32) usize {
+        var count: usize = 0;
+        for (self.peer_cids.items) |item| {
+            if (item.path_id == path_id) count += 1;
+        }
+        return count;
+    }
+
+    fn promotePeerCidForPath(self: *Connection, path_id: u32) void {
+        const path = self.paths.get(path_id) orelse return;
+        path.path.peer_cid = .{};
+        for (self.peer_cids.items) |item| {
+            if (item.path_id == path_id) {
+                path.path.peer_cid = item.cid;
+                break;
+            }
+        }
+        if (path_id == 0) {
+            self.peer_dcid = path.path.peer_cid;
+            self.peer_dcid_set = self.peer_dcid.len != 0;
+        }
+    }
+
+    fn retirePeerCidsPriorTo(
+        self: *Connection,
+        path_id: u32,
+        retire_prior_to: u64,
+    ) void {
+        var i: usize = 0;
+        var affected_current = false;
+        const current = if (self.paths.get(path_id)) |path| path.path.peer_cid else ConnectionId{};
+        while (i < self.peer_cids.items.len) {
+            const item = self.peer_cids.items[i];
+            if (item.path_id == path_id and item.sequence_number < retire_prior_to) {
+                if (ConnectionId.eql(item.cid, current)) affected_current = true;
+                _ = self.peer_cids.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        if (affected_current) self.promotePeerCidForPath(path_id);
+    }
+
+    fn retirePeerCidsForPath(self: *Connection, path_id: u32) void {
+        var i: usize = 0;
+        while (i < self.peer_cids.items.len) {
+            if (self.peer_cids.items[i].path_id == path_id) {
+                _ = self.peer_cids.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        self.promotePeerCidForPath(path_id);
+    }
+
+    fn registerPeerCid(
+        self: *Connection,
+        path_id: u32,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        cid: ConnectionId,
+        stateless_reset_token: [16]u8,
+    ) Error!void {
+        if (retire_prior_to > sequence_number) {
+            self.close(true, transport_error_protocol_violation, "invalid connection id retire_prior_to");
+            return;
+        }
+        if (self.multipathNegotiated() and !self.pathIdAllowedByLocalLimit(path_id)) return;
+
+        for (self.peer_cids.items) |*item| {
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                if (!ConnectionId.eql(item.cid, cid) or
+                    !tokenEql(item.stateless_reset_token, stateless_reset_token))
+                {
+                    self.close(true, transport_error_protocol_violation, "connection id sequence reused");
+                    return;
+                }
+                if (retire_prior_to > item.retire_prior_to) {
+                    item.retire_prior_to = retire_prior_to;
+                    self.retirePeerCidsPriorTo(path_id, retire_prior_to);
+                }
+                return;
+            }
+            if (cid.len != 0 and ConnectionId.eql(item.cid, cid)) {
+                self.close(true, transport_error_protocol_violation, "connection id reused across paths");
+                return;
+            }
+        }
+
+        self.retirePeerCidsPriorTo(path_id, retire_prior_to);
+        const active_limit = self.local_transport_params.active_connection_id_limit;
+        if (@as(u64, @intCast(self.peerCidActiveCountForPath(path_id))) >= active_limit) {
+            self.close(true, transport_error_protocol_violation, "active connection id limit exceeded");
+            return;
+        }
+        try self.peer_cids.append(self.allocator, .{
+            .path_id = path_id,
+            .sequence_number = sequence_number,
+            .retire_prior_to = retire_prior_to,
+            .cid = cid,
+            .stateless_reset_token = stateless_reset_token,
+        });
+        if (self.paths.get(path_id)) |path| {
+            if (path.path.peer_cid.len == 0 or sequence_number == 0) {
+                path.path.peer_cid = cid;
+            }
+        }
+        if (path_id == 0 and (self.peer_dcid.len == 0 or sequence_number == 0)) {
+            self.peer_dcid = cid;
+            self.peer_dcid_set = true;
+        }
+    }
+
     fn handleNewConnectionId(
         self: *Connection,
         nc: frame_types.NewConnectionId,
     ) Error!void {
-        try self.peer_cids.append(self.allocator, .{
-            .path_id = 0,
-            .sequence_number = nc.sequence_number,
-            .retire_prior_to = nc.retire_prior_to,
-            .cid = ConnectionId.fromSlice(nc.connection_id.slice()),
-            .stateless_reset_token = nc.stateless_reset_token,
-        });
+        const cid = ConnectionId.fromSlice(nc.connection_id.slice());
+        try self.registerPeerCid(0, nc.sequence_number, nc.retire_prior_to, cid, nc.stateless_reset_token);
+    }
+
+    fn handleRetireConnectionId(
+        self: *Connection,
+        rc: frame_types.RetireConnectionId,
+    ) void {
+        self.retireLocalCid(0, rc.sequence_number);
     }
 
     fn pathAckToAck(pa: frame_types.PathAck) frame_types.Ack {
@@ -2645,6 +2979,8 @@ pub const Connection = struct {
     fn handlePathAbandon(self: *Connection, pa: frame_types.PathAbandon) void {
         _ = pa.error_code;
         _ = self.paths.abandon(pa.path_id);
+        self.retirePeerCidsForPath(pa.path_id);
+        self.queuePathAbandon(pa.path_id, pa.error_code) catch {};
     }
 
     fn handlePathStatus(
@@ -2660,34 +2996,44 @@ pub const Connection = struct {
         self: *Connection,
         nc: frame_types.PathNewConnectionId,
     ) Error!void {
-        try self.peer_cids.append(self.allocator, .{
-            .path_id = nc.path_id,
-            .sequence_number = nc.sequence_number,
-            .retire_prior_to = nc.retire_prior_to,
-            .cid = ConnectionId.fromSlice(nc.connection_id.slice()),
-            .stateless_reset_token = nc.stateless_reset_token,
-        });
+        const cid = ConnectionId.fromSlice(nc.connection_id.slice());
+        try self.registerPeerCid(nc.path_id, nc.sequence_number, nc.retire_prior_to, cid, nc.stateless_reset_token);
     }
 
     fn handlePathRetireConnectionId(
         self: *Connection,
         rc: frame_types.PathRetireConnectionId,
     ) void {
-        _ = self;
-        _ = rc;
+        self.retireLocalCid(rc.path_id, rc.sequence_number);
     }
 
     fn handleMaxPathId(self: *Connection, mp: frame_types.MaxPathId) void {
+        if (self.cached_peer_transport_params) |params| {
+            if (params.initial_max_path_id) |initial_max_path_id| {
+                if (mp.maximum_path_id < initial_max_path_id) {
+                    self.close(true, transport_error_protocol_violation, "max path id below peer initial limit");
+                    return;
+                }
+            }
+        }
         if (mp.maximum_path_id > self.peer_max_path_id) {
             self.peer_max_path_id = mp.maximum_path_id;
         }
     }
 
     fn handlePathsBlocked(self: *Connection, pb: frame_types.PathsBlocked) void {
+        if (!self.pathIdAllowedByLocalLimit(pb.maximum_path_id)) return;
+        if (pb.maximum_path_id < self.local_max_path_id) return;
         self.peer_paths_blocked_at = pb.maximum_path_id;
     }
 
     fn handlePathCidsBlocked(self: *Connection, pcb: frame_types.PathCidsBlocked) void {
+        if (!self.pathIdAllowedByLocalLimit(pcb.path_id)) return;
+        const next = self.nextLocalCidSequence(pcb.path_id);
+        if (pcb.next_sequence_number > next) {
+            self.close(true, transport_error_protocol_violation, "path cids blocked skips local cid sequence");
+            return;
+        }
         self.peer_path_cids_blocked_path_id = pcb.path_id;
         self.peer_path_cids_blocked_next_sequence = pcb.next_sequence_number;
     }
@@ -4086,6 +4432,20 @@ fn installTestApplicationWriteSecret(conn: *Connection) void {
     conn.levels[EncryptionLevel.application.idx()].write = material;
 }
 
+fn installTestApplicationReadSecret(conn: *Connection) void {
+    var material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
+    material.secret_len = 32;
+    conn.levels[EncryptionLevel.application.idx()].read = material;
+}
+
+fn markTestMultipathNegotiated(conn: *Connection, max_path_id: u32) void {
+    conn.enableMultipath(true);
+    conn.local_transport_params.initial_max_path_id = max_path_id;
+    conn.local_max_path_id = max_path_id;
+    conn.cached_peer_transport_params = .{ .initial_max_path_id = max_path_id };
+    conn.peer_max_path_id = max_path_id;
+}
+
 test "pollLevel emits PATH_ACK for non-zero application path ACKs" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -4136,6 +4496,301 @@ test "pollDatagram can select a non-zero application path" {
     try std.testing.expect(datagram.to != null);
     try std.testing.expectEqual(@as(usize, 0), conn.pending_path_statuses.items.len);
     try std.testing.expectEqual(@as(u32, 1), conn.paths.get(path_id).?.sent.count);
+}
+
+test "multipath-negotiated non-zero path packets use draft-21 nonce" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    installTestApplicationWriteSecret(&conn);
+    markTestMultipathNegotiated(&conn, 1);
+    try conn.setPeerDcid(&.{0xaa});
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    const path = conn.paths.get(path_id).?;
+    path.app_pn_space.recordReceived(9, 1_000);
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevelOnPath(.application, path_id, &packet_buf, 1_001_000)).?;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+
+    try std.testing.expectError(
+        boringssl.crypto.aead.Error.Auth,
+        short_packet_mod.open1Rtt(&plaintext, packet_buf[0..n], .{
+            .dcid_len = 1,
+            .keys = &keys,
+            .largest_received = 0,
+        }),
+    );
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..n], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+        .multipath_path_id = path_id,
+    });
+    const decoded = try frame_mod.decode(opened.payload);
+    try std.testing.expect(decoded.frame == .path_ack);
+    try std.testing.expectEqual(path_id, decoded.frame.path_ack.path_id);
+}
+
+test "incoming short packets are routed by local CID before multipath nonce open" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    installTestApplicationReadSecret(&conn);
+    markTestMultipathNegotiated(&conn, 1);
+    try conn.setLocalScid(&.{0xa0});
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xbb}));
+    const path = conn.paths.get(path_id).?;
+
+    var payload: [16]u8 = undefined;
+    const payload_len = try frame_mod.encode(payload[0..], .{ .ping = .{} });
+    const keys = (try conn.packetKeys(.application, .read)).?;
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = path.path.local_cid.slice(),
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+        .multipath_path_id = path_id,
+    });
+
+    _ = try conn.handleShort(packet_buf[0..n], 1_000_000);
+    try std.testing.expectEqual(path_id, conn.current_incoming_path_id);
+    try std.testing.expectEqual(@as(?u64, 0), path.app_pn_space.received.largest);
+    try std.testing.expectEqual(@as(?u64, null), conn.primaryPath().app_pn_space.received.largest);
+}
+
+test "queued path CIDs participate in incoming short-header routing and retirement" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xbb}));
+    try conn.queuePathNewConnectionId(path_id, 1, 0, &.{0xc2}, @splat(0));
+
+    const bytes = [_]u8{ 0x40, 0xc2, 0, 0, 0, 0 } ++ [_]u8{0} ** 16;
+    try std.testing.expectEqual(path_id, conn.incomingShortPath(&bytes).?.id);
+
+    conn.handlePathRetireConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 1,
+    });
+    try std.testing.expect(conn.incomingShortPath(&bytes) == null);
+}
+
+test "multipath frames are rejected unless draft-21 was negotiated" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var payload: [16]u8 = undefined;
+    const payload_len = try frame_mod.encode(payload[0..], .{ .max_path_id = .{ .maximum_path_id = 1 } });
+    try conn.dispatchFrames(.application, payload[0..payload_len], 1_000_000);
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "setTransportParams advertises local multipath limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setTransportParams(.{ .initial_max_path_id = 2 });
+    try std.testing.expect(conn.multipathEnabled());
+    try std.testing.expectEqual(@as(u32, 2), conn.local_max_path_id);
+}
+
+test "openPath respects peer MAX_PATH_ID when multipath is negotiated" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    _ = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    try std.testing.expectError(
+        Error.PathLimitExceeded,
+        conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc2}), ConnectionId.fromSlice(&.{0xd2})),
+    );
+    try std.testing.expectEqual(@as(?u32, 1), conn.pending_paths_blocked);
+}
+
+test "PATH_NEW_CONNECTION_ID rejects sequence reuse with different cid" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x10}),
+        .stateless_reset_token = @splat(0),
+    });
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x11}),
+        .stateless_reset_token = @splat(0),
+    });
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "PATH_NEW_CONNECTION_ID rejects path ids above local limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    try conn.handlePathNewConnectionId(.{
+        .path_id = 2,
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x10}),
+        .stateless_reset_token = @splat(0),
+    });
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "MAX_PATH_ID cannot reduce the peer initial path limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 2);
+    conn.handleMaxPathId(.{ .maximum_path_id = 1 });
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "PATH_CIDS_BLOCKED cannot skip local cid sequence numbers" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    conn.handlePathCidsBlocked(.{ .path_id = path_id, .next_sequence_number = 2 });
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "PATHS_BLOCKED below current local limit is ignored" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 2);
+    conn.handlePathsBlocked(.{ .maximum_path_id = 1 });
+    try std.testing.expectEqual(@as(?u32, null), conn.peer_paths_blocked_at);
+    conn.handlePathsBlocked(.{ .maximum_path_id = 2 });
+    try std.testing.expectEqual(@as(?u32, 2), conn.peer_paths_blocked_at);
+}
+
+test "peer cid registration enforces active cid limit per path" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    conn.local_transport_params.active_connection_id_limit = 2;
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x10}),
+        .stateless_reset_token = @splat(0),
+    });
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x11}),
+        .stateless_reset_token = @splat(1),
+    });
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 2,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x12}),
+        .stateless_reset_token = @splat(2),
+    });
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "retire_prior_to retires peer cids only on the indicated path" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    try conn.handleNewConnectionId(.{
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x20}),
+        .stateless_reset_token = @splat(0x20),
+    });
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 0,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x10}),
+        .stateless_reset_token = @splat(0x10),
+    });
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x11}),
+        .stateless_reset_token = @splat(0x11),
+    });
+    try conn.handlePathNewConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 2,
+        .retire_prior_to = 2,
+        .connection_id = try frame_types.ConnId.fromSlice(&.{0x12}),
+        .stateless_reset_token = @splat(0x12),
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), conn.peerCidsCount());
+    try std.testing.expectEqualSlices(u8, &.{0x12}, conn.paths.get(path_id).?.path.peer_cid.slice());
+    try std.testing.expectEqualSlices(u8, &.{0x20}, conn.primaryPath().path.peer_cid.slice());
 }
 
 test "STREAM send tracking survives duplicate application PNs across paths" {

@@ -52,6 +52,23 @@ pub fn aeadNonce(iv: *const [12]u8, pn: u64) [12]u8 {
     return nonce;
 }
 
+/// Construct the multipath 1-RTT AEAD nonce from draft-ietf-quic-
+/// multipath-21 §2.4: IV XOR PPN, where PPN is path_id(32) ||
+/// zeroes(2) || packet_number(62), all in network byte order.
+pub fn aeadNonceForPath(iv: *const [12]u8, path_id: u32, pn: u64) [12]u8 {
+    var nonce = iv.*;
+    var ppn: [12]u8 = @splat(0);
+    var path_be: [4]u8 = undefined;
+    var pn_be: [8]u8 = undefined;
+    std.mem.writeInt(u32, &path_be, path_id, .big);
+    std.mem.writeInt(u64, &pn_be, pn & ((@as(u64, 1) << 62) - 1), .big);
+    @memcpy(ppn[0..4], &path_be);
+    @memcpy(ppn[4..12], &pn_be);
+    var i: usize = 0;
+    while (i < ppn.len) : (i += 1) nonce[i] ^= ppn[i];
+    return nonce;
+}
+
 /// Compute the 5-byte header-protection mask from a 16-byte
 /// ciphertext sample using AES-128 single-block encryption. The mask
 /// is the first 5 bytes of `AES_encrypt(hp_key, sample)`. RFC 9001
@@ -116,6 +133,20 @@ pub fn aeadSeal(
     return aead.seal(dst, &nonce, header, plaintext);
 }
 
+/// AEAD-seal using the draft multipath path-ID-aware nonce.
+pub fn aeadSealForPath(
+    aead: *const AesGcm128,
+    iv: *const [12]u8,
+    path_id: u32,
+    pn: u64,
+    header: []const u8,
+    plaintext: []const u8,
+    dst: []u8,
+) Error!usize {
+    const nonce = aeadNonceForPath(iv, path_id, pn);
+    return aead.seal(dst, &nonce, header, plaintext);
+}
+
 /// AEAD-open: reverse of `aeadSeal`. `ciphertext` includes the tag.
 pub fn aeadOpen(
     aead: *const AesGcm128,
@@ -126,6 +157,20 @@ pub fn aeadOpen(
     dst: []u8,
 ) Error!usize {
     const nonce = aeadNonce(iv, pn);
+    return aead.open(dst, &nonce, header, ciphertext);
+}
+
+/// AEAD-open using the draft multipath path-ID-aware nonce.
+pub fn aeadOpenForPath(
+    aead: *const AesGcm128,
+    iv: *const [12]u8,
+    path_id: u32,
+    pn: u64,
+    header: []const u8,
+    ciphertext: []const u8,
+    dst: []u8,
+) Error!usize {
+    const nonce = aeadNonceForPath(iv, path_id, pn);
     return aead.open(dst, &nonce, header, ciphertext);
 }
 
@@ -172,8 +217,14 @@ test "aeadNonce: PN 2 in canonical iv from RFC 9001 §A.1 client" {
     try std.testing.expectEqualSlices(u8, &expected, &n2);
 }
 
+test "aeadNonceForPath: draft-21 nonce example" {
+    const iv = fromHex("6b26114b9cba2b63a9e8dd4f");
+    const nonce = aeadNonceForPath(&iv, 3, 0xd431);
+    try std.testing.expectEqualSlices(u8, &fromHex("6b2611489cba2b63a9e8097e"), &nonce);
+}
+
 test "applyHpMask is involutive on long headers" {
-    var packet = [_]u8{0xc3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    var packet = [_]u8{ 0xc3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     const original = packet;
     const mask: [mask_len]u8 = .{ 0xa3, 0x5b, 0xc1, 0x77, 0x9d };
     try applyHpMask(&packet, .long, 1, 4, mask);

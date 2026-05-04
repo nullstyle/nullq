@@ -6,8 +6,8 @@ Current as of 2026-05-04.
 
 - `zig build test` in `nullq`: passing, including deterministic
   PTO/loss unit tests, path-aware multipath ACK/PTO tests, duplicate
-  per-path Application PN stream tracking, and the 10% simulated-loss
-  stream exchange.
+  per-path Application PN stream tracking, draft-21 nonce/CID limit
+  tests, and the 10% simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
 - `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
@@ -73,28 +73,47 @@ Current as of 2026-05-04.
 - Multipath draft-21 is explicit in the public surface:
   `multipath_draft_version = 21` and transport parameter
   `initial_max_path_id = 0x3e`.
+- Negotiated multipath now uses the draft-21 path-ID AEAD nonce for
+  every 1-RTT packet, including non-zero Application paths, and includes
+  the draft's published nonce vector in the unit suite.
+- Incoming short-header packets are routed by locally issued CID before
+  opening packet protection, so the correct path ID is used for both PN
+  reconstruction and the draft-21 nonce.
+- CID handling now keeps a local issued-CID registry for
+  RETIRE_CONNECTION_ID/PATH_RETIRE_CONNECTION_ID and validates
+  peer-issued NEW_CONNECTION_ID/PATH_NEW_CONNECTION_ID per path:
+  retire-prior-to bounds, duplicate sequence reuse, cross-path CID
+  reuse, active_connection_id_limit, and local MAX_PATH_ID bounds close
+  with PROTOCOL_VIOLATION.
+- Incoming multipath control frames are rejected unless draft-21 was
+  negotiated and are checked against the local maximum path ID;
+  MAX_PATH_ID cannot reduce the peer's initial limit, and
+  PATH_CIDS_BLOCKED cannot skip our next issued CID sequence.
 
 ## Still not production-grade
 
-1. **Draft multipath is still not complete.** Path registration,
-   lifecycle, stats, scheduler selection, path-aware polling, and
-   per-path Application recovery ownership exist. The remaining wire
-   work is true draft-21 path/CID negotiation, CID-based incoming path
-   mapping, and the draft multipath packet-protection nonce construction.
+1. **Draft multipath is much closer but not complete.** Path
+   registration, lifecycle, stats, scheduler selection, path-aware
+   polling, per-path Application recovery ownership, draft-21 nonce
+   construction, CID-based incoming path mapping, and core CID/limit
+   validation exist. Remaining wire work: proactive CID replenishment
+   up to peer/local limits, complete path establishment policy around
+   unused common path IDs, path-abandon 3x-PTO retention, and external
+   draft-21 peer validation.
 2. **Multipath frame emission is partial.** Draft-21 multipath control
    frames can be queued, emitted one per Application packet, ACKed, and
    requeued on loss, and PATH_ACK is generated for non-zero path ACK
    trackers. Remaining emission work: smarter pacing/coalescing,
-   PATH_CID limit enforcement/replenishment, and complete PATH_ACK
-   handling for all draft edge cases.
+   proactive PATH_NEW_CONNECTION_ID replenishment, and complete PATH_ACK
+   handling for abandoned-path retention edge cases.
 3. **Recovery is path-aware but not fully hardened.** Packet-threshold,
    time-threshold, PTO, ACK-delay, idle, draining, NewReno loss/ACK
    feedback, persistent congestion, and basic PTO probe selection are
    path-owned for Application data. Remaining recovery work: old-path
-   draining during active migration, DATAGRAM ack/loss app events, full
-   CID retirement/replenishment, and broader lossy/reordered interop
-   gates. Pacing, ECN, and advanced congestion controllers remain out of
-   scope for this push.
+   draining during active migration, DATAGRAM ack/loss app events,
+   retained abandoned-path ACK state, and broader lossy/reordered
+   interop gates. Pacing, ECN, and advanced congestion controllers
+   remain out of scope for this push.
 4. **Key update support is minimal.** nullq can react to observed peer
    key updates, but it does not yet keep current/previous/next read
    keys with 3x-PTO discard timing or enforce packet limits across all
