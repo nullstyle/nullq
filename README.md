@@ -13,11 +13,13 @@ status, and pollable `pollEvent()` notifications; draining suppresses
 incoming packet processing and stateless reset tokens close cleanly.
 Client-side Version Negotiation and Retry handling now validate CID
 echoes, Retry integrity tags, retry transport parameters, and re-arm
-Initial CRYPTO with the Retry token. Application key updates now keep
-previous/current/next read epochs, discard old keys after 3x-PTO,
-support local initiation, and enforce cross-suite AEAD packet/auth
-limits across all Application paths. Packet protection now supports all
-QUIC v1 TLS suites:
+Initial CRYPTO with the Retry token; nullq-peer now verifies live
+quic-go Retry and v2-to-v1 Version Negotiation scenarios using
+server-side `writeRetry` and `writeVersionNegotiation` helpers.
+Application key updates now keep previous/current/next read epochs,
+discard old keys after 3x-PTO, support local initiation, and enforce
+cross-suite AEAD packet/auth limits across all Application paths. Packet
+protection now supports all QUIC v1 TLS suites:
 `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, and
 `TLS_CHACHA20_POLY1305_SHA256`. 0-RTT now has early STREAM/DATAGRAM
 transport plumbing plus accepted and rejected go-quic-peer resumption

@@ -22,6 +22,13 @@ Current as of 2026-05-04.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
   bidi echo, 512 KiB upload, client/server uni streams, DATAGRAM echo,
   RESET_STREAM, and concurrent bidi streams.
+- `go-quic-peer client` against `nullq-peer -retry`: passing for a
+  server-forced Retry with HMAC-bound token validation, followed by the
+  full single-path stream/DATAGRAM/reset scenario.
+- `go-quic-peer client -prefer-v2` against `nullq-peer`: passing for
+  live Version Negotiation from quic-go's initial QUIC v2 attempt down
+  to nullq's supported QUIC v1, followed by the full single-path
+  scenario.
 - `go-quic-peer client -0rtt=true` against `nullq-peer`: passing,
   including ticket seed, resumed connection, early STREAM request, and
   `Used0RTT == true`.
@@ -66,6 +73,9 @@ Current as of 2026-05-04.
 - Server embedders can write a standards-compliant QUIC v1 Retry packet
   with `Connection.writeRetry`; token contents and acceptance policy
   intentionally remain application-owned.
+- Server embedders can write a Version Negotiation packet with
+  `Connection.writeVersionNegotiation`, and the peer harness now uses it
+  to negotiate quic-go from v2 down to v1.
 - Out-of-order CRYPTO receive reassembly remains in place and handles
   the quic-go ClientHello fragmentation shape.
 - Sent-packet metadata now records retransmittable control frames
@@ -220,12 +230,13 @@ Current as of 2026-05-04.
    ticket export/import examples, transport-parameter mismatch
    rejection vectors beyond replay-context mismatch, and broader 0-RTT
    datagram/loss scenarios.
-6. **Protocol hardening remains.** Retry and Version Negotiation have
-   deterministic core coverage, but still need live external Retry/VN
-   interop and a first-class server token validation policy. Bounded
+6. **Protocol hardening remains.** Retry and Version Negotiation now
+   have deterministic core coverage plus live quic-go interop through
+   nullq-peer. Remaining hardening work: promote the peer's HMAC Retry
+   token policy into reusable embedder guidance/API, add malformed and
+   replayed Retry-token vectors, add VN negative-path vectors, bounded
    allocation policy, qlog/keylog diagnostics, full flow-control
-   pacing, and broader shutdown-path interop with external peers still
-   need work.
+   pacing, and broader shutdown-path interop with external peers.
 
 Note: the passing mock multipath test now validates simultaneous
 two-path transfer inside nullq. The passing `go-quic-peer multipath`

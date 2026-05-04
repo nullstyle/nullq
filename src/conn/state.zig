@@ -1338,14 +1338,14 @@ pub const Connection = struct {
         try self.setTransportParams(params);
     }
 
-    fn initialHeaderCids(bytes: []const u8) Error!struct {
+    fn longHeaderCids(bytes: []const u8) Error!struct {
+        version: u32,
         dcid: []const u8,
         scid: []const u8,
     } {
         if (bytes.len < 6) return Error.InsufficientBytes;
         if ((bytes[0] & 0x80) == 0) return Error.NotShortHeader;
-        const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
-        if (long_type_bits != @intFromEnum(wire_header.LongType.initial)) return Error.NotInitialPacket;
+        const version = std.mem.readInt(u32, bytes[1..5], .big);
 
         const dcid_len = bytes[5];
         if (dcid_len > path_mod.max_cid_len) return Error.DcidTooLong;
@@ -1358,7 +1358,43 @@ pub const Connection = struct {
         pos += 1;
         if (bytes.len < pos + @as(usize, scid_len)) return Error.InsufficientBytes;
         const scid = bytes[pos .. pos + scid_len];
-        return .{ .dcid = dcid, .scid = scid };
+        return .{ .version = version, .dcid = dcid, .scid = scid };
+    }
+
+    fn initialHeaderCids(bytes: []const u8) Error!struct {
+        dcid: []const u8,
+        scid: []const u8,
+    } {
+        const cids = try longHeaderCids(bytes);
+        const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
+        if (long_type_bits != @intFromEnum(wire_header.LongType.initial)) return Error.NotInitialPacket;
+        return .{ .dcid = cids.dcid, .scid = cids.scid };
+    }
+
+    /// Server-side helper: write a Version Negotiation packet in
+    /// response to a client's unsupported-version long-header packet.
+    /// `supported_versions` is encoded in preference order.
+    pub fn writeVersionNegotiation(
+        self: *Connection,
+        dst: []u8,
+        client_packet: []const u8,
+        supported_versions: []const u32,
+    ) Error!usize {
+        if (self.role != .server) return error.NotServerContext;
+        if (supported_versions.len == 0) return error.InvalidVersionNegotiation;
+        if (supported_versions.len > 16) return error.BufferTooSmall;
+        const cids = try longHeaderCids(client_packet);
+
+        var versions_bytes: [16 * 4]u8 = undefined;
+        for (supported_versions, 0..) |version, i| {
+            std.mem.writeInt(u32, versions_bytes[i * 4 ..][0..4], version, .big);
+        }
+
+        return try wire_header.encode(dst, .{ .version_negotiation = .{
+            .dcid = try wire_header.ConnId.fromSlice(cids.scid),
+            .scid = try wire_header.ConnId.fromSlice(cids.dcid),
+            .versions_bytes = versions_bytes[0 .. supported_versions.len * 4],
+        } });
     }
 
     /// Server-side helper: write a QUIC v1 Retry packet in response
@@ -5595,6 +5631,43 @@ test "server writeRetry emits a Retry addressed to the client Initial SCID" {
     try std.testing.expectEqualSlices(u8, &retry_scid, parsed.header.retry.scid.slice());
     try std.testing.expectEqualSlices(u8, "server-token", parsed.header.retry.retry_token);
     try std.testing.expect(try long_packet_mod.validateRetryIntegrity(&odcid, retry[0..retry_len]));
+}
+
+test "server writeVersionNegotiation echoes client CIDs and versions" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const client_dcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3 };
+    const client_scid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5 };
+    const init_keys = try initial_keys_mod.deriveInitialKeys(&client_dcid, false);
+    const keys = try short_packet_mod.derivePacketKeys(.aes128_gcm_sha256, &init_keys.secret);
+
+    var initial: [256]u8 = undefined;
+    const initial_len = try long_packet_mod.sealInitial(&initial, .{
+        .version = 0x6b3343cf,
+        .dcid = &client_dcid,
+        .scid = &client_scid,
+        .pn = 0,
+        .payload = "CRYPTO",
+        .keys = &keys,
+    });
+
+    var vn: [128]u8 = undefined;
+    const vn_len = try conn.writeVersionNegotiation(
+        &vn,
+        initial[0..initial_len],
+        &.{quic_version_1},
+    );
+
+    const parsed = try wire_header.parse(vn[0..vn_len], 0);
+    try std.testing.expect(parsed.header == .version_negotiation);
+    try std.testing.expectEqualSlices(u8, &client_scid, parsed.header.version_negotiation.dcid.slice());
+    try std.testing.expectEqualSlices(u8, &client_dcid, parsed.header.version_negotiation.scid.slice());
+    try std.testing.expectEqual(@as(usize, 1), parsed.header.version_negotiation.versionCount());
+    try std.testing.expectEqual(quic_version_1, parsed.header.version_negotiation.version(0));
 }
 
 test "EncryptionLevel idx round-trip" {
