@@ -86,6 +86,7 @@ pub const Error = error{
     InvalidStreamId,
     StreamLimitExceeded,
 } || boringssl.tls.Error ||
+    boringssl.crypto.rand.Error ||
     short_packet_mod.Error ||
     long_packet_mod.Error ||
     send_stream_mod.Error ||
@@ -509,6 +510,7 @@ pub const Connection = struct {
     peer_path_cids_blocked_path_id: ?u32 = null,
     peer_path_cids_blocked_next_sequence: u64 = 0,
     current_incoming_path_id: u32 = 0,
+    last_authenticated_path_id: ?u32 = null,
     /// PTO backoff count for Initial and Handshake. Application PTO
     /// backoff is per-path in `PathState.pto_count`. Reset when an
     /// ACK newly acknowledges ack-eliciting data in that space.
@@ -661,9 +663,11 @@ pub const Connection = struct {
     /// owe a PATH_RESPONSE for. The next outgoing 1-RTT packet
     /// will carry it.
     pending_path_response: ?[8]u8 = null,
+    pending_path_response_path_id: u32 = 0,
     /// PATH_CHALLENGE token we've queued for transmission to start
     /// validating the current path.
     pending_path_challenge: ?[8]u8 = null,
+    pending_path_challenge_path_id: u32 = 0,
 
     /// Peer-issued connection IDs we've stashed via NEW_CONNECTION_ID.
     /// Phase 9 (migration) will pull from this set; for now, the
@@ -2375,6 +2379,7 @@ pub const Connection = struct {
     pub fn markPathValidated(self: *Connection, path_id: u32) bool {
         const p = self.paths.get(path_id) orelse return false;
         p.path.markValidated();
+        if (p.pending_migration_reset) self.resetPathRecoveryAfterMigration(p);
         return true;
     }
 
@@ -2704,6 +2709,14 @@ pub const Connection = struct {
     }
 
     fn applicationPathForPoll(self: *Connection) *PathState {
+        if (self.pending_path_response != null) {
+            const p = self.pathForId(self.pending_path_response_path_id);
+            if (p.path.state != .failed and p.path.state != .retiring) return p;
+        }
+        if (self.pending_path_challenge != null) {
+            const p = self.pathForId(self.pending_path_challenge_path_id);
+            if (p.path.state != .failed and p.path.state != .retiring) return p;
+        }
         for (self.paths.paths.items) |*p| {
             if (p.path.state == .failed) continue;
             if (p.app_pn_space.received.pending_ack) return p;
@@ -2723,6 +2736,106 @@ pub const Connection = struct {
             return self.activePath().id;
         }
         return self.activePath().id;
+    }
+
+    fn peerAddressChangeCandidate(
+        self: *Connection,
+        path_id: u32,
+        from: ?Address,
+    ) ?Address {
+        const addr = from orelse return null;
+        const path = self.pathForId(path_id);
+        if (!path.peer_addr_set) return null;
+        if (Address.eql(path.path.peer_addr, addr)) return null;
+        return addr;
+    }
+
+    fn queuePathResponseOnPath(
+        self: *Connection,
+        path_id: u32,
+        token: [8]u8,
+    ) void {
+        self.pending_path_response = token;
+        self.pending_path_response_path_id = path_id;
+    }
+
+    fn queuePathChallengeOnPath(
+        self: *Connection,
+        path_id: u32,
+        token: [8]u8,
+    ) void {
+        self.pending_path_challenge = token;
+        self.pending_path_challenge_path_id = path_id;
+    }
+
+    fn newPathChallengeToken(self: *Connection) Error![8]u8 {
+        _ = self;
+        var token: [8]u8 = undefined;
+        try boringssl.crypto.rand.fillBytes(&token);
+        return token;
+    }
+
+    fn resetPathRecoveryAfterMigration(
+        self: *Connection,
+        path: *PathState,
+    ) void {
+        path.resetRecoveryAfterMigration(.{ .max_datagram_size = self.mtu });
+    }
+
+    fn recordPathResponse(
+        self: *Connection,
+        path_id: u32,
+        token: [8]u8,
+    ) void {
+        const path = self.pathForId(path_id);
+        const matched = path.path.validator.recordResponse(token) catch return;
+        if (!matched) return;
+        path.path.validated = true;
+        if (path.pending_migration_reset) {
+            self.resetPathRecoveryAfterMigration(path);
+        }
+    }
+
+    fn handlePeerAddressChange(
+        self: *Connection,
+        path: *PathState,
+        addr: Address,
+        datagram_len: usize,
+        now_us: u64,
+    ) Error!void {
+        path.setPeerAddress(addr);
+        path.path.validated = false;
+        path.path.validator = .{};
+        path.path.bytes_received = 0;
+        path.path.bytes_sent = 0;
+        path.path.onDatagramReceived(datagram_len);
+        path.path.state = .active;
+        path.pending_migration_reset = true;
+
+        const token = try self.newPathChallengeToken();
+        const timeout_us = saturatingMul(self.ptoDurationForApplicationPath(path), 3);
+        path.path.validator.beginChallenge(token, now_us, timeout_us);
+        self.queuePathChallengeOnPath(path.id, token);
+    }
+
+    fn recordAuthenticatedDatagramAddress(
+        self: *Connection,
+        path_id: u32,
+        addr: Address,
+        datagram_len: usize,
+        now_us: u64,
+    ) Error!void {
+        const path = self.pathForId(path_id);
+        if (!path.peer_addr_set) {
+            path.setPeerAddress(addr);
+            path.path.onDatagramReceived(datagram_len);
+            return;
+        }
+        if (Address.eql(path.path.peer_addr, addr)) {
+            path.path.onDatagramReceived(datagram_len);
+            return;
+        }
+        try self.handlePeerAddressChange(path, addr, datagram_len, now_us);
     }
 
     fn incomingShortPath(self: *Connection, bytes: []const u8) ?*PathState {
@@ -2990,7 +3103,7 @@ pub const Connection = struct {
                 if (removed.stream_key) |stream_key| {
                     _ = try self.dispatchLostToStreams(stream_key);
                 }
-                _ = try self.dispatchLostControlFrames(&removed);
+                _ = try self.dispatchLostControlFramesOnPath(&removed, path.id);
                 self.discardSentCryptoForPacket(.early_data, removed.pn);
             }
         }
@@ -3008,6 +3121,12 @@ pub const Connection = struct {
 
     fn saturatingMul(a: u64, b: u64) u64 {
         return std.math.mul(u64, a, b) catch std.math.maxInt(u64);
+    }
+
+    fn u64ToUsizeClamped(value: u64) usize {
+        const max_usize_as_u64: u64 = @intCast(std.math.maxInt(usize));
+        if (value > max_usize_as_u64) return std.math.maxInt(usize);
+        return @intCast(value);
     }
 
     fn backoffDuration(base: u64, count: u32) u64 {
@@ -3467,8 +3586,14 @@ pub const Connection = struct {
             const long_overhead: usize = 1 + 4 + 1 + dcid_len + 1 + scid_len + 8 + 4 + 16 + 8; // ample
             const short_overhead: usize = 1 + dcid_len + 4 + 16;
             const overhead: usize = if (lvl == .application) short_overhead else long_overhead;
-            if (self.mtu <= overhead) break :blk 0;
-            break :blk @min(default_mtu, self.mtu - overhead);
+            var packet_capacity = @min(self.mtu, dst.len);
+            if ((lvl == .application or lvl == .early_data) and !app_path.path.isValidated()) {
+                const allowance = u64ToUsizeClamped(app_path.path.antiAmpAllowance());
+                packet_capacity = @min(packet_capacity, allowance);
+                if (packet_capacity <= overhead) return null;
+            }
+            if (packet_capacity <= overhead) break :blk 0;
+            break :blk @min(default_mtu, packet_capacity - overhead);
         };
         if (max_payload == 0) return Error.OutputTooSmall;
         const congestion_blocked = self.congestionBlockedOnPath(lvl, app_path);
@@ -3822,7 +3947,9 @@ pub const Connection = struct {
         //     RFC 9000 §19.17/19.18). PATH_RESPONSE has the highest
         //     priority on the application path so we don't make the
         //     peer wait through a stream-data backlog.
-        if (!congestion_blocked and lvl == .application and self.pending_path_response != null and pl_pos + 9 <= max_payload) {
+        if (!congestion_blocked and lvl == .application and self.pending_path_response != null and
+            self.pending_path_response_path_id == app_path.id and pl_pos + 9 <= max_payload)
+        {
             const tok = self.pending_path_response.?;
             const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                 .path_response = .{ .data = tok },
@@ -3834,7 +3961,9 @@ pub const Connection = struct {
             self.pending_path_response = null;
             ack_eliciting = true;
         }
-        if (!congestion_blocked and lvl == .application and self.pending_path_challenge != null and pl_pos + 9 <= max_payload) {
+        if (!congestion_blocked and lvl == .application and self.pending_path_challenge != null and
+            self.pending_path_challenge_path_id == app_path.id and pl_pos + 9 <= max_payload)
+        {
             const tok = self.pending_path_challenge.?;
             const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                 .path_challenge = .{ .data = tok },
@@ -4133,14 +4262,29 @@ pub const Connection = struct {
         const incoming_path_id = self.incomingPathId(from);
         self.current_incoming_path_id = incoming_path_id;
         const incoming_path = self.pathForId(incoming_path_id);
-        incoming_path.path.onDatagramReceived(bytes.len);
-        if (from) |addr| incoming_path.setPeerAddress(addr);
+        const rebind_addr = self.peerAddressChangeCandidate(incoming_path_id, from);
+        if (rebind_addr == null) {
+            incoming_path.path.onDatagramReceived(bytes.len);
+            if (from) |addr| {
+                if (!incoming_path.peer_addr_set) incoming_path.setPeerAddress(addr);
+            }
+        }
+        var rebind_recorded = false;
         var pos: usize = 0;
         while (pos < bytes.len) {
             const drain_tls_after_packet = shouldDrainTlsAfterPacket(bytes[pos..]);
+            self.last_authenticated_path_id = null;
             const consumed = try self.handleOnePacket(bytes[pos..], now_us);
             if (consumed == 0) break;
             pos += consumed;
+            if (!rebind_recorded) {
+                if (rebind_addr) |addr| {
+                    if (self.last_authenticated_path_id) |path_id| {
+                        try self.recordAuthenticatedDatagramAddress(path_id, addr, bytes.len, now_us);
+                        rebind_recorded = true;
+                    }
+                }
+            }
             if (self.pending_close != null or self.closed) break;
             if (!drain_tls_after_packet) break;
             // Drain CRYPTO into TLS BETWEEN packets, not just at
@@ -4152,7 +4296,13 @@ pub const Connection = struct {
         }
         // PATH_CHALLENGE → record-and-tick; the validator will
         // either succeed (echo arrived) or time out at PTO * 3.
-        self.primaryPath().path.validator.tick(now_us);
+        for (self.paths.paths.items) |*path| {
+            path.path.validator.tick(now_us);
+            if (path.path.validator.status == .failed) {
+                path.path.fail();
+                path.pending_migration_reset = false;
+            }
+        }
         if (self.alert) |_| return error.PeerAlerted;
     }
 
@@ -4177,8 +4327,19 @@ pub const Connection = struct {
         now_us: u64,
         timeout_us: u64,
     ) Error!void {
-        self.primaryPath().path.validator.beginChallenge(token, now_us, timeout_us);
-        self.pending_path_challenge = token;
+        try self.probePathId(0, token, now_us, timeout_us);
+    }
+
+    pub fn probePathId(
+        self: *Connection,
+        path_id: u32,
+        token: [8]u8,
+        now_us: u64,
+        timeout_us: u64,
+    ) Error!void {
+        const path = self.paths.get(path_id) orelse return Error.PathNotFound;
+        path.path.validator.beginChallenge(token, now_us, timeout_us);
+        self.queuePathChallengeOnPath(path_id, token);
     }
 
     /// True iff the active path has been validated (either via the
@@ -4528,6 +4689,7 @@ pub const Connection = struct {
         }
         const opened = open_result.opened;
 
+        self.last_authenticated_path_id = app_path.id;
         app_pn_space.recordReceived(opened.pn, now_us / 1000);
         try self.dispatchFrames(.application, opened.payload, now_us);
         return bytes.len;
@@ -4639,6 +4801,7 @@ pub const Connection = struct {
             }
         }
 
+        self.last_authenticated_path_id = self.current_incoming_path_id;
         self.pnSpaceForLevel(.initial).recordReceived(opened.pn, now_us / 1000);
         try self.dispatchFrames(.initial, opened.payload, now_us);
         return opened.bytes_consumed;
@@ -4707,6 +4870,7 @@ pub const Connection = struct {
             else => return e,
         };
 
+        self.last_authenticated_path_id = app_path.id;
         app_pn_space.recordReceived(opened.pn, now_us / 1000);
         try self.dispatchFrames(.early_data, opened.payload, now_us);
         return opened.bytes_consumed;
@@ -4729,6 +4893,7 @@ pub const Connection = struct {
             else => return e,
         };
 
+        self.last_authenticated_path_id = self.current_incoming_path_id;
         self.pnSpaceForLevel(.handshake).recordReceived(opened.pn, now_us / 1000);
         try self.dispatchFrames(.handshake, opened.payload, now_us);
         return opened.bytes_consumed;
@@ -4791,10 +4956,8 @@ pub const Connection = struct {
                 .stream => |s| try self.handleStream(lvl, s),
                 .reset_stream => |rs| try self.handleResetStream(rs),
                 .datagram => |dg| try self.handleDatagram(lvl, dg),
-                .path_challenge => |pc| self.pending_path_response = pc.data,
-                .path_response => |pr| {
-                    _ = self.pathForId(self.current_incoming_path_id).path.validator.recordResponse(pr.data) catch {};
-                },
+                .path_challenge => |pc| self.queuePathResponseOnPath(self.current_incoming_path_id, pc.data),
+                .path_response => |pr| self.recordPathResponse(self.current_incoming_path_id, pr.data),
                 .new_connection_id => |nc| try self.handleNewConnectionId(nc),
                 .stop_sending => |ss| try self.handleStopSending(ss),
                 .path_abandon => |pa| self.handlePathAbandon(pa, now_us),
@@ -5694,6 +5857,14 @@ pub const Connection = struct {
         self: *Connection,
         packet: *const sent_packets_mod.SentPacket,
     ) Error!bool {
+        return self.dispatchLostControlFramesOnPath(packet, self.activePath().id);
+    }
+
+    fn dispatchLostControlFramesOnPath(
+        self: *Connection,
+        packet: *const sent_packets_mod.SentPacket,
+        path_id: u32,
+    ) Error!bool {
         var any = false;
         for (packet.retransmit_frames.items) |frame| {
             switch (frame) {
@@ -5742,13 +5913,13 @@ pub const Connection = struct {
                 },
                 .path_response => |pr| {
                     if (self.pending_path_response == null) {
-                        self.pending_path_response = pr.data;
+                        self.queuePathResponseOnPath(path_id, pr.data);
                     }
                     any = true;
                 },
                 .path_challenge => |pc| {
                     if (self.pending_path_challenge == null) {
-                        self.pending_path_challenge = pc.data;
+                        self.queuePathChallengeOnPath(path_id, pc.data);
                     }
                     any = true;
                 },
@@ -5811,6 +5982,15 @@ pub const Connection = struct {
         lvl: EncryptionLevel,
         packet: *const sent_packets_mod.SentPacket,
     ) Error!bool {
+        return self.requeueLostPacketOnPath(lvl, packet, self.activePath().id);
+    }
+
+    fn requeueLostPacketOnPath(
+        self: *Connection,
+        lvl: EncryptionLevel,
+        packet: *const sent_packets_mod.SentPacket,
+        path_id: u32,
+    ) Error!bool {
         var any = false;
         self.recordDatagramLost(packet);
         if (lvl == .application) {
@@ -5819,7 +5999,7 @@ pub const Connection = struct {
             }
         }
         any = (try self.requeueSentCryptoForPacket(lvl, packet.pn)) or any;
-        any = (try self.dispatchLostControlFrames(packet)) or any;
+        any = (try self.dispatchLostControlFramesOnPath(packet, path_id)) or any;
         return any;
     }
 
@@ -5923,7 +6103,7 @@ pub const Connection = struct {
                 var lost = path.sent.removeAt(i);
                 defer lost.deinit(self.allocator);
                 stats.add(lost);
-                _ = try self.requeueLostPacket(.application, &lost);
+                _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
                 continue;
             }
             i += 1;
@@ -5991,7 +6171,7 @@ pub const Connection = struct {
                 var lost = path.sent.removeAt(i);
                 defer lost.deinit(self.allocator);
                 stats.add(lost);
-                _ = try self.requeueLostPacket(.application, &lost);
+                _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
                 continue;
             }
             i += 1;
@@ -6036,7 +6216,7 @@ pub const Connection = struct {
             defer lost.deinit(self.allocator);
             var stats: LossStats = .{};
             stats.add(lost);
-            const requeued = try self.requeueLostPacket(.application, &lost);
+            const requeued = try self.requeueLostPacketOnPath(.application, &lost, path.id);
             self.onApplicationPathPacketsLost(path, stats);
 
             path.pending_ping = !requeued;
@@ -6070,7 +6250,13 @@ pub const Connection = struct {
     /// idle timeout, and draining deadlines. The caller passes the
     /// current monotonic time in microseconds. Safe to call any time.
     pub fn tick(self: *Connection, now_us: u64) Error!void {
-        for (self.paths.paths.items) |*p| p.path.validator.tick(now_us);
+        for (self.paths.paths.items) |*p| {
+            p.path.validator.tick(now_us);
+            if (p.path.validator.status == .failed) {
+                p.path.fail();
+                p.pending_migration_reset = false;
+            }
+        }
         self.expireRetiringPaths(now_us);
         self.discardExpiredApplicationReadKeys(now_us);
 
@@ -7359,6 +7545,7 @@ test "non-zero path ACK clears local key update gate" {
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
     try conn.requestKeyUpdate(1_000_000);
 
     const path = conn.paths.get(path_id).?;
@@ -8096,6 +8283,7 @@ test "pollLevel emits PATH_ACK for non-zero application path ACKs" {
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
     const path = conn.paths.get(path_id).?;
     path.app_pn_space.recordReceived(9, 1_000);
 
@@ -8127,6 +8315,7 @@ test "pollDatagram can select a non-zero application path" {
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{ .bytes = .{ 1, 2, 3, 4 } ++ .{0} ** 18 }, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
     try std.testing.expect(conn.setActivePath(path_id));
     try conn.queuePathStatus(path_id, true, 1);
 
@@ -8149,6 +8338,7 @@ test "multipath-negotiated non-zero path packets use draft-21 nonce" {
     markTestMultipathNegotiated(&conn, 1);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
     const path = conn.paths.get(path_id).?;
     path.app_pn_space.recordReceived(9, 1_000);
 
@@ -8205,6 +8395,82 @@ test "incoming short packets are routed by local CID before multipath nonce open
     try std.testing.expectEqual(path_id, conn.current_incoming_path_id);
     try std.testing.expectEqual(@as(?u64, 0), path.app_pn_space.received.largest);
     try std.testing.expectEqual(@as(?u64, null), conn.primaryPath().app_pn_space.received.largest);
+}
+
+test "authenticated NAT rebinding starts validation and resets recovery after response" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationReadSecret(&conn);
+    try conn.setLocalScid(&.{0xa0});
+    const old_addr = Address{ .bytes = .{ 1, 2, 3, 4 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 5, 6, 7, 8 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.rtt.smoothed_rtt_us = 50_000;
+    path.path.rtt.latest_rtt_us = 40_000;
+    path.path.rtt.first_sample_taken = true;
+    path.path.cc.cwnd = 30_000;
+
+    var payload: [16]u8 = undefined;
+    const payload_len = try frame_mod.encode(payload[0..], .{ .ping = .{} });
+    const keys = (try conn.packetKeys(.application, .read)).?;
+    var packet_buf: [default_mtu]u8 = undefined;
+    const packet_len = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = conn.local_scid.slice(),
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+    });
+
+    try conn.handle(packet_buf[0..packet_len], new_addr, 1_000_000);
+
+    try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
+    try std.testing.expectEqual(@as(u64, packet_len), path.path.bytes_received);
+    try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expect(!conn.pathStats(0).?.validated);
+    try std.testing.expect(conn.pending_path_challenge != null);
+    try std.testing.expectEqual(@as(u32, 0), conn.pending_path_challenge_path_id);
+    try std.testing.expectEqual(@as(u64, 50_000), path.path.rtt.smoothed_rtt_us);
+    try std.testing.expectEqual(@as(u64, 30_000), path.path.cc.cwnd);
+
+    conn.recordPathResponse(0, path.path.validator.pending_token);
+
+    try std.testing.expect(conn.pathStats(0).?.validated);
+    try std.testing.expect(!path.pending_migration_reset);
+    try std.testing.expectEqual(rtt_mod.initial_rtt_us, path.path.rtt.smoothed_rtt_us);
+    try std.testing.expectEqual(@as(u64, 0), path.path.rtt.latest_rtt_us);
+    const expected_cwnd = (congestion_mod.Config{ .max_datagram_size = default_mtu }).initialWindow();
+    try std.testing.expectEqual(expected_cwnd, path.path.cc.cwnd);
+}
+
+test "unvalidated rebound path obeys anti-amplification before polling" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    const old_addr = Address{ .bytes = .{ 1, 1, 1, 1 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 2, 2, 2, 2 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    try conn.handlePeerAddressChange(path, new_addr, 1, 1_000_000);
+    path.pending_ping = true;
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), try conn.pollLevel(.application, &packet_buf, 1_001_000));
+    try std.testing.expect(path.pending_ping);
+    try std.testing.expect(conn.pending_path_challenge != null);
+    try std.testing.expectEqual(@as(u32, 0), path.sent.count);
+    try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
 }
 
 test "queued path CIDs participate in incoming short-header routing and retirement" {
@@ -8520,6 +8786,7 @@ test "STREAM send tracking survives duplicate application PNs across paths" {
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
     const path = conn.paths.get(path_id).?;
     const stream = try conn.openBidi(0);
 

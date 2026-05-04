@@ -216,6 +216,7 @@ pub const PathState = struct {
     peer_addr_set: bool = false,
     local_addr_set: bool = false,
     retire_deadline_us: ?u64 = null,
+    pending_migration_reset: bool = false,
     peer_prefers_backup: bool = false,
     peer_status_sequence_number: ?u64 = null,
     local_status_sequence_number: u64 = 0,
@@ -250,6 +251,17 @@ pub const PathState = struct {
         self.app_pn_space.received = .{};
         self.pending_ping = false;
         self.pto_count = 0;
+    }
+
+    pub fn resetRecoveryAfterMigration(
+        self: *PathState,
+        cc_cfg: congestion_mod.Config,
+    ) void {
+        self.path.rtt = .{};
+        self.path.cc = NewReno.init(cc_cfg);
+        self.pending_ping = false;
+        self.pto_count = 0;
+        self.pending_migration_reset = false;
     }
 
     pub fn peerAddress(self: *const PathState) ?Address {
