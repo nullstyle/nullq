@@ -77,6 +77,7 @@ pub const Error = error{
     PathLimitExceeded,
     ConnectionIdLimitExceeded,
     ConnectionIdRequired,
+    ConnectionIdAlreadyInUse,
     EmptyEarlyDataContext,
     KeyUpdateUnavailable,
     KeyUpdateBlocked,
@@ -246,6 +247,7 @@ pub const CloseEvent = struct {
 pub const ConnectionEvent = union(enum) {
     close: CloseEvent,
     flow_blocked: FlowBlockedInfo,
+    connection_ids_needed: ConnectionIdReplenishInfo,
     datagram_acked: DatagramSendEvent,
     datagram_lost: DatagramSendEvent,
 };
@@ -270,6 +272,23 @@ pub const FlowBlockedInfo = struct {
 };
 
 pub const max_flow_blocked_events: usize = 16;
+
+pub const ConnectionIdReplenishReason = enum {
+    retired,
+    path_cids_blocked,
+};
+
+pub const ConnectionIdReplenishInfo = struct {
+    path_id: u32,
+    reason: ConnectionIdReplenishReason,
+    active_count: usize,
+    active_limit: usize,
+    issue_budget: usize,
+    next_sequence_number: u64,
+    blocked_next_sequence_number: ?u64 = null,
+};
+
+pub const max_connection_id_events: usize = 16;
 
 pub const DatagramSendEvent = struct {
     id: u64,
@@ -536,7 +555,9 @@ pub const Connection = struct {
     peer_path_cids_blocked_path_id: ?u32 = null,
     peer_path_cids_blocked_next_sequence: u64 = 0,
     current_incoming_path_id: u32 = 0,
+    current_incoming_addr: ?Address = null,
     last_authenticated_path_id: ?u32 = null,
+    poll_addr_override: ?Address = null,
     /// PTO backoff count for Initial and Handshake. Application PTO
     /// backoff is per-path in `PathState.pto_count`. Reset when an
     /// ACK newly acknowledges ack-eliciting data in that space.
@@ -692,6 +713,7 @@ pub const Connection = struct {
     /// will carry it.
     pending_path_response: ?[8]u8 = null,
     pending_path_response_path_id: u32 = 0,
+    pending_path_response_addr: ?Address = null,
     /// PATH_CHALLENGE token we've queued for transmission to start
     /// validating the current path.
     pending_path_challenge: ?[8]u8 = null,
@@ -719,6 +741,8 @@ pub const Connection = struct {
     close_reason_buf: [max_close_reason_len]u8 = undefined,
     flow_blocked_events: [max_flow_blocked_events]FlowBlockedInfo = undefined,
     flow_blocked_event_count: usize = 0,
+    connection_id_events: [max_connection_id_events]ConnectionIdReplenishInfo = undefined,
+    connection_id_event_count: usize = 0,
     datagram_send_events: [max_datagram_send_events]StoredDatagramSendEvent = undefined,
     datagram_send_event_count: usize = 0,
     /// STOP_SENDING frames we owe the peer (one per stream id).
@@ -1370,6 +1394,7 @@ pub const Connection = struct {
             self.close(true, transport_error_protocol_violation, "invalid retire_prior_to");
             return;
         }
+        try self.ensureLocalCidAvailable(path_id, sequence_number, cid);
         for (self.local_cids.items) |*item| {
             if (item.path_id == path_id and item.sequence_number == sequence_number) {
                 item.retire_prior_to = retire_prior_to;
@@ -1442,6 +1467,14 @@ pub const Connection = struct {
         }
     }
 
+    fn retireLocalCidFromPeer(self: *Connection, path_id: u32, sequence_number: u64) void {
+        const before_budget = self.localConnectionIdIssueBudget(path_id);
+        self.retireLocalCid(path_id, sequence_number);
+        if (self.localConnectionIdIssueBudget(path_id) > before_budget) {
+            self.recordConnectionIdsNeeded(path_id, .retired, null);
+        }
+    }
+
     fn dropPendingLocalCidAdvertisement(
         self: *Connection,
         path_id: u32,
@@ -1497,6 +1530,22 @@ pub const Connection = struct {
         return false;
     }
 
+    fn ensureLocalCidAvailable(
+        self: *const Connection,
+        path_id: u32,
+        sequence_number: u64,
+        cid: ConnectionId,
+    ) Error!void {
+        if (cid.len == 0) return;
+        for (self.local_cids.items) |item| {
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                if (!ConnectionId.eql(item.cid, cid)) return Error.ConnectionIdAlreadyInUse;
+                continue;
+            }
+            if (ConnectionId.eql(item.cid, cid)) return Error.ConnectionIdAlreadyInUse;
+        }
+    }
+
     fn localCidForSequence(
         self: *const Connection,
         path_id: u32,
@@ -1535,6 +1584,13 @@ pub const Connection = struct {
     fn peerActiveConnectionIdLimit(self: *const Connection) u64 {
         const params = self.cached_peer_transport_params orelse return 2;
         return params.active_connection_id_limit;
+    }
+
+    fn peerActiveConnectionIdLimitUsize(self: *const Connection) usize {
+        const limit = self.peerActiveConnectionIdLimit();
+        const max_usize_as_u64: u64 = @intCast(std.math.maxInt(usize));
+        if (limit > max_usize_as_u64) return std.math.maxInt(usize);
+        return @intCast(limit);
     }
 
     pub fn localConnectionIdIssueBudget(self: *const Connection, path_id: u32) usize {
@@ -2111,6 +2167,103 @@ pub const Connection = struct {
         self.flow_blocked_event_count += 1;
     }
 
+    fn cidPathCanBeManaged(self: *const Connection, path_id: u32) bool {
+        if (path_id == 0) return true;
+        if (self.paths.getConst(path_id) != null) return true;
+        return self.multipathNegotiated() and path_id <= self.local_max_path_id;
+    }
+
+    pub fn connectionIdReplenishInfo(
+        self: *const Connection,
+        path_id: u32,
+    ) ?ConnectionIdReplenishInfo {
+        if (!self.cidPathCanBeManaged(path_id)) return null;
+        return self.connectionIdReplenishInfoFor(path_id, .retired, null);
+    }
+
+    fn connectionIdReplenishInfoFor(
+        self: *const Connection,
+        path_id: u32,
+        reason: ConnectionIdReplenishReason,
+        blocked_next_sequence_number: ?u64,
+    ) ConnectionIdReplenishInfo {
+        return .{
+            .path_id = path_id,
+            .reason = reason,
+            .active_count = self.localCidActiveCountForPath(path_id),
+            .active_limit = self.peerActiveConnectionIdLimitUsize(),
+            .issue_budget = self.localConnectionIdIssueBudget(path_id),
+            .next_sequence_number = self.nextLocalCidSequence(path_id),
+            .blocked_next_sequence_number = blocked_next_sequence_number,
+        };
+    }
+
+    fn recordConnectionIdsNeeded(
+        self: *Connection,
+        path_id: u32,
+        reason: ConnectionIdReplenishReason,
+        blocked_next_sequence_number: ?u64,
+    ) void {
+        if (!self.cidPathCanBeManaged(path_id)) return;
+        const info = self.connectionIdReplenishInfoFor(path_id, reason, blocked_next_sequence_number);
+        if (info.issue_budget == 0 and info.blocked_next_sequence_number == null) return;
+        var i: usize = 0;
+        while (i < self.connection_id_event_count) : (i += 1) {
+            if (self.connection_id_events[i].path_id == path_id and
+                self.connection_id_events[i].reason == reason)
+            {
+                self.connection_id_events[i] = info;
+                return;
+            }
+        }
+        if (self.connection_id_event_count == max_connection_id_events) {
+            std.mem.copyForwards(
+                ConnectionIdReplenishInfo,
+                self.connection_id_events[0 .. max_connection_id_events - 1],
+                self.connection_id_events[1..max_connection_id_events],
+            );
+            self.connection_id_event_count -= 1;
+        }
+        self.connection_id_events[self.connection_id_event_count] = info;
+        self.connection_id_event_count += 1;
+    }
+
+    fn connectionIdEventStillNeeded(self: *const Connection, path_id: u32) bool {
+        if (self.localConnectionIdIssueBudget(path_id) > 0) return true;
+        if (self.pendingPathCidsBlocked()) |blocked| {
+            if (blocked.path_id == path_id) return true;
+        }
+        return false;
+    }
+
+    fn refreshConnectionIdEventsForPath(self: *Connection, path_id: u32) void {
+        var i: usize = 0;
+        while (i < self.connection_id_event_count) {
+            if (self.connection_id_events[i].path_id != path_id) {
+                i += 1;
+                continue;
+            }
+            if (!self.connectionIdEventStillNeeded(path_id)) {
+                if (i + 1 < self.connection_id_event_count) {
+                    std.mem.copyForwards(
+                        ConnectionIdReplenishInfo,
+                        self.connection_id_events[i .. self.connection_id_event_count - 1],
+                        self.connection_id_events[i + 1 .. self.connection_id_event_count],
+                    );
+                }
+                self.connection_id_event_count -= 1;
+                continue;
+            }
+            const event = self.connection_id_events[i];
+            self.connection_id_events[i] = self.connectionIdReplenishInfoFor(
+                path_id,
+                event.reason,
+                event.blocked_next_sequence_number,
+            );
+            i += 1;
+        }
+    }
+
     fn recordDatagramSendEvent(self: *Connection, event: StoredDatagramSendEvent) void {
         if (self.datagram_send_event_count == max_datagram_send_events) {
             std.mem.copyForwards(
@@ -2397,8 +2550,12 @@ pub const Connection = struct {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
         try self.ensureCanIssueLocalCid(0, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
+        try self.ensureLocalCidAvailable(0, sequence_number, local_cid);
         for (self.pending_new_connection_ids.items) |item| {
-            if (item.sequence_number == sequence_number) return;
+            if (item.sequence_number == sequence_number) {
+                if (!std.mem.eql(u8, item.connection_id.slice(), cid)) return Error.ConnectionIdAlreadyInUse;
+                return;
+            }
         }
         var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
         @memcpy(connection_id.bytes[0..cid.len], cid);
@@ -2409,6 +2566,7 @@ pub const Connection = struct {
             .connection_id = connection_id,
             .stateless_reset_token = stateless_reset_token,
         });
+        self.refreshConnectionIdEventsForPath(0);
     }
 
     pub fn queueRetireConnectionId(
@@ -2488,6 +2646,7 @@ pub const Connection = struct {
             if (path_id > self.local_max_path_id) return Error.PathLimitExceeded;
             if (local_cid.len == 0 or peer_cid.len == 0) return Error.ConnectionIdRequired;
             try self.ensureCanIssueLocalCid(path_id, 0, 0, local_cid.len);
+            try self.ensureLocalCidAvailable(path_id, 0, local_cid);
         }
         const opened_path_id = try self.paths.openPath(
             self.allocator,
@@ -2605,8 +2764,12 @@ pub const Connection = struct {
         try self.ensureCanIssueCidForPathId(path_id);
         try self.ensureCanIssueLocalCid(path_id, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
+        try self.ensureLocalCidAvailable(path_id, sequence_number, local_cid);
         for (self.pending_path_new_connection_ids.items) |item| {
-            if (item.path_id == path_id and item.sequence_number == sequence_number) return;
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                if (!std.mem.eql(u8, item.connection_id.slice(), cid)) return Error.ConnectionIdAlreadyInUse;
+                return;
+            }
         }
         var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
         @memcpy(connection_id.bytes[0..cid.len], cid);
@@ -2618,6 +2781,7 @@ pub const Connection = struct {
             .connection_id = connection_id,
             .stateless_reset_token = stateless_reset_token,
         });
+        self.refreshConnectionIdEventsForPath(path_id);
     }
 
     pub fn queuePathRetireConnectionId(
@@ -2769,7 +2933,10 @@ pub const Connection = struct {
             queued += 1;
         }
 
-        if (queued > 0) self.clearSatisfiedPathCidsBlocked(path_id);
+        if (queued > 0) {
+            self.clearSatisfiedPathCidsBlocked(path_id);
+            self.refreshConnectionIdEventsForPath(path_id);
+        }
         return queued;
     }
 
@@ -2932,9 +3099,11 @@ pub const Connection = struct {
         self: *Connection,
         path_id: u32,
         token: [8]u8,
+        addr: ?Address,
     ) void {
         self.pending_path_response = token;
         self.pending_path_response_path_id = path_id;
+        self.pending_path_response_addr = addr;
     }
 
     fn queuePathChallengeOnPath(
@@ -3659,6 +3828,7 @@ pub const Connection = struct {
     ) Error!?OutgoingDatagram {
         if (self.closed) return null;
         try self.refreshEarlyDataStatus();
+        self.poll_addr_override = null;
         var pos: usize = 0;
         // Initial first (must lead a coalesced datagram).
         if (try self.pollLevel(.initial, dst[pos..], now_us)) |n| pos += n;
@@ -3681,16 +3851,23 @@ pub const Connection = struct {
             self.applicationPathForPoll().id
         else
             self.primaryPath().id;
+        const app_start_pos = pos;
         if (pos < dst.len) {
             if (try self.pollLevelOnPath(.application, app_path_id, dst[pos..], now_us)) |n| pos += n;
         }
         if (pos == 0) return null;
         self.last_activity_us = now_us;
         const out_path = self.pathForId(app_path_id);
-        out_path.path.onDatagramSent(pos);
+        const out_addr = if (pos > app_start_pos) self.poll_addr_override orelse out_path.peerAddress() else out_path.peerAddress();
+        self.poll_addr_override = null;
+        if (out_addr) |addr| {
+            if (Address.eql(addr, out_path.path.peer_addr)) out_path.path.onDatagramSent(pos);
+        } else {
+            out_path.path.onDatagramSent(pos);
+        }
         return .{
             .len = pos,
-            .to = out_path.peerAddress(),
+            .to = out_addr,
             .path_id = out_path.id,
         };
     }
@@ -3794,6 +3971,14 @@ pub const Connection = struct {
         };
         if (max_payload == 0) return Error.OutputTooSmall;
         const congestion_blocked = self.congestionBlockedOnPath(lvl, app_path);
+        const path_response_addr_overrides_current = blk: {
+            if (lvl != .application) break :blk false;
+            if (self.pending_path_response == null) break :blk false;
+            if (self.pending_path_response_path_id != app_path.id) break :blk false;
+            const addr = self.pending_path_response_addr orelse break :blk false;
+            break :blk !Address.eql(addr, app_path.path.peer_addr);
+        };
+        const app_control_blocked = congestion_blocked or path_response_addr_overrides_current;
 
         // CONNECTION_CLOSE pre-empts everything: if pending, that's
         // the only frame we emit, and we mark the connection
@@ -3900,7 +4085,7 @@ pub const Connection = struct {
 
         // 1a) PTO probe PING. A lost PING is not retransmitted as a
         // frame, but a later PTO will queue another probe.
-        if (lvl != .early_data and pending_ping.* and pl_pos + 1 <= max_payload) {
+        if (!path_response_addr_overrides_current and lvl != .early_data and pending_ping.* and pl_pos + 1 <= max_payload) {
             const ping_len = try frame_mod.encode(
                 pl_buf[pl_pos..max_payload],
                 .{ .ping = .{} },
@@ -3967,7 +4152,7 @@ pub const Connection = struct {
         // 2a) MAX_DATA / MAX_STREAM_DATA (application only). We queue these
         // when the application drains receive buffers so peers can
         // continue uploads beyond their current stream window.
-        if (!congestion_blocked and lvl == .application and self.pending_max_data != null) {
+        if (!app_control_blocked and lvl == .application and self.pending_max_data != null) {
             const maximum_data = self.pending_max_data.?;
             const overhead_md: usize = 1 + varint.encodedLen(maximum_data);
             if (max_payload >= pl_pos + overhead_md) {
@@ -3982,7 +4167,7 @@ pub const Connection = struct {
                 ack_eliciting = true;
             }
         }
-        if (!congestion_blocked and lvl == .application and self.pending_max_stream_data.items.len > 0) {
+        if (!app_control_blocked and lvl == .application and self.pending_max_stream_data.items.len > 0) {
             const item = self.pending_max_stream_data.items[0];
             const overhead_msd: usize = 1 +
                 varint.encodedLen(item.stream_id) +
@@ -4005,7 +4190,7 @@ pub const Connection = struct {
                 ack_eliciting = true;
             }
         }
-        if (!congestion_blocked and lvl == .application and (self.pending_max_streams_bidi != null or self.pending_max_streams_uni != null)) {
+        if (!app_control_blocked and lvl == .application and (self.pending_max_streams_bidi != null or self.pending_max_streams_uni != null)) {
             const bidi = self.pending_max_streams_bidi != null;
             const maximum_streams = if (bidi) self.pending_max_streams_bidi.? else self.pending_max_streams_uni.?;
             const overhead_ms: usize = 1 + varint.encodedLen(maximum_streams);
@@ -4031,7 +4216,7 @@ pub const Connection = struct {
                 ack_eliciting = true;
             }
         }
-        if (!congestion_blocked and lvl == .application and self.pending_data_blocked != null) {
+        if (!app_control_blocked and lvl == .application and self.pending_data_blocked != null) {
             const maximum_data = self.pending_data_blocked.?;
             const overhead_db: usize = 1 + varint.encodedLen(maximum_data);
             if (max_payload >= pl_pos + overhead_db) {
@@ -4046,7 +4231,7 @@ pub const Connection = struct {
                 ack_eliciting = true;
             }
         }
-        if (!congestion_blocked and lvl == .application and self.pending_stream_data_blocked.items.len > 0) {
+        if (!app_control_blocked and lvl == .application and self.pending_stream_data_blocked.items.len > 0) {
             const item = self.pending_stream_data_blocked.items[0];
             const overhead_sdb: usize = 1 +
                 varint.encodedLen(item.stream_id) +
@@ -4063,7 +4248,7 @@ pub const Connection = struct {
                 ack_eliciting = true;
             }
         }
-        if (!congestion_blocked and lvl == .application and (self.pending_streams_blocked_bidi != null or self.pending_streams_blocked_uni != null)) {
+        if (!app_control_blocked and lvl == .application and (self.pending_streams_blocked_bidi != null or self.pending_streams_blocked_uni != null)) {
             const bidi = self.pending_streams_blocked_bidi != null;
             const maximum_streams = if (bidi) self.pending_streams_blocked_bidi.? else self.pending_streams_blocked_uni.?;
             const overhead_sb: usize = 1 + varint.encodedLen(maximum_streams);
@@ -4088,7 +4273,7 @@ pub const Connection = struct {
 
         // 2b) NEW_CONNECTION_ID (application only). Advertise spare
         // CIDs so peers can validate/migrate additional paths.
-        if (!congestion_blocked and lvl == .application and self.pending_new_connection_ids.items.len > 0) {
+        if (!app_control_blocked and lvl == .application and self.pending_new_connection_ids.items.len > 0) {
             const item = self.pending_new_connection_ids.items[0];
             const overhead_ncid: usize = 1 +
                 varint.encodedLen(item.sequence_number) +
@@ -4117,7 +4302,7 @@ pub const Connection = struct {
             }
         }
 
-        if (!congestion_blocked and lvl == .application and self.pending_retire_connection_ids.items.len > 0) {
+        if (!app_control_blocked and lvl == .application and self.pending_retire_connection_ids.items.len > 0) {
             const item = self.pending_retire_connection_ids.items[0];
             const overhead_rcid: usize = 1 + varint.encodedLen(item.sequence_number);
             if (max_payload >= pl_pos + overhead_rcid) {
@@ -4134,7 +4319,7 @@ pub const Connection = struct {
         }
 
         // 2c) STOP_SENDING (one per packet for now — application only).
-        if (!congestion_blocked and lvl == .application and self.pending_stop_sending.items.len > 0) {
+        if (!app_control_blocked and lvl == .application and self.pending_stop_sending.items.len > 0) {
             const item = self.pending_stop_sending.items[0];
             const overhead_ss: usize = 1 + varint.encodedLen(item.stream_id) + varint.encodedLen(item.application_error_code);
             if (max_payload >= pl_pos + overhead_ss) {
@@ -4160,10 +4345,15 @@ pub const Connection = struct {
         //     RFC 9000 §19.17/19.18). PATH_RESPONSE has the highest
         //     priority on the application path so we don't make the
         //     peer wait through a stream-data backlog.
+        var path_response_used_addr_override = false;
         if (!congestion_blocked and lvl == .application and self.pending_path_response != null and
             self.pending_path_response_path_id == app_path.id and pl_pos + 9 <= max_payload)
         {
+            if (self.pending_path_response_addr) |addr| {
+                path_response_used_addr_override = !Address.eql(addr, app_path.path.peer_addr);
+            }
             const tok = self.pending_path_response.?;
+            self.poll_addr_override = self.pending_path_response_addr;
             const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                 .path_response = .{ .data = tok },
             });
@@ -4172,9 +4362,11 @@ pub const Connection = struct {
                 .path_response = .{ .data = tok },
             });
             self.pending_path_response = null;
+            self.pending_path_response_addr = null;
             ack_eliciting = true;
         }
-        if (!congestion_blocked and lvl == .application and self.pending_path_challenge != null and
+        if (!path_response_used_addr_override and
+            !congestion_blocked and lvl == .application and self.pending_path_challenge != null and
             self.pending_path_challenge_path_id == app_path.id and pl_pos + 9 <= max_payload)
         {
             const tok = self.pending_path_challenge.?;
@@ -4191,7 +4383,7 @@ pub const Connection = struct {
 
         // 2e) Draft-21 multipath control frames. Coalesce as many as
         //     fit while preserving per-frame retransmit metadata.
-        if (!congestion_blocked and lvl == .application) {
+        if (!path_response_used_addr_override and !congestion_blocked and lvl == .application) {
             if (try self.emitPendingMultipathFrames(&sent_packet, &pl_buf, &pl_pos, max_payload)) {
                 ack_eliciting = true;
             }
@@ -4200,7 +4392,7 @@ pub const Connection = struct {
         // 2e) RESET_STREAM frames for streams in reset_sent state
         //     whose RESET hasn't been queued yet. Emit at most one
         //     per packet; the loop handles all eventually.
-        if (!congestion_blocked and lvl == .application) {
+        if (!path_response_used_addr_override and !congestion_blocked and lvl == .application) {
             var rs_it = self.streams.iterator();
             while (rs_it.next()) |entry| {
                 const s = entry.value_ptr.*;
@@ -4236,7 +4428,7 @@ pub const Connection = struct {
         // 3a) DATAGRAM frame (Application PN space). One queued
         //     payload per packet; LEN-prefixed so DATAGRAM doesn't
         //     have to be the last frame.
-        if (!congestion_blocked and (lvl == .application or lvl == .early_data) and self.pending_send_datagrams.items.len > 0) {
+        if (!path_response_used_addr_override and !congestion_blocked and (lvl == .application or lvl == .early_data) and self.pending_send_datagrams.items.len > 0) {
             const dg = self.pending_send_datagrams.items[0];
             const dg_overhead: usize = 1 + varint.encodedLen(dg.data.len);
             if (max_payload >= pl_pos + dg_overhead + dg.data.len) {
@@ -4258,7 +4450,7 @@ pub const Connection = struct {
 
         // 3b) STREAM frame (Application PN space).
         var sent_chunk: ?struct { stream: *Stream, chunk: send_stream_mod.Chunk } = null;
-        if (!congestion_blocked and (lvl == .application or lvl == .early_data)) {
+        if (!path_response_used_addr_override and !congestion_blocked and (lvl == .application or lvl == .early_data)) {
             var s_it = self.streams.iterator();
             while (s_it.next()) |entry| {
                 const s = entry.value_ptr.*;
@@ -4491,6 +4683,7 @@ pub const Connection = struct {
         if (bytes.len > 0) self.last_activity_us = now_us;
         const incoming_path_id = self.incomingPathId(from);
         self.current_incoming_path_id = incoming_path_id;
+        self.current_incoming_addr = from;
         const incoming_path = self.pathForId(incoming_path_id);
         const rebind_addr = self.peerAddressChangeCandidate(incoming_path_id, from);
         const from_migration_rollback_addr = if (from) |addr|
@@ -4742,6 +4935,18 @@ pub const Connection = struct {
             }
             self.flow_blocked_event_count -= 1;
             return .{ .flow_blocked = out };
+        }
+        if (self.connection_id_event_count > 0) {
+            const out = self.connection_id_events[0];
+            if (self.connection_id_event_count > 1) {
+                std.mem.copyForwards(
+                    ConnectionIdReplenishInfo,
+                    self.connection_id_events[0 .. self.connection_id_event_count - 1],
+                    self.connection_id_events[1..self.connection_id_event_count],
+                );
+            }
+            self.connection_id_event_count -= 1;
+            return .{ .connection_ids_needed = out };
         }
         if (self.datagram_send_event_count > 0) {
             const out = self.datagram_send_events[0];
@@ -5191,7 +5396,11 @@ pub const Connection = struct {
                 .stream => |s| try self.handleStream(lvl, s),
                 .reset_stream => |rs| try self.handleResetStream(rs),
                 .datagram => |dg| try self.handleDatagram(lvl, dg),
-                .path_challenge => |pc| self.queuePathResponseOnPath(self.current_incoming_path_id, pc.data),
+                .path_challenge => |pc| self.queuePathResponseOnPath(
+                    self.current_incoming_path_id,
+                    pc.data,
+                    self.current_incoming_addr,
+                ),
                 .path_response => |pr| self.recordPathResponse(self.current_incoming_path_id, pr.data),
                 .new_connection_id => |nc| try self.handleNewConnectionId(nc),
                 .stop_sending => |ss| try self.handleStopSending(ss),
@@ -5441,7 +5650,7 @@ pub const Connection = struct {
         self: *Connection,
         rc: frame_types.RetireConnectionId,
     ) void {
-        self.retireLocalCid(0, rc.sequence_number);
+        self.retireLocalCidFromPeer(0, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(0, rc.sequence_number);
     }
 
@@ -5497,7 +5706,7 @@ pub const Connection = struct {
         self: *Connection,
         rc: frame_types.PathRetireConnectionId,
     ) void {
-        self.retireLocalCid(rc.path_id, rc.sequence_number);
+        self.retireLocalCidFromPeer(rc.path_id, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(rc.path_id, rc.sequence_number);
     }
 
@@ -5530,6 +5739,7 @@ pub const Connection = struct {
         }
         self.peer_path_cids_blocked_path_id = pcb.path_id;
         self.peer_path_cids_blocked_next_sequence = pcb.next_sequence_number;
+        self.recordConnectionIdsNeeded(pcb.path_id, .path_cids_blocked, pcb.next_sequence_number);
     }
 
     fn handleStopSending(
@@ -6149,7 +6359,7 @@ pub const Connection = struct {
                 },
                 .path_response => |pr| {
                     if (self.pending_path_response == null) {
-                        self.queuePathResponseOnPath(path_id, pr.data);
+                        self.queuePathResponseOnPath(path_id, pr.data, null);
                     }
                     any = true;
                 },
@@ -9169,6 +9379,51 @@ test "old address packets during pending rebinding do not lift new path anti-amp
     try std.testing.expectEqual(@as(u64, 30), path.path.antiAmpAllowance());
 }
 
+test "PATH_RESPONSE during pending rebinding is sent to the challenge address" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    const old_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 1, 0, 1, 0 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.markValidated();
+
+    try conn.handlePeerAddressChange(path, new_addr, 1200, 1_000_000);
+    const token: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    conn.queuePathResponseOnPath(0, token, old_addr);
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const datagram = (try conn.pollDatagram(&packet_buf, 1_000_100)).?;
+    try std.testing.expect(datagram.to != null);
+    try std.testing.expect(Address.eql(old_addr, datagram.to.?));
+    try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
+    try std.testing.expect(conn.pending_path_response == null);
+    try std.testing.expect(conn.pending_path_challenge != null);
+
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..datagram.len], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+    });
+    const decoded = try frame_mod.decode(opened.payload);
+    try std.testing.expect(decoded.frame == .path_response);
+    try std.testing.expectEqualSlices(u8, &token, &decoded.frame.path_response.data);
+
+    const followup = (try conn.pollDatagram(&packet_buf, 1_000_200)).?;
+    try std.testing.expect(followup.to != null);
+    try std.testing.expect(Address.eql(new_addr, followup.to.?));
+    try std.testing.expect(conn.pending_path_challenge == null);
+    try std.testing.expect(path.path.bytes_sent > 0);
+}
+
 test "queued path CIDs participate in incoming short-header routing and retirement" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -9254,6 +9509,68 @@ test "openPath requires common path id capacity and CIDs when multipath is negot
         Error.PathLimitExceeded,
         conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc2}), ConnectionId.fromSlice(&.{0xd2})),
     );
+}
+
+test "local CID issuance rejects reuse across paths and sequences" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 2);
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    try std.testing.expectError(
+        Error.ConnectionIdAlreadyInUse,
+        conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd2})),
+    );
+    try std.testing.expect(conn.paths.get(2) == null);
+    try std.testing.expectEqual(@as(u32, 2), conn.paths.next_path_id);
+
+    try std.testing.expectError(
+        Error.ConnectionIdAlreadyInUse,
+        conn.queuePathNewConnectionId(path_id, 1, 0, &.{0xc1}, @splat(0xc1)),
+    );
+    try std.testing.expectError(
+        Error.ConnectionIdAlreadyInUse,
+        conn.queueNewConnectionId(1, 0, &.{0xc1}, @splat(0xc1)),
+    );
+}
+
+test "RETIRE_CONNECTION_ID surfaces replacement CID budget to embedders" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 3 };
+    try conn.setLocalScid(&.{0xa0});
+    try conn.queueNewConnectionId(1, 0, &.{0xa1}, @splat(0xa1));
+    try conn.queueNewConnectionId(2, 0, &.{0xa2}, @splat(0xa2));
+    try std.testing.expectEqual(@as(usize, 0), conn.localConnectionIdIssueBudget(0));
+
+    conn.handleRetireConnectionId(.{ .sequence_number = 1 });
+    const info = conn.connectionIdReplenishInfo(0).?;
+    try std.testing.expectEqual(@as(u32, 0), info.path_id);
+    try std.testing.expectEqual(ConnectionIdReplenishReason.retired, info.reason);
+    try std.testing.expectEqual(@as(usize, 2), info.active_count);
+    try std.testing.expectEqual(@as(usize, 3), info.active_limit);
+    try std.testing.expectEqual(@as(usize, 1), info.issue_budget);
+    try std.testing.expectEqual(@as(u64, 3), info.next_sequence_number);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .connection_ids_needed);
+    try std.testing.expectEqual(@as(u32, 0), event.connection_ids_needed.path_id);
+    try std.testing.expectEqual(ConnectionIdReplenishReason.retired, event.connection_ids_needed.reason);
+    try std.testing.expectEqual(@as(usize, 1), event.connection_ids_needed.issue_budget);
+
+    const queued = try conn.replenishConnectionIds(&.{
+        .{ .connection_id = &.{0xa3}, .stateless_reset_token = @splat(0xa3) },
+    });
+    try std.testing.expectEqual(@as(usize, 1), queued);
+    try std.testing.expectEqual(@as(usize, 0), conn.localConnectionIdIssueBudget(0));
+    try std.testing.expect(conn.pollEvent() == null);
 }
 
 test "PATH_NEW_CONNECTION_ID rejects sequence reuse with different cid" {
@@ -9348,6 +9665,12 @@ test "PATH_CIDS_BLOCKED can be surfaced and replenished within peer active cid l
     try std.testing.expectEqual(path_id, blocked.path_id);
     try std.testing.expectEqual(@as(u64, 1), blocked.next_sequence_number);
     try std.testing.expectEqual(@as(usize, 2), conn.localConnectionIdIssueBudget(path_id));
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .connection_ids_needed);
+    try std.testing.expectEqual(path_id, event.connection_ids_needed.path_id);
+    try std.testing.expectEqual(ConnectionIdReplenishReason.path_cids_blocked, event.connection_ids_needed.reason);
+    try std.testing.expectEqual(@as(?u64, 1), event.connection_ids_needed.blocked_next_sequence_number);
+    try std.testing.expectEqual(@as(usize, 2), event.connection_ids_needed.issue_budget);
 
     const queued = try conn.replenishPathConnectionIds(path_id, &.{
         .{ .connection_id = &.{0xc2}, .stateless_reset_token = @splat(0xc2) },
@@ -9427,6 +9750,12 @@ test "PATH_RETIRE_CONNECTION_ID drops pending advertisements and allows replenis
     try std.testing.expectEqual(@as(usize, 1), conn.pending_path_new_connection_ids.items.len);
     try std.testing.expectEqual(@as(u64, 2), conn.pending_path_new_connection_ids.items[0].sequence_number);
     try std.testing.expectEqual(@as(usize, 1), conn.localConnectionIdIssueBudget(path_id));
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .connection_ids_needed);
+    try std.testing.expectEqual(path_id, event.connection_ids_needed.path_id);
+    try std.testing.expectEqual(ConnectionIdReplenishReason.retired, event.connection_ids_needed.reason);
+    try std.testing.expectEqual(@as(usize, 1), event.connection_ids_needed.issue_budget);
+    try std.testing.expectEqual(@as(u64, 3), event.connection_ids_needed.next_sequence_number);
 
     const queued = try conn.replenishPathConnectionIds(path_id, &.{
         .{ .connection_id = &.{0xc4}, .stateless_reset_token = @splat(0xc4) },

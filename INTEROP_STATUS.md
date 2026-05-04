@@ -191,15 +191,24 @@ Current as of 2026-05-04.
   peer-issued NEW_CONNECTION_ID/PATH_NEW_CONNECTION_ID per path:
   retire-prior-to bounds, duplicate sequence reuse, cross-path CID
   reuse, active_connection_id_limit, and local MAX_PATH_ID bounds close
-  with PROTOCOL_VIOLATION. PATH_CIDS_BLOCKED is surfaced as app-visible
-  replenishment demand, caller-provided CIDs are queued without
-  exceeding the peer's active_connection_id_limit, and retired local
-  CIDs are removed from pending advertisements before replacements are
-  issued.
+  with PROTOCOL_VIOLATION. Locally issued CIDs are also kept unique
+  across path IDs/sequences so short-header CID routing cannot become
+  ambiguous. PATH_CIDS_BLOCKED and peer CID retirement are surfaced as
+  app-visible `connection_ids_needed` events with active count, peer
+  limit, issue budget, and next sequence metadata; caller-provided CIDs
+  are queued without exceeding the peer's active_connection_id_limit,
+  and retired local CIDs are removed from pending advertisements before
+  replacements are issued.
 - PATH_ABANDON now puts the path into a retiring state with a deadline
   of three times the largest current Application PTO. Recovery, ACK, and
   timer state remain alive until that deadline, then `tick()` clears
   recovery metadata and marks the path failed.
+- NAT rebinding keeps the old peer address as rollback/drain metadata
+  while the new address is being validated. PATH_RESPONSE frames queued
+  for an old-address PATH_CHALLENGE are sent back to that challenge
+  address without debiting the new path's anti-amplification budget,
+  while the validation PATH_CHALLENGE for the new address remains queued
+  for a later datagram.
 - Incoming multipath control frames are rejected unless draft-21 was
   negotiated and are checked against the local maximum path ID;
   MAX_PATH_ID cannot reduce the peer's initial limit, and
@@ -224,9 +233,9 @@ Current as of 2026-05-04.
    polling, per-path Application recovery ownership, draft-21 nonce
    construction, CID-based incoming path mapping, concurrent mock
    transfer under loss/reordering, unused path-ID CID pre-provisioning,
-   common path-ID open gating, and core CID/limit validation exist.
-   Remaining wire work: richer app policy for when/how many replacement
-   CIDs to generate and external draft-21 peer validation.
+   common path-ID open gating, replacement-CID replenishment events,
+   local CID uniqueness, and core CID/limit validation exist. Remaining
+   confidence work is external draft-21 peer validation.
 2. **Multipath frame emission is locally complete but needs peer soak.**
    Draft-21 multipath control frames can be queued, coalesced into
    Application packets, ACKed, and requeued on loss, and PATH_ACK is
@@ -238,10 +247,11 @@ Current as of 2026-05-04.
    feedback, persistent congestion, and basic PTO probe selection are
    path-owned for Application data. Abandoned multipath paths retain
    peer CIDs and ACK/recovery state until the 3x-largest-PTO drain
-   window expires. Remaining recovery work: active-migration old-path
-   draining, migration-specific RTT/congestion reset, and broader
-   lossy/reordered interop gates. Pacing, ECN, and advanced congestion
-   controllers remain out of scope for this push.
+   window expires. NAT rebinding resets RTT/congestion after validation
+   and keeps old-address PATH_RESPONSE traffic off the new path's
+   anti-amplification accounting. Remaining recovery work: broader
+   lossy/reordered interop gates and live migration soak. Pacing, ECN,
+   and advanced congestion controllers remain out of scope for this push.
 4. **Key updates need external soak, not core lifecycle work.** The
    current implementation covers previous/current/next read keys,
    3x-PTO old-key discard, local initiation, ACK gating, and cross-suite
