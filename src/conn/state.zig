@@ -106,6 +106,8 @@ pub const Stream = struct {
     id: u64,
     send: SendStream,
     recv: RecvStream,
+    /// True once any byte for this stream arrived in a 0-RTT packet.
+    arrived_in_early_data: bool = false,
 };
 
 /// Default datagram budget for outgoing 1-RTT packets. RFC 9000 §14
@@ -188,6 +190,16 @@ pub const OutgoingDatagram = struct {
     len: usize,
     to: ?Address = null,
     path_id: u32 = 0,
+};
+
+pub const IncomingDatagram = struct {
+    len: usize,
+    arrived_in_early_data: bool = false,
+};
+
+const PendingRecvDatagram = struct {
+    data: []u8,
+    arrived_in_early_data: bool = false,
 };
 
 pub const TimerKind = enum {
@@ -343,7 +355,7 @@ pub const Connection = struct {
     pending_send_datagrams: std.ArrayList([]u8) = .empty,
     /// Inbound DATAGRAMs received but not yet pulled by the app.
     /// Each entry is allocator-owned.
-    pending_recv_datagrams: std.ArrayList([]u8) = .empty,
+    pending_recv_datagrams: std.ArrayList(PendingRecvDatagram) = .empty,
 
     /// DCID we put on outgoing packets (the peer chose this; client
     /// learns it from the server's first Initial SCID, or
@@ -501,7 +513,7 @@ pub const Connection = struct {
         }
         self.streams.deinit(self.allocator);
         for (self.pending_send_datagrams.items) |bytes| self.allocator.free(bytes);
-        for (self.pending_recv_datagrams.items) |bytes| self.allocator.free(bytes);
+        for (self.pending_recv_datagrams.items) |item| self.allocator.free(item.data);
         self.pending_send_datagrams.deinit(self.allocator);
         self.pending_recv_datagrams.deinit(self.allocator);
         for (&self.sent) |*tracker| {
@@ -1036,6 +1048,13 @@ pub const Connection = struct {
         return n;
     }
 
+    /// Whether the receive side of `id` has seen any STREAM bytes in
+    /// 0-RTT. Returns null for an unknown stream.
+    pub fn streamArrivedInEarlyData(self: *const Connection, id: u64) ?bool {
+        const s = self.streams.get(id) orelse return null;
+        return s.arrived_in_early_data;
+    }
+
     fn queueMaxStreamData(
         self: *Connection,
         stream_id: u64,
@@ -1111,12 +1130,20 @@ pub const Connection = struct {
     /// fit — caller must size `dst` to the peer's advertised
     /// `max_datagram_frame_size`.
     pub fn receiveDatagram(self: *Connection, dst: []u8) ?usize {
+        const item = self.receiveDatagramInfo(dst) orelse return null;
+        return item.len;
+    }
+
+    /// Pop the oldest received DATAGRAM and include whether it arrived
+    /// in 0-RTT. The payload is dropped from the queue regardless of
+    /// whether it fit.
+    pub fn receiveDatagramInfo(self: *Connection, dst: []u8) ?IncomingDatagram {
         if (self.pending_recv_datagrams.items.len == 0) return null;
         const item = self.pending_recv_datagrams.orderedRemove(0);
-        defer self.allocator.free(item);
-        const n = @min(dst.len, item.len);
-        @memcpy(dst[0..n], item[0..n]);
-        return n;
+        defer self.allocator.free(item.data);
+        const n = @min(dst.len, item.data.len);
+        @memcpy(dst[0..n], item.data[0..n]);
+        return .{ .len = n, .arrived_in_early_data = item.arrived_in_early_data };
     }
 
     /// Number of inbound DATAGRAMs queued for the app to read.
@@ -2893,9 +2920,9 @@ pub const Connection = struct {
                 .ack => |a| try self.handleAckAtLevel(lvl, a, now_us),
                 .path_ack => |a| try self.handlePathAck(a, now_us),
                 .crypto => |cr| try self.handleCrypto(lvl, cr),
-                .stream => |s| try self.handleStream(s),
+                .stream => |s| try self.handleStream(lvl, s),
                 .reset_stream => |rs| try self.handleResetStream(rs),
-                .datagram => |dg| try self.handleDatagram(dg),
+                .datagram => |dg| try self.handleDatagram(lvl, dg),
                 .path_challenge => |pc| self.pending_path_response = pc.data,
                 .path_response => |pr| {
                     _ = self.pathForId(self.current_incoming_path_id).path.validator.recordResponse(pr.data) catch {};
@@ -3216,11 +3243,18 @@ pub const Connection = struct {
         try ptr.send.resetStream(ss.application_error_code);
     }
 
-    fn handleDatagram(self: *Connection, dg: frame_types.Datagram) Error!void {
+    fn handleDatagram(
+        self: *Connection,
+        lvl: EncryptionLevel,
+        dg: frame_types.Datagram,
+    ) Error!void {
         const copy = try self.allocator.alloc(u8, dg.data.len);
         errdefer self.allocator.free(copy);
         @memcpy(copy, dg.data);
-        try self.pending_recv_datagrams.append(self.allocator, copy);
+        try self.pending_recv_datagrams.append(self.allocator, .{
+            .data = copy,
+            .arrived_in_early_data = lvl == .early_data,
+        });
     }
 
     fn handleCrypto(
@@ -3313,7 +3347,11 @@ pub const Connection = struct {
         try self.refreshEarlyDataStatus();
     }
 
-    fn handleStream(self: *Connection, s: frame_types.Stream) Error!void {
+    fn handleStream(
+        self: *Connection,
+        lvl: EncryptionLevel,
+        s: frame_types.Stream,
+    ) Error!void {
         const ptr = self.streams.get(s.stream_id) orelse blk: {
             const new_ptr = try self.allocator.create(Stream);
             errdefer self.allocator.destroy(new_ptr);
@@ -3325,6 +3363,7 @@ pub const Connection = struct {
             try self.streams.put(self.allocator, s.stream_id, new_ptr);
             break :blk new_ptr;
         };
+        if (lvl == .early_data) ptr.arrived_in_early_data = true;
         try ptr.recv.recv(s.offset, s.data, s.fin);
     }
 
@@ -4715,6 +4754,42 @@ test "server handles accepted 0-RTT STREAM frames" {
     var buf: [8]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 5), try conn.streamRead(0, &buf));
     try std.testing.expectEqualSlices(u8, "hello", buf[0..5]);
+    try std.testing.expectEqual(true, conn.streamArrivedInEarlyData(0).?);
+}
+
+test "server marks accepted 0-RTT DATAGRAM frames" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    installTestEarlyDataReadSecret(&conn);
+    const keys = try testEarlyDataPacketKeys();
+
+    var payload: [64]u8 = undefined;
+    const payload_len = try frame_mod.encode(&payload, .{ .datagram = .{
+        .data = "early-dgram",
+        .has_length = true,
+    } });
+
+    var packet: [256]u8 = undefined;
+    const packet_len = try long_packet_mod.sealZeroRtt(&packet, .{
+        .dcid = &.{ 9, 9, 9, 9 },
+        .scid = &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+    });
+
+    const consumed = try conn.handleOnePacket(packet[0..packet_len], 1_000);
+    try std.testing.expectEqual(packet_len, consumed);
+
+    var buf: [32]u8 = undefined;
+    const info = conn.receiveDatagramInfo(&buf).?;
+    try std.testing.expectEqual(@as(usize, 11), info.len);
+    try std.testing.expect(info.arrived_in_early_data);
+    try std.testing.expectEqualSlices(u8, "early-dgram", buf[0..info.len]);
 }
 
 test "server rejects forbidden frames in 0-RTT" {

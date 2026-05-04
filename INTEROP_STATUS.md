@@ -14,6 +14,9 @@ Current as of 2026-05-04.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
   bidi echo, 512 KiB upload, client/server uni streams, DATAGRAM echo,
   RESET_STREAM, and concurrent bidi streams.
+- `go-quic-peer client -0rtt=true` against `nullq-peer`: passing,
+  including ticket seed, resumed connection, early STREAM request, and
+  `Used0RTT == true`.
 - `go-quic-peer multipath` against `nullq-peer`: passing for secondary
   socket add, PATH_CHALLENGE/PATH_RESPONSE probe, path switch, echo,
   upload after switch, and DATAGRAM after switch.
@@ -97,6 +100,11 @@ Current as of 2026-05-04.
   Servers can install a canonical QUIC early-data replay context,
   decrypt accepted 0-RTT packets, reject forbidden 0-RTT frames, and
   expose BoringSSL's early-data status/reason.
+- The 0-RTT replay-context builder now excludes per-connection
+  identifiers/tokens while retaining replay-relevant transport limits,
+  so valid resumption does not reject solely because the new Initial
+  uses a different original destination CID. Incoming streams and
+  DATAGRAMs also expose `arrived_in_early_data` metadata.
 
 ## Still not production-grade
 
@@ -126,15 +134,15 @@ Current as of 2026-05-04.
    key updates, but it does not yet keep current/previous/next read
    keys with 3x-PTO discard timing or enforce packet limits across all
    paths.
-5. **0-RTT is implemented only at the first transport layer.** The
+5. **0-RTT is implemented but still needs rejection hardening.** The
    landed code covers packet protection, explicit send opt-in,
    server receive validation, early-data context construction, status
-   reporting, and rejected STREAM/control requeue. Remaining work:
-   public ticket export/import helpers, live accepted/rejected
-   resumption interop, application-visible early-data marking on
-   incoming streams/datagrams, stronger replay-context documentation,
-   0-RTT transport-parameter rejection tests, and go-quic-peer 0-RTT
-   scenarios.
+   reporting, accepted go-quic-peer resumption interop,
+   application-visible early-data marking on incoming streams/datagrams,
+   and rejected STREAM/control requeue. Remaining work: public ticket
+   export/import examples, live rejected-resumption interop,
+   transport-parameter mismatch rejection tests, and broader 0-RTT
+   datagram/loss scenarios.
 6. **Protocol hardening remains.** Retry, Version Negotiation,
    stateless reset, close/draining state, typed close errors, bounded
    allocation policy, qlog/keylog diagnostics, and full flow-control
@@ -156,5 +164,6 @@ zig build
 
 cd ~/prj/ai-workspace/go-quic-peer
 go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=false -json -timeout 20s
+go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=true -json -timeout 30s
 go run ./cmd/quicpeer multipath -addr 127.0.0.1:4242 -insecure -json -timeout 20s -cid-len 8
 ```

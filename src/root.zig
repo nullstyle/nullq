@@ -30,6 +30,7 @@ pub const conn = @import("conn/root.zig");
 
 pub const Connection = conn.Connection;
 pub const OutgoingDatagram = conn.OutgoingDatagram;
+pub const IncomingDatagram = conn.IncomingDatagram;
 pub const TimerDeadline = conn.TimerDeadline;
 pub const TimerKind = conn.TimerKind;
 pub const PathStats = conn.PathStats;

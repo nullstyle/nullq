@@ -50,13 +50,13 @@ pub fn buildForTransportParams(
 }
 
 fn updateTransportParams(h: *boringssl.crypto.hash.Sha256, p: Params) void {
-    updateOptionalCid(h, p.original_destination_connection_id);
+    // Deliberately exclude connection-instance identifiers and tokens
+    // such as original_destination_connection_id, stateless_reset_token,
+    // initial_source_connection_id, and retry_source_connection_id. Those
+    // vary for each connection attempt and would make every otherwise
+    // valid resumption reject 0-RTT. The context below covers the
+    // transport and application settings that constrain early bytes.
     updateU64(h, p.max_idle_timeout_ms);
-    if (p.stateless_reset_token) |tok| {
-        updateOptionalBytes(h, tok[0..]);
-    } else {
-        updateOptionalBytes(h, null);
-    }
     updateU64(h, p.max_udp_payload_size);
     updateU64(h, p.initial_max_data);
     updateU64(h, p.initial_max_stream_data_bidi_local);
@@ -68,30 +68,10 @@ fn updateTransportParams(h: *boringssl.crypto.hash.Sha256, p: Params) void {
     updateU64(h, p.max_ack_delay_ms);
     updateBool(h, p.disable_active_migration);
     updateU64(h, p.active_connection_id_limit);
-    updateOptionalCid(h, p.initial_source_connection_id);
-    updateOptionalCid(h, p.retry_source_connection_id);
     updateU64(h, p.max_datagram_frame_size);
     if (p.initial_max_path_id) |max_path_id| {
         h.update(&.{1});
         updateU32(h, max_path_id);
-    } else {
-        h.update(&.{0});
-    }
-}
-
-fn updateOptionalCid(h: *boringssl.crypto.hash.Sha256, cid: ?@import("../conn/path.zig").ConnectionId) void {
-    if (cid) |c| {
-        h.update(&.{1});
-        updateBytes(h, c.slice());
-    } else {
-        h.update(&.{0});
-    }
-}
-
-fn updateOptionalBytes(h: *boringssl.crypto.hash.Sha256, bytes: ?[]const u8) void {
-    if (bytes) |b| {
-        h.update(&.{1});
-        updateBytes(h, b);
     } else {
         h.update(&.{0});
     }
@@ -155,4 +135,38 @@ test "context is stable and sensitive to transport and app settings" {
     try std.testing.expectEqualSlices(u8, &base, &same);
     try std.testing.expect(!std.mem.eql(u8, &base, &changed_tp));
     try std.testing.expect(!std.mem.eql(u8, &base, &changed_app));
+}
+
+test "context ignores connection-instance identifiers" {
+    const path = @import("../conn/path.zig");
+    const base = build(.{
+        .transport_params = .{
+            .original_destination_connection_id = path.ConnectionId.fromSlice(&.{ 1, 2, 3, 4 }),
+            .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 5, 6, 7, 8 }),
+            .retry_source_connection_id = path.ConnectionId.fromSlice(&.{ 9, 10, 11, 12 }),
+            .stateless_reset_token = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+            .initial_max_data = 1024,
+        },
+    });
+    const changed_ids = build(.{
+        .transport_params = .{
+            .original_destination_connection_id = path.ConnectionId.fromSlice(&.{ 0xaa, 0xbb }),
+            .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 0xcc, 0xdd }),
+            .retry_source_connection_id = path.ConnectionId.fromSlice(&.{ 0xee, 0xff }),
+            .stateless_reset_token = .{ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 },
+            .initial_max_data = 1024,
+        },
+    });
+    const changed_limit = build(.{
+        .transport_params = .{
+            .original_destination_connection_id = path.ConnectionId.fromSlice(&.{ 1, 2, 3, 4 }),
+            .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 5, 6, 7, 8 }),
+            .retry_source_connection_id = path.ConnectionId.fromSlice(&.{ 9, 10, 11, 12 }),
+            .stateless_reset_token = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+            .initial_max_data = 2048,
+        },
+    });
+
+    try std.testing.expectEqualSlices(u8, &base, &changed_ids);
+    try std.testing.expect(!std.mem.eql(u8, &base, &changed_limit));
 }

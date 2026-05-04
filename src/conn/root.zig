@@ -15,6 +15,7 @@ pub const path = @import("path.zig");
 
 pub const Connection = state.Connection;
 pub const OutgoingDatagram = state.OutgoingDatagram;
+pub const IncomingDatagram = state.IncomingDatagram;
 pub const TimerDeadline = state.TimerDeadline;
 pub const TimerKind = state.TimerKind;
 pub const Role = state.Role;
