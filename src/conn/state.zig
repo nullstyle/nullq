@@ -6061,7 +6061,7 @@ pub const Connection = struct {
     ) Error!bool {
         var any = false;
         self.recordDatagramLost(packet);
-        if (lvl == .application) {
+        if (lvl == .application or lvl == .early_data or packet.is_early_data) {
             if (packet.stream_key) |stream_key| {
                 any = (try self.dispatchLostToStreams(stream_key)) or any;
             }
@@ -8223,6 +8223,85 @@ test "0-RTT rejection requeues STREAM data but not DATAGRAM payloads" {
     try std.testing.expect(event == .datagram_lost);
     try std.testing.expectEqual(datagram_id, event.datagram_lost.id);
     try std.testing.expect(event.datagram_lost.arrived_in_early_data);
+}
+
+test "0-RTT DATAGRAM ack event carries early-data metadata" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setPeerDcid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try conn.setLocalScid(&.{ 9, 9, 9, 9 });
+    installTestEarlyDataWriteSecret(&conn);
+    conn.setEarlyDataEnabled(true);
+
+    const datagram_id = try conn.sendDatagramTracked("early-ack");
+    var out: [256]u8 = undefined;
+    _ = (try conn.pollLevel(.early_data, &out, 1_000)).?;
+
+    const sent = conn.sentForLevel(.early_data).packets[0];
+    try std.testing.expect(sent.is_early_data);
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = sent.pn,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 1_050);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .datagram_acked);
+    try std.testing.expectEqual(datagram_id, event.datagram_acked.id);
+    try std.testing.expectEqual(@as(usize, 9), event.datagram_acked.len);
+    try std.testing.expectEqual(sent.pn, event.datagram_acked.packet_number);
+    try std.testing.expect(event.datagram_acked.arrived_in_early_data);
+    try std.testing.expect(conn.pollEvent() == null);
+}
+
+test "0-RTT DATAGRAM packet-threshold loss carries early-data metadata" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setPeerDcid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try conn.setLocalScid(&.{ 9, 9, 9, 9 });
+    installTestEarlyDataWriteSecret(&conn);
+    conn.setEarlyDataEnabled(true);
+
+    var datagram_ids: [4]u64 = undefined;
+    var out: [256]u8 = undefined;
+    for (&datagram_ids, 0..) |*id, i| {
+        id.* = try conn.sendDatagramTracked(if (i == 0) "lost" else "acked");
+        _ = (try conn.pollLevel(.early_data, &out, 1_000 + @as(u64, @intCast(i)))).?;
+    }
+    try std.testing.expectEqual(@as(u32, 4), conn.sentForLevel(.early_data).count);
+
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 3,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 2_000);
+
+    var event = conn.pollEvent().?;
+    try std.testing.expect(event == .datagram_acked);
+    try std.testing.expectEqual(datagram_ids[3], event.datagram_acked.id);
+    try std.testing.expectEqual(@as(u64, 3), event.datagram_acked.packet_number);
+    try std.testing.expect(event.datagram_acked.arrived_in_early_data);
+
+    event = conn.pollEvent().?;
+    try std.testing.expect(event == .datagram_lost);
+    try std.testing.expectEqual(datagram_ids[0], event.datagram_lost.id);
+    try std.testing.expectEqual(@as(u64, 0), event.datagram_lost.packet_number);
+    try std.testing.expect(event.datagram_lost.arrived_in_early_data);
+    try std.testing.expectEqual(@as(u32, 2), conn.sentForLevel(.early_data).count);
 }
 
 test "server handles accepted 0-RTT STREAM frames" {

@@ -41,6 +41,43 @@ mise install
 just test
 ```
 
+## 0-RTT Tickets
+
+Session tickets are owned by `boringssl-zig` and re-exported as
+`nullq.Session`. Capture them from the client TLS context, serialize
+with `Session.toBytes`, then parse with `Session.fromBytes` before the
+next client connection:
+
+```zig
+var client_ctx = try boringssl.tls.Context.initClient(.{
+    .early_data_enabled = true,
+});
+try client_ctx.setNewSessionCallback(onTicket, store_ptr);
+
+fn onTicket(user_data: ?*anyopaque, session: nullq.Session) void {
+    var owned = session;
+    defer owned.deinit();
+    const bytes = owned.toBytes(allocator) catch return;
+    saveTicket(user_data, bytes);
+}
+
+var resumed = try nullq.Session.fromBytes(client_ctx, ticket_bytes);
+defer resumed.deinit();
+try conn.setSession(resumed);
+conn.setEarlyDataEnabled(true);
+```
+
+Servers that enable early data must bind tickets to replay-relevant
+transport and application settings:
+
+```zig
+_ = try server_conn.setEarlyDataContextForParams(
+    transport_params,
+    "hq-interop",
+    app_settings_digest,
+);
+```
+
 ## What this is
 
 - The QUIC **transport**: streams, datagrams, packet protection, loss

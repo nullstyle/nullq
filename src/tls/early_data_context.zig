@@ -98,6 +98,12 @@ fn updateU64(h: *boringssl.crypto.hash.Sha256, value: u64) void {
     h.update(&buf);
 }
 
+fn expectContextDiffers(base: Options, changed: Options) !void {
+    const base_digest = build(base);
+    const changed_digest = build(changed);
+    try std.testing.expect(!std.mem.eql(u8, &base_digest, &changed_digest));
+}
+
 test "context is stable and sensitive to transport and app settings" {
     const base = build(.{
         .alpn = "h3",
@@ -135,6 +141,102 @@ test "context is stable and sensitive to transport and app settings" {
     try std.testing.expectEqualSlices(u8, &base, &same);
     try std.testing.expect(!std.mem.eql(u8, &base, &changed_tp));
     try std.testing.expect(!std.mem.eql(u8, &base, &changed_app));
+}
+
+test "context changes for every 0-RTT replay-relevant transport parameter" {
+    const base: Options = .{
+        .quic_version = 0x00000001,
+        .alpn = "h3",
+        .transport_params = .{
+            .max_idle_timeout_ms = 30_000,
+            .max_udp_payload_size = 1400,
+            .initial_max_data = 64 * 1024,
+            .initial_max_stream_data_bidi_local = 8 * 1024,
+            .initial_max_stream_data_bidi_remote = 9 * 1024,
+            .initial_max_stream_data_uni = 10 * 1024,
+            .initial_max_streams_bidi = 16,
+            .initial_max_streams_uni = 8,
+            .ack_delay_exponent = 4,
+            .max_ack_delay_ms = 15,
+            .disable_active_migration = false,
+            .active_connection_id_limit = 4,
+            .max_datagram_frame_size = 1200,
+            .initial_max_path_id = 2,
+        },
+        .application_context = "settings-v1",
+    };
+
+    var changed = base;
+    changed.quic_version = 0x6b3343cf;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.alpn = "hq-interop";
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.application_context = "settings-v2";
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.max_idle_timeout_ms += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.max_udp_payload_size -= 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_data += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_stream_data_bidi_local += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_stream_data_bidi_remote += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_stream_data_uni += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_streams_bidi += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_streams_uni += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.ack_delay_exponent += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.max_ack_delay_ms += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.disable_active_migration = true;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.active_connection_id_limit += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.max_datagram_frame_size += 1;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_path_id = 3;
+    try expectContextDiffers(base, changed);
+
+    changed = base;
+    changed.transport_params.initial_max_path_id = null;
+    try expectContextDiffers(base, changed);
 }
 
 test "context ignores connection-instance identifiers" {

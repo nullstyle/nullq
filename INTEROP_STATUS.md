@@ -252,10 +252,14 @@ Current as of 2026-05-04.
    reporting, accepted and rejected go-quic-peer resumption interop,
    application-visible early-data marking on incoming streams/datagrams,
    rejected STREAM/control requeue, and deterministic coverage that
-   DATAGRAM remains unreliable across rejection. Remaining work: public
-   ticket export/import examples, transport-parameter mismatch
-   rejection vectors beyond replay-context mismatch, and broader 0-RTT
-   datagram/loss scenarios.
+   DATAGRAM remains unreliable across rejection. Ticket export/import is
+   now documented through the public `Session.toBytes` /
+   `Session.fromBytes` path, replay-context tests cover every
+   replay-relevant transport parameter that nullq records, and normal
+   0-RTT DATAGRAM ACK/loss paths preserve app-visible early-data
+   metadata. Remaining work: end-to-end peer rejection probes for
+   individual transport-parameter changes and broader lossy external
+   0-RTT scenarios.
 6. **Protocol hardening remains.** Retry and Version Negotiation now
    have deterministic core coverage plus live quic-go interop through
    nullq-peer, and Retry address-validation helpers are reusable nullq
