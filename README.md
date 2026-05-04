@@ -7,13 +7,16 @@ using [`boringssl-zig`](../boringssl-zig) for TLS 1.3 and AEAD/HKDF crypto.
 QUIC v1 handshakes, streams, DATAGRAMs, RESET_STREAM, CID issuance,
 PATH_CHALLENGE/PATH_RESPONSE, timer-driven loss/PTO recovery with
 NewReno feedback, path-aware `PathSet` recovery ownership, and
-draft-21 multipath nonce/CID routing checks. 0-RTT now has early
-STREAM/DATAGRAM transport plumbing plus accepted and rejected
-go-quic-peer resumption smokes, while deeper mismatch/loss hardening
-still needs work. Multipath also has embedder-driven path CID
-replenishment, abandoned-path 3x-PTO retention coverage, and a
-deterministic two-path transfer stress test. go-quic-peer single-path,
-0-RTT, and path-switch smoke tests are maintained as interop gates. See
+draft-21 multipath nonce/CID routing checks. Application key updates
+now keep previous/current/next read epochs, discard old keys after
+3x-PTO, support local initiation, and enforce AES-GCM packet/auth
+limits across all Application paths. 0-RTT now has early STREAM/DATAGRAM
+transport plumbing plus accepted and rejected go-quic-peer resumption
+smokes, while deeper mismatch/loss hardening still needs work. Multipath
+also has embedder-driven path CID replenishment, abandoned-path 3x-PTO
+retention coverage, and a deterministic two-path transfer stress test.
+go-quic-peer single-path, 0-RTT, and path-switch smoke tests are
+maintained as interop gates. See
 [INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification log
 and remaining production gaps.
 

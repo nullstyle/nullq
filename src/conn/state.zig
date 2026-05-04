@@ -73,6 +73,8 @@ pub const Error = error{
     PathLimitExceeded,
     ConnectionIdLimitExceeded,
     EmptyEarlyDataContext,
+    KeyUpdateUnavailable,
+    KeyUpdateBlocked,
 } || boringssl.tls.Error ||
     short_packet_mod.Error ||
     long_packet_mod.Error ||
@@ -117,6 +119,7 @@ pub const Stream = struct {
 /// can lift this.
 pub const default_mtu: usize = 1200;
 const transport_error_protocol_violation: u64 = 0x0a;
+const transport_error_aead_limit_reached: u64 = 0x0f;
 
 /// Upper bound on AEAD plaintext for a single received packet.
 /// Sized to comfortably hold any UDP datagram a peer is likely to
@@ -222,6 +225,7 @@ pub const TimerKind = enum {
     idle,
     draining,
     path_retirement,
+    key_discard,
 };
 
 pub const TimerDeadline = struct {
@@ -251,6 +255,51 @@ const LossStats = struct {
             self.largest_lost_sent_time_us = packet.sent_time_us;
         }
     }
+};
+
+pub const ApplicationKeyUpdateLimits = struct {
+    /// RFC 9001 §6.6 gives AES-GCM a 2^23 packet confidentiality limit.
+    confidentiality_limit: u64 = @as(u64, 1) << 23,
+    /// Update slightly before the hard limit so we don't need to spend
+    /// the last legal packet on CONNECTION_CLOSE.
+    proactive_update_threshold: u64 = (@as(u64, 1) << 23) - 1024,
+    /// RFC 9001 §6.6 gives AES-GCM a 2^52 invalid-packet integrity limit.
+    integrity_limit: u64 = @as(u64, 1) << 52,
+};
+
+pub const ApplicationKeyUpdateStatus = struct {
+    read_epoch: ?u64 = null,
+    read_key_phase: bool = false,
+    previous_read_discard_deadline_us: ?u64 = null,
+    next_read_epoch_ready: bool = false,
+    write_epoch: ?u64 = null,
+    write_key_phase: bool = false,
+    write_packets_protected: u64 = 0,
+    write_update_pending_ack: bool = false,
+    next_local_update_after_us: ?u64 = null,
+    auth_failures: u64 = 0,
+};
+
+const ApplicationKeyEpoch = struct {
+    material: SecretMaterial,
+    keys: PacketKeys,
+    key_phase: bool = false,
+    epoch: u64 = 0,
+    installed_at_us: u64 = 0,
+    packets_protected: u64 = 0,
+    discard_deadline_us: ?u64 = null,
+    acked: bool = false,
+};
+
+const ApplicationReadKeySlot = enum {
+    current,
+    previous,
+    next,
+};
+
+const ApplicationOpenResult = struct {
+    opened: short_packet_mod.Open1RttResult,
+    slot: ApplicationReadKeySlot,
 };
 
 /// Fixed-size CRYPTO frame buffer per encryption level. The
@@ -395,13 +444,19 @@ pub const Connection = struct {
     initial_keys_read: ?short_packet_mod.PacketKeys = null,
     initial_keys_write: ?short_packet_mod.PacketKeys = null,
 
-    /// Application key-phase state. QUIC key updates derive new
+    /// Application key-update lifecycle. QUIC key updates derive new
     /// packet-protection key/IV from "quic ku" while retaining the
-    /// original header-protection key.
-    app_read_key_phase: bool = false,
-    app_write_key_phase: bool = false,
-    app_read_hp: ?[32]u8 = null,
-    app_write_hp: ?[32]u8 = null,
+    /// original header-protection key. Read side keeps previous/current/next
+    /// epochs so delayed old-phase packets survive until the 3x-PTO discard
+    /// timer; write side tracks ACK-gating and AEAD packet limits.
+    app_read_previous: ?ApplicationKeyEpoch = null,
+    app_read_current: ?ApplicationKeyEpoch = null,
+    app_read_next: ?ApplicationKeyEpoch = null,
+    app_write_current: ?ApplicationKeyEpoch = null,
+    app_write_update_pending_ack: bool = false,
+    app_next_local_update_after_us: ?u64 = null,
+    app_failed_auth_packets: u64 = 0,
+    app_key_update_limits: ApplicationKeyUpdateLimits = .{},
 
     /// Local datagram budget for outgoing packets.
     mtu: usize = default_mtu,
@@ -692,6 +747,12 @@ pub const Connection = struct {
         lvl: EncryptionLevel,
         dir: Direction,
     ) Error!?PacketKeys {
+        if (lvl == .application) {
+            switch (dir) {
+                .read => if (self.app_read_current) |epoch| return epoch.keys,
+                .write => if (self.app_write_current) |epoch| return epoch.keys,
+            }
+        }
         const slot = self.levels[lvl.idx()];
         const material_opt = switch (dir) {
             .read => slot.read,
@@ -701,43 +762,37 @@ pub const Connection = struct {
         const suite = Suite.fromProtocolId(material.cipher_protocol_id) orelse
             return Error.UnsupportedCipherSuite;
         const secret = material.secret[0..material.secret_len];
-        var keys = try short_packet_mod.derivePacketKeys(suite, secret);
-        if (lvl == .application) {
-            switch (dir) {
-                .read => if (self.app_read_hp) |hp| {
-                    keys.hp = hp;
-                },
-                .write => if (self.app_write_hp) |hp| {
-                    keys.hp = hp;
-                },
-            }
-        }
-        return keys;
+        return try short_packet_mod.derivePacketKeys(suite, secret);
     }
 
-    const ApplicationKeyUpdate = struct {
+    fn applicationKeyEpochFromMaterial(
         material: SecretMaterial,
-        keys: PacketKeys,
-        hp: [32]u8,
-    };
-
-    fn nextApplicationKeyUpdate(
-        self: *const Connection,
-        dir: Direction,
-    ) Error!?ApplicationKeyUpdate {
-        const app_idx = EncryptionLevel.application.idx();
-        var material = switch (dir) {
-            .read => self.levels[app_idx].read,
-            .write => self.levels[app_idx].write,
-        } orelse return null;
+        key_phase: bool,
+        epoch: u64,
+        installed_at_us: u64,
+    ) Error!ApplicationKeyEpoch {
         const suite = Suite.fromProtocolId(material.cipher_protocol_id) orelse
             return Error.UnsupportedCipherSuite;
+        const keys = try short_packet_mod.derivePacketKeys(
+            suite,
+            material.secret[0..material.secret_len],
+        );
+        return .{
+            .material = material,
+            .keys = keys,
+            .key_phase = key_phase,
+            .epoch = epoch,
+            .installed_at_us = installed_at_us,
+        };
+    }
 
-        const current_keys = (try self.packetKeys(.application, dir)) orelse return null;
-        const hp = switch (dir) {
-            .read => self.app_read_hp,
-            .write => self.app_write_hp,
-        } orelse current_keys.hp;
+    fn nextApplicationKeyEpoch(
+        current: ApplicationKeyEpoch,
+        installed_at_us: u64,
+    ) Error!ApplicationKeyEpoch {
+        var material = current.material;
+        const suite = Suite.fromProtocolId(material.cipher_protocol_id) orelse
+            return Error.UnsupportedCipherSuite;
         const next_secret = try short_packet_mod.deriveNextTrafficSecret(
             suite,
             material.secret[0..material.secret_len],
@@ -752,33 +807,181 @@ pub const Connection = struct {
             suite,
             material.secret[0..material.secret_len],
         );
-        next_keys.hp = hp;
-        return .{ .material = material, .keys = next_keys, .hp = hp };
+        next_keys.hp = current.keys.hp;
+        return .{
+            .material = material,
+            .keys = next_keys,
+            .key_phase = !current.key_phase,
+            .epoch = current.epoch +| 1,
+            .installed_at_us = installed_at_us,
+        };
     }
 
-    fn installApplicationKeyUpdate(
+    fn installApplicationSecret(
         self: *Connection,
         dir: Direction,
-        update: ApplicationKeyUpdate,
-    ) void {
+        material: SecretMaterial,
+    ) Error!void {
         const app_idx = EncryptionLevel.application.idx();
+        const epoch = try applicationKeyEpochFromMaterial(material, false, 0, 0);
         switch (dir) {
             .read => {
-                self.levels[app_idx].read = update.material;
-                self.app_read_hp = update.hp;
-                self.app_read_key_phase = !self.app_read_key_phase;
+                self.levels[app_idx].read = material;
+                self.app_read_previous = null;
+                self.app_read_current = epoch;
+                self.app_read_next = try nextApplicationKeyEpoch(epoch, 0);
+                self.app_failed_auth_packets = 0;
             },
             .write => {
-                self.levels[app_idx].write = update.material;
-                self.app_write_hp = update.hp;
-                self.app_write_key_phase = !self.app_write_key_phase;
+                self.levels[app_idx].write = material;
+                self.app_write_current = epoch;
+                self.app_write_update_pending_ack = false;
+                self.app_next_local_update_after_us = null;
             },
         }
     }
 
-    fn updateApplicationWriteKeys(self: *Connection) Error!void {
-        const update = (try self.nextApplicationKeyUpdate(.write)) orelse return;
-        self.installApplicationKeyUpdate(.write, update);
+    fn refreshNextApplicationReadKey(self: *Connection) Error!void {
+        const current = self.app_read_current orelse {
+            self.app_read_next = null;
+            return;
+        };
+        self.app_read_next = try nextApplicationKeyEpoch(current, current.installed_at_us);
+    }
+
+    fn promoteApplicationReadKeys(self: *Connection, now_us: u64) Error!void {
+        const current = self.app_read_current orelse return Error.KeyUpdateUnavailable;
+        var previous = current;
+        previous.discard_deadline_us = now_us +| self.retiredPathRetentionUs();
+        self.app_read_previous = previous;
+        self.app_read_current = self.app_read_next orelse
+            try nextApplicationKeyEpoch(current, now_us);
+        self.app_read_current.?.installed_at_us = now_us;
+        self.app_read_current.?.discard_deadline_us = null;
+        try self.refreshNextApplicationReadKey();
+    }
+
+    fn installNextApplicationWriteKeys(
+        self: *Connection,
+        now_us: u64,
+        pending_ack: bool,
+    ) Error!void {
+        const current = self.app_write_current orelse return Error.KeyUpdateUnavailable;
+        self.app_write_current = try nextApplicationKeyEpoch(current, now_us);
+        self.app_write_current.?.installed_at_us = now_us;
+        self.app_write_current.?.acked = false;
+        self.app_write_update_pending_ack = pending_ack;
+    }
+
+    fn maybeRespondToPeerKeyUpdate(self: *Connection, now_us: u64) Error!void {
+        const read = self.app_read_current orelse return;
+        const write = self.app_write_current orelse return;
+        if (write.key_phase == read.key_phase) return;
+        try self.installNextApplicationWriteKeys(now_us, true);
+    }
+
+    pub fn canInitiateKeyUpdateAt(self: *const Connection, now_us: u64) bool {
+        if (self.app_write_current == null) return false;
+        if (self.app_write_update_pending_ack) return false;
+        if (self.app_next_local_update_after_us) |deadline| {
+            if (now_us < deadline) return false;
+        }
+        return true;
+    }
+
+    pub fn requestKeyUpdate(self: *Connection, now_us: u64) Error!void {
+        if (!self.canInitiateKeyUpdateAt(now_us)) return Error.KeyUpdateBlocked;
+        try self.installNextApplicationWriteKeys(now_us, true);
+    }
+
+    pub fn keyUpdateStatus(self: *const Connection) ApplicationKeyUpdateStatus {
+        var status: ApplicationKeyUpdateStatus = .{
+            .write_update_pending_ack = self.app_write_update_pending_ack,
+            .next_local_update_after_us = self.app_next_local_update_after_us,
+            .auth_failures = self.app_failed_auth_packets,
+            .next_read_epoch_ready = self.app_read_next != null,
+        };
+        if (self.app_read_current) |epoch| {
+            status.read_epoch = epoch.epoch;
+            status.read_key_phase = epoch.key_phase;
+        }
+        if (self.app_read_previous) |epoch| {
+            status.previous_read_discard_deadline_us = epoch.discard_deadline_us;
+        }
+        if (self.app_write_current) |epoch| {
+            status.write_epoch = epoch.epoch;
+            status.write_key_phase = epoch.key_phase;
+            status.write_packets_protected = epoch.packets_protected;
+        }
+        return status;
+    }
+
+    pub fn setApplicationKeyUpdateLimitsForTesting(
+        self: *Connection,
+        limits: ApplicationKeyUpdateLimits,
+    ) void {
+        self.app_key_update_limits = limits;
+    }
+
+    fn applicationWriteKeyPhase(self: *const Connection) bool {
+        const current = self.app_write_current orelse return false;
+        return current.key_phase;
+    }
+
+    fn prepareApplicationWriteKeys(self: *Connection, now_us: u64) Error!void {
+        const current = self.app_write_current orelse return;
+        if (current.packets_protected >= self.app_key_update_limits.proactive_update_threshold and
+            self.canInitiateKeyUpdateAt(now_us))
+        {
+            try self.requestKeyUpdate(now_us);
+            return;
+        }
+        if (current.packets_protected >= self.app_key_update_limits.confidentiality_limit) {
+            self.close(true, transport_error_aead_limit_reached, "AEAD confidentiality limit reached");
+        }
+    }
+
+    fn recordApplicationPacketProtected(
+        self: *Connection,
+        sent_packet: *sent_packets_mod.SentPacket,
+    ) void {
+        if (self.app_write_current) |*epoch| {
+            epoch.packets_protected +|= 1;
+            sent_packet.key_epoch = epoch.epoch;
+            sent_packet.key_phase = epoch.key_phase;
+        }
+    }
+
+    fn onApplicationPacketAckedForKeys(
+        self: *Connection,
+        packet: *const sent_packets_mod.SentPacket,
+        now_us: u64,
+    ) void {
+        const epoch_id = packet.key_epoch orelse return;
+        if (self.app_write_current) |*epoch| {
+            if (epoch.epoch == epoch_id) {
+                epoch.acked = true;
+                if (self.app_write_update_pending_ack) {
+                    self.app_write_update_pending_ack = false;
+                    self.app_next_local_update_after_us = now_us +| self.retiredPathRetentionUs();
+                }
+            }
+        }
+    }
+
+    fn noteApplicationAuthFailure(self: *Connection) void {
+        self.app_failed_auth_packets +|= 1;
+        if (self.app_failed_auth_packets >= self.app_key_update_limits.integrity_limit) {
+            self.close(true, transport_error_aead_limit_reached, "AEAD integrity limit reached");
+        }
+    }
+
+    fn discardExpiredApplicationReadKeys(self: *Connection, now_us: u64) void {
+        if (self.app_read_previous) |epoch| {
+            if (epoch.discard_deadline_us) |deadline| {
+                if (now_us >= deadline) self.app_read_previous = null;
+            }
+        }
     }
 
     /// Set the DCID we put on outgoing 1-RTT packets. A zero-length
@@ -2147,6 +2350,15 @@ pub const Connection = struct {
                 });
             }
         }
+        if (self.app_read_previous) |epoch| {
+            if (epoch.discard_deadline_us) |at_us| {
+                considerDeadline(&best, .{
+                    .kind = .key_discard,
+                    .at_us = at_us,
+                    .level = .application,
+                });
+            }
+        }
 
         if (self.idleDeadline()) |at_us| {
             considerDeadline(&best, .{ .kind = .idle, .at_us = at_us });
@@ -2280,6 +2492,7 @@ pub const Connection = struct {
                 }
             },
             .handshake, .application => {
+                if (lvl == .application) try self.prepareApplicationWriteKeys(now_us);
                 if (try self.packetKeys(lvl, .write)) |k| {
                     keys = k;
                     have_keys = true;
@@ -2384,7 +2597,7 @@ pub const Connection = struct {
                     .largest_acked = largest_acked_close,
                     .payload = pl_buf[0..pl_pos],
                     .keys = &keys,
-                    .key_phase = self.app_write_key_phase,
+                    .key_phase = self.applicationWriteKeyPhase(),
                     .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
                 }),
                 .early_data => try long_packet_mod.sealZeroRtt(dst, .{
@@ -2396,14 +2609,16 @@ pub const Connection = struct {
                     .keys = &keys,
                 }),
             };
-            try sent_tracker.record(.{
+            var close_packet: sent_packets_mod.SentPacket = .{
                 .pn = pn,
                 .sent_time_us = now_us,
                 .bytes = n_close,
                 .ack_eliciting = false,
                 .in_flight = false,
                 .is_early_data = lvl == .early_data,
-            });
+            };
+            if (lvl == .application) self.recordApplicationPacketProtected(&close_packet);
+            try sent_tracker.record(close_packet);
             self.draining_deadline_us = now_us + self.drainingDurationUs();
             return n_close;
         }
@@ -2753,7 +2968,7 @@ pub const Connection = struct {
                 .largest_acked = largest_acked,
                 .payload = pl_buf[0..pl_pos],
                 .keys = &keys,
-                .key_phase = self.app_write_key_phase,
+                .key_phase = self.applicationWriteKeyPhase(),
                 .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
             }),
             .early_data => try long_packet_mod.sealZeroRtt(dst, .{
@@ -2772,6 +2987,7 @@ pub const Connection = struct {
         sent_packet.ack_eliciting = ack_eliciting;
         sent_packet.in_flight = ack_eliciting;
         sent_packet.is_early_data = lvl == .early_data;
+        if (lvl == .application) self.recordApplicationPacketProtected(&sent_packet);
         const sent_stream_key = if (sent_chunk != null) self.nextStreamPacketKey() else null;
         sent_packet.stream_key = sent_stream_key;
         try sent_tracker.record(sent_packet);
@@ -3026,51 +3242,98 @@ pub const Connection = struct {
         bytes: []u8,
         now_us: u64,
     ) Error!usize {
-        const r_keys_opt = try self.packetKeys(.application, .read);
-        const r_keys = r_keys_opt orelse return bytes.len;
         const app_path = self.incomingShortPath(bytes) orelse
             self.pathForId(self.current_incoming_path_id);
         self.current_incoming_path_id = app_path.id;
         const app_pn_space = &app_path.app_pn_space;
         const largest_received = if (app_pn_space.received.largest) |l| l else 0;
         const multipath_path_id: ?u32 = if (self.multipathNegotiated()) app_path.id else null;
+        if (self.app_read_current == null) return bytes.len;
 
         var pt_buf: [max_recv_plaintext]u8 = undefined;
-        const opened = short_packet_mod.open1Rtt(&pt_buf, bytes, .{
-            .dcid_len = app_path.path.local_cid.len,
-            .keys = &r_keys,
-            .largest_received = largest_received,
-            .multipath_path_id = multipath_path_id,
-        }) catch |e| switch (e) {
-            // RFC 9000 §5.2: a packet that fails authentication is
-            // silently dropped without affecting the rest of the
-            // connection. First try the next application read keys:
-            // quic-go initiates its first key update after about 100
-            // packets, which large uploads hit quickly.
-            boringssl.crypto.aead.Error.Auth => blk: {
-                const update = (try self.nextApplicationKeyUpdate(.read)) orelse
-                    return bytes.len;
-                const retried = short_packet_mod.open1Rtt(&pt_buf, bytes, .{
-                    .dcid_len = app_path.path.local_cid.len,
-                    .keys = &update.keys,
-                    .largest_received = largest_received,
-                    .multipath_path_id = multipath_path_id,
-                }) catch |retry_e| switch (retry_e) {
-                    boringssl.crypto.aead.Error.Auth => return bytes.len,
-                    else => return retry_e,
-                };
-                if (retried.key_phase == self.app_read_key_phase) return bytes.len;
-                self.installApplicationKeyUpdate(.read, update);
-                try self.updateApplicationWriteKeys();
-                break :blk retried;
-            },
-            else => return e,
+        const open_result = (try self.openApplicationPacket(
+            &pt_buf,
+            bytes,
+            app_path,
+            largest_received,
+            multipath_path_id,
+        )) orelse {
+            self.noteApplicationAuthFailure();
+            return bytes.len;
         };
-        if (opened.key_phase != self.app_read_key_phase) return bytes.len;
+        if (open_result.slot == .next) {
+            try self.promoteApplicationReadKeys(now_us);
+            try self.maybeRespondToPeerKeyUpdate(now_us);
+        }
+        const opened = open_result.opened;
 
         app_pn_space.recordReceived(opened.pn, now_us / 1000);
         try self.dispatchFrames(.application, opened.payload, now_us);
         return bytes.len;
+    }
+
+    fn openApplicationPacket(
+        self: *Connection,
+        pt_buf: *[max_recv_plaintext]u8,
+        bytes: []u8,
+        app_path: *const PathState,
+        largest_received: u64,
+        multipath_path_id: ?u32,
+    ) Error!?ApplicationOpenResult {
+        if (try self.tryOpenApplicationPacketWithEpoch(
+            pt_buf,
+            bytes,
+            app_path,
+            largest_received,
+            multipath_path_id,
+            self.app_read_current,
+            .current,
+        )) |result| return result;
+        if (try self.tryOpenApplicationPacketWithEpoch(
+            pt_buf,
+            bytes,
+            app_path,
+            largest_received,
+            multipath_path_id,
+            self.app_read_previous,
+            .previous,
+        )) |result| return result;
+        if (self.app_read_next == null) try self.refreshNextApplicationReadKey();
+        if (try self.tryOpenApplicationPacketWithEpoch(
+            pt_buf,
+            bytes,
+            app_path,
+            largest_received,
+            multipath_path_id,
+            self.app_read_next,
+            .next,
+        )) |result| return result;
+        return null;
+    }
+
+    fn tryOpenApplicationPacketWithEpoch(
+        self: *Connection,
+        pt_buf: *[max_recv_plaintext]u8,
+        bytes: []u8,
+        app_path: *const PathState,
+        largest_received: u64,
+        multipath_path_id: ?u32,
+        maybe_epoch: ?ApplicationKeyEpoch,
+        slot: ApplicationReadKeySlot,
+    ) Error!?ApplicationOpenResult {
+        _ = self;
+        const epoch = maybe_epoch orelse return null;
+        const opened = short_packet_mod.open1Rtt(pt_buf, bytes, .{
+            .dcid_len = app_path.path.local_cid.len,
+            .keys = &epoch.keys,
+            .largest_received = largest_received,
+            .multipath_path_id = multipath_path_id,
+        }) catch |e| switch (e) {
+            boringssl.crypto.aead.Error.Auth => return null,
+            else => return e,
+        };
+        if (opened.key_phase != epoch.key_phase) return null;
+        return .{ .opened = opened, .slot = slot };
     }
 
     fn handleInitial(
@@ -3719,6 +3982,7 @@ pub const Connection = struct {
                         }
                     }
                     if (lvl == .application) {
+                        self.onApplicationPacketAckedForKeys(&acked, now_us);
                         if (acked.stream_key) |stream_key| {
                             self.dispatchAckedToStreams(stream_key) catch |e| return e;
                         }
@@ -3787,6 +4051,7 @@ pub const Connection = struct {
                     if (acked.stream_key) |stream_key| {
                         self.dispatchAckedToStreams(stream_key) catch |e| return e;
                     }
+                    self.onApplicationPacketAckedForKeys(&acked, now_us);
                     self.discardSentCryptoForPacket(.application, acked.pn);
                     self.dispatchAckedControlFrames(&acked);
                 }
@@ -4265,6 +4530,7 @@ pub const Connection = struct {
     pub fn tick(self: *Connection, now_us: u64) Error!void {
         for (self.paths.paths.items) |*p| p.path.validator.tick(now_us);
         self.expireRetiringPaths(now_us);
+        self.discardExpiredApplicationReadKeys(now_us);
 
         if (self.draining_deadline_us) |deadline| {
             if (now_us >= deadline) {
@@ -4403,21 +4669,11 @@ fn setSecret(
     material.secret_len = @intCast(secret_len);
 
     const lvl = EncryptionLevel.fromBoringssl(@enumFromInt(level));
-    switch (dir) {
-        .read => {
-            conn.levels[lvl.idx()].read = material;
-            if (lvl == .application) {
-                conn.app_read_key_phase = false;
-                conn.app_read_hp = null;
-            }
-        },
-        .write => {
-            conn.levels[lvl.idx()].write = material;
-            if (lvl == .application) {
-                conn.app_write_key_phase = false;
-                conn.app_write_hp = null;
-            }
-        },
+    if (lvl == .application) {
+        conn.installApplicationSecret(dir, material) catch return 0;
+    } else switch (dir) {
+        .read => conn.levels[lvl.idx()].read = material,
+        .write => conn.levels[lvl.idx()].write = material,
     }
     return 1;
 }
@@ -4986,16 +5242,16 @@ test "PATH_ACK routes ACK processing to the indicated application path" {
     try std.testing.expectEqual(@as(u64, 50_000), path.path.rtt.latest_rtt_us);
 }
 
-fn installTestApplicationWriteSecret(conn: *Connection) void {
+fn installTestApplicationWriteSecret(conn: *Connection) !void {
     var material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
     material.secret_len = 32;
-    conn.levels[EncryptionLevel.application.idx()].write = material;
+    try conn.installApplicationSecret(.write, material);
 }
 
-fn installTestApplicationReadSecret(conn: *Connection) void {
+fn installTestApplicationReadSecret(conn: *Connection) !void {
     var material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
     material.secret_len = 32;
-    conn.levels[EncryptionLevel.application.idx()].read = material;
+    try conn.installApplicationSecret(.read, material);
 }
 
 fn installTestEarlyDataWriteSecret(conn: *Connection) void {
@@ -5008,6 +5264,197 @@ fn installTestEarlyDataReadSecret(conn: *Connection) void {
     var material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
     material.secret_len = 32;
     conn.levels[EncryptionLevel.early_data.idx()].read = material;
+}
+
+test "peer key update promotes next read keys and keeps previous until discard deadline" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationReadSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
+    const old_epoch = conn.app_read_current.?;
+    const next_epoch = conn.app_read_next.?;
+
+    var payload: [16]u8 = undefined;
+    const payload_len = try frame_mod.encode(&payload, .{ .ping = .{} });
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const new_len = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = &.{},
+        .pn = 1,
+        .largest_acked = 0,
+        .payload = payload[0..payload_len],
+        .keys = &next_epoch.keys,
+        .key_phase = next_epoch.key_phase,
+    });
+
+    _ = try conn.handleShort(packet_buf[0..new_len], 1_000_000);
+    var status = conn.keyUpdateStatus();
+    try std.testing.expectEqual(@as(?u64, 1), status.read_epoch);
+    try std.testing.expect(status.read_key_phase);
+    try std.testing.expectEqual(@as(?u64, 1), status.write_epoch);
+    try std.testing.expect(status.write_key_phase);
+    try std.testing.expect(status.write_update_pending_ack);
+    const discard_deadline = status.previous_read_discard_deadline_us.?;
+
+    const old_len = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = &.{},
+        .pn = 0,
+        .largest_acked = 0,
+        .payload = payload[0..payload_len],
+        .keys = &old_epoch.keys,
+        .key_phase = old_epoch.key_phase,
+    });
+    _ = try conn.handleShort(packet_buf[0..old_len], 1_001_000);
+    try std.testing.expectEqual(@as(u64, 0), conn.keyUpdateStatus().auth_failures);
+    try std.testing.expect(conn.app_read_previous != null);
+
+    try conn.tick(discard_deadline);
+    try std.testing.expect(conn.app_read_previous == null);
+
+    const late_old_len = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = &.{},
+        .pn = 2,
+        .largest_acked = 1,
+        .payload = payload[0..payload_len],
+        .keys = &old_epoch.keys,
+        .key_phase = old_epoch.key_phase,
+    });
+    _ = try conn.handleShort(packet_buf[0..late_old_len], discard_deadline + 1);
+    status = conn.keyUpdateStatus();
+    try std.testing.expectEqual(@as(u64, 1), status.auth_failures);
+}
+
+test "local key update waits for ACK and three PTOs before the next update" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{});
+
+    try conn.requestKeyUpdate(1_000_000);
+    var status = conn.keyUpdateStatus();
+    try std.testing.expectEqual(@as(?u64, 1), status.write_epoch);
+    try std.testing.expect(status.write_key_phase);
+    try std.testing.expect(status.write_update_pending_ack);
+    try std.testing.expectError(Error.KeyUpdateBlocked, conn.requestKeyUpdate(1_001_000));
+
+    conn.primaryPath().pending_ping = true;
+    var packet_buf: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_002_000)).?;
+    try std.testing.expectEqual(@as(?u64, 1), conn.primaryPath().sent.packets[0].key_epoch);
+
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 1_050_000);
+    status = conn.keyUpdateStatus();
+    try std.testing.expect(!status.write_update_pending_ack);
+    const next_after = status.next_local_update_after_us.?;
+    try std.testing.expect(!conn.canInitiateKeyUpdateAt(next_after - 1));
+    try std.testing.expectError(Error.KeyUpdateBlocked, conn.requestKeyUpdate(next_after - 1));
+    try conn.requestKeyUpdate(next_after);
+    try std.testing.expectEqual(@as(?u64, 2), conn.keyUpdateStatus().write_epoch);
+}
+
+test "automatic write key update happens before configured packet limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    conn.setApplicationKeyUpdateLimitsForTesting(.{
+        .confidentiality_limit = 4,
+        .proactive_update_threshold = 1,
+        .integrity_limit = 4,
+    });
+    try conn.setPeerDcid(&.{});
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_000_000)).?;
+    try std.testing.expectEqual(@as(?u64, 0), conn.keyUpdateStatus().write_epoch);
+    try std.testing.expectEqual(@as(u64, 1), conn.keyUpdateStatus().write_packets_protected);
+
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_001_000)).?;
+    const status = conn.keyUpdateStatus();
+    try std.testing.expectEqual(@as(?u64, 1), status.write_epoch);
+    try std.testing.expect(status.write_update_pending_ack);
+    try std.testing.expectEqual(@as(u64, 1), status.write_packets_protected);
+}
+
+test "non-zero path ACK clears local key update gate" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    try conn.requestKeyUpdate(1_000_000);
+
+    const path = conn.paths.get(path_id).?;
+    path.pending_ping = true;
+    var packet_buf: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevelOnPath(.application, path_id, &packet_buf, 1_001_000)).?;
+    try std.testing.expect(conn.keyUpdateStatus().write_update_pending_ack);
+
+    try conn.handlePathAck(.{
+        .path_id = path_id,
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 1_050_000);
+    try std.testing.expect(!conn.keyUpdateStatus().write_update_pending_ack);
+}
+
+test "AEAD authentication failure limit closes the connection" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationReadSecret(&conn);
+    conn.setApplicationKeyUpdateLimitsForTesting(.{
+        .confidentiality_limit = 4,
+        .proactive_update_threshold = 3,
+        .integrity_limit = 1,
+    });
+    const keys = conn.app_read_current.?.keys;
+
+    var payload: [16]u8 = undefined;
+    const payload_len = try frame_mod.encode(&payload, .{ .ping = .{} });
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = &.{},
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+    });
+    packet_buf[n - 1] ^= 0x01;
+
+    _ = try conn.handleShort(packet_buf[0..n], 1_000_000);
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_aead_limit_reached, conn.pending_close.?.error_code);
 }
 
 fn testEarlyDataPacketKeys() !PacketKeys {
@@ -5215,7 +5662,7 @@ test "pollLevel emits PATH_ACK for non-zero application path ACKs" {
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
-    installTestApplicationWriteSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
     const path = conn.paths.get(path_id).?;
@@ -5246,7 +5693,7 @@ test "pollDatagram can select a non-zero application path" {
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
-    installTestApplicationWriteSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{ .bytes = .{ 1, 2, 3, 4 } ++ .{0} ** 18 }, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
     try std.testing.expect(conn.setActivePath(path_id));
@@ -5267,7 +5714,7 @@ test "multipath-negotiated non-zero path packets use draft-21 nonce" {
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
-    installTestApplicationWriteSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
     markTestMultipathNegotiated(&conn, 1);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
@@ -5305,7 +5752,7 @@ test "incoming short packets are routed by local CID before multipath nonce open
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
-    installTestApplicationReadSecret(&conn);
+    try installTestApplicationReadSecret(&conn);
     markTestMultipathNegotiated(&conn, 1);
     try conn.setLocalScid(&.{0xa0});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xbb}));
@@ -5639,7 +6086,7 @@ test "STREAM send tracking survives duplicate application PNs across paths" {
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
-    installTestApplicationWriteSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
     const path = conn.paths.get(path_id).?;

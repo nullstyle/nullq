@@ -53,6 +53,11 @@ pub const SentPacket = struct {
     /// keys. If TLS rejects early data, callers can requeue STREAM
     /// bytes without treating the packet as congestion loss.
     is_early_data: bool = false,
+    /// 1-RTT application key epoch used to protect this packet.
+    /// Null for Initial, Handshake, and 0-RTT packets.
+    key_epoch: ?u64 = null,
+    /// Key Phase bit used on the wire for a 1-RTT application packet.
+    key_phase: ?bool = null,
 
     pub fn addRetransmitFrame(
         self: *SentPacket,

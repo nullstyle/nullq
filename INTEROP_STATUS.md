@@ -10,6 +10,10 @@ Current as of 2026-05-04.
   tests, path CID replenishment and abandoned-path retention tests,
   a deterministic two-path concurrent transfer with asymmetric delay,
   reordering, loss, DATAGRAMs, and mid-transfer path abandonment,
+  key-update lifecycle tests for previous/current/next read keys,
+  3x-PTO previous-key discard, local update ACK gating, multipath ACK
+  gating, proactive packet-limit updates, and AEAD integrity-limit
+  close behavior,
   initial 0-RTT packet/receive/rejection unit tests, and the 10%
   simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
@@ -96,6 +100,14 @@ Current as of 2026-05-04.
 - Negotiated multipath now uses the draft-21 path-ID AEAD nonce for
   every 1-RTT packet, including non-zero Application paths, and includes
   the draft's published nonce vector in the unit suite.
+- Application key updates now have an explicit lifecycle: read side
+  keeps previous/current/next epochs, old read keys are retained until a
+  3x-largest-Application-PTO discard deadline, peer-initiated updates
+  trigger matching write-key updates, local updates are public via
+  `requestKeyUpdate(now_us)`, ACK of any Application path clears the
+  local update gate, and AES-GCM packet/authentication limits are
+  counted across all Application paths. `keyUpdateStatus()` exposes the
+  current epoch state for embedders and tests.
 - Incoming short-header packets are routed by locally issued CID before
   opening packet protection, so the correct path ID is used for both PN
   reconstruction and the draft-21 nonce.
@@ -153,10 +165,13 @@ Current as of 2026-05-04.
    migration-specific RTT/congestion reset, and broader lossy/reordered
    interop gates. Pacing, ECN, and advanced congestion controllers
    remain out of scope for this push.
-4. **Key update support is minimal.** nullq can react to observed peer
-   key updates, but it does not yet keep current/previous/next read
-   keys with 3x-PTO discard timing or enforce packet limits across all
-   paths.
+4. **Key updates need external soak, not core lifecycle work.** The
+   current implementation covers previous/current/next read keys,
+   3x-PTO old-key discard, local initiation, ACK gating, and AES-GCM
+   packet/authentication limits across all Application paths. Remaining
+   confidence work is external delayed-old-phase interop, long-running
+   packet-limit soak with realistic thresholds, and keylog/qlog
+   diagnostics around update epochs.
 5. **0-RTT is implemented but still needs rejection hardening.** The
    landed code covers packet protection, explicit send opt-in,
    server receive validation, early-data context construction, status
@@ -192,5 +207,5 @@ cd ~/prj/ai-workspace/go-quic-peer
 go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=false -json -timeout 20s
 go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=true -0rtt-expect accepted -json -timeout 30s
 go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=true -0rtt-expect rejected -json -timeout 30s
-go run ./cmd/quicpeer multipath -addr 127.0.0.1:4242 -insecure -json -timeout 20s -cid-len 8
+go run ./cmd/quicpeer multipath -addr 127.0.0.1:4242 -insecure -json -timeout 30s -cid-len 8 -upload-size 524288 -concurrent 8
 ```
