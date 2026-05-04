@@ -8,6 +8,8 @@ Current as of 2026-05-04.
   PTO/loss unit tests, path-aware multipath ACK/PTO tests, duplicate
   per-path Application PN stream tracking, draft-21 nonce/CID limit
   tests, path CID replenishment and abandoned-path retention tests,
+  a deterministic two-path concurrent transfer with asymmetric delay,
+  reordering, loss, DATAGRAMs, and mid-transfer path abandonment,
   initial 0-RTT packet/receive/rejection unit tests, and the 10%
   simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
@@ -82,6 +84,12 @@ Current as of 2026-05-04.
   and can select non-zero Application paths for ACK/probe/scheduler
   traffic while `poll(dst, now_us)` remains the single-path
   compatibility API.
+- A mock multipath transport now exercises two active Application paths
+  concurrently with bidirectional STREAM data, DATAGRAMs on both paths,
+  asymmetric per-path delay, deterministic reordering/loss, and
+  mid-transfer PATH_ABANDON. The surviving primary path carries the
+  retransmissions to completion and the abandoned path retires through
+  the 3x-PTO cleanup path.
 - Multipath draft-21 is explicit in the public surface:
   `multipath_draft_version = 21` and transport parameter
   `initial_max_path_id = 0x3e`.
@@ -127,10 +135,11 @@ Current as of 2026-05-04.
 1. **Draft multipath is much closer but not complete.** Path
    registration, lifecycle, stats, scheduler selection, path-aware
    polling, per-path Application recovery ownership, draft-21 nonce
-   construction, CID-based incoming path mapping, and core CID/limit
-   validation exist. Remaining wire work: full path establishment policy
-   around unused common path IDs, richer app policy for when/how many
-   replacement CIDs to generate, and external draft-21 peer validation.
+   construction, CID-based incoming path mapping, concurrent mock
+   transfer under loss/reordering, and core CID/limit validation exist.
+   Remaining wire work: full path establishment policy around unused
+   common path IDs, richer app policy for when/how many replacement CIDs
+   to generate, and external draft-21 peer validation.
 2. **Multipath frame emission is partial.** Draft-21 multipath control
    frames can be queued, emitted one per Application packet, ACKed, and
    requeued on loss, and PATH_ACK is generated for non-zero path ACK
@@ -163,9 +172,11 @@ Current as of 2026-05-04.
    allocation policy, qlog/keylog diagnostics, and full flow-control
    pacing still need work.
 
-Note: the passing `go-quic-peer multipath` smoke test currently validates
-secondary socket probing and path switching against nullq-peer. It is not
-yet proof of full draft-21 simultaneous multipath transfer.
+Note: the passing mock multipath test now validates simultaneous
+two-path transfer inside nullq. The passing `go-quic-peer multipath`
+smoke test still validates secondary socket probing and path switching
+against nullq-peer, not external full draft-21 simultaneous multipath
+transfer.
 
 ## Useful commands
 

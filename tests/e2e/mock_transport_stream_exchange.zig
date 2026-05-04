@@ -4,11 +4,11 @@
 //! `Connection.handle` + `streamRead`, and ACKs flow back to the
 //! client so the send buffer drains.
 //!
-//! No simulated loss yet — that exercise lands when the
-//! Connection wires `loss_recovery.detectLosses` into a tick
-//! loop. This test is the integration "smoke": every primitive
-//! (key derivation, packet protection, frame codec, send/recv
-//! streams, ACK processing) cooperates over the same Connection.
+//! The later scenarios add deterministic loss, reordering, and
+//! multipath path abandonment. This file is the integration
+//! "smoke": every primitive (key derivation, packet protection,
+//! frame codec, send/recv streams, ACK processing) cooperates over
+//! the same Connection.
 
 const std = @import("std");
 const nullq = @import("nullq");
@@ -19,6 +19,8 @@ const test_key_pem = @embedFile("../data/test_key.pem");
 
 const ClientCid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
 const ServerCid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x99 };
+const ClientPath1Cid = [_]u8{ 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28 };
+const ServerPath1Cid = [_]u8{ 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xb0, 0xb1 };
 
 fn handshake(allocator: std.mem.Allocator, client: *nullq.Connection, server: *nullq.Connection) !void {
     var step: u32 = 0;
@@ -50,6 +52,177 @@ fn buildContexts(
         .max_version = boringssl.raw.TLS1_3_VERSION,
         .alpn = &protos,
     });
+}
+
+const SimPacket = struct {
+    bytes: []u8,
+    from_client: bool,
+    path_id: u32,
+    release_us: u64,
+};
+
+const MultipathNet = struct {
+    allocator: std.mem.Allocator,
+    queue: std.ArrayList(SimPacket) = .empty,
+    c2s_seq: [2]u32 = .{ 0, 0 },
+    s2c_seq: [2]u32 = .{ 0, 0 },
+    c2s_path_seen: [2]bool = .{ false, false },
+    s2c_path_seen: [2]bool = .{ false, false },
+    drop_enabled: bool = false,
+    dropped_c2s_path1: bool = false,
+    dropped_s2c_path0: bool = false,
+
+    fn init(allocator: std.mem.Allocator) MultipathNet {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *MultipathNet) void {
+        for (self.queue.items) |pkt| self.allocator.free(pkt.bytes);
+        self.queue.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn pathIndex(path_id: u32) usize {
+        return if (path_id == 0) 0 else 1;
+    }
+
+    fn delayUs(from_client: bool, path_id: u32, seq: u32) u64 {
+        if (path_id == 0) return if (from_client) 1_000 else 2_000;
+        return if (seq % 2 == 0) 8_000 else 1_000;
+    }
+
+    fn shouldDrop(self: *MultipathNet, from_client: bool, path_id: u32, seq: u32) bool {
+        if (!self.drop_enabled) return false;
+        if (from_client and path_id == 1 and !self.dropped_c2s_path1 and seq >= 1) {
+            self.dropped_c2s_path1 = true;
+            return true;
+        }
+        if (!from_client and path_id == 0 and !self.dropped_s2c_path0 and seq >= 1) {
+            self.dropped_s2c_path0 = true;
+            return true;
+        }
+        return false;
+    }
+
+    fn enqueue(
+        self: *MultipathNet,
+        from_client: bool,
+        datagram: nullq.OutgoingDatagram,
+        bytes: []const u8,
+        now_us: u64,
+    ) !void {
+        const idx = pathIndex(datagram.path_id);
+        const seq = if (from_client) self.c2s_seq[idx] else self.s2c_seq[idx];
+        if (from_client) {
+            self.c2s_seq[idx] += 1;
+            self.c2s_path_seen[idx] = true;
+        } else {
+            self.s2c_seq[idx] += 1;
+            self.s2c_path_seen[idx] = true;
+        }
+        if (self.shouldDrop(from_client, datagram.path_id, seq)) return;
+
+        const copy = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(copy);
+        try self.queue.append(self.allocator, .{
+            .bytes = copy,
+            .from_client = from_client,
+            .path_id = datagram.path_id,
+            .release_us = now_us + delayUs(from_client, datagram.path_id, seq),
+        });
+    }
+
+    fn pollEndpoint(
+        self: *MultipathNet,
+        from_client: bool,
+        conn: *nullq.Connection,
+        now_us: u64,
+    ) !void {
+        var pkt: [2048]u8 = undefined;
+        if (try conn.pollDatagram(&pkt, now_us)) |datagram| {
+            try self.enqueue(from_client, datagram, pkt[0..datagram.len], now_us);
+        }
+    }
+
+    fn deliverDue(
+        self: *MultipathNet,
+        client: *nullq.Connection,
+        server: *nullq.Connection,
+        now_us: u64,
+    ) !void {
+        var delivered = true;
+        while (delivered) {
+            delivered = false;
+            var i: usize = 0;
+            while (i < self.queue.items.len) {
+                if (self.queue.items[i].release_us > now_us) {
+                    i += 1;
+                    continue;
+                }
+                const pkt = self.queue.orderedRemove(i);
+                defer self.allocator.free(pkt.bytes);
+                if (pkt.from_client) {
+                    try server.handle(pkt.bytes, null, now_us);
+                } else {
+                    try client.handle(pkt.bytes, null, now_us);
+                }
+                delivered = true;
+                break;
+            }
+        }
+    }
+};
+
+fn configurePrimaryCids(client: *nullq.Connection, server: *nullq.Connection) !void {
+    try client.setPeerDcid(&ServerCid);
+    try client.setLocalScid(&ClientCid);
+    try server.setPeerDcid(&ClientCid);
+    try server.setLocalScid(&ServerCid);
+}
+
+fn openSecondPath(client: *nullq.Connection, server: *nullq.Connection) !u32 {
+    const Cid = nullq.conn.path.ConnectionId;
+    const client_path_id = try client.openPath(
+        .{},
+        .{},
+        Cid.fromSlice(&ClientPath1Cid),
+        Cid.fromSlice(&ServerPath1Cid),
+    );
+    const server_path_id = try server.openPath(
+        .{},
+        .{},
+        Cid.fromSlice(&ServerPath1Cid),
+        Cid.fromSlice(&ClientPath1Cid),
+    );
+    try std.testing.expectEqual(client_path_id, server_path_id);
+    try std.testing.expect(client.markPathValidated(client_path_id));
+    try std.testing.expect(server.markPathValidated(server_path_id));
+    return client_path_id;
+}
+
+fn noteDatagram(payload: []const u8, seen_p0: *bool, seen_p1: *bool) void {
+    if (std.mem.endsWith(u8, payload, "-p0")) seen_p0.* = true;
+    if (std.mem.endsWith(u8, payload, "-p1")) seen_p1.* = true;
+}
+
+fn drainExpectedStream(
+    conn: *nullq.Connection,
+    stream_id: u64,
+    expected: []const u8,
+    consumed: *usize,
+    scratch: []u8,
+) !void {
+    if (conn.stream(stream_id) == null) return;
+    while (true) {
+        const got = try conn.streamRead(stream_id, scratch);
+        if (got == 0) break;
+        try std.testing.expectEqualSlices(
+            u8,
+            expected[consumed.* .. consumed.* + got],
+            scratch[0..got],
+        );
+        consumed.* += got;
+    }
 }
 
 test "client streams 16 KiB to server through poll/handle" {
@@ -523,4 +696,171 @@ test "client streams 16 KiB to server with 10% simulated loss" {
     try std.testing.expect(cs.send.fin_acked);
     const ss = server.stream(0).?;
     try std.testing.expect(ss.recv.fin_seen);
+}
+
+test "multipath concurrent transfer survives reordering loss and path abandon" {
+    const allocator = std.testing.allocator;
+
+    var server_tls: boringssl.tls.Context = undefined;
+    var client_tls: boringssl.tls.Context = undefined;
+    try buildContexts(&server_tls, &client_tls);
+    defer server_tls.deinit();
+    defer client_tls.deinit();
+
+    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    defer client.deinit();
+    var server = try nullq.Connection.initServer(allocator, server_tls);
+    defer server.deinit();
+
+    try client.bind();
+    try server.bind();
+    client.peer = &server;
+    server.peer = &client;
+
+    const tp: nullq.tls.TransportParams = .{
+        .initial_max_data = 1 << 22,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
+        .initial_max_streams_bidi = 16,
+        .active_connection_id_limit = 4,
+        .max_datagram_frame_size = 1200,
+        .initial_max_path_id = 1,
+    };
+    try client.setTransportParams(tp);
+    try server.setTransportParams(tp);
+
+    try handshake(allocator, &client, &server);
+    try std.testing.expect(client.multipathNegotiated());
+    try std.testing.expect(server.multipathNegotiated());
+
+    try configurePrimaryCids(&client, &server);
+    const path1 = try openSecondPath(&client, &server);
+    try std.testing.expectEqual(@as(u32, 1), path1);
+
+    var net = MultipathNet.init(allocator);
+    defer net.deinit();
+    var now_us: u64 = 1_000_000;
+
+    client.setScheduler(.primary);
+    server.setScheduler(.primary);
+
+    try std.testing.expect(client.setActivePath(0));
+    try client.sendDatagram("client-dg-p0");
+    try net.pollEndpoint(true, &client, now_us);
+    try std.testing.expect(client.setActivePath(path1));
+    try client.sendDatagram("client-dg-p1");
+    try net.pollEndpoint(true, &client, now_us);
+
+    try std.testing.expect(server.setActivePath(0));
+    try server.sendDatagram("server-dg-p0");
+    try net.pollEndpoint(false, &server, now_us);
+    try std.testing.expect(server.setActivePath(path1));
+    try server.sendDatagram("server-dg-p1");
+    try net.pollEndpoint(false, &server, now_us);
+
+    var client_dg_p0 = false;
+    var client_dg_p1 = false;
+    var server_dg_p0 = false;
+    var server_dg_p1 = false;
+    var dg_buf: [256]u8 = undefined;
+    var dg_iters: u32 = 0;
+    while (!(client_dg_p0 and client_dg_p1 and server_dg_p0 and server_dg_p1)) : (dg_iters += 1) {
+        try std.testing.expect(dg_iters < 200);
+        try net.deliverDue(&client, &server, now_us);
+        try net.pollEndpoint(true, &client, now_us);
+        try net.pollEndpoint(false, &server, now_us);
+
+        while (client.receiveDatagram(&dg_buf)) |n| {
+            noteDatagram(dg_buf[0..n], &client_dg_p0, &client_dg_p1);
+        }
+        while (server.receiveDatagram(&dg_buf)) |n| {
+            noteDatagram(dg_buf[0..n], &server_dg_p0, &server_dg_p1);
+        }
+        now_us += 1_000;
+    }
+
+    client.setScheduler(.round_robin);
+    server.setScheduler(.round_robin);
+    try std.testing.expect(client.setActivePath(0));
+    try std.testing.expect(server.setActivePath(0));
+
+    const total: usize = 24 * 1024;
+    const client_data = try allocator.alloc(u8, total);
+    defer allocator.free(client_data);
+    const server_data = try allocator.alloc(u8, total);
+    defer allocator.free(server_data);
+    var prng = std.Random.DefaultPrng.init(0x5eed_21);
+    prng.random().bytes(client_data);
+    prng.random().bytes(server_data);
+
+    _ = try client.openBidi(0);
+    _ = try server.openBidi(1);
+    _ = try client.streamWrite(0, client_data);
+    _ = try server.streamWrite(1, server_data);
+    try client.streamFinish(0);
+    try server.streamFinish(1);
+
+    net.drop_enabled = true;
+    var client_consumed: usize = 0;
+    var server_consumed: usize = 0;
+    var cbuf: [4096]u8 = undefined;
+    var sbuf: [4096]u8 = undefined;
+    var abandoned = false;
+    var iters: u32 = 0;
+
+    while (iters < 700_000) : (iters += 1) {
+        try client.tick(now_us);
+        try server.tick(now_us);
+        try net.deliverDue(&client, &server, now_us);
+        try net.pollEndpoint(true, &client, now_us);
+        try net.pollEndpoint(false, &server, now_us);
+
+        try drainExpectedStream(&server, 0, client_data, &server_consumed, &sbuf);
+        try drainExpectedStream(&client, 1, server_data, &client_consumed, &cbuf);
+
+        if (!abandoned and server_consumed >= total / 3 and client_consumed >= total / 3) {
+            try std.testing.expect(client.abandonPathAt(path1, 0x51, now_us));
+            try std.testing.expect(server.abandonPathAt(path1, 0x51, now_us));
+            try std.testing.expect(client.setActivePath(0));
+            try std.testing.expect(server.setActivePath(0));
+            abandoned = true;
+        }
+
+        const cstream = client.stream(0).?;
+        const sstream = server.stream(1).?;
+        const done =
+            client_consumed == total and
+            server_consumed == total and
+            cstream.send.ackedFloor() == @as(u64, @intCast(total)) and
+            sstream.send.ackedFloor() == @as(u64, @intCast(total)) and
+            cstream.send.fin_acked and
+            sstream.send.fin_acked;
+        if (done) break;
+
+        now_us += 1_000;
+    }
+
+    try std.testing.expect(iters < 700_000);
+    try std.testing.expect(abandoned);
+    try std.testing.expect(net.dropped_c2s_path1);
+    try std.testing.expect(net.dropped_s2c_path0);
+    try std.testing.expect(net.c2s_path_seen[0]);
+    try std.testing.expect(net.c2s_path_seen[1]);
+    try std.testing.expect(net.s2c_path_seen[0]);
+    try std.testing.expect(net.s2c_path_seen[1]);
+
+    try std.testing.expectEqual(total, server_consumed);
+    try std.testing.expectEqual(total, client_consumed);
+    try std.testing.expectEqual(nullq.conn.path.State.retiring, client.pathStats(path1).?.state);
+    try std.testing.expectEqual(nullq.conn.path.State.retiring, server.pathStats(path1).?.state);
+
+    const retire_at = @max(
+        client.pathStats(path1).?.retire_deadline_us.?,
+        server.pathStats(path1).?.retire_deadline_us.?,
+    );
+    now_us = @max(now_us, retire_at);
+    try client.tick(now_us);
+    try server.tick(now_us);
+    try std.testing.expectEqual(nullq.conn.path.State.failed, client.pathStats(path1).?.state);
+    try std.testing.expectEqual(nullq.conn.path.State.failed, server.pathStats(path1).?.state);
 }

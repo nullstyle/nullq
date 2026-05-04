@@ -11,10 +11,11 @@ draft-21 multipath nonce/CID routing checks. 0-RTT now has early
 STREAM/DATAGRAM transport plumbing plus accepted and rejected
 go-quic-peer resumption smokes, while deeper mismatch/loss hardening
 still needs work. Multipath also has embedder-driven path CID
-replenishment and abandoned-path 3x-PTO retention coverage.
-go-quic-peer single-path, 0-RTT, and path-switch smoke tests are
-maintained as interop gates. See [INTEROP_STATUS.md](INTEROP_STATUS.md)
-for the current verification log and remaining production gaps.
+replenishment, abandoned-path 3x-PTO retention coverage, and a
+deterministic two-path transfer stress test. go-quic-peer single-path,
+0-RTT, and path-switch smoke tests are maintained as interop gates. See
+[INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification log
+and remaining production gaps.
 
 ```sh
 mise install
