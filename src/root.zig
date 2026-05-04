@@ -27,6 +27,7 @@ pub const tls = @import("tls/root.zig");
 /// Per-connection state machine (handshake; later: PN spaces,
 /// streams, paths, congestion control).
 pub const conn = @import("conn/root.zig");
+pub const retry_token = conn.retry_token;
 
 pub const Connection = conn.Connection;
 pub const OutgoingDatagram = conn.OutgoingDatagram;
@@ -46,6 +47,9 @@ pub const PathStats = conn.PathStats;
 pub const Scheduler = conn.Scheduler;
 pub const Session = conn.Session;
 pub const EarlyDataStatus = conn.EarlyDataStatus;
+pub const RetryToken = conn.RetryToken;
+pub const RetryTokenKey = conn.RetryTokenKey;
+pub const RetryTokenValidationResult = conn.RetryTokenValidationResult;
 
 pub fn version() []const u8 {
     return "0.0.0";

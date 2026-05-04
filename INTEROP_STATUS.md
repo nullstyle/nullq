@@ -15,8 +15,9 @@ Current as of 2026-05-04.
   gating, proactive packet-limit updates, AEAD integrity-limit close
   behavior, and AES-128/AES-256/ChaCha packet-protection round-trips,
   client-side Version Negotiation and Retry integrity/transport
-  parameter tests, initial 0-RTT packet/receive/rejection unit tests,
-  and the 10% simulated-loss stream exchange.
+  parameter tests, stateless Retry-token validation and negative-path
+  tests, initial 0-RTT packet/receive/rejection unit tests, and the
+  10% simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
 - `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
@@ -73,6 +74,12 @@ Current as of 2026-05-04.
 - Server embedders can write a standards-compliant QUIC v1 Retry packet
   with `Connection.writeRetry`; token contents and acceptance policy
   intentionally remain application-owned.
+- The public `retry_token` helper can mint and validate stateless
+  HMAC-SHA256 Retry tokens bound to caller-supplied client address
+  bytes, original DCID, Retry SCID, QUIC version, issue time, and
+  expiry. It has deterministic coverage for changed address/CID replay,
+  wrong version, expiry, future tokens, truncation, malformed format,
+  and bad MACs.
 - Server embedders can write a Version Negotiation packet with
   `Connection.writeVersionNegotiation`, and the peer harness now uses it
   to negotiate quic-go from v2 down to v1.
@@ -232,10 +239,10 @@ Current as of 2026-05-04.
    datagram/loss scenarios.
 6. **Protocol hardening remains.** Retry and Version Negotiation now
    have deterministic core coverage plus live quic-go interop through
-   nullq-peer. Remaining hardening work: promote the peer's HMAC Retry
-   token policy into reusable embedder guidance/API, add malformed and
-   replayed Retry-token vectors, add VN negative-path vectors, bounded
-   allocation policy, qlog/keylog diagnostics, full flow-control
+   nullq-peer, and Retry address-validation helpers are reusable nullq
+   API. Remaining hardening work: add live malformed/replayed Retry
+   token probes through the UDP harness, add VN negative-path vectors,
+   bounded allocation policy, qlog/keylog diagnostics, full flow-control
    pacing, and broader shutdown-path interop with external peers.
 
 Note: the passing mock multipath test now validates simultaneous

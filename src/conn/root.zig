@@ -12,6 +12,7 @@ pub const path_validator = @import("path_validator.zig");
 pub const send_stream = @import("send_stream.zig");
 pub const recv_stream = @import("recv_stream.zig");
 pub const path = @import("path.zig");
+pub const retry_token = @import("retry_token.zig");
 
 pub const Connection = state.Connection;
 pub const OutgoingDatagram = state.OutgoingDatagram;
@@ -43,6 +44,9 @@ pub const PathSet = path.PathSet;
 pub const PathState = path.PathState;
 pub const PathStats = path.PathStats;
 pub const Scheduler = path.Scheduler;
+pub const RetryToken = retry_token.Token;
+pub const RetryTokenKey = retry_token.Key;
+pub const RetryTokenValidationResult = retry_token.ValidationResult;
 
 test {
     _ = state;
@@ -57,4 +61,5 @@ test {
     _ = send_stream;
     _ = recv_stream;
     _ = path;
+    _ = retry_token;
 }
