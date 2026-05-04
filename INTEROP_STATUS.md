@@ -223,22 +223,25 @@ Current as of 2026-05-04.
    registration, lifecycle, stats, scheduler selection, path-aware
    polling, per-path Application recovery ownership, draft-21 nonce
    construction, CID-based incoming path mapping, concurrent mock
-   transfer under loss/reordering, and core CID/limit validation exist.
-   Remaining wire work: full path establishment policy around unused
-   common path IDs, richer app policy for when/how many replacement CIDs
-   to generate, and external draft-21 peer validation.
-2. **Multipath frame emission is partial.** Draft-21 multipath control
-   frames can be queued, emitted one per Application packet, ACKed, and
-   requeued on loss, and PATH_ACK is generated for non-zero path ACK
-   trackers. Remaining emission work: smarter pacing/coalescing and
-   more exhaustive PATH_ACK behavior over retiring paths.
+   transfer under loss/reordering, unused path-ID CID pre-provisioning,
+   common path-ID open gating, and core CID/limit validation exist.
+   Remaining wire work: richer app policy for when/how many replacement
+   CIDs to generate and external draft-21 peer validation.
+2. **Multipath frame emission is locally complete but needs peer soak.**
+   Draft-21 multipath control frames can be queued, coalesced into
+   Application packets, ACKed, and requeued on loss, and PATH_ACK is
+   generated for non-zero path ACK trackers including retiring paths.
+   Remaining confidence work: pacing behavior under live traffic and
+   external draft-21 peer validation.
 3. **Recovery is path-aware but not fully hardened.** Packet-threshold,
    time-threshold, PTO, ACK-delay, idle, draining, NewReno loss/ACK
    feedback, persistent congestion, and basic PTO probe selection are
-   path-owned for Application data. Remaining recovery work: old-path
-   draining during active migration, migration-specific RTT/congestion
-   reset, and broader lossy/reordered interop gates. Pacing, ECN, and
-   advanced congestion controllers remain out of scope for this push.
+   path-owned for Application data. Abandoned multipath paths retain
+   peer CIDs and ACK/recovery state until the 3x-largest-PTO drain
+   window expires. Remaining recovery work: active-migration old-path
+   draining, migration-specific RTT/congestion reset, and broader
+   lossy/reordered interop gates. Pacing, ECN, and advanced congestion
+   controllers remain out of scope for this push.
 4. **Key updates need external soak, not core lifecycle work.** The
    current implementation covers previous/current/next read keys,
    3x-PTO old-key discard, local initiation, ACK gating, and cross-suite

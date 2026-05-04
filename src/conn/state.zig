@@ -76,6 +76,7 @@ pub const Error = error{
     PathNotFound,
     PathLimitExceeded,
     ConnectionIdLimitExceeded,
+    ConnectionIdRequired,
     EmptyEarlyDataContext,
     KeyUpdateUnavailable,
     KeyUpdateBlocked,
@@ -2478,11 +2479,17 @@ pub const Connection = struct {
         local_cid: ConnectionId,
         peer_cid: ConnectionId,
     ) Error!u32 {
-        if (self.multipathNegotiated() and self.paths.next_path_id > self.peer_max_path_id) {
-            self.queuePathsBlocked(self.peer_max_path_id);
-            return Error.PathLimitExceeded;
+        const path_id = self.paths.next_path_id;
+        if (self.multipathNegotiated()) {
+            if (path_id > self.peer_max_path_id) {
+                self.queuePathsBlocked(self.peer_max_path_id);
+                return Error.PathLimitExceeded;
+            }
+            if (path_id > self.local_max_path_id) return Error.PathLimitExceeded;
+            if (local_cid.len == 0 or peer_cid.len == 0) return Error.ConnectionIdRequired;
+            try self.ensureCanIssueLocalCid(path_id, 0, 0, local_cid.len);
         }
-        const path_id = try self.paths.openPath(
+        const opened_path_id = try self.paths.openPath(
             self.allocator,
             peer_addr,
             local_addr,
@@ -2490,8 +2497,8 @@ pub const Connection = struct {
             peer_cid,
             .{ .max_datagram_size = self.mtu },
         );
-        try self.rememberLocalCid(path_id, 0, 0, local_cid, @splat(0));
-        return path_id;
+        try self.rememberLocalCid(opened_path_id, 0, 0, local_cid, @splat(0));
+        return opened_path_id;
     }
 
     pub fn setActivePath(self: *Connection, path_id: u32) bool {
@@ -2595,6 +2602,7 @@ pub const Connection = struct {
         stateless_reset_token: [16]u8,
     ) Error!void {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
+        try self.ensureCanIssueCidForPathId(path_id);
         try self.ensureCanIssueLocalCid(path_id, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
         for (self.pending_path_new_connection_ids.items) |item| {
@@ -2692,8 +2700,18 @@ pub const Connection = struct {
         path_id: u32,
         provisions: []const ConnectionIdProvision,
     ) Error!usize {
-        if (self.paths.get(path_id) == null) return Error.PathNotFound;
+        try self.ensureCanIssueCidForPathId(path_id);
         return self.replenishLocalConnectionIds(path_id, provisions);
+    }
+
+    fn ensureCanIssueCidForPathId(self: *const Connection, path_id: u32) Error!void {
+        if (path_id == 0) return;
+        if (self.multipathNegotiated() and path_id > self.local_max_path_id) {
+            return Error.PathLimitExceeded;
+        }
+        if (self.paths.getConst(path_id) != null) return;
+        if (self.multipathNegotiated()) return;
+        return Error.PathNotFound;
     }
 
     fn replenishLocalConnectionIds(
@@ -3358,7 +3376,6 @@ pub const Connection = struct {
         if (!self.paths.abandon(path_id)) return false;
         const path = self.paths.get(path_id) orelse return false;
         path.retire_deadline_us = now_us +| self.retiredPathRetentionUs();
-        self.retirePeerCidsForPath(path_id);
         if (queue_abandon) {
             self.queuePathAbandon(path_id, error_code) catch return false;
         }
@@ -3371,6 +3388,7 @@ pub const Connection = struct {
             const deadline = path.retire_deadline_us orelse continue;
             if (now_us < deadline) continue;
             path.clearRecovery(self.allocator);
+            self.retirePeerCidsForPath(path.id);
             path.path.fail();
             path.retire_deadline_us = null;
         }
@@ -4171,11 +4189,10 @@ pub const Connection = struct {
             ack_eliciting = true;
         }
 
-        // 2e) Draft-21 multipath control frames. Emit at most one per
-        //     packet so the fixed sent-packet retransmit metadata budget
-        //     stays predictable while the full scheduler is still landing.
+        // 2e) Draft-21 multipath control frames. Coalesce as many as
+        //     fit while preserving per-frame retransmit metadata.
         if (!congestion_blocked and lvl == .application) {
-            if (try self.emitOnePendingMultipathFrame(&sent_packet, &pl_buf, &pl_pos, max_payload)) {
+            if (try self.emitPendingMultipathFrames(&sent_packet, &pl_buf, &pl_pos, max_payload)) {
                 ack_eliciting = true;
             }
         }
@@ -4437,6 +4454,24 @@ pub const Connection = struct {
             }
         }
         return false;
+    }
+
+    fn emitPendingMultipathFrames(
+        self: *Connection,
+        sent_packet: *sent_packets_mod.SentPacket,
+        pl_buf: *[default_mtu]u8,
+        pl_pos: *usize,
+        max_payload: usize,
+    ) Error!bool {
+        var emitted = false;
+        const control_budget = sent_packets_mod.max_retransmit_frames - 1;
+        while (sent_packet.retransmit_frames.items.len < control_budget) {
+            const before = pl_pos.*;
+            if (!try self.emitOnePendingMultipathFrame(sent_packet, pl_buf, pl_pos, max_payload)) break;
+            emitted = true;
+            if (pl_pos.* == before) break;
+        }
+        return emitted;
     }
 
     /// Process an incoming UDP datagram. Splits coalesced packets
@@ -7309,6 +7344,47 @@ test "poll helper emits one draft multipath control frame with retransmit metada
     try std.testing.expectEqual(@as(u64, 7), decoded.frame.path_status_backup.sequence_number);
 }
 
+test "poll helper coalesces draft multipath control frames with retransmit metadata" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.queuePathStatus(2, true, 7);
+    conn.queueMaxPathId(4);
+    conn.queuePathsBlocked(3);
+
+    var packet: sent_packets_mod.SentPacket = .{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 0,
+        .ack_eliciting = false,
+        .in_flight = false,
+    };
+    defer packet.deinit(allocator);
+    var payload: [default_mtu]u8 = undefined;
+    var pos: usize = 0;
+
+    try std.testing.expect(try conn.emitPendingMultipathFrames(&packet, &payload, &pos, default_mtu));
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_path_statuses.items.len);
+    try std.testing.expectEqual(@as(?u32, null), conn.pending_max_path_id);
+    try std.testing.expectEqual(@as(?u32, null), conn.pending_paths_blocked);
+    try std.testing.expectEqual(@as(usize, 3), packet.retransmit_frames.items.len);
+    try std.testing.expect(packet.retransmit_frames.items[0] == .path_status_available);
+    try std.testing.expect(packet.retransmit_frames.items[1] == .max_path_id);
+    try std.testing.expect(packet.retransmit_frames.items[2] == .paths_blocked);
+
+    var it = frame_mod.iter(payload[0..pos]);
+    const first = (try it.next()).?;
+    const second = (try it.next()).?;
+    const third = (try it.next()).?;
+    try std.testing.expect(first == .path_status_available);
+    try std.testing.expect(second == .max_path_id);
+    try std.testing.expect(third == .paths_blocked);
+    try std.testing.expect((try it.next()) == null);
+}
+
 test "PTO requeues retransmittable draft multipath control frames" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -7612,6 +7688,65 @@ test "abandoned paths keep recovery until three largest PTOs elapse" {
     try std.testing.expectEqual(path_mod.State.failed, path.path.state);
     try std.testing.expectEqual(@as(?u64, null), path.retire_deadline_us);
     try std.testing.expectEqual(@as(u32, 0), path.sent.count);
+}
+
+test "retiring paths retain peer CIDs and emit PATH_ACK during drain" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    markTestMultipathNegotiated(&conn, 1);
+    try conn.setPeerDcid(&.{0xaa});
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
+    const path = conn.paths.get(path_id).?;
+    path.app_pn_space.recordReceived(9, 1_000);
+
+    const now_us: u64 = 10_000;
+    const expected_deadline = now_us +| conn.retiredPathRetentionUs();
+    try std.testing.expect(conn.abandonPathAt(path_id, 42, now_us));
+    try std.testing.expectEqual(path_mod.State.retiring, path.path.state);
+    try std.testing.expectEqualSlices(u8, &.{0xbb}, path.path.peer_cid.slice());
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const datagram = (try conn.pollDatagram(&packet_buf, now_us + 1)).?;
+    try std.testing.expectEqual(path_id, datagram.path_id);
+    try std.testing.expect(!path.app_pn_space.received.pending_ack);
+
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..datagram.len], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+        .multipath_path_id = path_id,
+    });
+
+    var saw_path_ack = false;
+    var saw_path_abandon = false;
+    var it = frame_mod.iter(opened.payload);
+    while (try it.next()) |frame| switch (frame) {
+        .path_ack => |ack| {
+            saw_path_ack = true;
+            try std.testing.expectEqual(path_id, ack.path_id);
+            try std.testing.expectEqual(@as(u64, 9), ack.largest_acked);
+        },
+        .path_abandon => |abandon| {
+            saw_path_abandon = true;
+            try std.testing.expectEqual(path_id, abandon.path_id);
+            try std.testing.expectEqual(@as(u64, 42), abandon.error_code);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_path_ack);
+    try std.testing.expect(saw_path_abandon);
+
+    try conn.tick(expected_deadline);
+    try std.testing.expectEqual(path_mod.State.failed, path.path.state);
+    try std.testing.expectEqual(@as(u8, 0), path.path.peer_cid.len);
 }
 
 test "PATH_ACK routes ACK processing to the indicated application path" {
@@ -9096,6 +9231,31 @@ test "openPath respects peer MAX_PATH_ID when multipath is negotiated" {
     try std.testing.expectEqual(@as(?u32, 1), conn.pending_paths_blocked);
 }
 
+test "openPath requires common path id capacity and CIDs when multipath is negotiated" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    try std.testing.expectError(
+        Error.ConnectionIdRequired,
+        conn.openPath(.{}, .{}, ConnectionId{}, ConnectionId.fromSlice(&.{0xd1})),
+    );
+    try std.testing.expectError(
+        Error.ConnectionIdRequired,
+        conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId{}),
+    );
+
+    conn.peer_max_path_id = 2;
+    _ = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    try std.testing.expectError(
+        Error.PathLimitExceeded,
+        conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc2}), ConnectionId.fromSlice(&.{0xd2})),
+    );
+}
+
 test "PATH_NEW_CONNECTION_ID rejects sequence reuse with different cid" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -9209,6 +9369,36 @@ test "PATH_CIDS_BLOCKED can be surfaced and replenished within peer active cid l
     try conn.queuePathNewConnectionId(path_id, 3, 1, &.{0xc5}, @splat(0xc5));
     try std.testing.expectEqual(@as(usize, 3), conn.pending_path_new_connection_ids.items.len);
     try std.testing.expectEqual(@as(u64, 4), conn.nextLocalConnectionIdSequence(path_id));
+}
+
+test "unused negotiated path ids can be pre-provisioned with PATH_NEW_CONNECTION_ID" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 3);
+    conn.cached_peer_transport_params = .{
+        .initial_max_path_id = 3,
+        .active_connection_id_limit = 2,
+    };
+
+    const queued = try conn.replenishPathConnectionIds(2, &.{
+        .{ .connection_id = &.{0xc2}, .stateless_reset_token = @splat(0xc2) },
+        .{ .connection_id = &.{0xc3}, .stateless_reset_token = @splat(0xc3) },
+    });
+    try std.testing.expectEqual(@as(usize, 2), queued);
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u32, 2), conn.pending_path_new_connection_ids.items[0].path_id);
+    try std.testing.expectEqual(@as(u64, 0), conn.pending_path_new_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(u64, 1), conn.pending_path_new_connection_ids.items[1].sequence_number);
+    try std.testing.expectEqual(@as(u64, 2), conn.nextLocalConnectionIdSequence(2));
+
+    try std.testing.expectError(
+        Error.PathLimitExceeded,
+        conn.queuePathNewConnectionId(4, 0, 0, &.{0xc4}, @splat(0xc4)),
+    );
 }
 
 test "PATH_RETIRE_CONNECTION_ID drops pending advertisements and allows replenishment" {
