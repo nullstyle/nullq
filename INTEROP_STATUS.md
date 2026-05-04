@@ -244,8 +244,10 @@ Current as of 2026-05-04.
    3x-PTO old-key discard, local initiation, ACK gating, and cross-suite
    AEAD packet/authentication limits across all Application paths. Remaining
    confidence work is external delayed-old-phase interop, long-running
-   packet-limit soak with realistic thresholds, and keylog/qlog
-   diagnostics around update epochs.
+   packet-limit soak with realistic thresholds, and external qlog/keylog
+   trace review. nullq now exposes an opt-in qlog-style callback for
+   Application key install/update/ACK/discard events, and re-exports the
+   BoringSSL keylog callback type for TLS-context key logging.
 5. **0-RTT is implemented but still needs rejection hardening.** The
    landed code covers packet protection, explicit send opt-in,
    server receive validation, early-data context construction, status
@@ -263,12 +265,14 @@ Current as of 2026-05-04.
 6. **Protocol hardening remains.** Retry and Version Negotiation now
    have deterministic core coverage plus live quic-go interop through
    nullq-peer, and Retry address-validation helpers are reusable nullq
-   API. Remaining hardening work: add live malformed/replayed Retry
-   token probes through the UDP harness, bounded allocation policy,
-   qlog/keylog diagnostics, send-side blocked-frame pacing, and broader
-   shutdown-path interop with external peers. Receive-side MAX_DATA /
-   MAX_STREAM_DATA updates are now half-window paced, and VN negative
-   path vectors now cover supported-version, wrong CID echo, malformed
+   API. Remaining hardening work: bounded allocation policy and broader
+   shutdown-path interop with external peers. Local endpoint probes now
+   cover malformed, replayed-address, replayed-CID, expired, and
+   wrong-version Retry tokens; send-side blocked-frame loss requeue now
+   skips stale DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED
+   frames after the peer raises limits; receive-side MAX_DATA /
+   MAX_STREAM_DATA updates are half-window paced; and VN negative path
+   vectors cover supported-version, wrong CID echo, malformed
    version-list, and server-ignore cases.
 7. **The official interop runner gate is scaffolded, not complete.**
    nullq now has QNS server and client endpoint roles plus a Zig-native

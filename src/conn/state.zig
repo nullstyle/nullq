@@ -418,6 +418,31 @@ pub const ApplicationKeyUpdateStatus = struct {
     auth_failures: u64 = 0,
 };
 
+pub const QlogEventName = enum {
+    application_read_key_installed,
+    application_read_key_updated,
+    application_read_key_discard_scheduled,
+    application_read_key_discarded,
+    application_write_key_installed,
+    application_write_key_updated,
+    application_write_update_acked,
+    aead_confidentiality_limit_reached,
+    aead_integrity_limit_reached,
+};
+
+pub const QlogEvent = struct {
+    name: QlogEventName,
+    at_us: u64 = 0,
+    level: EncryptionLevel = .application,
+    key_epoch: ?u64 = null,
+    key_phase: ?bool = null,
+    packet_number: ?u64 = null,
+    discard_deadline_us: ?u64 = null,
+    details: []const u8 = &.{},
+};
+
+pub const QlogCallback = *const fn (user_data: ?*anyopaque, event: QlogEvent) void;
+
 const ApplicationKeyEpoch = struct {
     material: SecretMaterial,
     keys: PacketKeys,
@@ -610,6 +635,8 @@ pub const Connection = struct {
     app_next_local_update_after_us: ?u64 = null,
     app_failed_auth_packets: u64 = 0,
     app_key_update_limits: ApplicationKeyUpdateLimits = .{},
+    qlog_callback: ?QlogCallback = null,
+    qlog_user_data: ?*anyopaque = null,
 
     /// Local datagram budget for outgoing packets.
     mtu: usize = default_mtu,
@@ -954,6 +981,22 @@ pub const Connection = struct {
         return self.inner.isQuic();
     }
 
+    /// Install an opt-in qlog-style callback for security/lifecycle
+    /// diagnostics. nullq never writes logs on its own; embedders can
+    /// translate these events into qlog JSON, metrics, or test probes.
+    pub fn setQlogCallback(
+        self: *Connection,
+        callback: ?QlogCallback,
+        user_data: ?*anyopaque,
+    ) void {
+        self.qlog_callback = callback;
+        self.qlog_user_data = user_data;
+    }
+
+    fn emitQlog(self: *Connection, event: QlogEvent) void {
+        if (self.qlog_callback) |callback| callback(self.qlog_user_data, event);
+    }
+
     /// Are read/write secrets installed at the given encryption level?
     pub fn haveSecret(self: *const Connection, lvl: EncryptionLevel, dir: Direction) bool {
         const slot = self.levels[lvl.idx()];
@@ -1073,12 +1116,22 @@ pub const Connection = struct {
                 self.app_read_current = epoch;
                 self.app_read_next = try nextApplicationKeyEpoch(epoch, 0);
                 self.app_failed_auth_packets = 0;
+                self.emitQlog(.{
+                    .name = .application_read_key_installed,
+                    .key_epoch = epoch.epoch,
+                    .key_phase = epoch.key_phase,
+                });
             },
             .write => {
                 self.levels[app_idx].write = material;
                 self.app_write_current = epoch;
                 self.app_write_update_pending_ack = false;
                 self.app_next_local_update_after_us = null;
+                self.emitQlog(.{
+                    .name = .application_write_key_installed,
+                    .key_epoch = epoch.epoch,
+                    .key_phase = epoch.key_phase,
+                });
             },
         }
     }
@@ -1101,6 +1154,19 @@ pub const Connection = struct {
         self.app_read_current.?.installed_at_us = now_us;
         self.app_read_current.?.discard_deadline_us = null;
         try self.refreshNextApplicationReadKey();
+        self.emitQlog(.{
+            .name = .application_read_key_discard_scheduled,
+            .at_us = now_us,
+            .key_epoch = previous.epoch,
+            .key_phase = previous.key_phase,
+            .discard_deadline_us = previous.discard_deadline_us,
+        });
+        self.emitQlog(.{
+            .name = .application_read_key_updated,
+            .at_us = now_us,
+            .key_epoch = self.app_read_current.?.epoch,
+            .key_phase = self.app_read_current.?.key_phase,
+        });
     }
 
     fn installNextApplicationWriteKeys(
@@ -1113,6 +1179,12 @@ pub const Connection = struct {
         self.app_write_current.?.installed_at_us = now_us;
         self.app_write_current.?.acked = false;
         self.app_write_update_pending_ack = pending_ack;
+        self.emitQlog(.{
+            .name = .application_write_key_updated,
+            .at_us = now_us,
+            .key_epoch = self.app_write_current.?.epoch,
+            .key_phase = self.app_write_current.?.key_phase,
+        });
     }
 
     fn maybeRespondToPeerKeyUpdate(self: *Connection, now_us: u64) Error!void {
@@ -1179,6 +1251,12 @@ pub const Connection = struct {
             return;
         }
         if (current.packets_protected >= self.app_key_update_limits.confidentiality_limit) {
+            self.emitQlog(.{
+                .name = .aead_confidentiality_limit_reached,
+                .at_us = now_us,
+                .key_epoch = current.epoch,
+                .key_phase = current.key_phase,
+            });
             self.close(true, transport_error_aead_limit_reached, "AEAD confidentiality limit reached");
         }
     }
@@ -1206,6 +1284,14 @@ pub const Connection = struct {
                 if (self.app_write_update_pending_ack) {
                     self.app_write_update_pending_ack = false;
                     self.app_next_local_update_after_us = now_us +| self.retiredPathRetentionUs();
+                    self.emitQlog(.{
+                        .name = .application_write_update_acked,
+                        .at_us = now_us,
+                        .key_epoch = epoch.epoch,
+                        .key_phase = epoch.key_phase,
+                        .packet_number = packet.pn,
+                        .discard_deadline_us = self.app_next_local_update_after_us,
+                    });
                 }
             }
         }
@@ -1214,6 +1300,11 @@ pub const Connection = struct {
     fn noteApplicationAuthFailure(self: *Connection) void {
         self.app_failed_auth_packets +|= 1;
         if (self.app_failed_auth_packets >= self.app_key_update_limits.integrity_limit) {
+            self.emitQlog(.{
+                .name = .aead_integrity_limit_reached,
+                .key_epoch = if (self.app_read_current) |epoch| epoch.epoch else null,
+                .key_phase = if (self.app_read_current) |epoch| epoch.key_phase else null,
+            });
             self.close(true, transport_error_aead_limit_reached, "AEAD integrity limit reached");
         }
     }
@@ -1221,7 +1312,16 @@ pub const Connection = struct {
     fn discardExpiredApplicationReadKeys(self: *Connection, now_us: u64) void {
         if (self.app_read_previous) |epoch| {
             if (epoch.discard_deadline_us) |deadline| {
-                if (now_us >= deadline) self.app_read_previous = null;
+                if (now_us >= deadline) {
+                    self.emitQlog(.{
+                        .name = .application_read_key_discarded,
+                        .at_us = now_us,
+                        .key_epoch = epoch.epoch,
+                        .key_phase = epoch.key_phase,
+                        .discard_deadline_us = deadline,
+                    });
+                    self.app_read_previous = null;
+                }
             }
         }
     }
@@ -2093,9 +2193,14 @@ pub const Connection = struct {
         }
     }
 
-    fn requeueDataBlocked(self: *Connection, maximum_data: u64) void {
-        self.local_data_blocked_at = maximum_data;
+    fn requeueDataBlocked(self: *Connection, maximum_data: u64) bool {
+        if (self.local_data_blocked_at == null or
+            self.local_data_blocked_at.? != maximum_data)
+        {
+            return false;
+        }
         self.pending_data_blocked = maximum_data;
+        return true;
     }
 
     fn clearLocalDataBlocked(self: *Connection, new_limit: u64) void {
@@ -2131,9 +2236,13 @@ pub const Connection = struct {
     fn requeueStreamDataBlocked(
         self: *Connection,
         item: frame_types.StreamDataBlocked,
-    ) Error!void {
-        _ = try upsertStreamBlocked(&self.local_stream_data_blocked, self.allocator, item);
+    ) Error!bool {
+        const idx = findStreamBlocked(self.local_stream_data_blocked.items, item.stream_id) orelse return false;
+        if (self.local_stream_data_blocked.items[idx].maximum_stream_data != item.maximum_stream_data) {
+            return false;
+        }
         _ = try upsertStreamBlocked(&self.pending_stream_data_blocked, self.allocator, item);
+        return true;
     }
 
     fn clearLocalStreamDataBlocked(
@@ -2173,14 +2282,23 @@ pub const Connection = struct {
         }
     }
 
-    fn requeueStreamsBlocked(self: *Connection, item: frame_types.StreamsBlocked) void {
+    fn requeueStreamsBlocked(self: *Connection, item: frame_types.StreamsBlocked) bool {
         if (item.bidi) {
-            self.local_streams_blocked_bidi = item.maximum_streams;
+            if (self.local_streams_blocked_bidi == null or
+                self.local_streams_blocked_bidi.? != item.maximum_streams)
+            {
+                return false;
+            }
             self.pending_streams_blocked_bidi = item.maximum_streams;
         } else {
-            self.local_streams_blocked_uni = item.maximum_streams;
+            if (self.local_streams_blocked_uni == null or
+                self.local_streams_blocked_uni.? != item.maximum_streams)
+            {
+                return false;
+            }
             self.pending_streams_blocked_uni = item.maximum_streams;
         }
+        return true;
     }
 
     fn clearLocalStreamsBlocked(self: *Connection, bidi: bool, new_limit: u64) void {
@@ -5966,16 +6084,13 @@ pub const Connection = struct {
                     any = true;
                 },
                 .data_blocked => |db| {
-                    self.requeueDataBlocked(db.maximum_data);
-                    any = true;
+                    any = self.requeueDataBlocked(db.maximum_data) or any;
                 },
                 .stream_data_blocked => |sdb| {
-                    try self.requeueStreamDataBlocked(sdb);
-                    any = true;
+                    any = (try self.requeueStreamDataBlocked(sdb)) or any;
                 },
                 .streams_blocked => |sb| {
-                    self.requeueStreamsBlocked(sb);
-                    any = true;
+                    any = self.requeueStreamsBlocked(sb) or any;
                 },
                 .new_connection_id => |nc| {
                     try self.queueNewConnectionId(
@@ -7717,6 +7832,44 @@ test "non-zero path ACK clears local key update gate" {
     try std.testing.expect(!conn.keyUpdateStatus().write_update_pending_ack);
 }
 
+test "qlog callback records application key update lifecycle" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+    try installTestApplicationReadSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
+    try std.testing.expect(recorder.contains(.application_read_key_installed));
+    try std.testing.expect(recorder.contains(.application_write_key_installed));
+
+    try conn.promoteApplicationReadKeys(1_000_000);
+    try std.testing.expect(recorder.contains(.application_read_key_discard_scheduled));
+    try std.testing.expect(recorder.contains(.application_read_key_updated));
+
+    try conn.requestKeyUpdate(1_100_000);
+    const write_epoch = conn.app_write_current.?;
+    try std.testing.expect(recorder.contains(.application_write_key_updated));
+    var packet: sent_packets_mod.SentPacket = .{
+        .pn = 42,
+        .sent_time_us = 1_100_000,
+        .bytes = 64,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .key_epoch = write_epoch.epoch,
+        .key_phase = write_epoch.key_phase,
+    };
+    conn.onApplicationPacketAckedForKeys(&packet, 1_150_000);
+    try std.testing.expect(recorder.contains(.application_write_update_acked));
+
+    const discard_deadline = conn.app_read_previous.?.discard_deadline_us.?;
+    try conn.tick(discard_deadline);
+    try std.testing.expect(recorder.contains(.application_read_key_discarded));
+}
+
 test "AEAD authentication failure limit closes the connection" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initServer(.{});
@@ -7752,6 +7905,25 @@ fn testEarlyDataPacketKeys() !PacketKeys {
     const secret: [32]u8 = @splat(0);
     return try short_packet_mod.derivePacketKeys(.aes128_gcm_sha256, &secret);
 }
+
+const TestQlogRecorder = struct {
+    events: [16]QlogEvent = undefined,
+    count: usize = 0,
+
+    fn callback(user_data: ?*anyopaque, event: QlogEvent) void {
+        const self: *TestQlogRecorder = @ptrCast(@alignCast(user_data.?));
+        if (self.count >= self.events.len) return;
+        self.events[self.count] = event;
+        self.count += 1;
+    }
+
+    fn contains(self: *const TestQlogRecorder, name: QlogEventName) bool {
+        for (self.events[0..self.count]) |event| {
+            if (event.name == name) return true;
+        }
+        return false;
+    }
+};
 
 fn markTestMultipathNegotiated(conn: *Connection, max_path_id: u32) void {
     conn.enableMultipath(true);
@@ -8216,6 +8388,44 @@ test "blocked frames emit with retransmit metadata and requeue on loss" {
     try std.testing.expectEqual(@as(?u64, 7), conn.pending_data_blocked);
     try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_data_blocked.items.len);
     try std.testing.expectEqual(@as(?u64, 3), conn.pending_streams_blocked_bidi);
+}
+
+test "stale blocked frames are not requeued after peer raises limits" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.noteDataBlocked(7);
+    try conn.noteStreamDataBlocked(0, 11);
+    conn.noteStreamsBlocked(true, 3);
+    conn.clearLocalDataBlocked(8);
+    conn.clearLocalStreamDataBlocked(0, 12);
+    conn.clearLocalStreamsBlocked(true, 4);
+
+    var packet: sent_packets_mod.SentPacket = .{
+        .pn = 9,
+        .sent_time_us = 1_000,
+        .bytes = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    defer packet.deinit(allocator);
+    try packet.addRetransmitFrame(allocator, .{ .data_blocked = .{ .maximum_data = 7 } });
+    try packet.addRetransmitFrame(allocator, .{ .stream_data_blocked = .{
+        .stream_id = 0,
+        .maximum_stream_data = 11,
+    } });
+    try packet.addRetransmitFrame(allocator, .{ .streams_blocked = .{
+        .bidi = true,
+        .maximum_streams = 3,
+    } });
+
+    try std.testing.expect(!(try conn.dispatchLostControlFrames(&packet)));
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_data_blocked);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_streams_blocked_bidi);
 }
 
 test "inbound blocked frames update peer state and pollable events" {

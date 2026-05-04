@@ -860,6 +860,22 @@ fn validRetryToken(
     retry_scid: []const u8,
     token: []const u8,
 ) bool {
+    return retryTokenValidationResult(
+        peer,
+        now_us,
+        original_dcid,
+        retry_scid,
+        token,
+    ) == .valid;
+}
+
+fn retryTokenValidationResult(
+    peer: Net.IpAddress,
+    now_us: u64,
+    original_dcid: []const u8,
+    retry_scid: []const u8,
+    token: []const u8,
+) nullq.RetryTokenValidationResult {
     var addr_buf: [32]u8 = undefined;
     const client_address = retryAddressContext(&addr_buf, peer);
     return nullq.retry_token.validate(token, .{
@@ -868,7 +884,7 @@ fn validRetryToken(
         .client_address = client_address,
         .original_dcid = original_dcid,
         .retry_scid = retry_scid,
-    }) == .valid;
+    });
 }
 
 fn retryAddressContext(dst: []u8, peer: Net.IpAddress) []const u8 {
@@ -902,6 +918,59 @@ fn peekInitialToken(bytes: []const u8) ?[]const u8 {
         .initial => |initial| initial.token,
         else => null,
     };
+}
+
+test "Retry-token endpoint validation rejects malformed and replayed probes" {
+    const peer = try Net.IpAddress.parseLiteral("127.0.0.1:4444");
+    const replay_peer = try Net.IpAddress.parseLiteral("127.0.0.1:4445");
+    const original_dcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const retry_scid = [_]u8{ 0x52, 0x45, 0x54, 0x52, 0x59, 0x21 };
+    var token = try retryToken(peer, 1_000_000, &original_dcid, &retry_scid);
+
+    try std.testing.expect(validRetryToken(
+        peer,
+        2_000_000,
+        &original_dcid,
+        &retry_scid,
+        &token,
+    ));
+    try std.testing.expectEqual(nullq.RetryTokenValidationResult.malformed, retryTokenValidationResult(
+        peer,
+        2_000_000,
+        &original_dcid,
+        &retry_scid,
+        token[0 .. token.len - 1],
+    ));
+    try std.testing.expectEqual(nullq.RetryTokenValidationResult.invalid, retryTokenValidationResult(
+        replay_peer,
+        2_000_000,
+        &original_dcid,
+        &retry_scid,
+        &token,
+    ));
+    try std.testing.expectEqual(nullq.RetryTokenValidationResult.invalid, retryTokenValidationResult(
+        peer,
+        2_000_000,
+        &.{ 1, 2, 3, 4, 5, 6, 7, 9 },
+        &retry_scid,
+        &token,
+    ));
+    try std.testing.expectEqual(nullq.RetryTokenValidationResult.expired, retryTokenValidationResult(
+        peer,
+        1_000_000 + retry_token_lifetime_us + 1,
+        &original_dcid,
+        &retry_scid,
+        &token,
+    ));
+
+    std.mem.writeInt(u32, token[1..5], 0x6b3343cf, .big);
+    try std.testing.expectEqual(nullq.RetryTokenValidationResult.wrong_version, retryTokenValidationResult(
+        peer,
+        2_000_000,
+        &original_dcid,
+        &retry_scid,
+        &token,
+    ));
 }
 
 const LongHeaderIds = struct {

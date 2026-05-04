@@ -78,6 +78,29 @@ _ = try server_conn.setEarlyDataContextForParams(
 );
 ```
 
+## Diagnostics
+
+TLS key logging is opt-in through `boringssl-zig` and re-exported as
+`nullq.KeylogCallback`:
+
+```zig
+try tls_ctx.setKeylogCallback(onKeylogLine);
+```
+
+Application key-update lifecycle events are opt-in through the
+connection qlog-style callback:
+
+```zig
+conn.setQlogCallback(onQlogEvent, app_state);
+
+fn onQlogEvent(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
+    _ = user_data;
+    if (event.name == .application_write_update_acked) {
+        // Translate to qlog JSON, metrics, or test assertions.
+    }
+}
+```
+
 ## What this is
 
 - The QUIC **transport**: streams, datagrams, packet protection, loss
