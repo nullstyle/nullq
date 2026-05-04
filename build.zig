@@ -36,4 +36,25 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{ .root_module = tests_mod });
     const run_integration_tests = b.addRunArtifact(integration_tests);
     test_step.dependOn(&run_integration_tests.step);
+
+    const qns_mod = b.createModule(.{
+        .root_source_file = b.path("interop/qns_endpoint.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    qns_mod.addImport("nullq", nullq_mod);
+    qns_mod.addImport("boringssl", boringssl_mod);
+
+    const qns_exe = b.addExecutable(.{
+        .name = "qns-endpoint",
+        .root_module = qns_mod,
+    });
+    b.installArtifact(qns_exe);
+
+    const qns_tests = b.addTest(.{ .root_module = qns_mod });
+    const run_qns_tests = b.addRunArtifact(qns_tests);
+    test_step.dependOn(&run_qns_tests.step);
+
+    const qns_step = b.step("qns-endpoint", "Build the QUIC interop-runner endpoint");
+    qns_step.dependOn(&qns_exe.step);
 }

@@ -40,6 +40,11 @@ Current as of 2026-05-04.
 - `go-quic-peer multipath` against `nullq-peer`: passing for secondary
   socket add, PATH_CHALLENGE/PATH_RESPONSE probe, path switch, echo,
   upload after switch, and DATAGRAM after switch.
+- `zig build qns-endpoint` in `nullq`: passing for the first official
+  QUIC interop-runner endpoint binary. The endpoint is currently
+  server-side only, speaks HTTP/0.9 ALPN `hq-interop`, serves `/www`,
+  loads `/certs` material, supports server-side Retry, and is wrapped
+  by `tools/external_interop.py` plus `interop/qns/Dockerfile`.
 
 ## Production work landed
 
@@ -74,6 +79,12 @@ Current as of 2026-05-04.
 - Server embedders can write a standards-compliant QUIC v1 Retry packet
   with `Connection.writeRetry`; token contents and acceptance policy
   intentionally remain application-owned.
+- A first official QUIC interop-runner gate has landed. `qns-endpoint`
+  adapts nullq to the runner's HTTP/0.9 server contract, while
+  `tools/external_interop.py` builds a local Docker endpoint, overlays a
+  `nullq` server entry into a throwaway runner copy, and runs
+  nullq-as-server against selected external clients without mutating the
+  external checkout.
 - The public `retry_token` helper can mint and validate stateless
   HMAC-SHA256 Retry tokens bound to caller-supplied client address
   bytes, original DCID, Retry SCID, QUIC version, issue time, and
@@ -96,6 +107,10 @@ Current as of 2026-05-04.
   RESET_STREAM.
 - RESET_STREAM now observes ACK/loss outcomes: ACK moves the stream to
   `reset_recvd`, loss clears `queued` so the frame is emitted again.
+- DATAGRAM remains unreliable by transport design, but senders can use
+  `sendDatagramTracked` and receive `datagram_acked` /
+  `datagram_lost` events through `pollEvent` for app-level retry and
+  telemetry policy.
 - ACK processing now feeds ack-eliciting largest-acked samples into the
   RTT estimator using cached peer ACK-delay transport parameters.
 - `Connection.nextTimerDeadline(now_us)` exposes ACK-delay,
@@ -216,10 +231,9 @@ Current as of 2026-05-04.
    time-threshold, PTO, ACK-delay, idle, draining, NewReno loss/ACK
    feedback, persistent congestion, and basic PTO probe selection are
    path-owned for Application data. Remaining recovery work: old-path
-   draining during active migration, DATAGRAM ack/loss app events,
-   migration-specific RTT/congestion reset, and broader lossy/reordered
-   interop gates. Pacing, ECN, and advanced congestion controllers
-   remain out of scope for this push.
+   draining during active migration, migration-specific RTT/congestion
+   reset, and broader lossy/reordered interop gates. Pacing, ECN, and
+   advanced congestion controllers remain out of scope for this push.
 4. **Key updates need external soak, not core lifecycle work.** The
    current implementation covers previous/current/next read keys,
    3x-PTO old-key discard, local initiation, ACK gating, and cross-suite
@@ -244,6 +258,12 @@ Current as of 2026-05-04.
    token probes through the UDP harness, add VN negative-path vectors,
    bounded allocation policy, qlog/keylog diagnostics, full flow-control
    pacing, and broader shutdown-path interop with external peers.
+7. **The official interop runner gate is scaffolded, not complete.**
+   nullq now has a server-side QNS endpoint and wrapper for
+   nullq-as-server matrices against quic-go, ngtcp2, and quiche. It
+   still needs a nullq QNS client role, actual runner execution in a
+   Docker/Wireshark-equipped environment, and fixes from the first real
+   external traces before it can be called a release gate.
 
 Note: the passing mock multipath test now validates simultaneous
 two-path transfer inside nullq. The passing `go-quic-peer multipath`
@@ -256,6 +276,8 @@ transfer.
 ```sh
 cd ~/prj/ai-workspace/nullq
 zig build test
+zig build qns-endpoint
+python3 tools/external_interop.py runner --dry-run
 
 cd ~/prj/ai-workspace/nullq-peer
 zig build

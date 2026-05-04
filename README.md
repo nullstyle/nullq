@@ -29,7 +29,10 @@ smokes, while deeper mismatch/loss hardening still needs work. Multipath
 also has embedder-driven path CID replenishment, abandoned-path 3x-PTO
 retention coverage, and a deterministic two-path transfer stress test.
 go-quic-peer single-path, 0-RTT, and path-switch smoke tests are
-maintained as interop gates. See
+maintained as interop gates. The first official QUIC interop-runner
+gate is also scaffolded under `interop/`: `qns-endpoint` is a
+server-side HTTP/0.9 `hq-interop` endpoint with Docker/run-wrapper
+support for nullq-as-server testing against external clients. See
 [INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification log
 and remaining production gaps.
 

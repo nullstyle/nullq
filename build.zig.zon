@@ -11,6 +11,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "interop",
         "src",
         "INITIAL_PROMPT.md",
         "README.md",
