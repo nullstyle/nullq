@@ -49,6 +49,10 @@ pub const SentPacket = struct {
     /// notifications. Application packet numbers are per-path when
     /// multipath is enabled, so a wire PN alone is not globally unique.
     stream_key: ?u64 = null,
+    /// True when this Application-space packet was sent under 0-RTT
+    /// keys. If TLS rejects early data, callers can requeue STREAM
+    /// bytes without treating the packet as congestion loss.
+    is_early_data: bool = false,
 
     pub fn addRetransmitFrame(
         self: *SentPacket,

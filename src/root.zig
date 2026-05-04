@@ -34,6 +34,8 @@ pub const TimerDeadline = conn.TimerDeadline;
 pub const TimerKind = conn.TimerKind;
 pub const PathStats = conn.PathStats;
 pub const Scheduler = conn.Scheduler;
+pub const Session = conn.Session;
+pub const EarlyDataStatus = conn.EarlyDataStatus;
 
 pub fn version() []const u8 {
     return "0.0.0";

@@ -7,10 +7,12 @@ using [`boringssl-zig`](../boringssl-zig) for TLS 1.3 and AEAD/HKDF crypto.
 QUIC v1 handshakes, streams, DATAGRAMs, RESET_STREAM, CID issuance,
 PATH_CHALLENGE/PATH_RESPONSE, timer-driven loss/PTO recovery with
 NewReno feedback, path-aware `PathSet` recovery ownership, and
-draft-21 multipath nonce/CID routing checks. go-quic-peer single-path
-and path-switch smoke tests are maintained as interop gates. See
-[INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification log
-and remaining production gaps.
+draft-21 multipath nonce/CID routing checks. An initial 0-RTT transport
+path is present for early STREAM/DATAGRAM sending and server receive
+validation, but ticket/resumption interop still needs hardening.
+go-quic-peer single-path and path-switch smoke tests are maintained as
+interop gates. See [INTEROP_STATUS.md](INTEROP_STATUS.md) for the
+current verification log and remaining production gaps.
 
 ```sh
 mise install
@@ -31,7 +33,7 @@ just test
 
 In scope for v0.1:
 - IETF QUIC v1 transport from RFCs 8999 / 9000 / 9001 / 9002.
-- 0-RTT (RFC 9001 §4.5/4.6) — Phase 8.
+- 0-RTT (RFC 9001 §4.5/4.6) — Phase 8, initial implementation landed.
 - Connection migration (RFC 9000 §9) — Phase 9.
 - Multipath QUIC (draft-ietf-quic-multipath) — Phase 10. Tracks the
   draft-ietf-quic-multipath-21 surface (`initial_max_path_id`,

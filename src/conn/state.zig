@@ -20,6 +20,7 @@ const short_packet_mod = @import("../wire/short_packet.zig");
 const long_packet_mod = @import("../wire/long_packet.zig");
 const initial_keys_mod = @import("../wire/initial.zig");
 const transport_params_mod = @import("../tls/transport_params.zig");
+const early_data_context_mod = @import("../tls/early_data_context.zig");
 const varint = @import("../wire/varint.zig");
 const frame_mod = @import("../frame/root.zig");
 const frame_types = @import("../frame/types.zig");
@@ -53,6 +54,8 @@ pub const PathValidator = path_mod.PathValidator;
 pub const RttEstimator = rtt_mod.RttEstimator;
 pub const TransportParams = transport_params_mod.Params;
 pub const NewReno = congestion_mod.NewReno;
+pub const Session = boringssl.tls.Session;
+pub const EarlyDataStatus = boringssl.tls.Conn.EarlyDataStatus;
 
 pub const Role = enum { client, server };
 
@@ -67,6 +70,7 @@ pub const Error = error{
     PnSpaceExhausted,
     PeerDcidNotSet,
     PathLimitExceeded,
+    EmptyEarlyDataContext,
 } || boringssl.tls.Error ||
     short_packet_mod.Error ||
     long_packet_mod.Error ||
@@ -381,6 +385,14 @@ pub const Connection = struct {
     local_transport_params: TransportParams = .{},
     /// Decoded peer parameters once BoringSSL exposes them.
     cached_peer_transport_params: ?TransportParams = null,
+    /// Per-connection opt-in for sending queued application bytes in
+    /// 0-RTT packets. Session resumption can still happen when this is
+    /// false; nullq just waits for 1-RTT before emitting app data.
+    early_data_send_enabled: bool = false,
+    /// Once BoringSSL reports rejection, every tracked 0-RTT packet is
+    /// removed from flight and its STREAM bytes are put back on the
+    /// send queue exactly once.
+    early_data_rejection_processed: bool = false,
 
     /// Last send/receive activity on this connection. Zero means no
     /// packet activity has been observed yet.
@@ -561,11 +573,54 @@ pub const Connection = struct {
         return params;
     }
 
+    /// Client-only: install a previously-captured TLS session before
+    /// the first handshake step so BoringSSL can attempt resumption.
+    pub fn setSession(self: *Connection, session: Session) !void {
+        if (self.role != .client) return error.NotClientContext;
+        try self.inner.setSession(session);
+    }
+
+    /// Per-connection 0-RTT toggle. This deliberately gates nullq's
+    /// packet scheduler as well as BoringSSL, so early application data
+    /// is only sent after the caller opts in for this connection.
+    pub fn setEarlyDataEnabled(self: *Connection, enabled: bool) void {
+        self.early_data_send_enabled = enabled;
+        self.inner.setEarlyDataEnabled(enabled);
+    }
+
+    pub fn earlyDataStatus(self: *Connection) EarlyDataStatus {
+        return self.inner.earlyDataStatus();
+    }
+
+    pub fn earlyDataReason(self: *Connection) []const u8 {
+        return self.inner.earlyDataReason();
+    }
+
     /// Server-only: install the QUIC 0-RTT replay context (RFC 9001
     /// §4.6.1). Required when 0-RTT is enabled on the server.
     pub fn setEarlyDataContext(self: *Connection, ctx: []const u8) !void {
         if (self.role != .server) return error.NotServerContext;
+        if (ctx.len == 0) return Error.EmptyEarlyDataContext;
         try self.inner.setQuicEarlyDataContext(ctx);
+    }
+
+    /// Server convenience: build and install nullq's canonical replay
+    /// context from current transport parameters plus app-owned bytes.
+    /// The returned digest is what callers should remember beside the
+    /// issued ticket if they keep their own ticket metadata.
+    pub fn setEarlyDataContextForParams(
+        self: *Connection,
+        params: TransportParams,
+        alpn: []const u8,
+        application_context: []const u8,
+    ) !early_data_context_mod.Digest {
+        const digest = early_data_context_mod.build(.{
+            .transport_params = params,
+            .alpn = alpn,
+            .application_context = application_context,
+        });
+        try self.setEarlyDataContext(&digest);
+        return digest;
     }
 
     pub fn handshakeDone(self: *Connection) bool {
@@ -1514,6 +1569,42 @@ pub const Connection = struct {
         for (self.paths.paths.items) |*p| p.pending_ping = false;
     }
 
+    fn canSendEarlyData(self: *Connection) bool {
+        if (self.role != .client) return false;
+        if (!self.early_data_send_enabled) return false;
+        if (self.inner.handshakeDone()) return false;
+        if (self.inner.earlyDataStatus() == .rejected) return false;
+        return self.haveSecret(.early_data, .write);
+    }
+
+    fn refreshEarlyDataStatus(self: *Connection) Error!void {
+        if (self.early_data_rejection_processed) return;
+        if (self.inner.earlyDataStatus() != .rejected) return;
+        try self.requeueRejectedEarlyData();
+        self.early_data_rejection_processed = true;
+    }
+
+    fn requeueRejectedEarlyData(self: *Connection) Error!void {
+        for (self.paths.paths.items) |*path| {
+            var i: u32 = 0;
+            while (i < path.sent.count) {
+                const packet = path.sent.packets[i];
+                if (!packet.is_early_data) {
+                    i += 1;
+                    continue;
+                }
+
+                var removed = path.sent.removeAt(i);
+                defer removed.deinit(self.allocator);
+                if (removed.stream_key) |stream_key| {
+                    _ = try self.dispatchLostToStreams(stream_key);
+                }
+                _ = try self.dispatchLostControlFrames(&removed);
+                self.discardSentCryptoForPacket(.early_data, removed.pn);
+            }
+        }
+    }
+
     fn nextStreamPacketKey(self: *Connection) u64 {
         const key = self.next_stream_packet_key;
         self.next_stream_packet_key +|= 1;
@@ -1648,7 +1739,7 @@ pub const Connection = struct {
     }
 
     fn congestionBlocked(self: *const Connection, lvl: EncryptionLevel) bool {
-        if (lvl != .application) return false;
+        if (lvl != .application and lvl != .early_data) return false;
         const path = self.primaryPathConst();
         if (path.pending_ping) return false;
         return path.path.cc.sendAllowance(path.sent.bytes_in_flight) == 0;
@@ -1660,7 +1751,7 @@ pub const Connection = struct {
         app_path: *const PathState,
     ) bool {
         _ = self;
-        if (lvl != .application) return false;
+        if (lvl != .application and lvl != .early_data) return false;
         if (app_path.pending_ping) return false;
         return app_path.path.cc.sendAllowance(app_path.sent.bytes_in_flight) == 0;
     }
@@ -1788,12 +1879,21 @@ pub const Connection = struct {
         now_us: u64,
     ) Error!?OutgoingDatagram {
         if (self.closed and self.pending_close == null) return null;
+        try self.refreshEarlyDataStatus();
         var pos: usize = 0;
         // Initial first (must lead a coalesced datagram).
         if (try self.pollLevel(.initial, dst[pos..], now_us)) |n| pos += n;
+        // Client 0-RTT uses a long header but shares the Application
+        // packet-number space. If the Initial padded this datagram to
+        // the caller's MTU, this simply waits for the next poll.
+        if (pos < dst.len) {
+            if (try self.pollLevel(.early_data, dst[pos..], now_us)) |n| pos += n;
+        }
         // Handshake next (after Initial keys are dropped post-handshake,
         // there's nothing here; otherwise it's CRYPTO + ACK).
-        if (try self.pollLevel(.handshake, dst[pos..], now_us)) |n| pos += n;
+        if (pos < dst.len) {
+            if (try self.pollLevel(.handshake, dst[pos..], now_us)) |n| pos += n;
+        }
         // Application last (the 1-RTT short header MUST be the last
         // packet in a coalesced datagram per §12.2). Only schedule a
         // non-zero path when there are no Initial/Handshake bytes already
@@ -1802,7 +1902,9 @@ pub const Connection = struct {
             self.applicationPathForPoll().id
         else
             self.primaryPath().id;
-        if (try self.pollLevelOnPath(.application, app_path_id, dst[pos..], now_us)) |n| pos += n;
+        if (pos < dst.len) {
+            if (try self.pollLevelOnPath(.application, app_path_id, dst[pos..], now_us)) |n| pos += n;
+        }
         if (pos == 0) return null;
         self.last_activity_us = now_us;
         const out_path = self.pathForId(app_path_id);
@@ -1852,7 +1954,13 @@ pub const Connection = struct {
                     have_keys = true;
                 }
             },
-            .early_data => {}, // 0-RTT not implemented yet
+            .early_data => {
+                if (!self.canSendEarlyData()) return null;
+                if (try self.packetKeys(lvl, .write)) |k| {
+                    keys = k;
+                    have_keys = true;
+                }
+            },
         }
         if (!have_keys) return null;
         if (!self.peer_dcid_set) return Error.PeerDcidNotSet;
@@ -1948,7 +2056,14 @@ pub const Connection = struct {
                     .key_phase = self.app_write_key_phase,
                     .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
                 }),
-                .early_data => unreachable,
+                .early_data => try long_packet_mod.sealZeroRtt(dst, .{
+                    .dcid = packet_dcid.slice(),
+                    .scid = self.local_scid.slice(),
+                    .pn = pn,
+                    .largest_acked = largest_acked_close,
+                    .payload = pl_buf[0..pl_pos],
+                    .keys = &keys,
+                }),
             };
             try sent_tracker.record(.{
                 .pn = pn,
@@ -1956,6 +2071,7 @@ pub const Connection = struct {
                 .bytes = n_close,
                 .ack_eliciting = false,
                 .in_flight = false,
+                .is_early_data = lvl == .early_data,
             });
             self.draining_deadline_us = now_us + self.drainingDurationUs();
             return n_close;
@@ -1963,7 +2079,7 @@ pub const Connection = struct {
 
         // 1) ACK frame (if pending in this level's space).
         const recv_tracker = &pn_space.received;
-        if (recv_tracker.pending_ack) {
+        if (lvl != .early_data and recv_tracker.pending_ack) {
             var ranges_buf: [128]u8 = undefined;
             const ack_frame = try recv_tracker.toAckFrame(
                 self.ackDelayScaled(recv_tracker, now_us),
@@ -1993,7 +2109,7 @@ pub const Connection = struct {
 
         // 1a) PTO probe PING. A lost PING is not retransmitted as a
         // frame, but a later PTO will queue another probe.
-        if (pending_ping.* and pl_pos + 1 <= max_payload) {
+        if (lvl != .early_data and pending_ping.* and pl_pos + 1 <= max_payload) {
             const ping_len = try frame_mod.encode(
                 pl_buf[pl_pos..max_payload],
                 .{ .ping = .{} },
@@ -2006,7 +2122,7 @@ pub const Connection = struct {
         // 2) CRYPTO frame: retransmit lost data first, then drain
         // fresh outbox bytes at this level into one frame.
         const out_idx = lvl.idx();
-        if (!congestion_blocked and self.crypto_retx[out_idx].items.len > 0 and pl_pos + 25 < max_payload) {
+        if (lvl != .early_data and !congestion_blocked and self.crypto_retx[out_idx].items.len > 0 and pl_pos + 25 < max_payload) {
             const max_data = max_payload - pl_pos - 25;
             const chunk = self.crypto_retx[out_idx].items[0];
             if (chunk.data.len <= max_data) {
@@ -2027,7 +2143,7 @@ pub const Connection = struct {
                 retx_crypto_index = 0;
                 ack_eliciting = true;
             }
-        } else if (!congestion_blocked and self.outbox[out_idx].len > 0 and pl_pos + 25 < max_payload) {
+        } else if (lvl != .early_data and !congestion_blocked and self.outbox[out_idx].len > 0 and pl_pos + 25 < max_payload) {
             const max_data = max_payload - pl_pos - 25;
             const drain_len = @min(self.outbox[out_idx].len, max_data);
             const data_slice = self.outbox[out_idx].buf[0..drain_len];
@@ -2227,10 +2343,10 @@ pub const Connection = struct {
             }
         }
 
-        // 3a) DATAGRAM frame (application level only). One queued
+        // 3a) DATAGRAM frame (Application PN space). One queued
         //     payload per packet; LEN-prefixed so DATAGRAM doesn't
         //     have to be the last frame.
-        if (!congestion_blocked and lvl == .application and self.pending_send_datagrams.items.len > 0) {
+        if (!congestion_blocked and (lvl == .application or lvl == .early_data) and self.pending_send_datagrams.items.len > 0) {
             const dg = self.pending_send_datagrams.items[0];
             const dg_overhead: usize = 1 + varint.encodedLen(dg.len);
             if (max_payload >= pl_pos + dg_overhead + dg.len) {
@@ -2244,9 +2360,9 @@ pub const Connection = struct {
             }
         }
 
-        // 3b) STREAM frame (application level only).
+        // 3b) STREAM frame (Application PN space).
         var sent_chunk: ?struct { stream: *Stream, chunk: send_stream_mod.Chunk } = null;
-        if (!congestion_blocked and lvl == .application) {
+        if (!congestion_blocked and (lvl == .application or lvl == .early_data)) {
             var s_it = self.streams.iterator();
             while (s_it.next()) |entry| {
                 const s = entry.value_ptr.*;
@@ -2309,7 +2425,14 @@ pub const Connection = struct {
                 .key_phase = self.app_write_key_phase,
                 .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
             }),
-            .early_data => unreachable,
+            .early_data => try long_packet_mod.sealZeroRtt(dst, .{
+                .dcid = packet_dcid.slice(),
+                .scid = self.local_scid.slice(),
+                .pn = pn,
+                .largest_acked = largest_acked,
+                .payload = pl_buf[0..pl_pos],
+                .keys = &keys,
+            }),
         };
 
         // 5) Commit.
@@ -2317,6 +2440,7 @@ pub const Connection = struct {
         sent_packet.bytes = n;
         sent_packet.ack_eliciting = ack_eliciting;
         sent_packet.in_flight = ack_eliciting;
+        sent_packet.is_early_data = lvl == .early_data;
         const sent_stream_key = if (sent_chunk != null) self.nextStreamPacketKey() else null;
         sent_packet.stream_key = sent_stream_key;
         try sent_tracker.record(sent_packet);
@@ -2559,8 +2683,9 @@ pub const Connection = struct {
         const long_type_bits: u2 = @intCast((first >> 4) & 0x03);
         return switch (long_type_bits) {
             0 => try self.handleInitial(bytes, now_us),
+            1 => try self.handleZeroRtt(bytes, now_us),
             2 => try self.handleHandshake(bytes, now_us),
-            // 1 = 0-RTT (not yet supported), 3 = Retry
+            // 3 = Retry
             else => bytes.len,
         };
     }
@@ -2664,6 +2789,34 @@ pub const Connection = struct {
         return opened.bytes_consumed;
     }
 
+    fn handleZeroRtt(
+        self: *Connection,
+        bytes: []u8,
+        now_us: u64,
+    ) Error!usize {
+        if (self.role != .server) return bytes.len;
+        if (self.inner.earlyDataStatus() == .rejected) return bytes.len;
+
+        const r_keys_opt = try self.packetKeys(.early_data, .read);
+        const r_keys = r_keys_opt orelse return bytes.len;
+        const app_path = self.pathForId(self.current_incoming_path_id);
+        const app_pn_space = &app_path.app_pn_space;
+        const largest_received = if (app_pn_space.received.largest) |l| l else 0;
+
+        var pt_buf: [max_recv_plaintext]u8 = undefined;
+        const opened = long_packet_mod.openZeroRtt(&pt_buf, bytes, .{
+            .keys = &r_keys,
+            .largest_received = largest_received,
+        }) catch |e| switch (e) {
+            boringssl.crypto.aead.Error.Auth => return bytes.len,
+            else => return e,
+        };
+
+        app_pn_space.recordReceived(opened.pn, now_us / 1000);
+        try self.dispatchFrames(.early_data, opened.payload, now_us);
+        return opened.bytes_consumed;
+    }
+
     fn handleHandshake(
         self: *Connection,
         bytes: []u8,
@@ -2717,6 +2870,10 @@ pub const Connection = struct {
                     .ping => std.debug.print("PING ", .{}),
                     else => |x| std.debug.print("{s} ", .{@tagName(x)}),
                 }
+            }
+            if (lvl == .early_data and !frameAllowedInEarlyData(f)) {
+                self.close(true, transport_error_protocol_violation, "forbidden frame in 0-RTT");
+                return;
             }
             if (lvl != .application and isMultipathFrame(f)) {
                 self.close(true, transport_error_protocol_violation, "multipath frame outside 1-RTT");
@@ -2779,6 +2936,19 @@ pub const Connection = struct {
             .path_cids_blocked,
             => true,
             else => false,
+        };
+    }
+
+    fn frameAllowedInEarlyData(f: frame_types.Frame) bool {
+        return switch (f) {
+            .ack,
+            .crypto,
+            .handshake_done,
+            .new_token,
+            .path_response,
+            .retire_connection_id,
+            => false,
+            else => true,
         };
     }
 
@@ -3140,6 +3310,7 @@ pub const Connection = struct {
         }
         if (!self.inner.handshakeDone()) try self.advanceHandshake();
         if (self.inner.handshakeDone()) try self.cachePeerTransportParams();
+        try self.refreshEarlyDataStatus();
     }
 
     fn handleStream(self: *Connection, s: frame_types.Stream) Error!void {
@@ -3807,6 +3978,7 @@ pub const Connection = struct {
         }
         if (!self.inner.handshakeDone()) try self.advanceHandshake();
         if (self.inner.handshakeDone()) try self.cachePeerTransportParams();
+        try self.refreshEarlyDataStatus();
         // Phase-4 in-process compatibility: shuttle outbox→peer.inbox
         // so the existing handshake test still works while the real
         // datagram-driven path is being built up.
@@ -4438,12 +4610,146 @@ fn installTestApplicationReadSecret(conn: *Connection) void {
     conn.levels[EncryptionLevel.application.idx()].read = material;
 }
 
+fn installTestEarlyDataWriteSecret(conn: *Connection) void {
+    var material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
+    material.secret_len = 32;
+    conn.levels[EncryptionLevel.early_data.idx()].write = material;
+}
+
+fn installTestEarlyDataReadSecret(conn: *Connection) void {
+    var material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
+    material.secret_len = 32;
+    conn.levels[EncryptionLevel.early_data.idx()].read = material;
+}
+
+fn testEarlyDataPacketKeys() !PacketKeys {
+    const secret: [32]u8 = @splat(0);
+    return try short_packet_mod.derivePacketKeys(.aes128_gcm_sha256, &secret);
+}
+
 fn markTestMultipathNegotiated(conn: *Connection, max_path_id: u32) void {
     conn.enableMultipath(true);
     conn.local_transport_params.initial_max_path_id = max_path_id;
     conn.local_max_path_id = max_path_id;
     conn.cached_peer_transport_params = .{ .initial_max_path_id = max_path_id };
     conn.peer_max_path_id = max_path_id;
+}
+
+test "0-RTT send path requires explicit per-connection opt-in" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setPeerDcid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try conn.setLocalScid(&.{ 9, 9, 9, 9 });
+    installTestEarlyDataWriteSecret(&conn);
+
+    const s = try conn.openBidi(0);
+    _ = try s.send.write("hello");
+
+    var out: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), try conn.pollLevel(.early_data, &out, 1_000));
+    try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.early_data).count);
+}
+
+test "0-RTT poll emits long-header packet in Application PN space" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setPeerDcid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try conn.setLocalScid(&.{ 9, 9, 9, 9 });
+    installTestEarlyDataWriteSecret(&conn);
+    conn.setEarlyDataEnabled(true);
+
+    const s = try conn.openBidi(0);
+    _ = try s.send.write("hello");
+
+    var out: [256]u8 = undefined;
+    const n = (try conn.pollLevel(.early_data, &out, 1_000)).?;
+    try std.testing.expect(n > 0);
+    try std.testing.expect((out[0] & 0x80) != 0);
+    try std.testing.expectEqual(@as(u2, 1), @as(u2, @intCast((out[0] >> 4) & 0x03)));
+    try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.early_data).count);
+    try std.testing.expect(conn.sentForLevel(.early_data).packets[0].is_early_data);
+    try std.testing.expectEqual(@as(u64, 1), conn.pnSpaceForLevel(.early_data).next_pn);
+}
+
+test "server handles accepted 0-RTT STREAM frames" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    installTestEarlyDataReadSecret(&conn);
+    const keys = try testEarlyDataPacketKeys();
+
+    var payload: [64]u8 = undefined;
+    const payload_len = try frame_mod.encode(&payload, .{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .data = "hello",
+        .has_offset = false,
+        .has_length = true,
+        .fin = false,
+    } });
+
+    var packet: [256]u8 = undefined;
+    const packet_len = try long_packet_mod.sealZeroRtt(&packet, .{
+        .dcid = &.{ 9, 9, 9, 9 },
+        .scid = &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+    });
+
+    const consumed = try conn.handleOnePacket(packet[0..packet_len], 1_000);
+    try std.testing.expectEqual(packet_len, consumed);
+    try std.testing.expect(conn.pnSpaceForLevel(.early_data).received.pending_ack);
+
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 5), try conn.streamRead(0, &buf));
+    try std.testing.expectEqualSlices(u8, "hello", buf[0..5]);
+}
+
+test "server rejects forbidden frames in 0-RTT" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    installTestEarlyDataReadSecret(&conn);
+    const keys = try testEarlyDataPacketKeys();
+
+    var payload: [32]u8 = undefined;
+    const payload_len = try frame_mod.encode(&payload, .{ .ack = .{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    } });
+
+    var packet: [256]u8 = undefined;
+    const packet_len = try long_packet_mod.sealZeroRtt(&packet, .{
+        .dcid = &.{ 9, 9, 9, 9 },
+        .scid = &.{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+    });
+
+    _ = try conn.handleOnePacket(packet[0..packet_len], 1_000);
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expectEqualStrings("forbidden frame in 0-RTT", conn.pending_close.?.reason);
 }
 
 test "pollLevel emits PATH_ACK for non-zero application path ACKs" {

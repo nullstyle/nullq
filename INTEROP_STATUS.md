@@ -7,7 +7,8 @@ Current as of 2026-05-04.
 - `zig build test` in `nullq`: passing, including deterministic
   PTO/loss unit tests, path-aware multipath ACK/PTO tests, duplicate
   per-path Application PN stream tracking, draft-21 nonce/CID limit
-  tests, and the 10% simulated-loss stream exchange.
+  tests, initial 0-RTT packet/receive/rejection unit tests, and the 10%
+  simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
 - `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
@@ -89,6 +90,13 @@ Current as of 2026-05-04.
   negotiated and are checked against the local maximum path ID;
   MAX_PATH_ID cannot reduce the peer's initial limit, and
   PATH_CIDS_BLOCKED cannot skip our next issued CID sequence.
+- Initial 0-RTT transport plumbing has landed. Clients can install a
+  BoringSSL session, explicitly opt a connection into early data, emit
+  STREAM/DATAGRAM bytes as 0-RTT long-header packets in the Application
+  PN space, and requeue STREAM/control data if TLS rejects early data.
+  Servers can install a canonical QUIC early-data replay context,
+  decrypt accepted 0-RTT packets, reject forbidden 0-RTT frames, and
+  expose BoringSSL's early-data status/reason.
 
 ## Still not production-grade
 
@@ -118,9 +126,15 @@ Current as of 2026-05-04.
    key updates, but it does not yet keep current/previous/next read
    keys with 3x-PTO discard timing or enforce packet limits across all
    paths.
-5. **0-RTT is not implemented.** Session tickets, early-data context,
-   accepted/rejected state, replay of rejected 0-RTT STREAM data, and
-   `arrived_in_early_data` marking remain open.
+5. **0-RTT is implemented only at the first transport layer.** The
+   landed code covers packet protection, explicit send opt-in,
+   server receive validation, early-data context construction, status
+   reporting, and rejected STREAM/control requeue. Remaining work:
+   public ticket export/import helpers, live accepted/rejected
+   resumption interop, application-visible early-data marking on
+   incoming streams/datagrams, stronger replay-context documentation,
+   0-RTT transport-parameter rejection tests, and go-quic-peer 0-RTT
+   scenarios.
 6. **Protocol hardening remains.** Retry, Version Negotiation,
    stateless reset, close/draining state, typed close errors, bounded
    allocation policy, qlog/keylog diagnostics, and full flow-control

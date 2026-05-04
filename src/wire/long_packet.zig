@@ -33,6 +33,7 @@ pub const Suite = short_packet.Suite;
 pub const Error = error{
     OutputTooSmall,
     NotInitialPacket,
+    NotZeroRttPacket,
     NotHandshakePacket,
     DcidTooLong,
     ScidTooLong,
@@ -202,6 +203,82 @@ pub fn openInitial(pt_dst: []u8, src: []u8, opts: InitialOpenOptions) Error!Long
     return openLongHeader(pt_dst, src, opts.keys, opts.largest_received, .initial);
 }
 
+// -- 0-RTT ---------------------------------------------------------------
+
+pub const ZeroRttSealOptions = struct {
+    version: u32 = 0x00000001,
+    dcid: []const u8,
+    scid: []const u8,
+    pn: u64,
+    largest_acked: ?u64 = null,
+    payload: []const u8,
+    keys: *const PacketKeys,
+    pn_length_override: ?u8 = null,
+};
+
+pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
+    if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
+    if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
+    if (opts.keys.suite != .aes128_gcm_sha256) return Error.UnsupportedSuite;
+
+    const pn_len = opts.pn_length_override orelse chooseLongPnLength(opts.pn, opts.largest_acked);
+    if (pn_len < 1 or pn_len > 4) return protection.Error.InvalidPnLength;
+
+    const min_pt_for_sample: usize = if (pn_len < 4) @as(usize, 4 - pn_len) else 0;
+    const pt_len: usize = @max(opts.payload.len, min_pt_for_sample);
+    const length_field_value: u64 = @as(u64, pt_len) + 16 + pn_len;
+    const length_varint_size = varint.encodedLen(length_field_value);
+
+    const total_size: usize = 1 + 4 + 1 + opts.dcid.len + 1 + opts.scid.len +
+        length_varint_size + pn_len + pt_len + 16;
+
+    if (dst.len < total_size) return Error.OutputTooSmall;
+
+    const dcid_id = try header.ConnId.fromSlice(opts.dcid);
+    const scid_id = try header.ConnId.fromSlice(opts.scid);
+    const pn_length: header.PnLength = pnLengthFromInt(pn_len);
+    const truncated = packetNumberTruncated(opts.pn, pn_len);
+
+    const hdr_len = try header.encode(dst, .{ .zero_rtt = .{
+        .version = opts.version,
+        .dcid = dcid_id,
+        .scid = scid_id,
+        .pn_length = pn_length,
+        .pn_truncated = truncated,
+        .payload_length = length_field_value,
+        .reserved_bits = 0,
+    } });
+    const pn_offset = hdr_len - pn_len;
+
+    var stage_buf: [2048]u8 = undefined;
+    if (pt_len > stage_buf.len) return Error.OutputTooSmall;
+    @memcpy(stage_buf[0..opts.payload.len], opts.payload);
+    @memset(stage_buf[opts.payload.len..pt_len], 0);
+
+    var aead = try AesGcm128.init(opts.keys.key[0..16]);
+    defer aead.deinit();
+    const ct_len = try protection.aeadSeal(
+        &aead,
+        &opts.keys.iv,
+        opts.pn,
+        dst[0..hdr_len],
+        stage_buf[0..pt_len],
+        dst[hdr_len..],
+    );
+    const total_len = hdr_len + ct_len;
+
+    const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
+    const hp_key: *const [16]u8 = @ptrCast(opts.keys.hp[0..16]);
+    const mask = protection.aesHpMask(hp_key, &sample);
+    try protection.applyHpMask(dst[0..total_len], .long, pn_offset, pn_len, mask);
+
+    return total_len;
+}
+
+pub fn openZeroRtt(pt_dst: []u8, src: []u8, opts: InitialOpenOptions) Error!LongOpenResult {
+    return openLongHeader(pt_dst, src, opts.keys, opts.largest_received, .zero_rtt);
+}
+
 // -- Handshake -----------------------------------------------------------
 
 pub const HandshakeSealOptions = struct {
@@ -289,11 +366,7 @@ fn openLongHeader(
 ) Error!LongOpenResult {
     if (src.len < 1) return Error.InsufficientBytes;
     if (src[0] & 0x80 == 0) {
-        return switch (expected_type) {
-            .initial => Error.NotInitialPacket,
-            .handshake => Error.NotHandshakePacket,
-            else => Error.NotInitialPacket,
-        };
+        return unexpectedPacketType(expected_type);
     }
     // Long-type bits (5-4 of the first byte) are NOT covered by HP
     // (which masks only bits 3-0 for long headers, RFC 9001 §5.4.1),
@@ -301,11 +374,7 @@ fn openLongHeader(
     const long_type_bits_pre: u2 = @intCast((src[0] >> 4) & 0x03);
     const pre_type: header.LongType = @enumFromInt(long_type_bits_pre);
     if (pre_type != expected_type) {
-        return switch (expected_type) {
-            .initial => Error.NotInitialPacket,
-            .handshake => Error.NotHandshakePacket,
-            else => Error.NotInitialPacket,
-        };
+        return unexpectedPacketType(expected_type);
     }
     if (keys.suite != .aes128_gcm_sha256) return Error.UnsupportedSuite;
 
@@ -368,11 +437,7 @@ fn openLongHeader(
     const long_type_bits: u2 = @intCast((src[0] >> 4) & 0x03);
     const actual_type: header.LongType = @enumFromInt(long_type_bits);
     if (actual_type != expected_type) {
-        return switch (expected_type) {
-            .initial => Error.NotInitialPacket,
-            .handshake => Error.NotHandshakePacket,
-            else => Error.NotInitialPacket,
-        };
+        return unexpectedPacketType(expected_type);
     }
 
     // Reconstruct PN.
@@ -407,6 +472,15 @@ fn openLongHeader(
 }
 
 // -- helpers -------------------------------------------------------------
+
+fn unexpectedPacketType(expected_type: header.LongType) Error {
+    return switch (expected_type) {
+        .initial => Error.NotInitialPacket,
+        .zero_rtt => Error.NotZeroRttPacket,
+        .handshake => Error.NotHandshakePacket,
+        .retry => Error.NotInitialPacket,
+    };
+}
 
 /// Choose a PN length for a long-header packet. Same shape as
 /// short_packet.chooseShortPnLength but exposed locally to avoid
@@ -563,6 +637,36 @@ test "Handshake seal/open round-trip" {
     try testing.expectEqualSlices(u8, payload, opened.payload[0..payload.len]);
     try testing.expectEqualSlices(u8, &dcid, opened.dcid.slice());
     try testing.expectEqualSlices(u8, &scid, opened.scid.slice());
+}
+
+test "0-RTT seal/open round-trip" {
+    const dcid: [8]u8 = .{ 4, 3, 2, 1, 8, 7, 6, 5 };
+    const secret = fromHex("d00df151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea");
+    const keys = try short_packet.derivePacketKeys(.aes128_gcm_sha256, &secret);
+
+    const scid: [4]u8 = .{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const payload = "early STREAM frames";
+
+    var packet: [256]u8 = undefined;
+    const len = try sealZeroRtt(&packet, .{
+        .dcid = &dcid,
+        .scid = &scid,
+        .pn = 9,
+        .largest_acked = 8,
+        .payload = payload,
+        .keys = &keys,
+    });
+
+    var pt: [256]u8 = undefined;
+    const opened = try openZeroRtt(&pt, packet[0..len], .{
+        .keys = &keys,
+        .largest_received = 8,
+    });
+    try testing.expectEqual(@as(u64, 9), opened.pn);
+    try testing.expectEqualSlices(u8, payload, opened.payload[0..payload.len]);
+    try testing.expectEqualSlices(u8, &dcid, opened.dcid.slice());
+    try testing.expectEqualSlices(u8, &scid, opened.scid.slice());
+    try testing.expectEqual(len, opened.bytes_consumed);
 }
 
 test "openInitial rejects bytes whose first bit indicates short header" {
