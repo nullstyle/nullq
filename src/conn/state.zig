@@ -78,6 +78,9 @@ pub const Error = error{
     EmptyEarlyDataContext,
     KeyUpdateUnavailable,
     KeyUpdateBlocked,
+    DatagramUnavailable,
+    DatagramTooLarge,
+    DatagramQueueFull,
 } || boringssl.tls.Error ||
     short_packet_mod.Error ||
     long_packet_mod.Error ||
@@ -123,12 +126,21 @@ pub const default_mtu: usize = 1200;
 const transport_error_protocol_violation: u64 = 0x0a;
 const transport_error_aead_limit_reached: u64 = 0x0f;
 
-/// Upper bound on AEAD plaintext for a single received packet.
-/// Sized to comfortably hold any UDP datagram a peer is likely to
-/// send: 65507-byte IPv4 max minus a token sliver of headers, but
-/// in practice peers stay under ~1500 bytes per Ethernet MTU. We
-/// pick 4 KiB as a safe headroom that still fits on the stack.
+/// Upper bound on AEAD plaintext for a single received packet. This
+/// implementation deliberately advertises and enforces the same 4 KiB
+/// UDP payload budget so packet protection can stay stack-backed.
 pub const max_recv_plaintext: usize = 4096;
+pub const max_supported_udp_payload_size: usize = max_recv_plaintext;
+pub const min_quic_udp_payload_size: usize = default_mtu;
+
+/// Bounded queue budgets for RFC 9221 DATAGRAM payloads.
+pub const max_outbound_datagram_payload_size: usize = default_mtu - 9;
+pub const max_pending_datagram_count: usize = 64;
+pub const max_pending_datagram_bytes: usize = 64 * 1024;
+
+/// Bounded reassembly budgets for peer-controlled CRYPTO gaps.
+pub const max_pending_crypto_bytes_per_level: usize = 64 * 1024;
+pub const max_crypto_reassembly_gap: u64 = 64 * 1024;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 fn debugFrames() ?*const anyopaque {
@@ -454,6 +466,7 @@ pub const Connection = struct {
     /// ClientHello into out-of-order CRYPTO frames inside a single
     /// Initial; without reassembly the handshake stalls.
     crypto_pending: [4]std.ArrayList(CryptoChunk) = .{ .empty, .empty, .empty, .empty },
+    crypto_pending_bytes: [4]usize = .{ 0, 0, 0, 0 },
     /// CRYPTO bytes that were sent in lost packets and need to be
     /// retransmitted at their original offsets.
     crypto_retx: [4]std.ArrayList(CryptoChunk) = .{ .empty, .empty, .empty, .empty },
@@ -470,9 +483,11 @@ pub const Connection = struct {
     /// Outbound RFC 9221 DATAGRAM payloads waiting to be packed
     /// into 1-RTT packets. Each entry is allocator-owned.
     pending_send_datagrams: std.ArrayList([]u8) = .empty,
+    pending_send_datagram_bytes: usize = 0,
     /// Inbound DATAGRAMs received but not yet pulled by the app.
     /// Each entry is allocator-owned.
     pending_recv_datagrams: std.ArrayList(PendingRecvDatagram) = .empty,
+    pending_recv_datagram_bytes: usize = 0,
 
     /// DCID we put on outgoing packets (the peer chose this; client
     /// learns it from the server's first Initial SCID, or
@@ -695,16 +710,29 @@ pub const Connection = struct {
     /// to BoringSSL for transmission inside CRYPTO frames during the
     /// handshake. Must be called before the first `advance`.
     pub fn setTransportParams(self: *Connection, params: TransportParams) !void {
+        const local = try normalizeLocalTransportParams(params);
         var buf: [1024]u8 = undefined;
-        const n = try params.encode(&buf);
-        self.local_transport_params = params;
-        if (params.initial_max_path_id) |max_path_id| {
+        const n = try local.encode(&buf);
+        self.local_transport_params = local;
+        if (local.initial_max_path_id) |max_path_id| {
             self.local_max_path_id = max_path_id;
             self.multipath_enabled = true;
         } else {
             self.local_max_path_id = 0;
         }
         try self.inner.setQuicTransportParams(buf[0..n]);
+    }
+
+    fn normalizeLocalTransportParams(params: TransportParams) transport_params_mod.Error!TransportParams {
+        var local = params;
+        if (local.max_udp_payload_size < min_quic_udp_payload_size) return error.InvalidValue;
+        if (local.max_udp_payload_size > max_supported_udp_payload_size) {
+            local.max_udp_payload_size = max_supported_udp_payload_size;
+        }
+        if (local.max_datagram_frame_size > max_supported_udp_payload_size) {
+            local.max_datagram_frame_size = max_supported_udp_payload_size;
+        }
+        return local;
     }
 
     /// Escape hatch: set already-encoded transport-parameter bytes.
@@ -725,6 +753,7 @@ pub const Connection = struct {
             self.peer_max_path_id = max_path_id;
             self.multipath_enabled = true;
         }
+        self.validatePeerTransportLimits();
         try self.installPeerTransportStatelessResetToken();
         self.validatePeerTransportConnectionIds();
         return params;
@@ -1596,16 +1625,35 @@ pub const Connection = struct {
         try s.send.resetStream(application_error_code);
     }
 
-    /// Queue an RFC 9221 DATAGRAM payload for transmission. The
-    /// next 1-RTT packet that fits the bytes ships them. The peer
-    /// must have advertised a non-zero `max_datagram_frame_size`
-    /// transport parameter for them to be received — that policy
-    /// check is the caller's; here we just queue and emit.
+    /// Queue an RFC 9221 DATAGRAM payload for transmission. The next
+    /// 1-RTT packet that fits the bytes ships them. Queueing is capped
+    /// by the implementation's UDP packet budget and, once known, the
+    /// peer's `max_datagram_frame_size` transport parameter.
     pub fn sendDatagram(self: *Connection, payload: []const u8) Error!void {
+        const max_payload = try self.maxOutboundDatagramPayload();
+        if (payload.len > max_payload) return Error.DatagramTooLarge;
+        if (self.pending_send_datagrams.items.len >= max_pending_datagram_count) {
+            return Error.DatagramQueueFull;
+        }
+        if (payload.len > max_pending_datagram_bytes or
+            self.pending_send_datagram_bytes > max_pending_datagram_bytes - payload.len)
+        {
+            return Error.DatagramQueueFull;
+        }
         const copy = try self.allocator.alloc(u8, payload.len);
         errdefer self.allocator.free(copy);
         @memcpy(copy, payload);
         try self.pending_send_datagrams.append(self.allocator, copy);
+        self.pending_send_datagram_bytes += payload.len;
+    }
+
+    fn maxOutboundDatagramPayload(self: *const Connection) Error!usize {
+        var limit: usize = max_outbound_datagram_payload_size;
+        if (self.cached_peer_transport_params) |params| {
+            if (params.max_datagram_frame_size == 0) return Error.DatagramUnavailable;
+            limit = @min(limit, @as(usize, @intCast(@min(params.max_datagram_frame_size, max_outbound_datagram_payload_size))));
+        }
+        return limit;
     }
 
     /// Queue a NEW_CONNECTION_ID frame. Sequence 0 is the Initial
@@ -1652,6 +1700,7 @@ pub const Connection = struct {
         if (self.pending_recv_datagrams.items.len == 0) return null;
         const item = self.pending_recv_datagrams.orderedRemove(0);
         defer self.allocator.free(item.data);
+        self.pending_recv_datagram_bytes -= item.data.len;
         const n = @min(dst.len, item.data.len);
         @memcpy(dst[0..n], item.data[0..n]);
         return .{ .len = n, .arrived_in_early_data = item.arrived_in_early_data };
@@ -1974,8 +2023,22 @@ pub const Connection = struct {
             self.peer_max_path_id = max_path_id;
             self.multipath_enabled = true;
         }
+        self.validatePeerTransportLimits();
         try self.installPeerTransportStatelessResetToken();
         self.validatePeerTransportConnectionIds();
+    }
+
+    fn validatePeerTransportLimits(self: *Connection) void {
+        const params = self.cached_peer_transport_params orelse return;
+        if (params.max_udp_payload_size < min_quic_udp_payload_size) {
+            self.close(true, transport_error_protocol_violation, "peer max udp payload below minimum");
+            return;
+        }
+        const peer_udp_limit: usize = @intCast(@min(params.max_udp_payload_size, max_supported_udp_payload_size));
+        self.mtu = @min(self.mtu, peer_udp_limit);
+        for (self.paths.paths.items) |*path| {
+            path.pmtu = @min(path.pmtu, peer_udp_limit);
+        }
     }
 
     fn peerAckDelayExponent(self: *const Connection) u6 {
@@ -3153,6 +3216,7 @@ pub const Connection = struct {
                 });
                 pl_pos += wrote;
                 _ = self.pending_send_datagrams.orderedRemove(0);
+                self.pending_send_datagram_bytes -= dg.len;
                 self.allocator.free(dg);
                 ack_eliciting = true;
             }
@@ -3365,6 +3429,10 @@ pub const Connection = struct {
         now_us: u64,
     ) Error!void {
         if (self.pending_close != null or self.closed) return;
+        if (bytes.len > self.localUdpPayloadLimit()) {
+            self.close(true, transport_error_protocol_violation, "udp payload exceeds local limit");
+            return;
+        }
         if (bytes.len > 0) self.last_activity_us = now_us;
         const incoming_path_id = self.incomingPathId(from);
         self.current_incoming_path_id = incoming_path_id;
@@ -3390,6 +3458,10 @@ pub const Connection = struct {
         // either succeed (echo arrived) or time out at PTO * 3.
         self.primaryPath().path.validator.tick(now_us);
         if (self.alert) |_| return error.PeerAlerted;
+    }
+
+    fn localUdpPayloadLimit(self: *const Connection) usize {
+        return @intCast(@min(self.local_transport_params.max_udp_payload_size, max_supported_udp_payload_size));
     }
 
     fn shouldDrainTlsAfterPacket(bytes: []const u8) bool {
@@ -4347,6 +4419,21 @@ pub const Connection = struct {
         lvl: EncryptionLevel,
         dg: frame_types.Datagram,
     ) Error!void {
+        const local_max = self.local_transport_params.max_datagram_frame_size;
+        if (local_max == 0 or dg.data.len > local_max or dg.data.len > max_supported_udp_payload_size) {
+            self.close(true, transport_error_protocol_violation, "datagram exceeds local limit");
+            return;
+        }
+        if (self.pending_recv_datagrams.items.len >= max_pending_datagram_count) {
+            self.close(true, transport_error_protocol_violation, "datagram receive queue exhausted");
+            return;
+        }
+        if (dg.data.len > max_pending_datagram_bytes or
+            self.pending_recv_datagram_bytes > max_pending_datagram_bytes - dg.data.len)
+        {
+            self.close(true, transport_error_protocol_violation, "datagram receive budget exhausted");
+            return;
+        }
         const copy = try self.allocator.alloc(u8, dg.data.len);
         errdefer self.allocator.free(copy);
         @memcpy(copy, dg.data);
@@ -4354,6 +4441,7 @@ pub const Connection = struct {
             .data = copy,
             .arrived_in_early_data = lvl == .early_data,
         });
+        self.pending_recv_datagram_bytes += dg.data.len;
     }
 
     fn handleCrypto(
@@ -4365,7 +4453,11 @@ pub const Connection = struct {
         if (cr.data.len == 0) return;
 
         const start = cr.offset;
-        const end = cr.offset + cr.data.len;
+        const data_len: u64 = @intCast(cr.data.len);
+        const end = std.math.add(u64, cr.offset, data_len) catch {
+            self.close(true, transport_error_protocol_violation, "crypto offset overflow");
+            return;
+        };
         const my_off = self.crypto_recv_offset[idx];
 
         // Already delivered → ignore (retransmit / overlap).
@@ -4385,6 +4477,16 @@ pub const Connection = struct {
             try self.drainPendingCrypto(idx);
         } else {
             // Out-of-order — buffer.
+            if (eff_offset - my_off > max_crypto_reassembly_gap) {
+                self.close(true, transport_error_protocol_violation, "crypto reassembly gap exceeds limit");
+                return;
+            }
+            if (eff_data.len > max_pending_crypto_bytes_per_level or
+                self.crypto_pending_bytes[idx] > max_pending_crypto_bytes_per_level - eff_data.len)
+            {
+                self.close(true, transport_error_protocol_violation, "crypto reassembly exceeds limit");
+                return;
+            }
             const copy = try self.allocator.alloc(u8, eff_data.len);
             errdefer self.allocator.free(copy);
             @memcpy(copy, eff_data);
@@ -4392,6 +4494,7 @@ pub const Connection = struct {
                 .offset = eff_offset,
                 .data = copy,
             });
+            self.crypto_pending_bytes[idx] += eff_data.len;
         }
     }
 
@@ -4404,9 +4507,13 @@ pub const Connection = struct {
             var i: usize = 0;
             while (i < self.crypto_pending[idx].items.len) : (i += 1) {
                 const chunk = self.crypto_pending[idx].items[i];
-                const c_end = chunk.offset + chunk.data.len;
+                const c_end = std.math.add(u64, chunk.offset, @as(u64, @intCast(chunk.data.len))) catch {
+                    self.close(true, transport_error_protocol_violation, "crypto pending offset overflow");
+                    return;
+                };
                 if (c_end <= my_off) {
                     // Wholly below the floor — drop.
+                    self.crypto_pending_bytes[idx] -= chunk.data.len;
                     self.allocator.free(chunk.data);
                     _ = self.crypto_pending[idx].orderedRemove(i);
                     continue :outer;
@@ -4417,6 +4524,7 @@ pub const Connection = struct {
                     const tail = chunk.data[skip..];
                     try self.inbox[idx].append(tail);
                     self.crypto_recv_offset[idx] += tail.len;
+                    self.crypto_pending_bytes[idx] -= chunk.data.len;
                     self.allocator.free(chunk.data);
                     _ = self.crypto_pending[idx].orderedRemove(i);
                     continue :outer;
@@ -4463,7 +4571,13 @@ pub const Connection = struct {
             break :blk new_ptr;
         };
         if (lvl == .early_data) ptr.arrived_in_early_data = true;
-        try ptr.recv.recv(s.offset, s.data, s.fin);
+        ptr.recv.recv(s.offset, s.data, s.fin) catch |err| switch (err) {
+            error.BufferLimitExceeded => {
+                self.close(true, transport_error_protocol_violation, "stream reassembly exceeds allocation limit");
+                return;
+            },
+            else => return err,
+        };
     }
 
     fn handleResetStream(self: *Connection, rs: frame_types.ResetStream) Error!void {
@@ -6410,6 +6524,122 @@ fn markTestMultipathNegotiated(conn: *Connection, max_path_id: u32) void {
     conn.peer_max_path_id = max_path_id;
 }
 
+test "setTransportParams advertises bounded UDP payload limits" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setTransportParams(.{ .max_datagram_frame_size = 9000 });
+    try std.testing.expectEqual(@as(u64, max_supported_udp_payload_size), conn.local_transport_params.max_udp_payload_size);
+    try std.testing.expectEqual(@as(u64, max_supported_udp_payload_size), conn.local_transport_params.max_datagram_frame_size);
+
+    try std.testing.expectError(error.InvalidValue, conn.setTransportParams(.{ .max_udp_payload_size = default_mtu - 1 }));
+}
+
+test "handle rejects UDP datagrams above local payload limit before path credit" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setTransportParams(.{ .max_udp_payload_size = default_mtu });
+
+    var bytes: [default_mtu + 1]u8 = @splat(0);
+    try conn.handle(&bytes, null, 123);
+
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expectEqual(@as(u64, 0), conn.primaryPath().path.bytes_received);
+    try std.testing.expectEqual(@as(u64, 0), conn.last_activity_us);
+}
+
+test "sendDatagram enforces peer support and bounded queue" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .max_datagram_frame_size = 0 };
+    try std.testing.expectError(Error.DatagramUnavailable, conn.sendDatagram("x"));
+
+    conn.cached_peer_transport_params = .{ .max_datagram_frame_size = 4 };
+    try std.testing.expectError(Error.DatagramTooLarge, conn.sendDatagram("12345"));
+    try conn.sendDatagram("1234");
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_send_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 4), conn.pending_send_datagram_bytes);
+
+    while (conn.pending_send_datagrams.items.len < max_pending_datagram_count) {
+        try conn.sendDatagram("x");
+    }
+    try std.testing.expectError(Error.DatagramQueueFull, conn.sendDatagram("x"));
+}
+
+test "handleDatagram enforces local DATAGRAM limit and queue budget" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+
+    {
+        var conn = try Connection.initServer(allocator, ctx);
+        defer conn.deinit();
+        try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
+        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+        try std.testing.expectEqual(@as(usize, 0), conn.pending_recv_datagrams.items.len);
+    }
+
+    {
+        var conn = try Connection.initServer(allocator, ctx);
+        defer conn.deinit();
+        conn.local_transport_params.max_datagram_frame_size = max_supported_udp_payload_size;
+        while (conn.pending_recv_datagrams.items.len < max_pending_datagram_count) {
+            try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
+        }
+        try std.testing.expectEqual(max_pending_datagram_count, conn.pending_recv_datagrams.items.len);
+        try std.testing.expectEqual(max_pending_datagram_count, conn.pending_recv_datagram_bytes);
+
+        var buf: [1]u8 = undefined;
+        const info = conn.receiveDatagramInfo(&buf).?;
+        try std.testing.expectEqual(@as(usize, 1), info.len);
+        try std.testing.expectEqual(max_pending_datagram_count - 1, conn.pending_recv_datagrams.items.len);
+        try std.testing.expectEqual(max_pending_datagram_count - 1, conn.pending_recv_datagram_bytes);
+
+        try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
+        try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
+        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    }
+}
+
+test "handleCrypto bounds out-of-order reassembly" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+
+    {
+        var conn = try Connection.initServer(allocator, ctx);
+        defer conn.deinit();
+        try conn.handleCrypto(.initial, .{ .offset = max_crypto_reassembly_gap + 1, .data = "x" });
+        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending[0].items.len);
+        try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending_bytes[0]);
+    }
+
+    {
+        var conn = try Connection.initServer(allocator, ctx);
+        defer conn.deinit();
+        var huge: [max_pending_crypto_bytes_per_level + 1]u8 = @splat(0);
+        try conn.handleCrypto(.initial, .{ .offset = 1, .data = &huge });
+        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending[0].items.len);
+        try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending_bytes[0]);
+    }
+}
+
 test "0-RTT send path requires explicit per-connection opt-in" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -6533,6 +6763,7 @@ test "server marks accepted 0-RTT DATAGRAM frames" {
     defer conn.deinit();
 
     installTestEarlyDataReadSecret(&conn);
+    conn.local_transport_params.max_datagram_frame_size = max_supported_udp_payload_size;
     const keys = try testEarlyDataPacketKeys();
 
     var payload: [64]u8 = undefined;

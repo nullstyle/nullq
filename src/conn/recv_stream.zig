@@ -27,7 +27,16 @@ pub const Error = error{
     /// is below the highest offset we've already received bytes for
     /// (RFC 9000 §4.5 / FINAL_SIZE_ERROR).
     FinalSizeChanged,
+    /// The frame would force the reassembly buffer to cover an
+    /// implementation-defined, peer-controlled span.
+    BufferLimitExceeded,
 } || std.mem.Allocator.Error;
+
+/// Default cap for the contiguous receive reassembly span of one
+/// stream. This is intentionally independent from QUIC flow control:
+/// flow control is a protocol limit, while this is an allocation
+/// guard against sparse offsets before fuller stream windows land.
+pub const default_max_buffered_span: u64 = 16 * 1024 * 1024;
 
 /// State of the receive half (RFC 9000 §3.2):
 /// recv → size_known → data_recvd → data_read
@@ -77,6 +86,9 @@ pub const RecvStream = struct {
     fin_seen: bool = false,
     /// Non-null when RESET_STREAM has been processed.
     reset: ?ResetInfo = null,
+
+    /// Maximum contiguous span `bytes` may cover from `read_offset`.
+    max_buffered_span: u64 = default_max_buffered_span,
 
     state: State = .recv,
 
@@ -131,7 +143,8 @@ pub const RecvStream = struct {
         if (self.reset != null) return; // RESET_STREAM ignores subsequent data
         if (self.state == .data_recvd or self.state == .data_read) return;
 
-        const new_end = offset + data.len;
+        const data_len: u64 = @intCast(data.len);
+        const new_end = std.math.add(u64, offset, data_len) catch return Error.BufferLimitExceeded;
 
         // §4.5: data can never extend past a locked final_size.
         if (self.final_size) |fs| {
@@ -152,9 +165,6 @@ pub const RecvStream = struct {
             if (self.state == .recv) self.state = .size_known;
         }
 
-        // Track the high water-mark.
-        if (new_end > self.end_offset) self.end_offset = new_end;
-
         // Bytes below read_offset are already-consumed duplicates.
         var clip_offset = offset;
         var clip_data = data;
@@ -169,17 +179,28 @@ pub const RecvStream = struct {
             clip_data = clip_data[@intCast(skip)..];
         }
         if (clip_data.len == 0) {
+            // Track the high water-mark after the frame has passed
+            // overflow checks, even when it only carried duplicates.
+            if (new_end > self.end_offset) self.end_offset = new_end;
             self.maybeAdvanceState();
             return;
         }
 
         // Make sure the buffer covers up to clip_offset+clip_data.len.
-        const buf_required: usize = @intCast(clip_offset + clip_data.len - self.read_offset);
+        const clip_data_len: u64 = @intCast(clip_data.len);
+        const clip_end = std.math.add(u64, clip_offset, clip_data_len) catch return Error.BufferLimitExceeded;
+        const span = clip_end - self.read_offset;
+        if (span > self.max_buffered_span) return Error.BufferLimitExceeded;
+        const buf_required: usize = @intCast(span);
         if (self.bytes.items.len < buf_required) {
             const grow_by = buf_required - self.bytes.items.len;
             const slack = try self.bytes.addManyAsSlice(self.allocator, grow_by);
             @memset(slack, 0);
         }
+
+        // Track the high water-mark only after sparse-offset allocation
+        // limits have accepted the frame.
+        if (new_end > self.end_offset) self.end_offset = new_end;
 
         // Walk over `clip_data`, writing only the bytes that fall
         // into gaps (no overlap with an existing range).
@@ -231,7 +252,7 @@ pub const RecvStream = struct {
         // range list, merging neighbors.
         try insertMerge(&self.ranges, self.allocator, .{
             .offset = clip_offset,
-            .end = clip_offset + clip_data.len,
+            .end = clip_end,
         });
 
         self.maybeAdvanceState();
@@ -508,6 +529,25 @@ test "duplicate-after-read bytes are skipped" {
     try s.recv(0, "abcdef", false);
 
     try testing.expectEqual(@as(u64, 3), s.readableBytes());
+}
+
+test "sparse STREAM offsets are bounded before allocation" {
+    var s = RecvStream.init(test_alloc);
+    defer s.deinit();
+    s.max_buffered_span = 16;
+
+    try testing.expectError(Error.BufferLimitExceeded, s.recv(1024, "x", false));
+    try testing.expectEqual(@as(usize, 0), s.bytes.items.len);
+    try testing.expectEqual(@as(u64, 0), s.end_offset);
+}
+
+test "STREAM offset overflow is rejected before mutation" {
+    var s = RecvStream.init(test_alloc);
+    defer s.deinit();
+
+    try testing.expectError(Error.BufferLimitExceeded, s.recv(std.math.maxInt(u64), "x", false));
+    try testing.expectEqual(@as(usize, 0), s.bytes.items.len);
+    try testing.expectEqual(@as(u64, 0), s.end_offset);
 }
 
 test "stress: 64 KiB random shuffle reassembles in order with FIN" {

@@ -186,8 +186,8 @@ pub const Params = struct {
             pos += id_d.bytes_read;
             const len_d = try varint.decode(src[pos..]);
             pos += len_d.bytes_read;
+            if (len_d.value > src.len - pos) return Error.InvalidValue;
             const value_len: usize = @intCast(len_d.value);
-            if (pos + value_len > src.len) return Error.InvalidValue;
             const value = src[pos .. pos + value_len];
             pos += value_len;
             try setOne(&p, id_d.value, value);
