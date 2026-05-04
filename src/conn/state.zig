@@ -82,6 +82,7 @@ pub const Error = error{
     DatagramUnavailable,
     DatagramTooLarge,
     DatagramQueueFull,
+    DatagramIdExhausted,
     InvalidStreamId,
     StreamLimitExceeded,
 } || boringssl.tls.Error ||
@@ -243,6 +244,8 @@ pub const CloseEvent = struct {
 pub const ConnectionEvent = union(enum) {
     close: CloseEvent,
     flow_blocked: FlowBlockedInfo,
+    datagram_acked: DatagramSendEvent,
+    datagram_lost: DatagramSendEvent,
 };
 
 pub const FlowBlockedSource = enum {
@@ -265,6 +268,22 @@ pub const FlowBlockedInfo = struct {
 };
 
 pub const max_flow_blocked_events: usize = 16;
+
+pub const DatagramSendEvent = struct {
+    id: u64,
+    len: usize,
+    path_id: u32 = 0,
+    packet_number: u64 = 0,
+    sent_time_us: u64 = 0,
+    arrived_in_early_data: bool = false,
+};
+
+pub const max_datagram_send_events: usize = 64;
+
+const StoredDatagramSendEvent = union(enum) {
+    acked: DatagramSendEvent,
+    lost: DatagramSendEvent,
+};
 
 const StoredCloseEvent = struct {
     source: CloseSource,
@@ -326,6 +345,11 @@ pub const IncomingDatagram = struct {
 const PendingRecvDatagram = struct {
     data: []u8,
     arrived_in_early_data: bool = false,
+};
+
+const PendingSendDatagram = struct {
+    id: u64,
+    data: []u8,
 };
 
 pub const TimerKind = enum {
@@ -529,8 +553,9 @@ pub const Connection = struct {
 
     /// Outbound RFC 9221 DATAGRAM payloads waiting to be packed
     /// into 1-RTT packets. Each entry is allocator-owned.
-    pending_send_datagrams: std.ArrayList([]u8) = .empty,
+    pending_send_datagrams: std.ArrayList(PendingSendDatagram) = .empty,
     pending_send_datagram_bytes: usize = 0,
+    next_datagram_id: u64 = 0,
     /// Inbound DATAGRAMs received but not yet pulled by the app.
     /// Each entry is allocator-owned.
     pending_recv_datagrams: std.ArrayList(PendingRecvDatagram) = .empty,
@@ -662,6 +687,8 @@ pub const Connection = struct {
     close_reason_buf: [max_close_reason_len]u8 = undefined,
     flow_blocked_events: [max_flow_blocked_events]FlowBlockedInfo = undefined,
     flow_blocked_event_count: usize = 0,
+    datagram_send_events: [max_datagram_send_events]StoredDatagramSendEvent = undefined,
+    datagram_send_event_count: usize = 0,
     /// STOP_SENDING frames we owe the peer (one per stream id).
     pending_stop_sending: std.ArrayList(StopSendingItem) = .empty,
     /// MAX_STREAM_DATA frames we owe after the application drains
@@ -752,7 +779,7 @@ pub const Connection = struct {
             self.allocator.destroy(s);
         }
         self.streams.deinit(self.allocator);
-        for (self.pending_send_datagrams.items) |bytes| self.allocator.free(bytes);
+        for (self.pending_send_datagrams.items) |item| self.allocator.free(item.data);
         for (self.pending_recv_datagrams.items) |item| self.allocator.free(item.data);
         self.pending_send_datagrams.deinit(self.allocator);
         self.pending_recv_datagrams.deinit(self.allocator);
@@ -1957,6 +1984,41 @@ pub const Connection = struct {
         self.flow_blocked_event_count += 1;
     }
 
+    fn recordDatagramSendEvent(self: *Connection, event: StoredDatagramSendEvent) void {
+        if (self.datagram_send_event_count == max_datagram_send_events) {
+            std.mem.copyForwards(
+                StoredDatagramSendEvent,
+                self.datagram_send_events[0 .. max_datagram_send_events - 1],
+                self.datagram_send_events[1..max_datagram_send_events],
+            );
+            self.datagram_send_event_count -= 1;
+        }
+        self.datagram_send_events[self.datagram_send_event_count] = event;
+        self.datagram_send_event_count += 1;
+    }
+
+    fn datagramEventFromPacket(packet: *const sent_packets_mod.SentPacket) ?DatagramSendEvent {
+        const dg = packet.datagram orelse return null;
+        return .{
+            .id = dg.id,
+            .len = dg.len,
+            .path_id = dg.path_id,
+            .packet_number = packet.pn,
+            .sent_time_us = packet.sent_time_us,
+            .arrived_in_early_data = packet.is_early_data,
+        };
+    }
+
+    fn recordDatagramAcked(self: *Connection, packet: *const sent_packets_mod.SentPacket) void {
+        const event = datagramEventFromPacket(packet) orelse return;
+        self.recordDatagramSendEvent(.{ .acked = event });
+    }
+
+    fn recordDatagramLost(self: *Connection, packet: *const sent_packets_mod.SentPacket) void {
+        const event = datagramEventFromPacket(packet) orelse return;
+        self.recordDatagramSendEvent(.{ .lost = event });
+    }
+
     fn findStreamBlocked(
         list: []const frame_types.StreamDataBlocked,
         stream_id: u64,
@@ -2137,6 +2199,13 @@ pub const Connection = struct {
     /// by the implementation's UDP packet budget and, once known, the
     /// peer's `max_datagram_frame_size` transport parameter.
     pub fn sendDatagram(self: *Connection, payload: []const u8) Error!void {
+        _ = try self.sendDatagramTracked(payload);
+    }
+
+    /// Queue a DATAGRAM and return a connection-local id that will be
+    /// echoed in `datagram_acked` / `datagram_lost` events. QUIC never
+    /// retransmits DATAGRAM frames; this id is only for app retry policy.
+    pub fn sendDatagramTracked(self: *Connection, payload: []const u8) Error!u64 {
         const max_payload = try self.maxOutboundDatagramPayload();
         if (payload.len > max_payload) return Error.DatagramTooLarge;
         if (self.pending_send_datagrams.items.len >= max_pending_datagram_count) {
@@ -2150,8 +2219,15 @@ pub const Connection = struct {
         const copy = try self.allocator.alloc(u8, payload.len);
         errdefer self.allocator.free(copy);
         @memcpy(copy, payload);
-        try self.pending_send_datagrams.append(self.allocator, copy);
+        if (self.next_datagram_id == std.math.maxInt(u64)) return Error.DatagramIdExhausted;
+        const id = self.next_datagram_id;
+        self.next_datagram_id += 1;
+        try self.pending_send_datagrams.append(self.allocator, .{
+            .id = id,
+            .data = copy,
+        });
         self.pending_send_datagram_bytes += payload.len;
+        return id;
     }
 
     fn maxOutboundDatagramPayload(self: *const Connection) Error!usize {
@@ -2910,6 +2986,7 @@ pub const Connection = struct {
 
                 var removed = path.sent.removeAt(i);
                 defer removed.deinit(self.allocator);
+                self.recordDatagramLost(&removed);
                 if (removed.stream_key) |stream_key| {
                     _ = try self.dispatchLostToStreams(stream_key);
                 }
@@ -3374,6 +3451,7 @@ pub const Connection = struct {
             offset: u64,
             data: []u8,
         } = null;
+        var sent_datagram: ?sent_packets_mod.SentDatagram = null;
         var crypto_copy: ?[]u8 = null;
         var retx_crypto_index: ?usize = null;
         errdefer if (crypto_copy) |bytes| self.allocator.free(bytes);
@@ -3819,15 +3897,20 @@ pub const Connection = struct {
         //     have to be the last frame.
         if (!congestion_blocked and (lvl == .application or lvl == .early_data) and self.pending_send_datagrams.items.len > 0) {
             const dg = self.pending_send_datagrams.items[0];
-            const dg_overhead: usize = 1 + varint.encodedLen(dg.len);
-            if (max_payload >= pl_pos + dg_overhead + dg.len) {
+            const dg_overhead: usize = 1 + varint.encodedLen(dg.data.len);
+            if (max_payload >= pl_pos + dg_overhead + dg.data.len) {
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
-                    .datagram = .{ .data = dg, .has_length = true },
+                    .datagram = .{ .data = dg.data, .has_length = true },
                 });
                 pl_pos += wrote;
                 _ = self.pending_send_datagrams.orderedRemove(0);
-                self.pending_send_datagram_bytes -= dg.len;
-                self.allocator.free(dg);
+                self.pending_send_datagram_bytes -= dg.data.len;
+                sent_datagram = .{
+                    .id = dg.id,
+                    .len = dg.data.len,
+                    .path_id = app_path.id,
+                };
+                self.allocator.free(dg.data);
                 ack_eliciting = true;
             }
         }
@@ -3914,6 +3997,7 @@ pub const Connection = struct {
         sent_packet.ack_eliciting = ack_eliciting;
         sent_packet.in_flight = ack_eliciting;
         sent_packet.is_early_data = lvl == .early_data;
+        sent_packet.datagram = sent_datagram;
         if (lvl == .application) self.recordApplicationPacketProtected(&sent_packet);
         const sent_stream_key = if (sent_chunk != null) self.nextStreamPacketKey() else null;
         sent_packet.stream_key = sent_stream_key;
@@ -4262,6 +4346,21 @@ pub const Connection = struct {
             }
             self.flow_blocked_event_count -= 1;
             return .{ .flow_blocked = out };
+        }
+        if (self.datagram_send_event_count > 0) {
+            const out = self.datagram_send_events[0];
+            if (self.datagram_send_event_count > 1) {
+                std.mem.copyForwards(
+                    StoredDatagramSendEvent,
+                    self.datagram_send_events[0 .. self.datagram_send_event_count - 1],
+                    self.datagram_send_events[1..self.datagram_send_event_count],
+                );
+            }
+            self.datagram_send_event_count -= 1;
+            return switch (out) {
+                .acked => |event| .{ .datagram_acked = event },
+                .lost => |event| .{ .datagram_lost = event },
+            };
         }
         return null;
     }
@@ -5413,6 +5512,7 @@ pub const Connection = struct {
                     }
                     self.discardSentCryptoForPacket(lvl, acked.pn);
                     self.dispatchAckedControlFrames(&acked);
+                    self.recordDatagramAcked(&acked);
                 }
                 if (pn == interval.largest) break;
                 pn += 1;
@@ -5478,6 +5578,7 @@ pub const Connection = struct {
                     self.onApplicationPacketAckedForKeys(&acked, now_us);
                     self.discardSentCryptoForPacket(.application, acked.pn);
                     self.dispatchAckedControlFrames(&acked);
+                    self.recordDatagramAcked(&acked);
                 }
                 if (pn == interval.largest) break;
                 pn += 1;
@@ -5711,6 +5812,7 @@ pub const Connection = struct {
         packet: *const sent_packets_mod.SentPacket,
     ) Error!bool {
         var any = false;
+        self.recordDatagramLost(packet);
         if (lvl == .application) {
             if (packet.stream_key) |stream_key| {
                 any = (try self.dispatchLostToStreams(stream_key)) or any;
@@ -7375,6 +7477,71 @@ test "sendDatagram enforces peer support and bounded queue" {
     try std.testing.expectError(Error.DatagramQueueFull, conn.sendDatagram("x"));
 }
 
+test "tracked DATAGRAM emits ack event when packet is acknowledged" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+
+    const id = try conn.sendDatagramTracked("ack-me");
+    var out: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevel(.application, &out, 1_000)).?;
+
+    const sent = conn.primaryPath().sent.packets[0];
+    try std.testing.expect(sent.datagram != null);
+    try std.testing.expectEqual(id, sent.datagram.?.id);
+    try std.testing.expectEqual(@as(usize, 6), sent.datagram.?.len);
+
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = sent.pn,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 1_050);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .datagram_acked);
+    try std.testing.expectEqual(id, event.datagram_acked.id);
+    try std.testing.expectEqual(@as(usize, 6), event.datagram_acked.len);
+    try std.testing.expectEqual(sent.pn, event.datagram_acked.packet_number);
+    try std.testing.expectEqual(@as(u32, 0), event.datagram_acked.path_id);
+    try std.testing.expect(!event.datagram_acked.arrived_in_early_data);
+    try std.testing.expect(conn.pollEvent() == null);
+}
+
+test "tracked DATAGRAM emits loss event without retransmission" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+
+    const id = try conn.sendDatagramTracked("lost");
+    var out: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevel(.application, &out, 1_000)).?;
+
+    var lost = conn.primaryPath().sent.removeAt(0);
+    defer lost.deinit(conn.allocator);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+    try std.testing.expect(!(try conn.requeueLostPacket(.application, &lost)));
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .datagram_lost);
+    try std.testing.expectEqual(id, event.datagram_lost.id);
+    try std.testing.expectEqual(@as(usize, 4), event.datagram_lost.len);
+    try std.testing.expectEqual(lost.pn, event.datagram_lost.packet_number);
+}
+
 test "handleDatagram enforces local DATAGRAM limit and queue budget" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initServer(.{});
@@ -7780,7 +7947,7 @@ test "0-RTT rejection requeues STREAM data but not DATAGRAM payloads" {
     installTestEarlyDataWriteSecret(&conn);
     conn.setEarlyDataEnabled(true);
 
-    try conn.sendDatagram("early-datagram");
+    const datagram_id = try conn.sendDatagramTracked("early-datagram");
     const s = try conn.openBidi(0);
     _ = try s.send.write("early-stream");
 
@@ -7798,6 +7965,10 @@ test "0-RTT rejection requeues STREAM data but not DATAGRAM payloads" {
     try std.testing.expectEqual(@as(u64, 0), chunk.offset);
     try std.testing.expectEqual(@as(u64, 12), chunk.length);
     try std.testing.expectEqualSlices(u8, "early-stream", s.send.chunkBytes(chunk));
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .datagram_lost);
+    try std.testing.expectEqual(datagram_id, event.datagram_lost.id);
+    try std.testing.expect(event.datagram_lost.arrived_in_early_data);
 }
 
 test "server handles accepted 0-RTT STREAM frames" {

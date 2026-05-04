@@ -32,6 +32,12 @@ pub const RetransmitFrame = union(enum) {
     path_cids_blocked: frame_types.PathCidsBlocked,
 };
 
+pub const SentDatagram = struct {
+    id: u64,
+    len: usize,
+    path_id: u32 = 0,
+};
+
 pub const SentPacket = struct {
     pn: u64,
     /// Send time in microseconds (monotonic clock the caller manages).
@@ -49,6 +55,9 @@ pub const SentPacket = struct {
     /// handling. STREAM frames are tracked by SendStream; DATAGRAM,
     /// ACK, PADDING, and CONNECTION_CLOSE are intentionally absent.
     retransmit_frames: std.ArrayList(RetransmitFrame) = .empty,
+    /// DATAGRAM frames are not retransmitted by QUIC, but apps need
+    /// ack/loss visibility to implement their own retry policy.
+    datagram: ?SentDatagram = null,
     /// Connection-local identifier used to route STREAM ACK/loss
     /// notifications. Application packet numbers are per-path when
     /// multipath is enabled, so a wire PN alone is not globally unique.

@@ -22,6 +22,7 @@ pub const CloseEvent = state.CloseEvent;
 pub const CloseSource = state.CloseSource;
 pub const CloseState = state.CloseState;
 pub const ConnectionEvent = state.ConnectionEvent;
+pub const DatagramSendEvent = state.DatagramSendEvent;
 pub const FlowBlockedInfo = state.FlowBlockedInfo;
 pub const FlowBlockedKind = state.FlowBlockedKind;
 pub const FlowBlockedSource = state.FlowBlockedSource;
