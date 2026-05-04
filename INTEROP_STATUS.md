@@ -40,10 +40,20 @@ Current as of 2026-05-04.
   queued STREAM data, and reports the current written byte count as the
   final size.
 - Embedders now get close/error status without reaching into private
-  state. `Connection.closeEvent()` exposes sticky local, peer, and idle
-  timeout close metadata, while `Connection.pollEvent()` delivers the
-  same close notification once through the public `ConnectionEvent`
-  union.
+  state. `Connection.closeState()` distinguishes open, closing,
+  draining, and terminal closed states; `Connection.closeEvent()`
+  exposes sticky local, peer, idle-timeout, and stateless-reset close
+  metadata; and `Connection.pollEvent()` delivers the same close
+  notification once through the public `ConnectionEvent` union.
+- Draining is now enforced on the receive side: once close is pending or
+  draining, incoming datagrams are ignored instead of mutating path,
+  stream, or TLS state. Draining expiration clears recovery timers and
+  transitions the public close state to terminal closed.
+- Stateless reset detection now compares short-header packet tails
+  against peer-issued tokens from transport parameters and
+  NEW_CONNECTION_ID/PATH_NEW_CONNECTION_ID. Matching packets enter
+  draining without queuing CONNECTION_CLOSE or charging AEAD auth
+  failure limits.
 - Out-of-order CRYPTO receive reassembly remains in place and handles
   the quic-go ClientHello fragmentation shape.
 - Sent-packet metadata now records retransmittable control frames
@@ -198,12 +208,11 @@ Current as of 2026-05-04.
    ticket export/import examples, transport-parameter mismatch
    rejection vectors beyond replay-context mismatch, and broader 0-RTT
    datagram/loss scenarios.
-6. **Protocol hardening remains.** Retry, Version Negotiation,
-   stateless reset, deeper close/draining behavior, bounded allocation
-   policy, qlog/keylog diagnostics, and full flow-control pacing still
-   need work. Close/error details are now surfaced publicly, but the
-   transport still needs broader shutdown-path interop and stateless
-   reset coverage.
+6. **Protocol hardening remains.** Retry, Version Negotiation, bounded
+   allocation policy, qlog/keylog diagnostics, and full flow-control
+   pacing still need work. Close/draining and stateless reset now have
+   public state and deterministic unit coverage, but still need broader
+   shutdown-path interop with external peers.
 
 Note: the passing mock multipath test now validates simultaneous
 two-path transfer inside nullq. The passing `go-quic-peer multipath`

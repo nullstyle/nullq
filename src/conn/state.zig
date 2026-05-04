@@ -171,11 +171,19 @@ pub const CloseSource = enum {
     local,
     peer,
     idle_timeout,
+    stateless_reset,
 };
 
 pub const CloseErrorSpace = enum {
     transport,
     application,
+};
+
+pub const CloseState = enum {
+    open,
+    closing,
+    draining,
+    closed,
 };
 
 pub const max_close_reason_len: usize = 256;
@@ -508,6 +516,10 @@ pub const Connection = struct {
     local_transport_params: TransportParams = .{},
     /// Decoded peer parameters once BoringSSL exposes them.
     cached_peer_transport_params: ?TransportParams = null,
+    /// The peer's transport-parameter stateless reset token is bound
+    /// to its initial source CID. Register it once; later peer DCID
+    /// rotation is driven by NEW_CONNECTION_ID metadata.
+    peer_transport_reset_token_installed: bool = false,
     /// Per-connection opt-in for sending queued application bytes in
     /// 0-RTT packets. Session resumption can still happen when this is
     /// false; nullq just waits for 1-RTT before emitting app data.
@@ -698,6 +710,7 @@ pub const Connection = struct {
             self.peer_max_path_id = max_path_id;
             self.multipath_enabled = true;
         }
+        try self.installPeerTransportStatelessResetToken();
         return params;
     }
 
@@ -1040,6 +1053,7 @@ pub const Connection = struct {
         self.peer_dcid = ConnectionId.fromSlice(cid);
         self.primaryPath().path.peer_cid = self.peer_dcid;
         self.peer_dcid_set = true;
+        try self.installPeerTransportStatelessResetToken();
     }
 
     /// Set the SCID this endpoint identifies with. A zero-length
@@ -1860,6 +1874,7 @@ pub const Connection = struct {
             self.peer_max_path_id = max_path_id;
             self.multipath_enabled = true;
         }
+        try self.installPeerTransportStatelessResetToken();
     }
 
     fn peerAckDelayExponent(self: *const Connection) u6 {
@@ -2106,12 +2121,41 @@ pub const Connection = struct {
         for (self.paths.paths.items) |*p| p.pending_ping = false;
     }
 
+    fn clearSentTracker(self: *Connection, tracker: *SentPacketTracker) void {
+        var i: u32 = 0;
+        while (i < tracker.count) : (i += 1) {
+            tracker.packets[i].deinit(self.allocator);
+        }
+        tracker.count = 0;
+        tracker.bytes_in_flight = 0;
+        tracker.ack_eliciting_in_flight = 0;
+    }
+
+    fn clearRecoveryState(self: *Connection) void {
+        for (&self.sent) |*tracker| self.clearSentTracker(tracker);
+        for (self.paths.paths.items) |*path| {
+            self.clearSentTracker(&path.sent);
+            path.pending_ping = false;
+            path.pto_count = 0;
+        }
+        self.clearPendingPings();
+    }
+
     fn canSendEarlyData(self: *Connection) bool {
         if (self.role != .client) return false;
         if (!self.early_data_send_enabled) return false;
         if (self.inner.handshakeDone()) return false;
         if (self.inner.earlyDataStatus() == .rejected) return false;
         return self.haveSecret(.early_data, .write);
+    }
+
+    fn installPeerTransportStatelessResetToken(self: *Connection) Error!void {
+        if (self.peer_transport_reset_token_installed) return;
+        const params = self.cached_peer_transport_params orelse return;
+        const token = params.stateless_reset_token orelse return;
+        if (!self.peer_dcid_set or self.peer_dcid.len == 0) return;
+        try self.registerPeerCid(0, 0, 0, self.peer_dcid, token);
+        self.peer_transport_reset_token_installed = true;
     }
 
     fn refreshEarlyDataStatus(self: *Connection) Error!void {
@@ -2347,6 +2391,7 @@ pub const Connection = struct {
             considerDeadline(&best, .{ .kind = .draining, .at_us = at_us });
             return best;
         }
+        if (self.closed) return null;
 
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
             const tracker = &self.pnSpaceForLevelConst(lvl).received;
@@ -2429,6 +2474,7 @@ pub const Connection = struct {
     /// True if `poll` would produce an outgoing packet right now.
     pub fn canSend(self: *const Connection) bool {
         if (self.pending_close != null) return true;
+        if (self.closed) return false;
         if (self.anyPendingPing()) return true;
         inline for (level_mod.all) |lvl| {
             const level_idx = lvl.idx();
@@ -2481,7 +2527,7 @@ pub const Connection = struct {
         dst: []u8,
         now_us: u64,
     ) Error!?OutgoingDatagram {
-        if (self.closed and self.pending_close == null) return null;
+        if (self.closed) return null;
         try self.refreshEarlyDataStatus();
         var pos: usize = 0;
         // Initial first (must lead a coalesced datagram).
@@ -3174,6 +3220,7 @@ pub const Connection = struct {
         from: ?Address,
         now_us: u64,
     ) Error!void {
+        if (self.pending_close != null or self.closed) return;
         if (bytes.len > 0) self.last_activity_us = now_us;
         const incoming_path_id = self.incomingPathId(from);
         self.current_incoming_path_id = incoming_path_id;
@@ -3185,6 +3232,7 @@ pub const Connection = struct {
             const consumed = try self.handleOnePacket(bytes[pos..], now_us);
             if (consumed == 0) break;
             pos += consumed;
+            if (self.pending_close != null or self.closed) break;
             // Drain CRYPTO into TLS BETWEEN packets, not just at
             // the end. A coalesced Initial+Handshake datagram
             // delivers the ServerHello at Initial level — we have
@@ -3217,7 +3265,17 @@ pub const Connection = struct {
         return self.primaryPathConst().path.validator.isValidated();
     }
 
-    /// True after we've sent or received a CONNECTION_CLOSE frame.
+    /// Current public shutdown state.
+    pub fn closeState(self: *const Connection) CloseState {
+        if (self.draining_deadline_us != null) return .draining;
+        if (self.pending_close != null) return .closing;
+        if (self.closed) return .closed;
+        return .open;
+    }
+
+    /// True after we've sent or received CONNECTION_CLOSE, received a
+    /// stateless reset, or timed out. Use `closeState` to distinguish
+    /// closing, draining, and terminal closed states.
     pub fn isClosed(self: *const Connection) bool {
         return self.closed;
     }
@@ -3257,6 +3315,49 @@ pub const Connection = struct {
         if (self.close_event) |*event| {
             event.draining_deadline_us = deadline_us;
         }
+    }
+
+    fn enterDraining(
+        self: *Connection,
+        source: CloseSource,
+        error_space: CloseErrorSpace,
+        error_code: u64,
+        frame_type: u64,
+        reason: []const u8,
+        now_us: u64,
+    ) void {
+        const draining_deadline = now_us +| self.drainingDurationUs();
+        self.recordCloseEvent(
+            source,
+            error_space,
+            error_code,
+            frame_type,
+            reason,
+            now_us,
+            draining_deadline,
+        );
+        self.pending_close = null;
+        self.closed = true;
+        self.draining_deadline_us = draining_deadline;
+        self.clearPendingPings();
+    }
+
+    fn finishDraining(self: *Connection) void {
+        self.pending_close = null;
+        self.draining_deadline_us = null;
+        self.closed = true;
+        self.clearRecoveryState();
+    }
+
+    fn enterStatelessReset(self: *Connection, now_us: u64) void {
+        self.enterDraining(
+            .stateless_reset,
+            .transport,
+            0,
+            0,
+            "stateless reset",
+            now_us,
+        );
     }
 
     fn closeEventFromStored(self: *const Connection, event: StoredCloseEvent) CloseEvent {
@@ -3389,7 +3490,10 @@ pub const Connection = struct {
         const app_pn_space = &app_path.app_pn_space;
         const largest_received = if (app_pn_space.received.largest) |l| l else 0;
         const multipath_path_id: ?u32 = if (self.multipathNegotiated()) app_path.id else null;
-        if (self.app_read_current == null) return bytes.len;
+        if (self.app_read_current == null) {
+            if (self.isKnownStatelessReset(bytes)) self.enterStatelessReset(now_us);
+            return bytes.len;
+        }
 
         var pt_buf: [max_recv_plaintext]u8 = undefined;
         const open_result = (try self.openApplicationPacket(
@@ -3399,6 +3503,10 @@ pub const Connection = struct {
             largest_received,
             multipath_path_id,
         )) orelse {
+            if (self.isKnownStatelessReset(bytes)) {
+                self.enterStatelessReset(now_us);
+                return bytes.len;
+            }
             self.noteApplicationAuthFailure();
             return bytes.len;
         };
@@ -3646,19 +3754,14 @@ pub const Connection = struct {
                 .paths_blocked => |pb| self.handlePathsBlocked(pb),
                 .path_cids_blocked => |pcb| self.handlePathCidsBlocked(pcb),
                 .connection_close => |cc| {
-                    const draining_deadline = now_us + self.drainingDurationUs();
-                    self.recordCloseEvent(
+                    self.enterDraining(
                         .peer,
                         closeErrorSpace(cc.is_transport),
                         cc.error_code,
                         if (cc.is_transport) cc.frame_type else 0,
                         cc.reason_phrase,
                         now_us,
-                        draining_deadline,
                     );
-                    self.pending_close = null;
-                    self.closed = true;
-                    self.draining_deadline_us = draining_deadline;
                 },
                 .retire_connection_id => |rc| self.handleRetireConnectionId(rc),
                 .max_data, .max_stream_data, .max_streams, .data_blocked, .stream_data_blocked, .streams_blocked, .new_token => {},
@@ -3700,6 +3803,22 @@ pub const Connection = struct {
 
     fn tokenEql(a: [16]u8, b: [16]u8) bool {
         return std.mem.eql(u8, a[0..], b[0..]);
+    }
+
+    fn statelessResetTokenFromDatagram(bytes: []const u8) ?[16]u8 {
+        if (bytes.len < 21) return null;
+        if ((bytes[0] & 0x80) != 0) return null;
+        var token: [16]u8 = undefined;
+        @memcpy(&token, bytes[bytes.len - 16 ..]);
+        return token;
+    }
+
+    fn isKnownStatelessReset(self: *const Connection, bytes: []const u8) bool {
+        const token = statelessResetTokenFromDatagram(bytes) orelse return false;
+        for (self.peer_cids.items) |item| {
+            if (tokenEql(item.stateless_reset_token, token)) return true;
+        }
+        return false;
     }
 
     fn pathIdAllowedByLocalLimit(self: *Connection, path_id: u32) bool {
@@ -4686,27 +4805,24 @@ pub const Connection = struct {
 
         if (self.draining_deadline_us) |deadline| {
             if (now_us >= deadline) {
-                self.pending_close = null;
-                self.clearPendingPings();
+                self.finishDraining();
             }
             return;
         }
 
+        if (self.closed) return;
+
         if (!self.closed) {
             if (self.idleDeadline()) |deadline| {
                 if (now_us >= deadline) {
-                    const draining_deadline = now_us +| self.drainingDurationUs();
-                    self.recordCloseEvent(
+                    self.enterDraining(
                         .idle_timeout,
                         .transport,
                         0,
                         0,
                         "idle timeout",
                         now_us,
-                        draining_deadline,
                     );
-                    self.closed = true;
-                    self.draining_deadline_us = draining_deadline;
                     return;
                 }
             }
@@ -4920,6 +5036,7 @@ test "local close is exposed as sticky and pollable event" {
     defer conn.deinit();
 
     conn.close(false, 0x42, "shutting down");
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
 
     const sticky = conn.closeEvent().?;
     try std.testing.expectEqual(CloseSource.local, sticky.source);
@@ -4934,6 +5051,42 @@ test "local close is exposed as sticky and pollable event" {
     try std.testing.expectEqualStrings("shutting down", event.close.reason);
     try std.testing.expect(conn.pollEvent() == null);
     try std.testing.expect(conn.closeEvent() != null);
+}
+
+test "closing and draining ignore incoming datagrams" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.close(false, 0x42, "closing");
+    var random_short = [_]u8{ 0x40, 0, 1, 2, 3, 4, 5 };
+    try conn.handle(&random_short, null, 1_000_000);
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    try std.testing.expectEqual(@as(u64, 0), conn.last_activity_us);
+    try std.testing.expectEqual(@as(u64, 0), conn.primaryPathConst().path.bytes_received);
+
+    var peer_ctx = try boringssl.tls.Context.initClient(.{});
+    defer peer_ctx.deinit();
+    var peer_closed = try Connection.initClient(allocator, peer_ctx, "x");
+    defer peer_closed.deinit();
+    var payload: [128]u8 = undefined;
+    const n = try frame_mod.encode(&payload, .{
+        .connection_close = .{
+            .is_transport = false,
+            .error_code = 0x7,
+            .reason_phrase = "bye",
+        },
+    });
+    try peer_closed.dispatchFrames(.application, payload[0..n], 2_000_000);
+    try std.testing.expectEqual(CloseState.draining, peer_closed.closeState());
+    const deadline = peer_closed.draining_deadline_us.?;
+    try peer_closed.handle(&random_short, null, 2_000_001);
+    try std.testing.expectEqual(@as(u64, 0), peer_closed.last_activity_us);
+    try peer_closed.tick(deadline);
+    try std.testing.expectEqual(CloseState.closed, peer_closed.closeState());
+    try std.testing.expect(peer_closed.nextTimerDeadline(deadline) == null);
 }
 
 test "peer close records transport error details" {
@@ -4956,6 +5109,7 @@ test "peer close records transport error details" {
 
     const sticky = conn.closeEvent().?;
     try std.testing.expect(conn.isClosed());
+    try std.testing.expectEqual(CloseState.draining, conn.closeState());
     try std.testing.expectEqual(CloseSource.peer, sticky.source);
     try std.testing.expectEqual(CloseErrorSpace.transport, sticky.error_space);
     try std.testing.expectEqual(@as(u64, 0x0a), sticky.error_code);
@@ -4963,6 +5117,44 @@ test "peer close records transport error details" {
     try std.testing.expectEqualStrings("bad stream frame", sticky.reason);
     try std.testing.expectEqual(@as(u64, 1_000_000), sticky.at_us.?);
     try std.testing.expect(sticky.draining_deadline_us != null);
+}
+
+test "stateless reset token closes without CONNECTION_CLOSE" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const token: [16]u8 = .{
+        0x10, 0x11, 0x12, 0x13,
+        0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b,
+        0x1c, 0x1d, 0x1e, 0x1f,
+    };
+    conn.cached_peer_transport_params = .{ .stateless_reset_token = token };
+    try conn.setPeerDcid(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+
+    var packet: [24]u8 = .{
+        0x40, 0xaa, 0xbb, 0xcc,
+        0xdd, 0x55, 0x66, 0x77,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+        0,    0,    0,    0,
+    };
+    @memcpy(packet[packet.len - 16 ..], &token);
+
+    try conn.handle(&packet, null, 3_000_000);
+
+    try std.testing.expect(conn.isClosed());
+    try std.testing.expectEqual(CloseState.draining, conn.closeState());
+    try std.testing.expect(conn.pending_close == null);
+    const close_event = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.stateless_reset, close_event.source);
+    try std.testing.expectEqual(CloseErrorSpace.transport, close_event.error_space);
+    try std.testing.expectEqualStrings("stateless reset", close_event.reason);
+    try std.testing.expectEqual(@as(u64, 3_000_000), close_event.at_us.?);
 }
 
 test "EncryptionLevel idx round-trip" {
@@ -6408,10 +6600,15 @@ test "idle timer closes and enters draining" {
 
     try conn.tick(6_000);
     try std.testing.expect(conn.isClosed());
+    try std.testing.expectEqual(CloseState.draining, conn.closeState());
     try std.testing.expect(conn.draining_deadline_us != null);
     const close_event = conn.closeEvent().?;
     try std.testing.expectEqual(CloseSource.idle_timeout, close_event.source);
     try std.testing.expectEqual(CloseErrorSpace.transport, close_event.error_space);
     try std.testing.expectEqual(@as(u64, 0), close_event.error_code);
     try std.testing.expectEqualStrings("idle timeout", close_event.reason);
+
+    try conn.tick(conn.draining_deadline_us.?);
+    try std.testing.expectEqual(CloseState.closed, conn.closeState());
+    try std.testing.expect(conn.nextTimerDeadline(10_000) == null);
 }

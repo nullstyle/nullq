@@ -19,6 +19,7 @@ pub const IncomingDatagram = state.IncomingDatagram;
 pub const CloseErrorSpace = state.CloseErrorSpace;
 pub const CloseEvent = state.CloseEvent;
 pub const CloseSource = state.CloseSource;
+pub const CloseState = state.CloseState;
 pub const ConnectionEvent = state.ConnectionEvent;
 pub const ApplicationKeyUpdateLimits = state.ApplicationKeyUpdateLimits;
 pub const ApplicationKeyUpdateStatus = state.ApplicationKeyUpdateStatus;

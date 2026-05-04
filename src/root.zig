@@ -34,6 +34,7 @@ pub const IncomingDatagram = conn.IncomingDatagram;
 pub const CloseErrorSpace = conn.CloseErrorSpace;
 pub const CloseEvent = conn.CloseEvent;
 pub const CloseSource = conn.CloseSource;
+pub const CloseState = conn.CloseState;
 pub const ConnectionEvent = conn.ConnectionEvent;
 pub const ApplicationKeyUpdateLimits = conn.ApplicationKeyUpdateLimits;
 pub const ApplicationKeyUpdateStatus = conn.ApplicationKeyUpdateStatus;
