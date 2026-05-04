@@ -720,6 +720,7 @@ pub const Connection = struct {
     /// Server/client-issued CIDs to advertise to the peer. This is
     /// enough for migration and multipath probes to obtain spare CIDs.
     pending_new_connection_ids: std.ArrayList(PendingNewConnectionId) = .empty,
+    pending_retire_connection_ids: std.ArrayList(frame_types.RetireConnectionId) = .empty,
     pending_path_abandons: std.ArrayList(frame_types.PathAbandon) = .empty,
     pending_path_statuses: std.ArrayList(PendingPathStatus) = .empty,
     pending_path_new_connection_ids: std.ArrayList(frame_types.PathNewConnectionId) = .empty,
@@ -815,6 +816,7 @@ pub const Connection = struct {
         self.local_stream_data_blocked.deinit(self.allocator);
         self.peer_stream_data_blocked.deinit(self.allocator);
         self.pending_new_connection_ids.deinit(self.allocator);
+        self.pending_retire_connection_ids.deinit(self.allocator);
         self.pending_path_abandons.deinit(self.allocator);
         self.pending_path_statuses.deinit(self.allocator);
         self.pending_path_new_connection_ids.deinit(self.allocator);
@@ -2270,6 +2272,18 @@ pub const Connection = struct {
         });
     }
 
+    pub fn queueRetireConnectionId(
+        self: *Connection,
+        sequence_number: u64,
+    ) Error!void {
+        for (self.pending_retire_connection_ids.items) |item| {
+            if (item.sequence_number == sequence_number) return;
+        }
+        try self.pending_retire_connection_ids.append(self.allocator, .{
+            .sequence_number = sequence_number,
+        });
+    }
+
     /// Pop the oldest received DATAGRAM into `dst`. Returns the
     /// number of bytes written, or null if none pending. The
     /// payload is dropped from the queue regardless of whether it
@@ -2731,7 +2745,7 @@ pub const Connection = struct {
     fn incomingPathId(self: *Connection, from: ?Address) u32 {
         if (from) |addr| {
             for (self.paths.paths.items) |*p| {
-                if (p.peer_addr_set and Address.eql(p.path.peer_addr, addr)) return p.id;
+                if (p.matchesPeerAddress(addr)) return p.id;
             }
             return self.activePath().id;
         }
@@ -2746,8 +2760,16 @@ pub const Connection = struct {
         const addr = from orelse return null;
         const path = self.pathForId(path_id);
         if (!path.peer_addr_set) return null;
-        if (Address.eql(path.path.peer_addr, addr)) return null;
+        if (path.matchesPeerAddress(addr)) return null;
         return addr;
+    }
+
+    fn clearQueuedPathChallengeForPath(self: *Connection, path_id: u32) void {
+        if (self.pending_path_challenge != null and
+            self.pending_path_challenge_path_id == path_id)
+        {
+            self.pending_path_challenge = null;
+        }
     }
 
     fn queuePathResponseOnPath(
@@ -2782,6 +2804,20 @@ pub const Connection = struct {
         path.resetRecoveryAfterMigration(.{ .max_datagram_size = self.mtu });
     }
 
+    fn handlePathValidationFailure(
+        self: *Connection,
+        path: *PathState,
+    ) void {
+        if (path.pending_migration_reset and path.rollbackFailedMigration()) {
+            self.clearQueuedPathChallengeForPath(path.id);
+            return;
+        }
+        path.path.fail();
+        path.pending_migration_reset = false;
+        path.migration_rollback = null;
+        self.clearQueuedPathChallengeForPath(path.id);
+    }
+
     fn recordPathResponse(
         self: *Connection,
         path_id: u32,
@@ -2796,6 +2832,16 @@ pub const Connection = struct {
         }
     }
 
+    fn shouldRequeuePathChallenge(
+        self: *Connection,
+        path_id: u32,
+        token: [8]u8,
+    ) bool {
+        const path = self.paths.get(path_id) orelse return false;
+        if (path.path.validator.status != .pending) return false;
+        return std.mem.eql(u8, &token, &path.path.validator.pending_token);
+    }
+
     fn handlePeerAddressChange(
         self: *Connection,
         path: *PathState,
@@ -2803,14 +2849,7 @@ pub const Connection = struct {
         datagram_len: usize,
         now_us: u64,
     ) Error!void {
-        path.setPeerAddress(addr);
-        path.path.validated = false;
-        path.path.validator = .{};
-        path.path.bytes_received = 0;
-        path.path.bytes_sent = 0;
-        path.path.onDatagramReceived(datagram_len);
-        path.path.state = .active;
-        path.pending_migration_reset = true;
+        path.beginMigration(addr, datagram_len);
 
         const token = try self.newPathChallengeToken();
         const timeout_us = saturatingMul(self.ptoDurationForApplicationPath(path), 3);
@@ -2835,6 +2874,7 @@ pub const Connection = struct {
             path.path.onDatagramReceived(datagram_len);
             return;
         }
+        if (path.matchesMigrationRollbackAddress(addr)) return;
         try self.handlePeerAddressChange(path, addr, datagram_len, now_us);
     }
 
@@ -3420,6 +3460,7 @@ pub const Connection = struct {
         if (self.pending_stream_data_blocked.items.len > 0) return true;
         if (self.pending_streams_blocked_bidi != null or self.pending_streams_blocked_uni != null) return true;
         if (self.pending_new_connection_ids.items.len > 0) return true;
+        if (self.pending_retire_connection_ids.items.len > 0) return true;
         if (self.pending_stop_sending.items.len > 0) return true;
         if (self.pending_path_response != null) return true;
         if (self.pending_path_challenge != null) return true;
@@ -3920,6 +3961,22 @@ pub const Connection = struct {
             }
         }
 
+        if (!congestion_blocked and lvl == .application and self.pending_retire_connection_ids.items.len > 0) {
+            const item = self.pending_retire_connection_ids.items[0];
+            const overhead_rcid: usize = 1 + varint.encodedLen(item.sequence_number);
+            if (max_payload >= pl_pos + overhead_rcid) {
+                const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
+                    .retire_connection_id = item,
+                });
+                pl_pos += wrote;
+                try sent_packet.addRetransmitFrame(self.allocator, .{
+                    .retire_connection_id = item,
+                });
+                _ = self.pending_retire_connection_ids.orderedRemove(0);
+                ack_eliciting = true;
+            }
+        }
+
         // 2c) STOP_SENDING (one per packet for now — application only).
         if (!congestion_blocked and lvl == .application and self.pending_stop_sending.items.len > 0) {
             const item = self.pending_stop_sending.items[0];
@@ -4263,8 +4320,14 @@ pub const Connection = struct {
         self.current_incoming_path_id = incoming_path_id;
         const incoming_path = self.pathForId(incoming_path_id);
         const rebind_addr = self.peerAddressChangeCandidate(incoming_path_id, from);
+        const from_migration_rollback_addr = if (from) |addr|
+            incoming_path.matchesMigrationRollbackAddress(addr)
+        else
+            false;
         if (rebind_addr == null) {
-            incoming_path.path.onDatagramReceived(bytes.len);
+            if (!from_migration_rollback_addr) {
+                incoming_path.path.onDatagramReceived(bytes.len);
+            }
             if (from) |addr| {
                 if (!incoming_path.peer_addr_set) incoming_path.setPeerAddress(addr);
             }
@@ -4299,8 +4362,7 @@ pub const Connection = struct {
         for (self.paths.paths.items) |*path| {
             path.path.validator.tick(now_us);
             if (path.path.validator.status == .failed) {
-                path.path.fail();
-                path.pending_migration_reset = false;
+                self.handlePathValidationFailure(path);
             }
         }
         if (self.alert) |_| return error.PeerAlerted;
@@ -5904,6 +5966,10 @@ pub const Connection = struct {
                     );
                     any = true;
                 },
+                .retire_connection_id => |rc| {
+                    try self.queueRetireConnectionId(rc.sequence_number);
+                    any = true;
+                },
                 .stop_sending => |ss| {
                     try self.queueStopSending(.{
                         .stream_id = ss.stream_id,
@@ -5918,10 +5984,12 @@ pub const Connection = struct {
                     any = true;
                 },
                 .path_challenge => |pc| {
-                    if (self.pending_path_challenge == null) {
+                    if (self.pending_path_challenge == null and
+                        self.shouldRequeuePathChallenge(path_id, pc.data))
+                    {
                         self.queuePathChallengeOnPath(path_id, pc.data);
+                        any = true;
                     }
-                    any = true;
                 },
                 .reset_stream => |rs| {
                     const s = self.streams.get(rs.stream_id) orelse continue;
@@ -6253,8 +6321,7 @@ pub const Connection = struct {
         for (self.paths.paths.items) |*p| {
             p.path.validator.tick(now_us);
             if (p.path.validator.status == .failed) {
-                p.path.fail();
-                p.pending_migration_reset = false;
+                self.handlePathValidationFailure(p);
             }
         }
         self.expireRetiringPaths(now_us);
@@ -8433,6 +8500,7 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
     try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
     try std.testing.expectEqual(.pending, path.path.validator.status);
     try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expect(path.migration_rollback != null);
     try std.testing.expect(!conn.pathStats(0).?.validated);
     try std.testing.expect(conn.pending_path_challenge != null);
     try std.testing.expectEqual(@as(u32, 0), conn.pending_path_challenge_path_id);
@@ -8443,6 +8511,7 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
 
     try std.testing.expect(conn.pathStats(0).?.validated);
     try std.testing.expect(!path.pending_migration_reset);
+    try std.testing.expect(path.migration_rollback == null);
     try std.testing.expectEqual(rtt_mod.initial_rtt_us, path.path.rtt.smoothed_rtt_us);
     try std.testing.expectEqual(@as(u64, 0), path.path.rtt.latest_rtt_us);
     const expected_cwnd = (congestion_mod.Config{ .max_datagram_size = default_mtu }).initialWindow();
@@ -8471,6 +8540,79 @@ test "unvalidated rebound path obeys anti-amplification before polling" {
     try std.testing.expect(conn.pending_path_challenge != null);
     try std.testing.expectEqual(@as(u32, 0), path.sent.count);
     try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
+}
+
+test "failed NAT rebinding validation rolls back to the previous address" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const old_addr = Address{ .bytes = .{ 3, 3, 3, 3 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 4, 4, 4, 4 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.markValidated();
+    path.path.bytes_received = 900;
+    path.path.bytes_sent = 300;
+
+    try conn.handlePeerAddressChange(path, new_addr, 40, 1_000_000);
+    try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expectEqual(@as(u64, 40), path.path.bytes_received);
+    try std.testing.expect(conn.pending_path_challenge != null);
+    const stale_token = path.path.validator.pending_token;
+
+    try conn.tick(1_000_000 + path.path.validator.timeout_us + 1);
+
+    try std.testing.expect(Address.eql(old_addr, path.path.peer_addr));
+    try std.testing.expect(path.path.isValidated());
+    try std.testing.expectEqual(.validated, path.path.validator.status);
+    try std.testing.expect(!path.pending_migration_reset);
+    try std.testing.expect(path.migration_rollback == null);
+    try std.testing.expectEqual(path_mod.State.active, path.path.state);
+    try std.testing.expectEqual(@as(u64, 900), path.path.bytes_received);
+    try std.testing.expectEqual(@as(u64, 300), path.path.bytes_sent);
+    try std.testing.expect(conn.pending_path_challenge == null);
+
+    var stale_packet: sent_packets_mod.SentPacket = .{
+        .pn = 0,
+        .sent_time_us = 1_000_000,
+        .bytes = 64,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    defer stale_packet.deinit(allocator);
+    try stale_packet.addRetransmitFrame(allocator, .{ .path_challenge = .{ .data = stale_token } });
+    try std.testing.expect(!(try conn.dispatchLostControlFrames(&stale_packet)));
+    try std.testing.expect(conn.pending_path_challenge == null);
+}
+
+test "old address packets during pending rebinding do not lift new path anti-amplification" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const old_addr = Address{ .bytes = .{ 7, 7, 7, 7 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 8, 8, 8, 8 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.markValidated();
+
+    try conn.handlePeerAddressChange(path, new_addr, 10, 1_000_000);
+    try std.testing.expectEqual(@as(u32, 0), conn.incomingPathId(old_addr));
+    try std.testing.expect(conn.peerAddressChangeCandidate(0, old_addr) == null);
+
+    try conn.recordAuthenticatedDatagramAddress(0, old_addr, 1200, 1_000_100);
+
+    try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expectEqual(@as(u64, 10), path.path.bytes_received);
+    try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
+    try std.testing.expectEqual(@as(u64, 30), path.path.antiAmpAllowance());
 }
 
 test "queued path CIDs participate in incoming short-header routing and retirement" {
@@ -8683,6 +8825,42 @@ test "PATH_RETIRE_CONNECTION_ID drops pending advertisements and allows replenis
     try std.testing.expectEqual(@as(usize, 1), queued);
     try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
     try std.testing.expectEqual(@as(u64, 3), conn.pending_path_new_connection_ids.items[1].sequence_number);
+}
+
+test "RETIRE_CONNECTION_ID emits with retransmit metadata and requeues on loss" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    try conn.queueRetireConnectionId(7);
+    try std.testing.expect(conn.canSend());
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevel(.application, &packet_buf, 1_000_000)).?;
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_retire_connection_ids.items.len);
+
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..n], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+    });
+    const decoded = try frame_mod.decode(opened.payload);
+    try std.testing.expect(decoded.frame == .retire_connection_id);
+    try std.testing.expectEqual(@as(u64, 7), decoded.frame.retire_connection_id.sequence_number);
+
+    const sent = &conn.primaryPath().sent.packets[0];
+    try std.testing.expectEqual(@as(usize, 1), sent.retransmit_frames.items.len);
+    try std.testing.expect(sent.retransmit_frames.items[0] == .retire_connection_id);
+
+    _ = try conn.dispatchLostControlFrames(sent);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_retire_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 7), conn.pending_retire_connection_ids.items[0].sequence_number);
 }
 
 test "PATHS_BLOCKED below current local limit is ignored" {

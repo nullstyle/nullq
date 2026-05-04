@@ -202,6 +202,15 @@ pub const PathStats = struct {
     peer_status_sequence_number: ?u64,
 };
 
+pub const MigrationRollback = struct {
+    peer_addr: Address,
+    peer_addr_set: bool,
+    validated: bool,
+    bytes_received: u64,
+    bytes_sent: u64,
+    state: State,
+};
+
 /// Per-path connection state that draft multipath requires to be
 /// independent for Application packets. Initial and Handshake packet
 /// number spaces stay connection-level.
@@ -217,6 +226,7 @@ pub const PathState = struct {
     local_addr_set: bool = false,
     retire_deadline_us: ?u64 = null,
     pending_migration_reset: bool = false,
+    migration_rollback: ?MigrationRollback = null,
     peer_prefers_backup: bool = false,
     peer_status_sequence_number: ?u64 = null,
     local_status_sequence_number: u64 = 0,
@@ -262,11 +272,62 @@ pub const PathState = struct {
         self.pending_ping = false;
         self.pto_count = 0;
         self.pending_migration_reset = false;
+        self.migration_rollback = null;
+    }
+
+    pub fn beginMigration(
+        self: *PathState,
+        peer_addr: Address,
+        datagram_len: usize,
+    ) void {
+        if (self.migration_rollback == null) {
+            self.migration_rollback = .{
+                .peer_addr = self.path.peer_addr,
+                .peer_addr_set = self.peer_addr_set,
+                .validated = self.path.isValidated(),
+                .bytes_received = self.path.bytes_received,
+                .bytes_sent = self.path.bytes_sent,
+                .state = self.path.state,
+            };
+        }
+        self.setPeerAddress(peer_addr);
+        self.path.validated = false;
+        self.path.validator = .{};
+        self.path.bytes_received = 0;
+        self.path.bytes_sent = 0;
+        self.path.onDatagramReceived(datagram_len);
+        self.path.state = .active;
+        self.pending_migration_reset = true;
+    }
+
+    pub fn rollbackFailedMigration(self: *PathState) bool {
+        const rollback = self.migration_rollback orelse return false;
+        self.path.peer_addr = rollback.peer_addr;
+        self.peer_addr_set = rollback.peer_addr_set;
+        self.path.validated = rollback.validated;
+        self.path.validator = .{};
+        if (rollback.validated) self.path.validator.status = .validated;
+        self.path.bytes_received = rollback.bytes_received;
+        self.path.bytes_sent = rollback.bytes_sent;
+        self.path.state = rollback.state;
+        self.pending_migration_reset = false;
+        self.migration_rollback = null;
+        return true;
     }
 
     pub fn peerAddress(self: *const PathState) ?Address {
         if (!self.peer_addr_set) return null;
         return self.path.peer_addr;
+    }
+
+    pub fn matchesPeerAddress(self: *const PathState, addr: Address) bool {
+        if (self.peer_addr_set and Address.eql(self.path.peer_addr, addr)) return true;
+        return self.matchesMigrationRollbackAddress(addr);
+    }
+
+    pub fn matchesMigrationRollbackAddress(self: *const PathState, addr: Address) bool {
+        const rollback = self.migration_rollback orelse return false;
+        return rollback.peer_addr_set and Address.eql(rollback.peer_addr, addr);
     }
 
     pub fn setPeerAddress(self: *PathState, addr: Address) void {
