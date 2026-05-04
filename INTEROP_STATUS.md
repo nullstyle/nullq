@@ -1,0 +1,127 @@
+# nullq interop status
+
+Current as of 2026-05-04.
+
+## Verified in this workspace
+
+- `zig build test` in `nullq`: passing, including deterministic
+  PTO/loss unit tests, path-aware multipath ACK/PTO tests, duplicate
+  per-path Application PN stream tracking, and the 10% simulated-loss
+  stream exchange.
+- `zig build` in `nullq-peer`: passing.
+- `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
+- `go-quic-peer client` against `nullq-peer`: passing for handshake,
+  bidi echo, 512 KiB upload, client/server uni streams, DATAGRAM echo,
+  RESET_STREAM, and concurrent bidi streams.
+- `go-quic-peer multipath` against `nullq-peer`: passing for secondary
+  socket add, PATH_CHALLENGE/PATH_RESPONSE probe, path switch, echo,
+  upload after switch, and DATAGRAM after switch.
+
+## Production work landed
+
+- Out-of-order CRYPTO receive reassembly remains in place and handles
+  the quic-go ClientHello fragmentation shape.
+- Sent-packet metadata now records retransmittable control frames
+  without inflating every packet slot; outstanding metadata is cleaned
+  up on ACK, loss, and connection deinit. STREAM-bearing packets also
+  carry a connection-local stream key so duplicate per-path Application
+  PNs cannot collide in `SendStream` ACK/loss bookkeeping.
+- Loss requeues STREAM data via `SendStream`, CRYPTO bytes at their
+  original offsets, and control frames for MAX_DATA, MAX_STREAM_DATA,
+  NEW_CONNECTION_ID, STOP_SENDING, PATH_RESPONSE, PATH_CHALLENGE, and
+  RESET_STREAM.
+- RESET_STREAM now observes ACK/loss outcomes: ACK moves the stream to
+  `reset_recvd`, loss clears `queued` so the frame is emitted again.
+- ACK processing now feeds ack-eliciting largest-acked samples into the
+  RTT estimator using cached peer ACK-delay transport parameters.
+- `Connection.nextTimerDeadline(now_us)` exposes ACK-delay,
+  loss-detection, PTO, idle, and draining deadlines. `tick(now_us)`
+  now drives time-threshold loss, PTO requeue/probe PINGs, idle close,
+  and draining cleanup.
+- PTO is handled per PN space/path: Initial and Handshake remain
+  connection-level, while every Application path tracks backoff
+  separately and requeues STREAM, CRYPTO, and retransmittable control
+  data through the same loss path.
+- NewReno congestion control is wired into Application data sending:
+  ACKed in-flight bytes grow the congestion window, packet loss reduces
+  it, persistent congestion resets it to the minimum window, and
+  application data is gated while PTO probes can still escape.
+- PTO probe selection now prefers retransmittable STREAM, CRYPTO, and
+  control data. Probe PINGs are only armed when a PTO has no useful
+  retransmittable data to requeue.
+- `PathSet` is now real infrastructure. Path id 0 is the initial path,
+  non-zero paths can be opened publicly, and each Application path owns
+  PN, ACK, sent-packet, RTT, congestion, validation, PTO, PMTU, and
+  anti-amplification state while Initial/Handshake PN spaces remain
+  connection-level.
+- The public multipath surface now includes `enableMultipath`,
+  `openPath`, `setActivePath`, `abandonPath`, `setPathStatus`,
+  `setPathBackup`, `markPathValidated`, `setScheduler`, `activePathId`,
+  and `pathStats`.
+- Draft-21 multipath frame codecs and receive handlers are present for
+  PATH_ACK, PATH_ABANDON, PATH_STATUS_BACKUP/AVAILABLE,
+  PATH_NEW_CONNECTION_ID, PATH_RETIRE_CONNECTION_ID, MAX_PATH_ID,
+  PATHS_BLOCKED, and PATH_CIDS_BLOCKED. PATH_ACK can be emitted from
+  non-zero path ACK trackers and can update the indicated Application
+  path's sent-packet, RTT, congestion, and PTO state.
+- Draft-21 multipath control frames can now be queued for poll-side
+  emission and are recorded in sent-packet metadata for loss requeue.
+- `Connection.pollDatagram(dst, now_us)` exposes `{ len, to, path_id }`
+  and can select non-zero Application paths for ACK/probe/scheduler
+  traffic while `poll(dst, now_us)` remains the single-path
+  compatibility API.
+- Multipath draft-21 is explicit in the public surface:
+  `multipath_draft_version = 21` and transport parameter
+  `initial_max_path_id = 0x3e`.
+
+## Still not production-grade
+
+1. **Draft multipath is still not complete.** Path registration,
+   lifecycle, stats, scheduler selection, path-aware polling, and
+   per-path Application recovery ownership exist. The remaining wire
+   work is true draft-21 path/CID negotiation, CID-based incoming path
+   mapping, and the draft multipath packet-protection nonce construction.
+2. **Multipath frame emission is partial.** Draft-21 multipath control
+   frames can be queued, emitted one per Application packet, ACKed, and
+   requeued on loss, and PATH_ACK is generated for non-zero path ACK
+   trackers. Remaining emission work: smarter pacing/coalescing,
+   PATH_CID limit enforcement/replenishment, and complete PATH_ACK
+   handling for all draft edge cases.
+3. **Recovery is path-aware but not fully hardened.** Packet-threshold,
+   time-threshold, PTO, ACK-delay, idle, draining, NewReno loss/ACK
+   feedback, persistent congestion, and basic PTO probe selection are
+   path-owned for Application data. Remaining recovery work: old-path
+   draining during active migration, DATAGRAM ack/loss app events, full
+   CID retirement/replenishment, and broader lossy/reordered interop
+   gates. Pacing, ECN, and advanced congestion controllers remain out of
+   scope for this push.
+4. **Key update support is minimal.** nullq can react to observed peer
+   key updates, but it does not yet keep current/previous/next read
+   keys with 3x-PTO discard timing or enforce packet limits across all
+   paths.
+5. **0-RTT is not implemented.** Session tickets, early-data context,
+   accepted/rejected state, replay of rejected 0-RTT STREAM data, and
+   `arrived_in_early_data` marking remain open.
+6. **Protocol hardening remains.** Retry, Version Negotiation,
+   stateless reset, close/draining state, typed close errors, bounded
+   allocation policy, qlog/keylog diagnostics, and full flow-control
+   pacing still need work.
+
+Note: the passing `go-quic-peer multipath` smoke test currently validates
+secondary socket probing and path switching against nullq-peer. It is not
+yet proof of full draft-21 simultaneous multipath transfer.
+
+## Useful commands
+
+```sh
+cd ~/prj/ai-workspace/nullq
+zig build test
+
+cd ~/prj/ai-workspace/nullq-peer
+zig build
+./zig-out/bin/nullq-peer server -listen 127.0.0.1:4242
+
+cd ~/prj/ai-workspace/go-quic-peer
+go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=false -json -timeout 20s
+go run ./cmd/quicpeer multipath -addr 127.0.0.1:4242 -insecure -json -timeout 20s -cid-len 8
+```

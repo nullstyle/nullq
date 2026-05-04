@@ -1,0 +1,18 @@
+.{
+    .name = .nullq,
+    .version = "0.0.0",
+    .fingerprint = 0x134639da49b66715,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .boringssl_zig = .{
+            .path = "../boringssl-zig",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "INITIAL_PROMPT.md",
+        "README.md",
+    },
+}

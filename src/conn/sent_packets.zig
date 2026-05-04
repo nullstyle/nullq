@@ -1,0 +1,225 @@
+//! Sent-packet tracker (RFC 9002 §A.1).
+//!
+//! Per packet number space, records each sent packet's metadata
+//! until it's acknowledged or declared lost. Loss recovery walks
+//! this set when an ACK arrives to compute newly-acked PNs and
+//! detect lost ones.
+
+const std = @import("std");
+const frame_types = @import("../frame/types.zig");
+
+pub const max_retransmit_frames: usize = 8;
+
+pub const RetransmitFrame = union(enum) {
+    max_data: frame_types.MaxData,
+    max_stream_data: frame_types.MaxStreamData,
+    new_connection_id: frame_types.NewConnectionId,
+    stop_sending: frame_types.StopSending,
+    path_response: frame_types.PathResponse,
+    path_challenge: frame_types.PathChallenge,
+    reset_stream: frame_types.ResetStream,
+    path_abandon: frame_types.PathAbandon,
+    path_status_backup: frame_types.PathStatus,
+    path_status_available: frame_types.PathStatus,
+    path_new_connection_id: frame_types.PathNewConnectionId,
+    path_retire_connection_id: frame_types.PathRetireConnectionId,
+    max_path_id: frame_types.MaxPathId,
+    paths_blocked: frame_types.PathsBlocked,
+    path_cids_blocked: frame_types.PathCidsBlocked,
+};
+
+pub const SentPacket = struct {
+    pn: u64,
+    /// Send time in microseconds (monotonic clock the caller manages).
+    sent_time_us: u64,
+    /// Wire size of the encoded packet (header + ciphertext + tag).
+    /// Used for in-flight bookkeeping and congestion-controller updates.
+    bytes: u64,
+    /// Did this packet contain at least one ack-eliciting frame?
+    /// (Almost any frame except PADDING/ACK/CONNECTION_CLOSE.)
+    ack_eliciting: bool,
+    /// Did this packet contribute to bytes-in-flight? Most packets
+    /// do; ACK-only packets and pure PADDING runs do not.
+    in_flight: bool,
+    /// Ack-eliciting control frames that need explicit ACK/loss
+    /// handling. STREAM frames are tracked by SendStream; DATAGRAM,
+    /// ACK, PADDING, and CONNECTION_CLOSE are intentionally absent.
+    retransmit_frames: std.ArrayList(RetransmitFrame) = .empty,
+    /// Connection-local identifier used to route STREAM ACK/loss
+    /// notifications. Application packet numbers are per-path when
+    /// multipath is enabled, so a wire PN alone is not globally unique.
+    stream_key: ?u64 = null,
+
+    pub fn addRetransmitFrame(
+        self: *SentPacket,
+        allocator: std.mem.Allocator,
+        frame: RetransmitFrame,
+    ) Error!void {
+        if (self.retransmit_frames.items.len >= max_retransmit_frames) {
+            return Error.TooManyRetransmittableFrames;
+        }
+        try self.retransmit_frames.append(allocator, frame);
+    }
+
+    pub fn deinit(self: *SentPacket, allocator: std.mem.Allocator) void {
+        self.retransmit_frames.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Maximum tracked in-flight packets per PN space. Real connections
+/// rarely exceed a few hundred; we cap at 4096 so fixed-size
+/// arrays don't blow up the struct. When full, `record` returns
+/// `Error.TooManyInFlight` — a connection-fatal condition the
+/// caller should map to a CONNECTION_CLOSE.
+pub const max_tracked: usize = 4096;
+
+pub const Error = error{
+    TooManyInFlight,
+    TooManyRetransmittableFrames,
+} || std.mem.Allocator.Error;
+
+pub const SentPacketTracker = struct {
+    /// Sorted ascending by PN. Sent packets are appended at the
+    /// high end; ACKs/loss removes from anywhere.
+    packets: [max_tracked]SentPacket = undefined,
+    count: u32 = 0,
+    /// Sum of bytes for in-flight packets currently tracked.
+    bytes_in_flight: u64 = 0,
+    /// Sum of bytes for ack-eliciting packets currently tracked.
+    /// Used for some loss-recovery state; tracked separately so
+    /// we don't have to walk the array.
+    ack_eliciting_in_flight: u64 = 0,
+
+    /// Record a newly-sent packet. PNs must be strictly increasing.
+    pub fn record(self: *SentPacketTracker, p: SentPacket) Error!void {
+        if (self.count >= max_tracked) return Error.TooManyInFlight;
+        if (self.count > 0) {
+            std.debug.assert(p.pn > self.packets[self.count - 1].pn);
+        }
+        self.packets[self.count] = p;
+        self.count += 1;
+        if (p.in_flight) {
+            self.bytes_in_flight += p.bytes;
+            if (p.ack_eliciting) self.ack_eliciting_in_flight += p.bytes;
+        }
+    }
+
+    /// Remove a tracked packet by index. Returns the removed entry.
+    pub fn removeAt(self: *SentPacketTracker, idx: u32) SentPacket {
+        std.debug.assert(idx < self.count);
+        const p = self.packets[idx];
+        var k: u32 = idx;
+        while (k + 1 < self.count) : (k += 1) {
+            self.packets[k] = self.packets[k + 1];
+        }
+        self.count -= 1;
+        if (p.in_flight) {
+            self.bytes_in_flight -= p.bytes;
+            if (p.ack_eliciting) self.ack_eliciting_in_flight -= p.bytes;
+        }
+        return p;
+    }
+
+    /// Find the index of the tracked packet with the given PN.
+    /// Returns null if no match. O(log N) binary search.
+    pub fn indexOf(self: *const SentPacketTracker, pn: u64) ?u32 {
+        var lo: u32 = 0;
+        var hi: u32 = self.count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const p = self.packets[mid];
+            if (p.pn == pn) return mid;
+            if (p.pn < pn) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return null;
+    }
+
+    /// Find the first tracked packet whose PN is >= `pn`.
+    /// Returns null if all tracked PNs are smaller.
+    pub fn lowerBound(self: *const SentPacketTracker, pn: u64) ?u32 {
+        var lo: u32 = 0;
+        var hi: u32 = self.count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.packets[mid].pn < pn) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= self.count) return null;
+        return lo;
+    }
+};
+
+// -- tests ---------------------------------------------------------------
+
+test "record + remove + bytes_in_flight bookkeeping" {
+    var t: SentPacketTracker = .{};
+    try t.record(.{ .pn = 0, .sent_time_us = 100, .bytes = 1200, .ack_eliciting = true, .in_flight = true });
+    try t.record(.{ .pn = 1, .sent_time_us = 110, .bytes = 800, .ack_eliciting = true, .in_flight = true });
+    try t.record(.{ .pn = 2, .sent_time_us = 120, .bytes = 60, .ack_eliciting = false, .in_flight = false });
+
+    try std.testing.expectEqual(@as(u32, 3), t.count);
+    try std.testing.expectEqual(@as(u64, 2000), t.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 2000), t.ack_eliciting_in_flight);
+
+    const idx = t.indexOf(1) orelse unreachable;
+    const removed = t.removeAt(idx);
+    try std.testing.expectEqual(@as(u64, 1), removed.pn);
+    try std.testing.expectEqual(@as(u32, 2), t.count);
+    try std.testing.expectEqual(@as(u64, 1200), t.bytes_in_flight);
+}
+
+test "indexOf returns null for missing PNs" {
+    var t: SentPacketTracker = .{};
+    try t.record(.{ .pn = 5, .sent_time_us = 0, .bytes = 100, .ack_eliciting = true, .in_flight = true });
+    try std.testing.expectEqual(@as(?u32, 0), t.indexOf(5));
+    try std.testing.expectEqual(@as(?u32, null), t.indexOf(4));
+    try std.testing.expectEqual(@as(?u32, null), t.indexOf(6));
+}
+
+test "lowerBound finds the first PN >= target" {
+    var t: SentPacketTracker = .{};
+    try t.record(.{ .pn = 1, .sent_time_us = 0, .bytes = 100, .ack_eliciting = true, .in_flight = true });
+    try t.record(.{ .pn = 3, .sent_time_us = 0, .bytes = 100, .ack_eliciting = true, .in_flight = true });
+    try t.record(.{ .pn = 7, .sent_time_us = 0, .bytes = 100, .ack_eliciting = true, .in_flight = true });
+    try std.testing.expectEqual(@as(?u32, 0), t.lowerBound(0));
+    try std.testing.expectEqual(@as(?u32, 0), t.lowerBound(1));
+    try std.testing.expectEqual(@as(?u32, 1), t.lowerBound(2));
+    try std.testing.expectEqual(@as(?u32, 1), t.lowerBound(3));
+    try std.testing.expectEqual(@as(?u32, 2), t.lowerBound(4));
+    try std.testing.expectEqual(@as(?u32, 2), t.lowerBound(7));
+    try std.testing.expectEqual(@as(?u32, null), t.lowerBound(8));
+}
+
+test "non-in-flight packets don't update bytes_in_flight" {
+    var t: SentPacketTracker = .{};
+    try t.record(.{ .pn = 0, .sent_time_us = 0, .bytes = 50, .ack_eliciting = false, .in_flight = false });
+    try std.testing.expectEqual(@as(u64, 0), t.bytes_in_flight);
+    _ = t.removeAt(0);
+    try std.testing.expectEqual(@as(u64, 0), t.bytes_in_flight);
+}
+
+test "SentPacket stores retransmittable control frames" {
+    var p: SentPacket = .{
+        .pn = 1,
+        .sent_time_us = 10,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    defer p.deinit(std.testing.allocator);
+    try p.addRetransmitFrame(std.testing.allocator, .{ .max_data = .{ .maximum_data = 4096 } });
+    try p.addRetransmitFrame(std.testing.allocator, .{ .path_challenge = .{ .data = .{ 1, 2, 3, 4, 5, 6, 7, 8 } } });
+
+    try std.testing.expectEqual(@as(usize, 2), p.retransmit_frames.items.len);
+    try std.testing.expect(p.retransmit_frames.items[0] == .max_data);
+    try std.testing.expectEqual(@as(u64, 4096), p.retransmit_frames.items[0].max_data.maximum_data);
+    try std.testing.expect(p.retransmit_frames.items[1] == .path_challenge);
+}

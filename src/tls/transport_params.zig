@@ -1,0 +1,419 @@
+//! QUIC transport parameters (RFC 9000 §18 + RFC 9221).
+//!
+//! Transport parameters are a sequence of `(id, length, value)`
+//! triples where each component is a QUIC varint (the value is
+//! itself either a varint, a fixed-size byte string, or a
+//! zero-length flag depending on the parameter id).
+//!
+//! Both endpoints encode their parameters as one opaque blob and
+//! ship it to BoringSSL via `Conn.setQuicTransportParams`. The peer
+//! receives them via `Conn.peerQuicTransportParams`. This module
+//! provides a typed `Params` struct plus `encode` / `decode` so
+//! callers don't have to push raw bytes through.
+
+const std = @import("std");
+const varint = @import("../wire/varint.zig");
+const path_mod = @import("../conn/path.zig");
+
+pub const ConnectionId = path_mod.ConnectionId;
+
+/// Multipath QUIC draft version targeted by nullq's public API.
+pub const multipath_draft_version: u32 = 21;
+
+/// IANA Transport Parameter Registry — RFC 9000 §18.2 + RFC 9221.
+pub const Id = struct {
+    pub const original_destination_connection_id: u64 = 0x00;
+    pub const max_idle_timeout: u64 = 0x01;
+    pub const stateless_reset_token: u64 = 0x02;
+    pub const max_udp_payload_size: u64 = 0x03;
+    pub const initial_max_data: u64 = 0x04;
+    pub const initial_max_stream_data_bidi_local: u64 = 0x05;
+    pub const initial_max_stream_data_bidi_remote: u64 = 0x06;
+    pub const initial_max_stream_data_uni: u64 = 0x07;
+    pub const initial_max_streams_bidi: u64 = 0x08;
+    pub const initial_max_streams_uni: u64 = 0x09;
+    pub const ack_delay_exponent: u64 = 0x0a;
+    pub const max_ack_delay: u64 = 0x0b;
+    pub const disable_active_migration: u64 = 0x0c;
+    pub const preferred_address: u64 = 0x0d;
+    pub const active_connection_id_limit: u64 = 0x0e;
+    pub const initial_source_connection_id: u64 = 0x0f;
+    pub const retry_source_connection_id: u64 = 0x10;
+    /// RFC 9221 §3
+    pub const max_datagram_frame_size: u64 = 0x20;
+    /// draft-ietf-quic-multipath-21 §2.1
+    pub const initial_max_path_id: u64 = 0x3e;
+};
+
+pub const Error = error{
+    BufferTooSmall,
+    DuplicateParameter,
+    UnknownLength,
+    ValueTooLarge,
+    InvalidValue,
+} || varint.Error;
+
+pub const Params = struct {
+    /// 0x00 — server-only echo of the client's first-Initial DCID.
+    /// Required on server transport params (RFC 9000 §7.3); the client
+    /// validates the echo to detect off-path injection.
+    original_destination_connection_id: ?ConnectionId = null,
+
+    /// 0x01 — idle timeout in milliseconds. 0 disables the timer.
+    max_idle_timeout_ms: u64 = 0,
+
+    /// 0x02 — server-only 16-byte stateless reset token.
+    stateless_reset_token: ?[16]u8 = null,
+
+    /// 0x03 — max UDP payload the endpoint accepts. RFC default 65527
+    /// (effectively unbounded). The wire codec only emits non-default
+    /// values.
+    max_udp_payload_size: u64 = 65527,
+
+    /// 0x04 — connection-level flow-control limit on incoming bytes.
+    initial_max_data: u64 = 0,
+
+    /// 0x05 — initial max data for client-initiated bidi streams
+    /// receive side at this endpoint.
+    initial_max_stream_data_bidi_local: u64 = 0,
+    /// 0x06 — initial max data for peer-initiated bidi streams
+    /// receive side at this endpoint.
+    initial_max_stream_data_bidi_remote: u64 = 0,
+    /// 0x07 — initial max data for unidirectional streams.
+    initial_max_stream_data_uni: u64 = 0,
+
+    /// 0x08 — max number of bidi streams the peer may open.
+    initial_max_streams_bidi: u64 = 0,
+    /// 0x09 — max number of uni streams the peer may open.
+    initial_max_streams_uni: u64 = 0,
+
+    /// 0x0a — RFC 9000 §13.2.5: encodes ack_delay scaling. RFC default 3.
+    ack_delay_exponent: u64 = 3,
+    /// 0x0b — max time before peer must send ACK, in ms. RFC default 25.
+    max_ack_delay_ms: u64 = 25,
+
+    /// 0x0c — zero-length flag.
+    disable_active_migration: bool = false,
+
+    // 0x0d preferred_address — not implemented yet (complex composite).
+
+    /// 0x0e — number of CIDs the peer is willing to store. Min 2; default 2.
+    active_connection_id_limit: u64 = 2,
+    /// 0x0f — SCID echoed by the endpoint on its first Initial.
+    initial_source_connection_id: ?ConnectionId = null,
+    /// 0x10 — server-only: SCID from the Retry packet, if Retry was sent.
+    retry_source_connection_id: ?ConnectionId = null,
+
+    /// 0x20 — RFC 9221: max datagram frame size accepted. 0 = no DATAGRAM support.
+    max_datagram_frame_size: u64 = 0,
+
+    /// 0x3e — draft-ietf-quic-multipath-21: maximum path ID this
+    /// endpoint is willing to maintain at connection initiation.
+    /// Null means multipath was not advertised; a value of 0 still
+    /// advertises the extension but allows no extra paths yet.
+    initial_max_path_id: ?u32 = null,
+
+    /// Serialize `self` into `dst`. Only non-default fields are
+    /// emitted; the resulting blob is the same shape regardless of
+    /// whether the sender is client or server.
+    pub fn encode(self: Params, dst: []u8) Error!usize {
+        var pos: usize = 0;
+        if (self.original_destination_connection_id) |cid| {
+            pos += try writeBytes(dst, pos, Id.original_destination_connection_id, cid.slice());
+        }
+        if (self.max_idle_timeout_ms != 0) {
+            pos += try writeVarint(dst, pos, Id.max_idle_timeout, self.max_idle_timeout_ms);
+        }
+        if (self.stateless_reset_token) |tok| {
+            pos += try writeBytes(dst, pos, Id.stateless_reset_token, &tok);
+        }
+        if (self.max_udp_payload_size != 65527) {
+            pos += try writeVarint(dst, pos, Id.max_udp_payload_size, self.max_udp_payload_size);
+        }
+        if (self.initial_max_data != 0) {
+            pos += try writeVarint(dst, pos, Id.initial_max_data, self.initial_max_data);
+        }
+        if (self.initial_max_stream_data_bidi_local != 0) {
+            pos += try writeVarint(dst, pos, Id.initial_max_stream_data_bidi_local, self.initial_max_stream_data_bidi_local);
+        }
+        if (self.initial_max_stream_data_bidi_remote != 0) {
+            pos += try writeVarint(dst, pos, Id.initial_max_stream_data_bidi_remote, self.initial_max_stream_data_bidi_remote);
+        }
+        if (self.initial_max_stream_data_uni != 0) {
+            pos += try writeVarint(dst, pos, Id.initial_max_stream_data_uni, self.initial_max_stream_data_uni);
+        }
+        if (self.initial_max_streams_bidi != 0) {
+            pos += try writeVarint(dst, pos, Id.initial_max_streams_bidi, self.initial_max_streams_bidi);
+        }
+        if (self.initial_max_streams_uni != 0) {
+            pos += try writeVarint(dst, pos, Id.initial_max_streams_uni, self.initial_max_streams_uni);
+        }
+        if (self.ack_delay_exponent != 3) {
+            pos += try writeVarint(dst, pos, Id.ack_delay_exponent, self.ack_delay_exponent);
+        }
+        if (self.max_ack_delay_ms != 25) {
+            pos += try writeVarint(dst, pos, Id.max_ack_delay, self.max_ack_delay_ms);
+        }
+        if (self.disable_active_migration) {
+            pos += try writeFlag(dst, pos, Id.disable_active_migration);
+        }
+        if (self.active_connection_id_limit != 2) {
+            pos += try writeVarint(dst, pos, Id.active_connection_id_limit, self.active_connection_id_limit);
+        }
+        if (self.initial_source_connection_id) |cid| {
+            pos += try writeBytes(dst, pos, Id.initial_source_connection_id, cid.slice());
+        }
+        if (self.retry_source_connection_id) |cid| {
+            pos += try writeBytes(dst, pos, Id.retry_source_connection_id, cid.slice());
+        }
+        if (self.max_datagram_frame_size != 0) {
+            pos += try writeVarint(dst, pos, Id.max_datagram_frame_size, self.max_datagram_frame_size);
+        }
+        if (self.initial_max_path_id) |max_path_id| {
+            pos += try writeVarint(dst, pos, Id.initial_max_path_id, max_path_id);
+        }
+        return pos;
+    }
+
+    /// Parse a transport-parameters blob. Unknown parameter ids are
+    /// silently ignored per RFC 9000 §18 (allows forward extension
+    /// without breaking interop).
+    pub fn decode(src: []const u8) Error!Params {
+        var p: Params = .{};
+        var pos: usize = 0;
+        while (pos < src.len) {
+            const id_d = try varint.decode(src[pos..]);
+            pos += id_d.bytes_read;
+            const len_d = try varint.decode(src[pos..]);
+            pos += len_d.bytes_read;
+            const value_len: usize = @intCast(len_d.value);
+            if (pos + value_len > src.len) return Error.InvalidValue;
+            const value = src[pos .. pos + value_len];
+            pos += value_len;
+            try setOne(&p, id_d.value, value);
+        }
+        return p;
+    }
+};
+
+fn writeVarint(dst: []u8, pos: usize, id: u64, value: u64) Error!usize {
+    var written: usize = 0;
+    if (dst.len < pos) return Error.BufferTooSmall;
+    written += try varint.encode(dst[pos..], id);
+    const value_len = varint.encodedLen(value);
+    if (value_len == 0) return Error.ValueTooLarge;
+    written += try varint.encode(dst[pos + written ..], value_len);
+    written += try varint.encode(dst[pos + written ..], value);
+    return written;
+}
+
+fn writeBytes(dst: []u8, pos: usize, id: u64, bytes: []const u8) Error!usize {
+    var written: usize = 0;
+    written += try varint.encode(dst[pos..], id);
+    written += try varint.encode(dst[pos + written ..], bytes.len);
+    if (dst.len < pos + written + bytes.len) return Error.BufferTooSmall;
+    @memcpy(dst[pos + written .. pos + written + bytes.len], bytes);
+    written += bytes.len;
+    return written;
+}
+
+fn writeFlag(dst: []u8, pos: usize, id: u64) Error!usize {
+    var written: usize = 0;
+    written += try varint.encode(dst[pos..], id);
+    written += try varint.encode(dst[pos + written ..], 0);
+    return written;
+}
+
+fn setOne(p: *Params, id: u64, value: []const u8) Error!void {
+    switch (id) {
+        Id.original_destination_connection_id => {
+            if (value.len > path_mod.max_cid_len) return Error.InvalidValue;
+            p.original_destination_connection_id = ConnectionId.fromSlice(value);
+        },
+        Id.max_idle_timeout => p.max_idle_timeout_ms = try decodeVarintValue(value),
+        Id.stateless_reset_token => {
+            if (value.len != 16) return Error.InvalidValue;
+            var tok: [16]u8 = undefined;
+            @memcpy(&tok, value);
+            p.stateless_reset_token = tok;
+        },
+        Id.max_udp_payload_size => p.max_udp_payload_size = try decodeVarintValue(value),
+        Id.initial_max_data => p.initial_max_data = try decodeVarintValue(value),
+        Id.initial_max_stream_data_bidi_local => p.initial_max_stream_data_bidi_local = try decodeVarintValue(value),
+        Id.initial_max_stream_data_bidi_remote => p.initial_max_stream_data_bidi_remote = try decodeVarintValue(value),
+        Id.initial_max_stream_data_uni => p.initial_max_stream_data_uni = try decodeVarintValue(value),
+        Id.initial_max_streams_bidi => p.initial_max_streams_bidi = try decodeVarintValue(value),
+        Id.initial_max_streams_uni => p.initial_max_streams_uni = try decodeVarintValue(value),
+        Id.ack_delay_exponent => {
+            const v = try decodeVarintValue(value);
+            if (v > 20) return Error.InvalidValue; // RFC 9000 §18.2
+            p.ack_delay_exponent = v;
+        },
+        Id.max_ack_delay => {
+            const v = try decodeVarintValue(value);
+            if (v >= (@as(u64, 1) << 14)) return Error.InvalidValue;
+            p.max_ack_delay_ms = v;
+        },
+        Id.disable_active_migration => {
+            if (value.len != 0) return Error.InvalidValue;
+            p.disable_active_migration = true;
+        },
+        Id.active_connection_id_limit => {
+            const v = try decodeVarintValue(value);
+            if (v < 2) return Error.InvalidValue;
+            p.active_connection_id_limit = v;
+        },
+        Id.initial_source_connection_id => {
+            if (value.len > path_mod.max_cid_len) return Error.InvalidValue;
+            p.initial_source_connection_id = ConnectionId.fromSlice(value);
+        },
+        Id.retry_source_connection_id => {
+            if (value.len > path_mod.max_cid_len) return Error.InvalidValue;
+            p.retry_source_connection_id = ConnectionId.fromSlice(value);
+        },
+        Id.max_datagram_frame_size => p.max_datagram_frame_size = try decodeVarintValue(value),
+        Id.initial_max_path_id => {
+            const v = try decodeVarintValue(value);
+            if (v > std.math.maxInt(u32)) return Error.InvalidValue;
+            p.initial_max_path_id = @intCast(v);
+        },
+        else => {}, // unknown ids are ignored per §18
+    }
+}
+
+fn decodeVarintValue(value: []const u8) Error!u64 {
+    const d = try varint.decode(value);
+    if (d.bytes_read != value.len) return Error.InvalidValue;
+    return d.value;
+}
+
+// -- tests ---------------------------------------------------------------
+
+const testing = std.testing;
+
+test "round-trip with the parameters a typical client advertises" {
+    const scid = ConnectionId.fromSlice(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const sent: Params = .{
+        .max_idle_timeout_ms = 30_000,
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 18,
+        .initial_max_stream_data_bidi_remote = 1 << 18,
+        .initial_max_stream_data_uni = 1 << 18,
+        .initial_max_streams_bidi = 100,
+        .initial_max_streams_uni = 100,
+        .max_udp_payload_size = 1452,
+        .active_connection_id_limit = 4,
+        .initial_source_connection_id = scid,
+        .max_datagram_frame_size = 1200,
+        .initial_max_path_id = 2,
+    };
+
+    var buf: [256]u8 = undefined;
+    const n = try sent.encode(&buf);
+
+    const got = try Params.decode(buf[0..n]);
+    try testing.expectEqual(sent.max_idle_timeout_ms, got.max_idle_timeout_ms);
+    try testing.expectEqual(sent.initial_max_data, got.initial_max_data);
+    try testing.expectEqual(sent.initial_max_stream_data_bidi_local, got.initial_max_stream_data_bidi_local);
+    try testing.expectEqual(sent.initial_max_stream_data_bidi_remote, got.initial_max_stream_data_bidi_remote);
+    try testing.expectEqual(sent.initial_max_stream_data_uni, got.initial_max_stream_data_uni);
+    try testing.expectEqual(sent.initial_max_streams_bidi, got.initial_max_streams_bidi);
+    try testing.expectEqual(sent.initial_max_streams_uni, got.initial_max_streams_uni);
+    try testing.expectEqual(sent.max_udp_payload_size, got.max_udp_payload_size);
+    try testing.expectEqual(sent.active_connection_id_limit, got.active_connection_id_limit);
+    try testing.expectEqual(sent.max_datagram_frame_size, got.max_datagram_frame_size);
+    try testing.expectEqual(sent.initial_max_path_id, got.initial_max_path_id);
+    try testing.expectEqualSlices(u8, scid.slice(), got.initial_source_connection_id.?.slice());
+}
+
+test "server-only fields round-trip" {
+    const dcid = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc });
+    const scid = ConnectionId.fromSlice(&.{ 0xdd, 0xee });
+    const reset_tok: [16]u8 = .{
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    };
+    const sent: Params = .{
+        .original_destination_connection_id = dcid,
+        .initial_source_connection_id = scid,
+        .stateless_reset_token = reset_tok,
+        .retry_source_connection_id = scid,
+        .disable_active_migration = true,
+    };
+    var buf: [256]u8 = undefined;
+    const n = try sent.encode(&buf);
+    const got = try Params.decode(buf[0..n]);
+    try testing.expectEqualSlices(u8, dcid.slice(), got.original_destination_connection_id.?.slice());
+    try testing.expectEqualSlices(u8, scid.slice(), got.initial_source_connection_id.?.slice());
+    try testing.expectEqualSlices(u8, scid.slice(), got.retry_source_connection_id.?.slice());
+    try testing.expectEqualSlices(u8, &reset_tok, &got.stateless_reset_token.?);
+    try testing.expect(got.disable_active_migration);
+}
+
+test "decode rejects oversized stateless_reset_token" {
+    // id=0x02 (stateless_reset_token), len=8 (must be 16) — invalid.
+    const blob = [_]u8{ 0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try testing.expectError(Error.InvalidValue, Params.decode(&blob));
+}
+
+test "decode rejects active_connection_id_limit < 2" {
+    // id=0x0e, len=1, value=varint(1) = 0x01.
+    const blob = [_]u8{ 0x0e, 0x01, 0x01 };
+    try testing.expectError(Error.InvalidValue, Params.decode(&blob));
+}
+
+test "decode rejects initial_max_path_id above u32 max" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    pos += try varint.encode(buf[pos..], Id.initial_max_path_id);
+    pos += try varint.encode(buf[pos..], 8);
+    pos += try varint.encode(buf[pos..], @as(u64, std.math.maxInt(u32)) + 1);
+    try testing.expectError(Error.InvalidValue, Params.decode(buf[0..pos]));
+}
+
+test "decode rejects disable_active_migration with non-zero length" {
+    const blob = [_]u8{ 0x0c, 0x01, 0x00 };
+    try testing.expectError(Error.InvalidValue, Params.decode(&blob));
+}
+
+test "decode rejects ack_delay_exponent > 20" {
+    // id=0x0a, len=1, value=varint(21).
+    const blob = [_]u8{ 0x0a, 0x01, 21 };
+    try testing.expectError(Error.InvalidValue, Params.decode(&blob));
+}
+
+test "decode skips unknown ids" {
+    // id=0xfe (reserved/unknown), len=2, then a normal known id.
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    pos += try varint.encode(buf[pos..], 0xfe);
+    pos += try varint.encode(buf[pos..], 2);
+    buf[pos] = 0xaa;
+    buf[pos + 1] = 0xbb;
+    pos += 2;
+    pos += try varint.encode(buf[pos..], Id.initial_max_data);
+    pos += try varint.encode(buf[pos..], 1);
+    buf[pos] = 0x05;
+    pos += 1;
+
+    const got = try Params.decode(buf[0..pos]);
+    try testing.expectEqual(@as(u64, 5), got.initial_max_data);
+}
+
+test "default-only Params encodes to empty blob" {
+    const empty: Params = .{};
+    var buf: [16]u8 = undefined;
+    const n = try empty.encode(&buf);
+    try testing.expectEqual(@as(usize, 0), n);
+    const decoded = try Params.decode(buf[0..n]);
+    try testing.expectEqual(empty.max_idle_timeout_ms, decoded.max_idle_timeout_ms);
+    try testing.expectEqual(empty.initial_max_data, decoded.initial_max_data);
+}
+
+test "unknown-but-large id round-trips through varint" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    pos += try varint.encode(buf[pos..], 0x1234); // 2-byte varint id
+    pos += try varint.encode(buf[pos..], 0);
+    const got = try Params.decode(buf[0..pos]);
+    _ = got;
+}
