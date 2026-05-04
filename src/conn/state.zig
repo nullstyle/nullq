@@ -69,7 +69,9 @@ pub const Error = error{
     StreamNotFound,
     PnSpaceExhausted,
     PeerDcidNotSet,
+    PathNotFound,
     PathLimitExceeded,
+    ConnectionIdLimitExceeded,
     EmptyEarlyDataContext,
 } || boringssl.tls.Error ||
     short_packet_mod.Error ||
@@ -180,6 +182,17 @@ pub const PendingNewConnectionId = struct {
     stateless_reset_token: [16]u8,
 };
 
+pub const ConnectionIdProvision = struct {
+    connection_id: []const u8,
+    stateless_reset_token: [16]u8,
+    retire_prior_to: u64 = 0,
+};
+
+pub const PathCidsBlockedInfo = struct {
+    path_id: u32,
+    next_sequence_number: u64,
+};
+
 pub const PendingPathStatus = struct {
     path_id: u32,
     sequence_number: u64,
@@ -208,6 +221,7 @@ pub const TimerKind = enum {
     pto,
     idle,
     draining,
+    path_retirement,
 };
 
 pub const TimerDeadline = struct {
@@ -881,6 +895,34 @@ pub const Connection = struct {
         }
     }
 
+    fn dropPendingLocalCidAdvertisement(
+        self: *Connection,
+        path_id: u32,
+        sequence_number: u64,
+    ) void {
+        if (path_id == 0) {
+            var i: usize = 0;
+            while (i < self.pending_new_connection_ids.items.len) {
+                if (self.pending_new_connection_ids.items[i].sequence_number == sequence_number) {
+                    _ = self.pending_new_connection_ids.orderedRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+            return;
+        }
+
+        var i: usize = 0;
+        while (i < self.pending_path_new_connection_ids.items.len) {
+            const item = self.pending_path_new_connection_ids.items[i];
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                _ = self.pending_path_new_connection_ids.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     fn nextLocalCidSequence(self: *const Connection, path_id: u32) u64 {
         var next: u64 = 0;
         for (self.local_cids.items) |item| {
@@ -889,6 +931,97 @@ pub const Connection = struct {
             }
         }
         return next;
+    }
+
+    pub fn nextLocalConnectionIdSequence(self: *const Connection, path_id: u32) u64 {
+        return self.nextLocalCidSequence(path_id);
+    }
+
+    fn localCidSequenceExists(
+        self: *const Connection,
+        path_id: u32,
+        sequence_number: u64,
+    ) bool {
+        for (self.local_cids.items) |item| {
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn localCidForSequence(
+        self: *const Connection,
+        path_id: u32,
+        sequence_number: u64,
+    ) ?IssuedCid {
+        for (self.local_cids.items) |item| {
+            if (item.path_id == path_id and item.sequence_number == sequence_number) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    fn localCidActiveCountForPath(self: *const Connection, path_id: u32) usize {
+        var count: usize = 0;
+        for (self.local_cids.items) |item| {
+            if (item.path_id == path_id) count += 1;
+        }
+        return count;
+    }
+
+    fn localCidActiveCountForPathAfterRetirePriorTo(
+        self: *const Connection,
+        path_id: u32,
+        retire_prior_to: u64,
+    ) usize {
+        var count: usize = 0;
+        for (self.local_cids.items) |item| {
+            if (item.path_id == path_id and item.sequence_number >= retire_prior_to) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn peerActiveConnectionIdLimit(self: *const Connection) u64 {
+        const params = self.cached_peer_transport_params orelse return 2;
+        return params.active_connection_id_limit;
+    }
+
+    pub fn localConnectionIdIssueBudget(self: *const Connection, path_id: u32) usize {
+        return self.localConnectionIdIssueBudgetAfterRetirePriorTo(path_id, 0);
+    }
+
+    fn localConnectionIdIssueBudgetAfterRetirePriorTo(
+        self: *const Connection,
+        path_id: u32,
+        retire_prior_to: u64,
+    ) usize {
+        const limit = self.peerActiveConnectionIdLimit();
+        const active: u64 = @intCast(
+            self.localCidActiveCountForPathAfterRetirePriorTo(path_id, retire_prior_to),
+        );
+        if (active >= limit) return 0;
+        const remaining = limit - active;
+        const max_usize_as_u64: u64 = @intCast(std.math.maxInt(usize));
+        if (remaining > max_usize_as_u64) return std.math.maxInt(usize);
+        return @intCast(remaining);
+    }
+
+    fn ensureCanIssueLocalCid(
+        self: *Connection,
+        path_id: u32,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        cid_len: usize,
+    ) Error!void {
+        if (cid_len == 0) return;
+        if (self.localCidSequenceExists(path_id, sequence_number)) return;
+        if (self.localConnectionIdIssueBudgetAfterRetirePriorTo(path_id, retire_prior_to) == 0) {
+            return Error.ConnectionIdLimitExceeded;
+        }
     }
 
     /// Server-side helper: peek the unprotected DCID + SCID out of
@@ -1109,6 +1242,7 @@ pub const Connection = struct {
         stateless_reset_token: [16]u8,
     ) Error!void {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
+        try self.ensureCanIssueLocalCid(0, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
         for (self.pending_new_connection_ids.items) |item| {
             if (item.sequence_number == sequence_number) return;
@@ -1200,10 +1334,16 @@ pub const Connection = struct {
     }
 
     pub fn abandonPath(self: *Connection, path_id: u32) bool {
-        if (!self.paths.abandon(path_id)) return false;
-        self.retirePeerCidsForPath(path_id);
-        self.queuePathAbandon(path_id, 0) catch return false;
-        return true;
+        return self.abandonPathAt(path_id, 0, self.last_activity_us);
+    }
+
+    pub fn abandonPathAt(
+        self: *Connection,
+        path_id: u32,
+        error_code: u64,
+        now_us: u64,
+    ) bool {
+        return self.retirePath(path_id, error_code, now_us, true);
     }
 
     pub fn setPathStatus(self: *Connection, path_id: u32, state: path_mod.State) bool {
@@ -1289,6 +1429,7 @@ pub const Connection = struct {
         stateless_reset_token: [16]u8,
     ) Error!void {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
+        try self.ensureCanIssueLocalCid(path_id, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
         for (self.pending_path_new_connection_ids.items) |item| {
             if (item.path_id == path_id and item.sequence_number == sequence_number) return;
@@ -1343,6 +1484,109 @@ pub const Connection = struct {
             .path_id = path_id,
             .next_sequence_number = next_sequence_number,
         };
+    }
+
+    pub fn pendingPathCidsBlocked(self: *const Connection) ?PathCidsBlockedInfo {
+        const path_id = self.peer_path_cids_blocked_path_id orelse return null;
+        return .{
+            .path_id = path_id,
+            .next_sequence_number = self.peer_path_cids_blocked_next_sequence,
+        };
+    }
+
+    pub fn clearPendingPathCidsBlocked(
+        self: *Connection,
+        path_id: u32,
+        next_sequence_number: u64,
+    ) void {
+        if (self.peer_path_cids_blocked_path_id == null) return;
+        if (self.peer_path_cids_blocked_path_id.? != path_id) return;
+        if (self.peer_path_cids_blocked_next_sequence != next_sequence_number) return;
+        self.peer_path_cids_blocked_path_id = null;
+        self.peer_path_cids_blocked_next_sequence = 0;
+    }
+
+    fn clearSatisfiedPathCidsBlocked(self: *Connection, path_id: u32) void {
+        const pending = self.pendingPathCidsBlocked() orelse return;
+        if (pending.path_id != path_id) return;
+        if (self.nextLocalCidSequence(path_id) > pending.next_sequence_number) {
+            self.clearPendingPathCidsBlocked(path_id, pending.next_sequence_number);
+        }
+    }
+
+    pub fn replenishConnectionIds(
+        self: *Connection,
+        provisions: []const ConnectionIdProvision,
+    ) Error!usize {
+        return self.replenishLocalConnectionIds(0, provisions);
+    }
+
+    pub fn replenishPathConnectionIds(
+        self: *Connection,
+        path_id: u32,
+        provisions: []const ConnectionIdProvision,
+    ) Error!usize {
+        if (self.paths.get(path_id) == null) return Error.PathNotFound;
+        return self.replenishLocalConnectionIds(path_id, provisions);
+    }
+
+    fn replenishLocalConnectionIds(
+        self: *Connection,
+        path_id: u32,
+        provisions: []const ConnectionIdProvision,
+    ) Error!usize {
+        var queued: usize = 0;
+        if (self.pendingPathCidsBlocked()) |blocked| {
+            if (blocked.path_id == path_id) {
+                var seq = blocked.next_sequence_number;
+                const next = self.nextLocalCidSequence(path_id);
+                while (seq < next) : (seq += 1) {
+                    const issued = self.localCidForSequence(path_id, seq) orelse continue;
+                    if (path_id == 0) {
+                        try self.queueNewConnectionId(
+                            issued.sequence_number,
+                            issued.retire_prior_to,
+                            issued.cid.slice(),
+                            issued.stateless_reset_token,
+                        );
+                    } else {
+                        try self.queuePathNewConnectionId(
+                            path_id,
+                            issued.sequence_number,
+                            issued.retire_prior_to,
+                            issued.cid.slice(),
+                            issued.stateless_reset_token,
+                        );
+                    }
+                    queued += 1;
+                }
+            }
+        }
+
+        for (provisions) |provision| {
+            if (self.localConnectionIdIssueBudget(path_id) == 0) break;
+            const sequence_number = self.nextLocalCidSequence(path_id);
+            if (path_id == 0) {
+                try self.queueNewConnectionId(
+                    sequence_number,
+                    provision.retire_prior_to,
+                    provision.connection_id,
+                    provision.stateless_reset_token,
+                );
+            } else {
+                try self.queuePathNewConnectionId(
+                    path_id,
+                    sequence_number,
+                    provision.retire_prior_to,
+                    provision.connection_id,
+                    provision.stateless_reset_token,
+                );
+            }
+            queued += 1;
+        }
+
+        if (queued > 0) self.clearSatisfiedPathCidsBlocked(path_id);
+        return queued;
     }
 
     fn cachePeerTransportParams(self: *Connection) Error!void {
@@ -1417,9 +1661,11 @@ pub const Connection = struct {
 
     fn applicationPathForPoll(self: *Connection) *PathState {
         for (self.paths.paths.items) |*p| {
+            if (p.path.state == .failed) continue;
             if (p.app_pn_space.received.pending_ack) return p;
         }
         for (self.paths.paths.items) |*p| {
+            if (p.path.state == .failed) continue;
             if (p.pending_ping) return p;
         }
         return self.paths.selectForSending();
@@ -1586,6 +1832,7 @@ pub const Connection = struct {
             if (ping) return true;
         }
         for (self.paths.paths.items) |*p| {
+            if (p.path.state == .failed) continue;
             if (p.pending_ping) return true;
         }
         return false;
@@ -1642,6 +1889,10 @@ pub const Connection = struct {
         return 3 * self.primaryPathConst().path.rtt.pto(self.peerMaxAckDelayUs());
     }
 
+    fn saturatingMul(a: u64, b: u64) u64 {
+        return std.math.mul(u64, a, b) catch std.math.maxInt(u64);
+    }
+
     fn backoffDuration(base: u64, count: u32) u64 {
         const shift: u6 = @intCast(@min(count, 16));
         const max_u64: u64 = std.math.maxInt(u64);
@@ -1667,6 +1918,48 @@ pub const Connection = struct {
 
     fn ptoDurationForApplicationPath(self: *const Connection, path: *const PathState) u64 {
         return backoffDuration(self.basePtoDurationForApplicationPath(path), path.pto_count);
+    }
+
+    fn largestApplicationPtoDurationUs(self: *const Connection) u64 {
+        var largest: u64 = 0;
+        for (self.paths.paths.items) |*path| {
+            if (path.path.state == .failed) continue;
+            largest = @max(largest, self.ptoDurationForApplicationPath(path));
+        }
+        if (largest == 0) largest = self.ptoDurationForApplicationPath(self.primaryPathConst());
+        return largest;
+    }
+
+    fn retiredPathRetentionUs(self: *const Connection) u64 {
+        return saturatingMul(3, self.largestApplicationPtoDurationUs());
+    }
+
+    fn retirePath(
+        self: *Connection,
+        path_id: u32,
+        error_code: u64,
+        now_us: u64,
+        queue_abandon: bool,
+    ) bool {
+        if (!self.paths.abandon(path_id)) return false;
+        const path = self.paths.get(path_id) orelse return false;
+        path.retire_deadline_us = now_us +| self.retiredPathRetentionUs();
+        self.retirePeerCidsForPath(path_id);
+        if (queue_abandon) {
+            self.queuePathAbandon(path_id, error_code) catch return false;
+        }
+        return true;
+    }
+
+    fn expireRetiringPaths(self: *Connection, now_us: u64) void {
+        for (self.paths.paths.items) |*path| {
+            if (path.path.state != .retiring) continue;
+            const deadline = path.retire_deadline_us orelse continue;
+            if (now_us < deadline) continue;
+            path.clearRecovery(self.allocator);
+            path.path.fail();
+            path.retire_deadline_us = null;
+        }
     }
 
     fn considerDeadline(best: *?TimerDeadline, candidate: TimerDeadline) void {
@@ -1817,6 +2110,17 @@ pub const Connection = struct {
             }
         }
         for (self.paths.paths.items) |*path| {
+            if (path.path.state == .failed) continue;
+            if (path.path.state == .retiring) {
+                if (path.retire_deadline_us) |at_us| {
+                    considerDeadline(&best, .{
+                        .kind = .path_retirement,
+                        .at_us = at_us,
+                        .level = .application,
+                        .path_id = path.id,
+                    });
+                }
+            }
             const tracker = &path.app_pn_space.received;
             if (tracker.pending_ack) {
                 considerDeadline(&best, .{
@@ -2929,7 +3233,7 @@ pub const Connection = struct {
                 },
                 .new_connection_id => |nc| try self.handleNewConnectionId(nc),
                 .stop_sending => |ss| try self.handleStopSending(ss),
-                .path_abandon => |pa| self.handlePathAbandon(pa),
+                .path_abandon => |pa| self.handlePathAbandon(pa, now_us),
                 .path_status_backup => |ps| self.handlePathStatus(ps, false),
                 .path_status_available => |ps| self.handlePathStatus(ps, true),
                 .path_new_connection_id => |nc| try self.handlePathNewConnectionId(nc),
@@ -3148,6 +3452,7 @@ pub const Connection = struct {
         rc: frame_types.RetireConnectionId,
     ) void {
         self.retireLocalCid(0, rc.sequence_number);
+        self.dropPendingLocalCidAdvertisement(0, rc.sequence_number);
     }
 
     fn pathAckToAck(pa: frame_types.PathAck) frame_types.Ack {
@@ -3173,11 +3478,12 @@ pub const Connection = struct {
         try self.handleApplicationAckOnPath(path, pathAckToAck(pa), now_us);
     }
 
-    fn handlePathAbandon(self: *Connection, pa: frame_types.PathAbandon) void {
-        _ = pa.error_code;
-        _ = self.paths.abandon(pa.path_id);
-        self.retirePeerCidsForPath(pa.path_id);
-        self.queuePathAbandon(pa.path_id, pa.error_code) catch {};
+    fn handlePathAbandon(
+        self: *Connection,
+        pa: frame_types.PathAbandon,
+        now_us: u64,
+    ) void {
+        _ = self.retirePath(pa.path_id, pa.error_code, now_us, true);
     }
 
     fn handlePathStatus(
@@ -3202,6 +3508,7 @@ pub const Connection = struct {
         rc: frame_types.PathRetireConnectionId,
     ) void {
         self.retireLocalCid(rc.path_id, rc.sequence_number);
+        self.dropPendingLocalCidAdvertisement(rc.path_id, rc.sequence_number);
     }
 
     fn handleMaxPathId(self: *Connection, mp: frame_types.MaxPathId) void {
@@ -3957,6 +4264,7 @@ pub const Connection = struct {
     /// current monotonic time in microseconds. Safe to call any time.
     pub fn tick(self: *Connection, now_us: u64) Error!void {
         for (self.paths.paths.items) |*p| p.path.validator.tick(now_us);
+        self.expireRetiringPaths(now_us);
 
         if (self.draining_deadline_us) |deadline| {
             if (now_us >= deadline) {
@@ -3979,12 +4287,14 @@ pub const Connection = struct {
         try self.detectLossesByTimeThresholdAtLevel(.initial, now_us);
         try self.detectLossesByTimeThresholdAtLevel(.handshake, now_us);
         for (self.paths.paths.items) |*path| {
+            if (path.path.state == .failed) continue;
             try self.detectLossesByTimeThresholdOnApplicationPath(path, now_us);
         }
 
         try self.fireDuePtoAtLevel(.initial, now_us);
         try self.fireDuePtoAtLevel(.handshake, now_us);
         for (self.paths.paths.items) |*path| {
+            if (path.path.state == .failed) continue;
             try self.fireDuePtoOnApplicationPath(path, now_us);
         }
     }
@@ -4604,6 +4914,45 @@ test "PathSet API exposes path lifecycle and application recovery state" {
     try std.testing.expectEqual(@as(u32, 0), conn.activePathId());
 }
 
+test "abandoned paths keep recovery until three largest PTOs elapse" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0x02}));
+    const path = conn.paths.get(path_id).?;
+    try path.sent.record(.{
+        .pn = 0,
+        .sent_time_us = 1_000,
+        .bytes = 64,
+        .ack_eliciting = false,
+        .in_flight = false,
+    });
+
+    conn.primaryPath().pto_count = 1;
+    const now_us: u64 = 10_000;
+    const expected_deadline = now_us +| 3 * conn.largestApplicationPtoDurationUs();
+    try std.testing.expect(conn.abandonPathAt(path_id, 42, now_us));
+    try std.testing.expectEqual(path_mod.State.retiring, path.path.state);
+    try std.testing.expectEqual(expected_deadline, path.retire_deadline_us.?);
+    try std.testing.expectEqual(expected_deadline, conn.pathStats(path_id).?.retire_deadline_us.?);
+
+    const deadline = conn.nextTimerDeadline(now_us).?;
+    try std.testing.expectEqual(TimerKind.path_retirement, deadline.kind);
+    try std.testing.expectEqual(path_id, deadline.path_id);
+
+    try conn.tick(expected_deadline - 1);
+    try std.testing.expectEqual(path_mod.State.retiring, path.path.state);
+    try std.testing.expectEqual(@as(u32, 1), path.sent.count);
+
+    try conn.tick(expected_deadline);
+    try std.testing.expectEqual(path_mod.State.failed, path.path.state);
+    try std.testing.expectEqual(@as(?u64, null), path.retire_deadline_us);
+    try std.testing.expectEqual(@as(u32, 0), path.sent.count);
+}
+
 test "PATH_ACK routes ACK processing to the indicated application path" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -5113,6 +5462,83 @@ test "PATH_CIDS_BLOCKED cannot skip local cid sequence numbers" {
     conn.handlePathCidsBlocked(.{ .path_id = path_id, .next_sequence_number = 2 });
     try std.testing.expect(conn.pending_close != null);
     try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "PATH_CIDS_BLOCKED can be surfaced and replenished within peer active cid limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    conn.cached_peer_transport_params = .{
+        .initial_max_path_id = 1,
+        .active_connection_id_limit = 3,
+    };
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+
+    conn.handlePathCidsBlocked(.{ .path_id = path_id, .next_sequence_number = 1 });
+    const blocked = conn.pendingPathCidsBlocked().?;
+    try std.testing.expectEqual(path_id, blocked.path_id);
+    try std.testing.expectEqual(@as(u64, 1), blocked.next_sequence_number);
+    try std.testing.expectEqual(@as(usize, 2), conn.localConnectionIdIssueBudget(path_id));
+
+    const queued = try conn.replenishPathConnectionIds(path_id, &.{
+        .{ .connection_id = &.{0xc2}, .stateless_reset_token = @splat(0xc2) },
+        .{ .connection_id = &.{0xc3}, .stateless_reset_token = @splat(0xc3) },
+        .{ .connection_id = &.{0xc4}, .stateless_reset_token = @splat(0xc4) },
+    });
+    try std.testing.expectEqual(@as(usize, 2), queued);
+    try std.testing.expectEqual(@as(?PathCidsBlockedInfo, null), conn.pendingPathCidsBlocked());
+    try std.testing.expectEqual(@as(usize, 0), conn.localConnectionIdIssueBudget(path_id));
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 1), conn.pending_path_new_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(u64, 2), conn.pending_path_new_connection_ids.items[1].sequence_number);
+    try std.testing.expectEqual(@as(u64, 3), conn.nextLocalConnectionIdSequence(path_id));
+
+    try std.testing.expectError(
+        Error.ConnectionIdLimitExceeded,
+        conn.queuePathNewConnectionId(path_id, 3, 0, &.{0xc5}, @splat(0xc5)),
+    );
+    try conn.queuePathNewConnectionId(path_id, 3, 1, &.{0xc5}, @splat(0xc5));
+    try std.testing.expectEqual(@as(usize, 3), conn.pending_path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 4), conn.nextLocalConnectionIdSequence(path_id));
+}
+
+test "PATH_RETIRE_CONNECTION_ID drops pending advertisements and allows replenishment" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    markTestMultipathNegotiated(&conn, 1);
+    conn.cached_peer_transport_params = .{
+        .initial_max_path_id = 1,
+        .active_connection_id_limit = 3,
+    };
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
+    _ = try conn.replenishPathConnectionIds(path_id, &.{
+        .{ .connection_id = &.{0xc2}, .stateless_reset_token = @splat(0xc2) },
+        .{ .connection_id = &.{0xc3}, .stateless_reset_token = @splat(0xc3) },
+    });
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
+
+    conn.handlePathRetireConnectionId(.{
+        .path_id = path_id,
+        .sequence_number = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 2), conn.pending_path_new_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(usize, 1), conn.localConnectionIdIssueBudget(path_id));
+
+    const queued = try conn.replenishPathConnectionIds(path_id, &.{
+        .{ .connection_id = &.{0xc4}, .stateless_reset_token = @splat(0xc4) },
+    });
+    try std.testing.expectEqual(@as(usize, 1), queued);
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 3), conn.pending_path_new_connection_ids.items[1].sequence_number);
 }
 
 test "PATHS_BLOCKED below current local limit is ignored" {

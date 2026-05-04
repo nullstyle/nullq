@@ -7,7 +7,8 @@ Current as of 2026-05-04.
 - `zig build test` in `nullq`: passing, including deterministic
   PTO/loss unit tests, path-aware multipath ACK/PTO tests, duplicate
   per-path Application PN stream tracking, draft-21 nonce/CID limit
-  tests, initial 0-RTT packet/receive/rejection unit tests, and the 10%
+  tests, path CID replenishment and abandoned-path retention tests,
+  initial 0-RTT packet/receive/rejection unit tests, and the 10%
   simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
 - `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
@@ -43,9 +44,10 @@ Current as of 2026-05-04.
 - ACK processing now feeds ack-eliciting largest-acked samples into the
   RTT estimator using cached peer ACK-delay transport parameters.
 - `Connection.nextTimerDeadline(now_us)` exposes ACK-delay,
-  loss-detection, PTO, idle, and draining deadlines. `tick(now_us)`
-  now drives time-threshold loss, PTO requeue/probe PINGs, idle close,
-  and draining cleanup.
+  loss-detection, PTO, idle, draining, and abandoned-path retirement
+  deadlines. `tick(now_us)` now drives time-threshold loss, PTO
+  requeue/probe PINGs, idle close, draining cleanup, and expired
+  abandoned-path recovery cleanup.
 - PTO is handled per PN space/path: Initial and Handshake remain
   connection-level, while every Application path tracks backoff
   separately and requeues STREAM, CRYPTO, and retransmittable control
@@ -65,7 +67,9 @@ Current as of 2026-05-04.
 - The public multipath surface now includes `enableMultipath`,
   `openPath`, `setActivePath`, `abandonPath`, `setPathStatus`,
   `setPathBackup`, `markPathValidated`, `setScheduler`, `activePathId`,
-  and `pathStats`.
+  `pathStats`, `pendingPathCidsBlocked`,
+  `replenishPathConnectionIds`, `localConnectionIdIssueBudget`, and
+  `nextLocalConnectionIdSequence`.
 - Draft-21 multipath frame codecs and receive handlers are present for
   PATH_ACK, PATH_ABANDON, PATH_STATUS_BACKUP/AVAILABLE,
   PATH_NEW_CONNECTION_ID, PATH_RETIRE_CONNECTION_ID, MAX_PATH_ID,
@@ -92,7 +96,15 @@ Current as of 2026-05-04.
   peer-issued NEW_CONNECTION_ID/PATH_NEW_CONNECTION_ID per path:
   retire-prior-to bounds, duplicate sequence reuse, cross-path CID
   reuse, active_connection_id_limit, and local MAX_PATH_ID bounds close
-  with PROTOCOL_VIOLATION.
+  with PROTOCOL_VIOLATION. PATH_CIDS_BLOCKED is surfaced as app-visible
+  replenishment demand, caller-provided CIDs are queued without
+  exceeding the peer's active_connection_id_limit, and retired local
+  CIDs are removed from pending advertisements before replacements are
+  issued.
+- PATH_ABANDON now puts the path into a retiring state with a deadline
+  of three times the largest current Application PTO. Recovery, ACK, and
+  timer state remain alive until that deadline, then `tick()` clears
+  recovery metadata and marks the path failed.
 - Incoming multipath control frames are rejected unless draft-21 was
   negotiated and are checked against the local maximum path ID;
   MAX_PATH_ID cannot reduce the peer's initial limit, and
@@ -116,22 +128,20 @@ Current as of 2026-05-04.
    registration, lifecycle, stats, scheduler selection, path-aware
    polling, per-path Application recovery ownership, draft-21 nonce
    construction, CID-based incoming path mapping, and core CID/limit
-   validation exist. Remaining wire work: proactive CID replenishment
-   up to peer/local limits, complete path establishment policy around
-   unused common path IDs, path-abandon 3x-PTO retention, and external
-   draft-21 peer validation.
+   validation exist. Remaining wire work: full path establishment policy
+   around unused common path IDs, richer app policy for when/how many
+   replacement CIDs to generate, and external draft-21 peer validation.
 2. **Multipath frame emission is partial.** Draft-21 multipath control
    frames can be queued, emitted one per Application packet, ACKed, and
    requeued on loss, and PATH_ACK is generated for non-zero path ACK
-   trackers. Remaining emission work: smarter pacing/coalescing,
-   proactive PATH_NEW_CONNECTION_ID replenishment, and complete PATH_ACK
-   handling for abandoned-path retention edge cases.
+   trackers. Remaining emission work: smarter pacing/coalescing and
+   more exhaustive PATH_ACK behavior over retiring paths.
 3. **Recovery is path-aware but not fully hardened.** Packet-threshold,
    time-threshold, PTO, ACK-delay, idle, draining, NewReno loss/ACK
    feedback, persistent congestion, and basic PTO probe selection are
    path-owned for Application data. Remaining recovery work: old-path
    draining during active migration, DATAGRAM ack/loss app events,
-   retained abandoned-path ACK state, and broader lossy/reordered
+   migration-specific RTT/congestion reset, and broader lossy/reordered
    interop gates. Pacing, ECN, and advanced congestion controllers
    remain out of scope for this push.
 4. **Key update support is minimal.** nullq can react to observed peer

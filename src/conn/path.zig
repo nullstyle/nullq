@@ -188,6 +188,7 @@ pub const PathStats = struct {
     path_id: u32,
     state: State,
     validated: bool,
+    retire_deadline_us: ?u64,
     bytes_received: u64,
     bytes_sent: u64,
     bytes_in_flight: u64,
@@ -214,6 +215,7 @@ pub const PathState = struct {
     pmtu: usize = 1200,
     peer_addr_set: bool = false,
     local_addr_set: bool = false,
+    retire_deadline_us: ?u64 = null,
     peer_prefers_backup: bool = false,
     peer_status_sequence_number: ?u64 = null,
     local_status_sequence_number: u64 = 0,
@@ -239,6 +241,17 @@ pub const PathState = struct {
         }
     }
 
+    pub fn clearRecovery(self: *PathState, allocator: std.mem.Allocator) void {
+        var i: u32 = 0;
+        while (i < self.sent.count) : (i += 1) {
+            self.sent.packets[i].deinit(allocator);
+        }
+        self.sent = .{};
+        self.app_pn_space.received = .{};
+        self.pending_ping = false;
+        self.pto_count = 0;
+    }
+
     pub fn peerAddress(self: *const PathState) ?Address {
         if (!self.peer_addr_set) return null;
         return self.path.peer_addr;
@@ -259,6 +272,7 @@ pub const PathState = struct {
             .path_id = self.id,
             .state = self.path.state,
             .validated = self.path.isValidated(),
+            .retire_deadline_us = self.retire_deadline_us,
             .bytes_received = self.path.bytes_received,
             .bytes_sent = self.path.bytes_sent,
             .bytes_in_flight = self.sent.bytes_in_flight,
@@ -369,6 +383,7 @@ pub const PathSet = struct {
 
     pub fn abandon(self: *PathSet, id: u32) bool {
         const p = self.get(id) orelse return false;
+        if (p.path.state == .failed) return false;
         p.path.retire();
         if (self.active_id == id) self.active_id = self.primary_id;
         return true;
