@@ -13,6 +13,7 @@ pub const max_retransmit_frames: usize = 8;
 pub const RetransmitFrame = union(enum) {
     max_data: frame_types.MaxData,
     max_stream_data: frame_types.MaxStreamData,
+    max_streams: frame_types.MaxStreams,
     new_connection_id: frame_types.NewConnectionId,
     stop_sending: frame_types.StopSending,
     path_response: frame_types.PathResponse,

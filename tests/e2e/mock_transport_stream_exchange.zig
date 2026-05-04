@@ -345,6 +345,8 @@ test "DATAGRAM round-trips through the 1-RTT path" {
 
     const tp: nullq.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
         .initial_max_streams_bidi = 16,
         .max_datagram_frame_size = 1200,
     };
@@ -400,6 +402,8 @@ test "CONNECTION_CLOSE propagates from sender to receiver" {
 
     const tp: nullq.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
         .initial_max_streams_bidi = 16,
     };
     try client.setTransportParams(tp);
@@ -450,6 +454,8 @@ test "STOP_SENDING propagates and resets the sender's stream" {
 
     const tp: nullq.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
         .initial_max_streams_bidi = 16,
     };
     try client.setTransportParams(tp);
@@ -579,6 +585,8 @@ test "PATH_CHALLENGE → PATH_RESPONSE validates the path round-trip" {
 
     const tp: nullq.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
         .initial_max_streams_bidi = 16,
     };
     try client.setTransportParams(tp);

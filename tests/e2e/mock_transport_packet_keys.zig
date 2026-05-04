@@ -44,6 +44,8 @@ test "1-RTT keys derive cross-consistently and round-trip a packet" {
 
     const params: nullq.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
         .initial_max_streams_bidi = 16,
     };
     try client.setTransportParams(params);
@@ -154,6 +156,8 @@ test "frames round-trip end-to-end through 1-RTT seal/open" {
 
     const tp: nullq.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
         .initial_max_streams_bidi = 16,
     };
     try client.setTransportParams(tp);
