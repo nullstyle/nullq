@@ -11,11 +11,9 @@
 //! AEAD-decrypt the payload, and return the frame bytes, full PN,
 //! and key phase.
 //!
-//! Cipher-suite coverage: TLS_AES_128_GCM_SHA256 only. AES-256
-//! and ChaCha20-Poly1305 land alongside the matching boringssl
-//! primitives (the 256-bit AES single-block isn't wrapped yet,
-//! and `crypto.chacha20.quicHpMask` exists but the AEAD adapter
-//! doesn't).
+//! Cipher-suite coverage: the QUIC v1 TLS 1.3 suites
+//! TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, and
+//! TLS_CHACHA20_POLY1305_SHA256.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
@@ -26,17 +24,22 @@ const protection = @import("protection.zig");
 const initial_mod = @import("initial.zig");
 
 const AesGcm128 = boringssl.crypto.aead.AesGcm128;
+const AesGcm256 = boringssl.crypto.aead.AesGcm256;
+const ChaCha20Poly1305 = boringssl.crypto.aead.ChaCha20Poly1305;
 
 /// TLS 1.3 cipher suite (the only suites legal in QUIC v1).
 pub const Suite = enum {
     aes128_gcm_sha256,
-    // future: aes256_gcm_sha384, chacha20_poly1305_sha256
+    aes256_gcm_sha384,
+    chacha20_poly1305_sha256,
 
     /// Protocol ID per IANA TLS Cipher Suite registry. Used to
     /// translate from BoringSSL's `SSL_CIPHER_get_protocol_id`.
     pub fn fromProtocolId(id: u16) ?Suite {
         return switch (id) {
             0x1301 => .aes128_gcm_sha256,
+            0x1302 => .aes256_gcm_sha384,
+            0x1303 => .chacha20_poly1305_sha256,
             else => null,
         };
     }
@@ -44,6 +47,9 @@ pub const Suite = enum {
     pub fn keyLen(self: Suite) u8 {
         return switch (self) {
             .aes128_gcm_sha256 => 16,
+            .aes256_gcm_sha384,
+            .chacha20_poly1305_sha256,
+            => 32,
         };
     }
 
@@ -55,15 +61,32 @@ pub const Suite = enum {
     pub fn hpLen(self: Suite) u8 {
         return switch (self) {
             .aes128_gcm_sha256 => 16,
+            .aes256_gcm_sha384,
+            .chacha20_poly1305_sha256,
+            => 32,
         };
     }
 
     pub fn secretLen(self: Suite) u8 {
         return switch (self) {
             .aes128_gcm_sha256 => 32,
+            .aes256_gcm_sha384 => 48,
+            .chacha20_poly1305_sha256 => 32,
+        };
+    }
+
+    pub fn hkdfHash(self: Suite) initial_mod.HkdfHash {
+        return switch (self) {
+            .aes128_gcm_sha256,
+            .chacha20_poly1305_sha256,
+            => .sha256,
+            .aes256_gcm_sha384 => .sha384,
         };
     }
 };
+
+pub const max_traffic_secret_len: usize = 64;
+pub const TrafficSecret = [max_traffic_secret_len]u8;
 
 /// Per-direction packet protection keys — derived from a TLS
 /// secret and a suite. The lengths used inside the fixed-size
@@ -88,6 +111,7 @@ pub const PacketKeys = struct {
 pub const Error = error{
     /// `secret.len` doesn't match `suite.secretLen()`.
     SecretWrongLength,
+    UnsupportedSuite,
     /// Output buffer too small for the protected packet.
     OutputTooSmall,
     /// Input bytes can't be a 1-RTT packet — first bit set, or
@@ -103,14 +127,16 @@ pub const Error = error{
 pub fn derivePacketKeys(suite: Suite, secret: []const u8) Error!PacketKeys {
     if (secret.len != suite.secretLen()) return Error.SecretWrongLength;
     var keys: PacketKeys = .{ .suite = suite };
-    try initial_mod.hkdfExpandLabel(
+    try initial_mod.hkdfExpandLabelWithHash(
+        suite.hkdfHash(),
         keys.key[0..suite.keyLen()],
         secret,
         "quic key",
         "",
     );
-    try initial_mod.hkdfExpandLabel(&keys.iv, secret, "quic iv", "");
-    try initial_mod.hkdfExpandLabel(
+    try initial_mod.hkdfExpandLabelWithHash(suite.hkdfHash(), &keys.iv, secret, "quic iv", "");
+    try initial_mod.hkdfExpandLabelWithHash(
+        suite.hkdfHash(),
         keys.hp[0..suite.hpLen()],
         secret,
         "quic hp",
@@ -123,11 +149,139 @@ pub fn derivePacketKeys(suite: Suite, secret: []const u8) Error!PacketKeys {
 /// update (RFC 9001 §6). Header-protection keys are intentionally
 /// not updated; callers that turn the returned secret into
 /// `PacketKeys` must retain the previous `hp` value.
-pub fn deriveNextTrafficSecret(suite: Suite, secret: []const u8) Error![32]u8 {
+pub fn deriveNextTrafficSecret(suite: Suite, secret: []const u8) Error!TrafficSecret {
     if (secret.len != suite.secretLen()) return Error.SecretWrongLength;
-    var next: [32]u8 = @splat(0);
-    try initial_mod.hkdfExpandLabel(next[0..suite.secretLen()], secret, "quic ku", "");
+    var next: TrafficSecret = @splat(0);
+    try initial_mod.hkdfExpandLabelWithHash(
+        suite.hkdfHash(),
+        next[0..suite.secretLen()],
+        secret,
+        "quic ku",
+        "",
+    );
     return next;
+}
+
+pub fn headerProtectionMask(keys: *const PacketKeys, sample: *const [protection.sample_len]u8) [protection.mask_len]u8 {
+    return switch (keys.suite) {
+        .aes128_gcm_sha256 => protection.aesHpMask(@ptrCast(keys.hp[0..16]), sample),
+        .aes256_gcm_sha384 => protection.aes256HpMask(@ptrCast(keys.hp[0..32]), sample),
+        .chacha20_poly1305_sha256 => protection.chacha20HpMask(@ptrCast(keys.hp[0..32]), sample),
+    };
+}
+
+pub fn sealPayloadWithKeys(
+    keys: *const PacketKeys,
+    multipath_path_id: ?u32,
+    pn: u64,
+    packet_header: []const u8,
+    plaintext: []const u8,
+    dst: []u8,
+) protection.Error!usize {
+    return switch (keys.suite) {
+        .aes128_gcm_sha256 => blk: {
+            var aead = try AesGcm128.init(@ptrCast(keys.key[0..16]));
+            defer aead.deinit();
+            break :blk try sealPayloadWithAead(&aead, keys, multipath_path_id, pn, packet_header, plaintext, dst);
+        },
+        .aes256_gcm_sha384 => blk: {
+            var aead = try AesGcm256.init(@ptrCast(keys.key[0..32]));
+            defer aead.deinit();
+            break :blk try sealPayloadWithAead(&aead, keys, multipath_path_id, pn, packet_header, plaintext, dst);
+        },
+        .chacha20_poly1305_sha256 => blk: {
+            var aead = try ChaCha20Poly1305.init(@ptrCast(keys.key[0..32]));
+            defer aead.deinit();
+            break :blk try sealPayloadWithAead(&aead, keys, multipath_path_id, pn, packet_header, plaintext, dst);
+        },
+    };
+}
+
+fn sealPayloadWithAead(
+    aead: anytype,
+    keys: *const PacketKeys,
+    multipath_path_id: ?u32,
+    pn: u64,
+    packet_header: []const u8,
+    plaintext: []const u8,
+    dst: []u8,
+) protection.Error!usize {
+    return if (multipath_path_id) |path_id|
+        try protection.aeadSealForPath(
+            aead,
+            &keys.iv,
+            path_id,
+            pn,
+            packet_header,
+            plaintext,
+            dst,
+        )
+    else
+        try protection.aeadSeal(
+            aead,
+            &keys.iv,
+            pn,
+            packet_header,
+            plaintext,
+            dst,
+        );
+}
+
+pub fn openPayloadWithKeys(
+    keys: *const PacketKeys,
+    multipath_path_id: ?u32,
+    pn: u64,
+    packet_header: []const u8,
+    ciphertext: []const u8,
+    dst: []u8,
+) protection.Error!usize {
+    return switch (keys.suite) {
+        .aes128_gcm_sha256 => blk: {
+            var aead = try AesGcm128.init(@ptrCast(keys.key[0..16]));
+            defer aead.deinit();
+            break :blk try openPayloadWithAead(&aead, keys, multipath_path_id, pn, packet_header, ciphertext, dst);
+        },
+        .aes256_gcm_sha384 => blk: {
+            var aead = try AesGcm256.init(@ptrCast(keys.key[0..32]));
+            defer aead.deinit();
+            break :blk try openPayloadWithAead(&aead, keys, multipath_path_id, pn, packet_header, ciphertext, dst);
+        },
+        .chacha20_poly1305_sha256 => blk: {
+            var aead = try ChaCha20Poly1305.init(@ptrCast(keys.key[0..32]));
+            defer aead.deinit();
+            break :blk try openPayloadWithAead(&aead, keys, multipath_path_id, pn, packet_header, ciphertext, dst);
+        },
+    };
+}
+
+fn openPayloadWithAead(
+    aead: anytype,
+    keys: *const PacketKeys,
+    multipath_path_id: ?u32,
+    pn: u64,
+    packet_header: []const u8,
+    ciphertext: []const u8,
+    dst: []u8,
+) protection.Error!usize {
+    return if (multipath_path_id) |path_id|
+        try protection.aeadOpenForPath(
+            aead,
+            &keys.iv,
+            path_id,
+            pn,
+            packet_header,
+            ciphertext,
+            dst,
+        )
+    else
+        try protection.aeadOpen(
+            aead,
+            &keys.iv,
+            pn,
+            packet_header,
+            ciphertext,
+            dst,
+        );
 }
 
 /// Choose a packet-number length per RFC 9000 §17.1: enough bits to
@@ -173,7 +327,6 @@ pub const SealOptions = struct {
 /// (0x00 bytes) inside the AEAD-protected payload.
 pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
     if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
-    if (opts.keys.suite != .aes128_gcm_sha256) return error.UnsupportedSuite;
     const pn_len = opts.pn_length_override orelse chooseShortPnLength(opts.pn, opts.largest_acked);
     if (pn_len < 1 or pn_len > 4) return protection.Error.InvalidPnLength;
 
@@ -205,10 +358,6 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
         .pn_truncated = truncated,
     } });
 
-    // AEAD-seal the payload immediately after the header.
-    var aead = try AesGcm128.init(opts.keys.key[0..16]);
-    defer aead.deinit();
-
     // Stage the plaintext if we need to pad. Common case (no padding)
     // hands the caller's slice straight through.
     var pad_buf: [4]u8 = @splat(0);
@@ -223,32 +372,20 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
         break :blk staged_buf[0..pt_len];
     };
 
-    const ct_len = if (opts.multipath_path_id) |path_id|
-        try protection.aeadSealForPath(
-            &aead,
-            &opts.keys.iv,
-            path_id,
-            opts.pn,
-            dst[0..hdr_len],
-            pt_slice,
-            dst[hdr_len..],
-        )
-    else
-        try protection.aeadSeal(
-            &aead,
-            &opts.keys.iv,
-            opts.pn,
-            dst[0..hdr_len],
-            pt_slice,
-            dst[hdr_len..],
-        );
+    const ct_len = try sealPayloadWithKeys(
+        opts.keys,
+        opts.multipath_path_id,
+        opts.pn,
+        dst[0..hdr_len],
+        pt_slice,
+        dst[hdr_len..],
+    );
 
     // Header-protect.
     const total_len = hdr_len + ct_len;
     const pn_offset = hdr_len - pn_len;
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const hp_key: *const [16]u8 = @ptrCast(opts.keys.hp[0..16]);
-    const mask = protection.aesHpMask(hp_key, &sample);
+    const mask = headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .short, pn_offset, pn_len, mask);
 
     return total_len;
@@ -284,7 +421,6 @@ pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult
     if (src.len < 1) return Error.NotShortHeader;
     if (src[0] & 0x80 != 0) return Error.NotShortHeader;
     if (opts.dcid_len > header.max_cid_len) return Error.DcidTooLong;
-    if (opts.keys.suite != .aes128_gcm_sha256) return error.UnsupportedSuite;
 
     // The PN immediately follows the DCID. We don't yet know its
     // length — that's gated by HP. Use the worst-case PN-end (PN
@@ -293,8 +429,7 @@ pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult
     if (src.len < pn_offset + 4 + protection.sample_len) return Error.InsufficientCiphertext;
 
     const sample = try protection.sampleAt(src, pn_offset);
-    const hp_key: *const [16]u8 = @ptrCast(opts.keys.hp[0..16]);
-    const mask = protection.aesHpMask(hp_key, &sample);
+    const mask = headerProtectionMask(opts.keys, &sample);
 
     // Strip HP into local copies. The source datagram stays intact
     // so callers can retry with updated packet-protection keys.
@@ -313,33 +448,19 @@ pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult
 
     // AEAD-open: AAD is now-unmasked header bytes [0, pn_offset+pn_len);
     // ciphertext is everything after.
-    var aead = try AesGcm128.init(opts.keys.key[0..16]);
-    defer aead.deinit();
-
     const hdr_len = pn_offset + pn_len;
     var aad_buf: [1 + header.max_cid_len + 4]u8 = undefined;
     aad_buf[0] = first;
     @memcpy(aad_buf[1..pn_offset], src[1..pn_offset]);
     @memcpy(aad_buf[pn_offset..hdr_len], pn_bytes[0..pn_len]);
-    const pt_len = if (opts.multipath_path_id) |path_id|
-        try protection.aeadOpenForPath(
-            &aead,
-            &opts.keys.iv,
-            path_id,
-            full_pn,
-            aad_buf[0..hdr_len],
-            src[hdr_len..],
-            pt_dst,
-        )
-    else
-        try protection.aeadOpen(
-            &aead,
-            &opts.keys.iv,
-            full_pn,
-            aad_buf[0..hdr_len],
-            src[hdr_len..],
-            pt_dst,
-        );
+    const pt_len = try openPayloadWithKeys(
+        opts.keys,
+        opts.multipath_path_id,
+        full_pn,
+        aad_buf[0..hdr_len],
+        src[hdr_len..],
+        pt_dst,
+    );
 
     return .{ .pn = full_pn, .key_phase = key_phase, .payload = pt_dst[0..pt_len] };
 }
@@ -361,6 +482,26 @@ fn fromHex(comptime hex: []const u8) [hex.len / 2]u8 {
     return out;
 }
 
+fn fillSecret(dst: []u8, seed: u8) void {
+    for (dst, 0..) |*b, i| {
+        b.* = seed +% @as(u8, @truncate(i));
+    }
+}
+
+test "Suite metadata covers the QUIC v1 TLS cipher suites" {
+    try testing.expectEqual(Suite.aes128_gcm_sha256, Suite.fromProtocolId(0x1301).?);
+    try testing.expectEqual(Suite.aes256_gcm_sha384, Suite.fromProtocolId(0x1302).?);
+    try testing.expectEqual(Suite.chacha20_poly1305_sha256, Suite.fromProtocolId(0x1303).?);
+    try testing.expectEqual(@as(?Suite, null), Suite.fromProtocolId(0x1304));
+
+    try testing.expectEqual(@as(u8, 16), Suite.aes128_gcm_sha256.keyLen());
+    try testing.expectEqual(@as(u8, 32), Suite.aes128_gcm_sha256.secretLen());
+    try testing.expectEqual(@as(u8, 32), Suite.aes256_gcm_sha384.keyLen());
+    try testing.expectEqual(@as(u8, 48), Suite.aes256_gcm_sha384.secretLen());
+    try testing.expectEqual(@as(u8, 32), Suite.chacha20_poly1305_sha256.keyLen());
+    try testing.expectEqual(@as(u8, 32), Suite.chacha20_poly1305_sha256.secretLen());
+}
+
 test "derivePacketKeys: matches initial.zig output for AES-128-GCM-SHA256" {
     // Derive Initial keys via initial.zig, then derive packet keys
     // from the same secret via this module, and check that the
@@ -372,6 +513,34 @@ test "derivePacketKeys: matches initial.zig output for AES-128-GCM-SHA256" {
     try testing.expectEqualSlices(u8, &init_keys.key, got.keySlice());
     try testing.expectEqualSlices(u8, &init_keys.iv, &got.iv);
     try testing.expectEqualSlices(u8, &init_keys.hp, got.hpSlice());
+}
+
+test "derivePacketKeys and key updates support every QUIC v1 suite" {
+    const suites = [_]Suite{
+        .aes128_gcm_sha256,
+        .aes256_gcm_sha384,
+        .chacha20_poly1305_sha256,
+    };
+
+    for (suites, 0..) |suite, suite_idx| {
+        var secret: TrafficSecret = @splat(0);
+        fillSecret(secret[0..suite.secretLen()], @as(u8, @truncate(0x30 + suite_idx * 0x20)));
+
+        const keys = try derivePacketKeys(suite, secret[0..suite.secretLen()]);
+        try testing.expectEqual(@as(usize, suite.keyLen()), keys.keySlice().len);
+        try testing.expectEqual(@as(usize, 12), keys.ivSlice().len);
+        try testing.expectEqual(@as(usize, suite.hpLen()), keys.hpSlice().len);
+
+        const next_secret = try deriveNextTrafficSecret(suite, secret[0..suite.secretLen()]);
+        try testing.expect(!std.mem.eql(
+            u8,
+            secret[0..suite.secretLen()],
+            next_secret[0..suite.secretLen()],
+        ));
+        for (next_secret[suite.secretLen()..]) |b| {
+            try testing.expectEqual(@as(u8, 0), b);
+        }
+    }
 }
 
 test "derivePacketKeys rejects mis-sized secrets" {
@@ -426,6 +595,40 @@ test "seal1Rtt + open1Rtt round-trip" {
     try testing.expectEqual(false, opened.key_phase);
     try testing.expectEqualSlices(u8, payload, opened.payload);
     try testing.expectEqualSlices(u8, protected[0..len], packet[0..len]);
+}
+
+test "seal1Rtt + open1Rtt round-trip across all supported cipher suites" {
+    const suites = [_]Suite{
+        .aes128_gcm_sha256,
+        .aes256_gcm_sha384,
+        .chacha20_poly1305_sha256,
+    };
+    const dcid: [8]u8 = .{ 1, 1, 2, 3, 5, 8, 13, 21 };
+    const payload = "suite-flexible 1-RTT STREAM and DATAGRAM-ish frame bytes";
+
+    for (suites, 0..) |suite, suite_idx| {
+        var secret: TrafficSecret = @splat(0);
+        fillSecret(secret[0..suite.secretLen()], @as(u8, @truncate(0x51 + suite_idx * 0x17)));
+        const keys = try derivePacketKeys(suite, secret[0..suite.secretLen()]);
+
+        var packet: [256]u8 = undefined;
+        const len = try seal1Rtt(&packet, .{
+            .dcid = &dcid,
+            .pn = 77,
+            .largest_acked = 76,
+            .payload = payload,
+            .keys = &keys,
+        });
+
+        var pt_buf: [256]u8 = undefined;
+        const opened = try open1Rtt(&pt_buf, packet[0..len], .{
+            .dcid_len = dcid.len,
+            .keys = &keys,
+            .largest_received = 76,
+        });
+        try testing.expectEqual(@as(u64, 77), opened.pn);
+        try testing.expectEqualSlices(u8, payload, opened.payload);
+    }
 }
 
 test "seal1Rtt + open1Rtt use draft-21 path id in multipath nonce" {
@@ -510,7 +713,7 @@ test "1-RTT key update opens with next traffic secret and stable HP" {
     );
     const keys = try derivePacketKeys(.aes128_gcm_sha256, &secret);
     const next_secret = try deriveNextTrafficSecret(.aes128_gcm_sha256, &secret);
-    var next_keys = try derivePacketKeys(.aes128_gcm_sha256, &next_secret);
+    var next_keys = try derivePacketKeys(.aes128_gcm_sha256, next_secret[0..Suite.aes128_gcm_sha256.secretLen()]);
     next_keys.hp = keys.hp;
 
     const dcid: [8]u8 = .{ 1, 3, 5, 7, 9, 11, 13, 15 };

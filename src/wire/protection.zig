@@ -10,18 +10,17 @@
 //!    low bits and the encrypted PN bytes, so the PN length and
 //!    PN value can't be read without first recovering the keys.
 //!
-//! This module covers AES-128-GCM (the TLS_AES_128_GCM_SHA256
-//! cipher suite). AES-256 and ChaCha20-Poly1305 follow the same
-//! structure but need additional boringssl-zig primitives
-//! (`crypto.aes.Aes256` is already shipped; ChaCha20 single-block
-//! still lives behind `boringssl.raw.zbssl_*`). Wider suite
-//! coverage lands when the connection state machine needs it.
+//! This module covers the packet-protection mechanics shared by the
+//! QUIC v1 TLS cipher suites: TLS_AES_128_GCM_SHA256,
+//! TLS_AES_256_GCM_SHA384, and TLS_CHACHA20_POLY1305_SHA256.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
 
 const AesGcm128 = boringssl.crypto.aead.AesGcm128;
 const Aes128 = boringssl.crypto.aes.Aes128;
+const Aes256 = boringssl.crypto.aes.Aes256;
+const chacha20 = boringssl.crypto.chacha20;
 
 /// Sample size used to derive the header-protection mask. Always 16
 /// bytes regardless of cipher suite (RFC 9001 §5.4.2).
@@ -69,10 +68,9 @@ pub fn aeadNonceForPath(iv: *const [12]u8, path_id: u32, pn: u64) [12]u8 {
     return nonce;
 }
 
-/// Compute the 5-byte header-protection mask from a 16-byte
-/// ciphertext sample using AES-128 single-block encryption. The mask
-/// is the first 5 bytes of `AES_encrypt(hp_key, sample)`. RFC 9001
-/// §5.4.3.
+/// Compute the 5-byte header-protection mask from a 16-byte ciphertext
+/// sample using AES-128 single-block encryption. The mask is the first
+/// 5 bytes of `AES_encrypt(hp_key, sample)`. RFC 9001 §5.4.3.
 pub fn aesHpMask(hp_key: *const [16]u8, sample: *const [sample_len]u8) [mask_len]u8 {
     const aes = Aes128.init(hp_key);
     var block: [16]u8 = undefined;
@@ -80,6 +78,21 @@ pub fn aesHpMask(hp_key: *const [16]u8, sample: *const [sample_len]u8) [mask_len
     var mask: [mask_len]u8 = undefined;
     @memcpy(&mask, block[0..mask_len]);
     return mask;
+}
+
+/// AES-256-GCM uses AES-256 for QUIC header protection.
+pub fn aes256HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) [mask_len]u8 {
+    const aes = Aes256.init(hp_key);
+    var block: [16]u8 = undefined;
+    aes.encryptBlock(sample, &block);
+    var mask: [mask_len]u8 = undefined;
+    @memcpy(&mask, block[0..mask_len]);
+    return mask;
+}
+
+/// ChaCha20-Poly1305 uses RFC 9001 §5.4.4 header protection.
+pub fn chacha20HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) [mask_len]u8 {
+    return chacha20.quicHpMask(hp_key, sample);
 }
 
 pub const HeaderForm = enum {
@@ -122,7 +135,7 @@ pub fn applyHpMask(
 /// already-initialized AEAD context. Writes ciphertext (with
 /// 16-byte tag appended) into `dst`. Returns total bytes written.
 pub fn aeadSeal(
-    aead: *const AesGcm128,
+    aead: anytype,
     iv: *const [12]u8,
     pn: u64,
     header: []const u8,
@@ -135,7 +148,7 @@ pub fn aeadSeal(
 
 /// AEAD-seal using the draft multipath path-ID-aware nonce.
 pub fn aeadSealForPath(
-    aead: *const AesGcm128,
+    aead: anytype,
     iv: *const [12]u8,
     path_id: u32,
     pn: u64,
@@ -149,7 +162,7 @@ pub fn aeadSealForPath(
 
 /// AEAD-open: reverse of `aeadSeal`. `ciphertext` includes the tag.
 pub fn aeadOpen(
-    aead: *const AesGcm128,
+    aead: anytype,
     iv: *const [12]u8,
     pn: u64,
     header: []const u8,
@@ -162,7 +175,7 @@ pub fn aeadOpen(
 
 /// AEAD-open using the draft multipath path-ID-aware nonce.
 pub fn aeadOpenForPath(
-    aead: *const AesGcm128,
+    aead: anytype,
     iv: *const [12]u8,
     path_id: u32,
     pn: u64,

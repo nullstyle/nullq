@@ -87,10 +87,9 @@ pub const Error = error{
     ack_tracker_mod.Error ||
     transport_params_mod.Error;
 
-/// Per-level secret bookkeeping. We don't actually derive AEAD keys
-/// in Phase 4 — that's Phase 5's packet-protection wiring. For now,
-/// a flag plus the cipher protocol-id + secret bytes is enough to
-/// validate that BoringSSL handed us material at the right point.
+/// Per-level secret bookkeeping. The TLS bridge stores the BoringSSL
+/// cipher protocol-id plus raw traffic secret; packet-protection keys
+/// are derived on demand from the negotiated suite.
 pub const SecretMaterial = struct {
     cipher_protocol_id: u16,
     secret: [64]u8 = @splat(0),
@@ -259,12 +258,15 @@ const LossStats = struct {
 
 pub const ApplicationKeyUpdateLimits = struct {
     /// RFC 9001 §6.6 gives AES-GCM a 2^23 packet confidentiality limit.
+    /// ChaCha20-Poly1305 does not force a lower update point, so the
+    /// default uses the cross-suite conservative floor.
     confidentiality_limit: u64 = @as(u64, 1) << 23,
     /// Update slightly before the hard limit so we don't need to spend
     /// the last legal packet on CONNECTION_CLOSE.
     proactive_update_threshold: u64 = (@as(u64, 1) << 23) - 1024,
-    /// RFC 9001 §6.6 gives AES-GCM a 2^52 invalid-packet integrity limit.
-    integrity_limit: u64 = @as(u64, 1) << 52,
+    /// RFC 9001 §6.6 gives ChaCha20-Poly1305 the strictest invalid-
+    /// packet integrity limit among the supported QUIC v1 suites.
+    integrity_limit: u64 = @as(u64, 1) << 36,
 };
 
 pub const ApplicationKeyUpdateStatus = struct {
@@ -724,7 +726,7 @@ pub const Connection = struct {
     /// Cipher suite negotiated for the given encryption level, if
     /// the secret has been installed and the protocol-id is one we
     /// support. RFC 9001 only permits TLS 1.3 cipher suites; nullq
-    /// currently understands `TLS_AES_128_GCM_SHA256` only.
+    /// understands the three QUIC v1 suites.
     pub fn cipherSuite(
         self: *const Connection,
         lvl: EncryptionLevel,

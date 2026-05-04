@@ -9,8 +9,11 @@ PATH_CHALLENGE/PATH_RESPONSE, timer-driven loss/PTO recovery with
 NewReno feedback, path-aware `PathSet` recovery ownership, and
 draft-21 multipath nonce/CID routing checks. Application key updates
 now keep previous/current/next read epochs, discard old keys after
-3x-PTO, support local initiation, and enforce AES-GCM packet/auth
-limits across all Application paths. 0-RTT now has early STREAM/DATAGRAM
+3x-PTO, support local initiation, and enforce cross-suite AEAD
+packet/auth limits across all Application paths. Packet protection now
+supports all QUIC v1 TLS suites: `TLS_AES_128_GCM_SHA256`,
+`TLS_AES_256_GCM_SHA384`, and `TLS_CHACHA20_POLY1305_SHA256`. 0-RTT now
+has early STREAM/DATAGRAM
 transport plumbing plus accepted and rejected go-quic-peer resumption
 smokes, while deeper mismatch/loss hardening still needs work. Multipath
 also has embedder-driven path CID replenishment, abandoned-path 3x-PTO
@@ -33,7 +36,8 @@ just test
   an event loop; the embedder drives `handleIncoming` /
   `pollOutgoing` against a `Clock`.
 - Pure Zig for everything that isn't crypto. BoringSSL is called only
-  for AEAD seal/open, HKDF, AES block, and TLS 1.3 handshake.
+  for AEAD seal/open, HKDF, AES/ChaCha header protection, and TLS 1.3
+  handshake.
 
 ## Scope
 

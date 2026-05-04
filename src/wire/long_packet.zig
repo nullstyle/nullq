@@ -9,23 +9,17 @@
 //!
 //! Protection mechanics are identical to short_packet:
 //!   - AEAD nonce = static_iv XOR pn (RFC 9001 §5.3).
-//!   - Header-protection mask = AES-128-ECB(hp_key, sample) (§5.4.3),
+//!   - Header-protection mask is suite-specific (§5.4.3/§5.4.4),
 //!     XORed into the low 4 bits of byte 0 + the PN bytes.
 //!   - Sample begins at pn_offset + 4 regardless of pn_len (§5.4.2).
-//!
-//! Cipher-suite coverage: TLS_AES_128_GCM_SHA256 only (matches
-//! short_packet).
 
 const std = @import("std");
-const boringssl = @import("boringssl");
 
 const header = @import("header.zig");
 const packet_number_mod = @import("packet_number.zig");
 const protection = @import("protection.zig");
 const short_packet = @import("short_packet.zig");
 const varint = @import("varint.zig");
-
-const AesGcm128 = boringssl.crypto.aead.AesGcm128;
 
 pub const PacketKeys = short_packet.PacketKeys;
 pub const Suite = short_packet.Suite;
@@ -154,11 +148,9 @@ pub fn sealInitial(dst: []u8, opts: InitialSealOptions) Error!usize {
     @memset(stage_buf[opts.payload.len..pt_len], 0);
 
     // AEAD seal.
-    var aead = try AesGcm128.init(opts.keys.key[0..16]);
-    defer aead.deinit();
-    const ct_len = try protection.aeadSeal(
-        &aead,
-        &opts.keys.iv,
+    const ct_len = try short_packet.sealPayloadWithKeys(
+        opts.keys,
+        null,
         opts.pn,
         dst[0..hdr_len],
         stage_buf[0..pt_len],
@@ -168,8 +160,7 @@ pub fn sealInitial(dst: []u8, opts: InitialSealOptions) Error!usize {
 
     // Header-protect.
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const hp_key: *const [16]u8 = @ptrCast(opts.keys.hp[0..16]);
-    const mask = protection.aesHpMask(hp_key, &sample);
+    const mask = short_packet.headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .long, pn_offset, pn_len, mask);
 
     return total_len;
@@ -219,7 +210,6 @@ pub const ZeroRttSealOptions = struct {
 pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
     if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
-    if (opts.keys.suite != .aes128_gcm_sha256) return Error.UnsupportedSuite;
 
     const pn_len = opts.pn_length_override orelse chooseLongPnLength(opts.pn, opts.largest_acked);
     if (pn_len < 1 or pn_len > 4) return protection.Error.InvalidPnLength;
@@ -255,11 +245,9 @@ pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
     @memcpy(stage_buf[0..opts.payload.len], opts.payload);
     @memset(stage_buf[opts.payload.len..pt_len], 0);
 
-    var aead = try AesGcm128.init(opts.keys.key[0..16]);
-    defer aead.deinit();
-    const ct_len = try protection.aeadSeal(
-        &aead,
-        &opts.keys.iv,
+    const ct_len = try short_packet.sealPayloadWithKeys(
+        opts.keys,
+        null,
         opts.pn,
         dst[0..hdr_len],
         stage_buf[0..pt_len],
@@ -268,8 +256,7 @@ pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
     const total_len = hdr_len + ct_len;
 
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const hp_key: *const [16]u8 = @ptrCast(opts.keys.hp[0..16]);
-    const mask = protection.aesHpMask(hp_key, &sample);
+    const mask = short_packet.headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .long, pn_offset, pn_len, mask);
 
     return total_len;
@@ -295,7 +282,6 @@ pub const HandshakeSealOptions = struct {
 pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
     if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
-    if (opts.keys.suite != .aes128_gcm_sha256) return Error.UnsupportedSuite;
 
     const pn_len = opts.pn_length_override orelse chooseLongPnLength(opts.pn, opts.largest_acked);
     if (pn_len < 1 or pn_len > 4) return protection.Error.InvalidPnLength;
@@ -331,11 +317,9 @@ pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
     @memcpy(stage_buf[0..opts.payload.len], opts.payload);
     @memset(stage_buf[opts.payload.len..pt_len], 0);
 
-    var aead = try AesGcm128.init(opts.keys.key[0..16]);
-    defer aead.deinit();
-    const ct_len = try protection.aeadSeal(
-        &aead,
-        &opts.keys.iv,
+    const ct_len = try short_packet.sealPayloadWithKeys(
+        opts.keys,
+        null,
         opts.pn,
         dst[0..hdr_len],
         stage_buf[0..pt_len],
@@ -344,8 +328,7 @@ pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
     const total_len = hdr_len + ct_len;
 
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const hp_key: *const [16]u8 = @ptrCast(opts.keys.hp[0..16]);
-    const mask = protection.aesHpMask(hp_key, &sample);
+    const mask = short_packet.headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .long, pn_offset, pn_len, mask);
 
     return total_len;
@@ -376,7 +359,9 @@ fn openLongHeader(
     if (pre_type != expected_type) {
         return unexpectedPacketType(expected_type);
     }
-    if (keys.suite != .aes128_gcm_sha256) return Error.UnsupportedSuite;
+    if (expected_type == .initial and keys.suite != .aes128_gcm_sha256) {
+        return Error.UnsupportedSuite;
+    }
 
     // Walk the unprotected header structure manually; the PN bytes
     // are still HP-masked, so we ignore the parser's pn_length /
@@ -422,8 +407,7 @@ fn openLongHeader(
     // Sample for HP.
     if (src.len < pn_offset + 4 + protection.sample_len) return Error.InsufficientCiphertext;
     const sample = try protection.sampleAt(src, pn_offset);
-    const hp_key: *const [16]u8 = @ptrCast(keys.hp[0..16]);
-    const mask = protection.aesHpMask(hp_key, &sample);
+    const mask = short_packet.headerProtectionMask(keys, &sample);
 
     // Strip HP from byte 0 (low 4 bits) and PN bytes.
     src[0] ^= mask[0] & 0x0f;
@@ -446,15 +430,12 @@ fn openLongHeader(
 
     // AEAD-open. AAD = src[0..pn_offset+pn_len]; ciphertext is the
     // remaining `length_value - pn_len` bytes.
-    var aead = try AesGcm128.init(keys.key[0..16]);
-    defer aead.deinit();
-
     const aad_len = pn_offset + pn_len;
     const length_value_usize: usize = @intCast(length_value);
     const ct_len: usize = length_value_usize - pn_len;
-    const pt_len = try protection.aeadOpen(
-        &aead,
-        &keys.iv,
+    const pt_len = try short_packet.openPayloadWithKeys(
+        keys,
+        null,
         full_pn,
         src[0..aad_len],
         src[aad_len .. aad_len + ct_len],
@@ -522,6 +503,12 @@ fn fromHex(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
     return out;
+}
+
+fn fillSecret(dst: []u8, seed: u8) void {
+    for (dst, 0..) |*b, i| {
+        b.* = seed +% @as(u8, @truncate(i * 3));
+    }
 }
 
 test "Initial seal/open round-trip with §A.1 client keys" {
@@ -667,6 +654,82 @@ test "0-RTT seal/open round-trip" {
     try testing.expectEqualSlices(u8, &dcid, opened.dcid.slice());
     try testing.expectEqualSlices(u8, &scid, opened.scid.slice());
     try testing.expectEqual(len, opened.bytes_consumed);
+}
+
+test "Handshake and 0-RTT support every negotiated QUIC v1 suite" {
+    const suites = [_]Suite{
+        .aes128_gcm_sha256,
+        .aes256_gcm_sha384,
+        .chacha20_poly1305_sha256,
+    };
+    const dcid: [8]u8 = .{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    const scid: [4]u8 = .{ 0xa0, 0xb0, 0xc0, 0xd0 };
+
+    for (suites, 0..) |suite, suite_idx| {
+        var secret: short_packet.TrafficSecret = @splat(0);
+        fillSecret(secret[0..suite.secretLen()], @as(u8, @truncate(0x40 + suite_idx * 0x13)));
+        const keys = try short_packet.derivePacketKeys(suite, secret[0..suite.secretLen()]);
+
+        var handshake_packet: [256]u8 = undefined;
+        const hs_payload = "suite-flexible HANDSHAKE CRYPTO frames";
+        const hs_len = try sealHandshake(&handshake_packet, .{
+            .dcid = &dcid,
+            .scid = &scid,
+            .pn = 11,
+            .largest_acked = 10,
+            .payload = hs_payload,
+            .keys = &keys,
+        });
+
+        var pt: [256]u8 = undefined;
+        const hs_opened = try openHandshake(&pt, handshake_packet[0..hs_len], .{
+            .keys = &keys,
+            .largest_received = 10,
+        });
+        try testing.expectEqual(@as(u64, 11), hs_opened.pn);
+        try testing.expectEqualSlices(u8, hs_payload, hs_opened.payload[0..hs_payload.len]);
+
+        var zero_rtt_packet: [256]u8 = undefined;
+        const zr_payload = "suite-flexible 0-RTT STREAM frames";
+        const zr_len = try sealZeroRtt(&zero_rtt_packet, .{
+            .dcid = &dcid,
+            .scid = &scid,
+            .pn = 12,
+            .largest_acked = 11,
+            .payload = zr_payload,
+            .keys = &keys,
+        });
+
+        const zr_opened = try openZeroRtt(&pt, zero_rtt_packet[0..zr_len], .{
+            .keys = &keys,
+            .largest_received = 11,
+        });
+        try testing.expectEqual(@as(u64, 12), zr_opened.pn);
+        try testing.expectEqualSlices(u8, zr_payload, zr_opened.payload[0..zr_payload.len]);
+    }
+}
+
+test "Initial rejects non-initial cipher suites" {
+    var secret: short_packet.TrafficSecret = @splat(0);
+    fillSecret(secret[0..Suite.aes256_gcm_sha384.secretLen()], 0x74);
+    const keys = try short_packet.derivePacketKeys(
+        .aes256_gcm_sha384,
+        secret[0..Suite.aes256_gcm_sha384.secretLen()],
+    );
+
+    const dcid: [8]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const scid: [4]u8 = .{ 8, 9, 10, 11 };
+    var packet: [256]u8 = undefined;
+    try testing.expectError(
+        Error.UnsupportedSuite,
+        sealInitial(&packet, .{
+            .dcid = &dcid,
+            .scid = &scid,
+            .pn = 0,
+            .payload = "x",
+            .keys = &keys,
+        }),
+    );
 }
 
 test "openInitial rejects bytes whose first bit indicates short header" {

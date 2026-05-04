@@ -600,11 +600,11 @@ Implemented in [`wire/protection.zig`](src/wire/protection.zig).
 - ✅ **AEAD nonce construction** (RFC 9001 §5.3) — left-pad PN to 12
   bytes big-endian, XOR with static IV.
 - ✅ **AEAD seal/open** — `aeadSeal` / `aeadOpen` wrap
-  `boringssl.crypto.aead.AesGcm128` with the constructed nonce;
-  packet header is the AAD.
-- ✅ **AES-128-ECB header-protection mask** (§5.4.3) — `aesHpMask`
-  takes the 16-byte sample and returns the 5-byte mask via
-  `boringssl.crypto.aes.Aes128.encryptBlock`.
+  the negotiated `boringssl.crypto.aead` implementation with the
+  constructed nonce; packet header is the AAD.
+- ✅ **Header-protection masks** (§5.4.3/§5.4.4) — AES-128, AES-256,
+  and ChaCha20 variants take the 16-byte sample and return the 5-byte
+  mask required by the negotiated QUIC v1 TLS cipher suite.
 - ✅ **HP application** — `applyHpMask` masks low 4 bits (long) or
   low 5 bits (short) of byte 0, plus 1..4 PN bytes; involutive XOR
   serves both protect and unprotect.
@@ -624,12 +624,11 @@ file; transcribing 2400 hex chars inline invites typo bugs without
 adding much over the HP-mask KAT plus the synthetic full-pipeline
 test.
 
-Cipher-suite coverage: AES-128-GCM only for now. AES-256-GCM follows
-the same shape with `Aes256` (already in boringssl-zig v0.2.0);
-ChaCha20-Poly1305 needs a single-block ChaCha20 primitive that's not
-yet wrapped — both are bookmarked as future upstream PRs that fall
-out naturally when the connection state machine selects a non-default
-suite.
+Cipher-suite coverage now includes all QUIC v1 TLS 1.3 suites:
+`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, and
+`TLS_CHACHA20_POLY1305_SHA256`. Initial packets remain
+AES-128/HKDF-SHA256 per RFC 9001; Handshake, 0-RTT, and 1-RTT packet
+protection derive AEAD/HP material from the negotiated suite.
 
 #### Original plan
 

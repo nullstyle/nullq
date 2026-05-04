@@ -8,12 +8,20 @@
 //!
 //! This is the first crypto-aware module in `wire/`; everything else
 //! in this directory is pure-Zig wire-format code. We sit on top of
-//! `boringssl.crypto.kdf.HkdfSha256`.
+//! `boringssl.crypto.kdf.HkdfSha256`. The TLS 1.3 HKDF label helper
+//! is also reused by Handshake/Application packet protection, where
+//! the negotiated TLS cipher suite can select SHA-384.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
 
 const HkdfSha256 = boringssl.crypto.kdf.HkdfSha256;
+const HkdfSha384 = boringssl.crypto.kdf.HkdfSha384;
+
+pub const HkdfHash = enum {
+    sha256,
+    sha384,
+};
 
 /// QUIC v1 Initial Salt (RFC 9001 §5.2).
 pub const initial_salt_v1 = [_]u8{
@@ -46,10 +54,24 @@ pub const Error = error{
 /// HKDF-Expand-Label per RFC 8446 §7.1, with the TLS 1.3 prefix
 /// `"tls13 "` baked in. Writes `dst.len` bytes into `dst`.
 ///
-/// QUIC uses this with `secret` of digest length, `context` of zero
-/// length, and `dst.len` ∈ {12, 16, 32} for IVs, AEAD/HP keys, and
-/// derived secrets respectively.
+/// QUIC Initial uses this with `secret` of SHA-256 digest length,
+/// `context` of zero length, and `dst.len` in {12, 16, 32}; negotiated
+/// packet protection can also request 32-byte keys and 48-byte SHA-384
+/// traffic secrets through `hkdfExpandLabelWithHash`.
 pub fn hkdfExpandLabel(
+    dst: []u8,
+    secret: []const u8,
+    label: []const u8,
+    context: []const u8,
+) Error!void {
+    return hkdfExpandLabelWithHash(.sha256, dst, secret, label, context);
+}
+
+/// HKDF-Expand-Label with an explicit TLS 1.3 hash. QUIC Initial keys
+/// always use SHA-256; Handshake/Application keys follow the negotiated
+/// TLS cipher suite.
+pub fn hkdfExpandLabelWithHash(
+    hash: HkdfHash,
     dst: []u8,
     secret: []const u8,
     label: []const u8,
@@ -84,7 +106,10 @@ pub fn hkdfExpandLabel(
     @memcpy(info_buf[pos .. pos + context.len], context);
     pos += context.len;
 
-    HkdfSha256.expand(secret, info_buf[0..pos], dst);
+    switch (hash) {
+        .sha256 => HkdfSha256.expand(secret, info_buf[0..pos], dst),
+        .sha384 => HkdfSha384.expand(secret, info_buf[0..pos], dst),
+    }
 }
 
 /// Derive a full set of Initial keys for a given role.
