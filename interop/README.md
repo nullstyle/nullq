@@ -20,7 +20,7 @@ The default external matrix targets server-side nullq against the
 current official clients `quic-go`, `ngtcp2`, and `quiche`, using:
 
 ```sh
-python3 tools/external_interop.py runner --build-image
+zig build external-interop -- runner --build-image
 ```
 
 By default that expands to:
@@ -40,8 +40,9 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
 - Docker with the quic-network-simulator base image reachable.
 - A checkout of `quic-interop-runner` next to this repo, or
   `--runner-dir /path/to/quic-interop-runner`.
-- Runner Python dependencies installed in the Python used by
-  `python3 run.py`.
+- Runner Python dependencies installed for the official runner. nullq's
+  wrapper is Zig-native, but the upstream runner itself still executes
+  `run.py`.
 - Wireshark/tshark new enough for the runner's trace checks.
 
 The wrapper creates local throwaway state under `.zig-cache/` and does
@@ -50,11 +51,11 @@ not mutate the runner checkout.
 ## Useful commands
 
 ```sh
-python3 tools/external_interop.py preflight
-python3 tools/external_interop.py build-image
-python3 tools/external_interop.py runner --dry-run
-python3 tools/external_interop.py runner --clients quic-go --tests H,D,C
-python3 tools/external_interop.py runner --clients quic-go,ngtcp2,quiche --tests core+retry
+zig build external-interop -- preflight
+zig build external-interop -- build-image
+zig build external-interop -- runner --dry-run
+zig build external-interop -- runner --clients quic-go --tests H,D,C
+zig build external-interop -- runner --clients quic-go,ngtcp2,quiche --tests core+retry
 ```
 
 Runner logs land in `interop/logs/`; matrix JSON lands in

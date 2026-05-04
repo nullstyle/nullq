@@ -44,7 +44,12 @@ Current as of 2026-05-04.
   QUIC interop-runner endpoint binary. The endpoint is currently
   server-side only, speaks HTTP/0.9 ALPN `hq-interop`, serves `/www`,
   loads `/certs` material, supports server-side Retry, and is wrapped
-  by `tools/external_interop.py` plus `interop/qns/Dockerfile`.
+  by the Zig-native `external-interop` helper plus
+  `interop/qns/Dockerfile`.
+- `zig build external-interop -- preflight` and
+  `zig build external-interop -- build-image --dry-run` in `nullq`:
+  passing. The helper stages a throwaway Docker context under
+  `.zig-cache/` and prints the expected Docker build invocation.
 
 ## Production work landed
 
@@ -81,10 +86,10 @@ Current as of 2026-05-04.
   intentionally remain application-owned.
 - A first official QUIC interop-runner gate has landed. `qns-endpoint`
   adapts nullq to the runner's HTTP/0.9 server contract, while
-  `tools/external_interop.py` builds a local Docker endpoint, overlays a
-  `nullq` server entry into a throwaway runner copy, and runs
-  nullq-as-server against selected external clients without mutating the
-  external checkout.
+  `zig build external-interop -- ...` builds a local Docker endpoint,
+  overlays a `nullq` server entry into a throwaway runner copy, and
+  runs nullq-as-server against selected external clients without
+  mutating the external checkout.
 - The public `retry_token` helper can mint and validate stateless
   HMAC-SHA256 Retry tokens bound to caller-supplied client address
   bytes, original DCID, Retry SCID, QUIC version, issue time, and
@@ -277,7 +282,7 @@ transfer.
 cd ~/prj/ai-workspace/nullq
 zig build test
 zig build qns-endpoint
-python3 tools/external_interop.py runner --dry-run
+zig build external-interop -- runner --dry-run
 
 cd ~/prj/ai-workspace/nullq-peer
 zig build

@@ -57,4 +57,24 @@ pub fn build(b: *std.Build) void {
 
     const qns_step = b.step("qns-endpoint", "Build the QUIC interop-runner endpoint");
     qns_step.dependOn(&qns_exe.step);
+
+    const interop_tool_mod = b.createModule(.{
+        .root_source_file = b.path("tools/external_interop.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const interop_tool_exe = b.addExecutable(.{
+        .name = "nullq-external-interop",
+        .root_module = interop_tool_mod,
+    });
+    b.installArtifact(interop_tool_exe);
+
+    const interop_tool_tests = b.addTest(.{ .root_module = interop_tool_mod });
+    const run_interop_tool_tests = b.addRunArtifact(interop_tool_tests);
+    test_step.dependOn(&run_interop_tool_tests.step);
+
+    const run_interop_tool = b.addRunArtifact(interop_tool_exe);
+    if (b.args) |args| run_interop_tool.addArgs(args);
+    const external_interop_step = b.step("external-interop", "Run the external QUIC interop gate helper");
+    external_interop_step.dependOn(&run_interop_tool.step);
 }
