@@ -6750,6 +6750,70 @@ test "Version Negotiation is ignored when it lists QUIC v1 or has wrong CID echo
     try std.testing.expectEqual(CloseState.open, conn.closeState());
 }
 
+test "Version Negotiation is ignored with wrong SCID echo or malformed versions" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const odcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const client_scid = [_]u8{ 8, 7, 6, 5 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setPeerDcid(&odcid);
+    try conn.setLocalScid(&client_scid);
+
+    const other_versions = [_]u8{ 0x6b, 0x33, 0x43, 0xcf };
+    var packet: [128]u8 = undefined;
+    const n = try wire_header.encode(&packet, .{ .version_negotiation = .{
+        .dcid = try wire_header.ConnId.fromSlice(&client_scid),
+        .scid = try wire_header.ConnId.fromSlice(&.{ 0xde, 0xad }),
+        .versions_bytes = &other_versions,
+    } });
+    try conn.handle(packet[0..n], null, 4_000_002);
+    try std.testing.expectEqual(CloseState.open, conn.closeState());
+
+    var malformed: [128]u8 = undefined;
+    var pos: usize = 0;
+    malformed[pos] = 0x80;
+    pos += 1;
+    std.mem.writeInt(u32, malformed[pos..][0..4], 0, .big);
+    pos += 4;
+    malformed[pos] = @intCast(client_scid.len);
+    pos += 1;
+    @memcpy(malformed[pos .. pos + client_scid.len], &client_scid);
+    pos += client_scid.len;
+    malformed[pos] = @intCast(odcid.len);
+    pos += 1;
+    @memcpy(malformed[pos .. pos + odcid.len], &odcid);
+    pos += odcid.len;
+    @memcpy(malformed[pos .. pos + 3], &[_]u8{ 0x6b, 0x33, 0x43 });
+    pos += 3;
+
+    try conn.handle(malformed[0..pos], null, 4_000_003);
+    try std.testing.expectEqual(CloseState.open, conn.closeState());
+}
+
+test "Version Negotiation packets are ignored by servers" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const other_versions = [_]u8{ 0x6b, 0x33, 0x43, 0xcf };
+    var packet: [128]u8 = undefined;
+    const n = try wire_header.encode(&packet, .{ .version_negotiation = .{
+        .dcid = try wire_header.ConnId.fromSlice(&.{ 8, 7, 6, 5 }),
+        .scid = try wire_header.ConnId.fromSlice(&.{ 1, 2, 3, 4 }),
+        .versions_bytes = &other_versions,
+    } });
+
+    try conn.handle(packet[0..n], null, 4_000_004);
+    try std.testing.expectEqual(CloseState.open, conn.closeState());
+    try std.testing.expect(conn.closeEvent() == null);
+}
+
 test "Retry is accepted once and re-arms Initial crypto with token" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
