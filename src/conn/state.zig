@@ -4718,6 +4718,38 @@ test "0-RTT poll emits long-header packet in Application PN space" {
     try std.testing.expectEqual(@as(u64, 1), conn.pnSpaceForLevel(.early_data).next_pn);
 }
 
+test "0-RTT rejection requeues STREAM data but not DATAGRAM payloads" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setPeerDcid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try conn.setLocalScid(&.{ 9, 9, 9, 9 });
+    installTestEarlyDataWriteSecret(&conn);
+    conn.setEarlyDataEnabled(true);
+
+    try conn.sendDatagram("early-datagram");
+    const s = try conn.openBidi(0);
+    _ = try s.send.write("early-stream");
+
+    var out: [512]u8 = undefined;
+    const n = (try conn.pollLevel(.early_data, &out, 1_000)).?;
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+    try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.early_data).count);
+
+    try conn.requeueRejectedEarlyData();
+
+    try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.early_data).count);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+    const chunk = s.send.peekChunk(64).?;
+    try std.testing.expectEqual(@as(u64, 0), chunk.offset);
+    try std.testing.expectEqual(@as(u64, 12), chunk.length);
+    try std.testing.expectEqualSlices(u8, "early-stream", s.send.chunkBytes(chunk));
+}
+
 test "server handles accepted 0-RTT STREAM frames" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initServer(.{});

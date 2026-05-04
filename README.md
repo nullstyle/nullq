@@ -8,8 +8,9 @@ QUIC v1 handshakes, streams, DATAGRAMs, RESET_STREAM, CID issuance,
 PATH_CHALLENGE/PATH_RESPONSE, timer-driven loss/PTO recovery with
 NewReno feedback, path-aware `PathSet` recovery ownership, and
 draft-21 multipath nonce/CID routing checks. 0-RTT now has early
-STREAM/DATAGRAM transport plumbing plus an accepted go-quic-peer
-resumption smoke, while rejection/mismatch hardening still needs work.
+STREAM/DATAGRAM transport plumbing plus accepted and rejected
+go-quic-peer resumption smokes, while deeper mismatch/loss hardening
+still needs work.
 go-quic-peer single-path, 0-RTT, and path-switch smoke tests are
 maintained as interop gates. See [INTEROP_STATUS.md](INTEROP_STATUS.md)
 for the current verification log and remaining production gaps.

@@ -17,6 +17,10 @@ Current as of 2026-05-04.
 - `go-quic-peer client -0rtt=true` against `nullq-peer`: passing,
   including ticket seed, resumed connection, early STREAM request, and
   `Used0RTT == true`.
+- `go-quic-peer client -0rtt=true -0rtt-expect rejected` against
+  `nullq-peer -reject-0rtt-after 2`: passing; the peer intentionally
+  changes the replay context on the resumed connection, quic-go reports
+  0-RTT rejection, and the scenario retries the request as 1-RTT.
 - `go-quic-peer multipath` against `nullq-peer`: passing for secondary
   socket add, PATH_CHALLENGE/PATH_RESPONSE probe, path switch, echo,
   upload after switch, and DATAGRAM after switch.
@@ -137,11 +141,12 @@ Current as of 2026-05-04.
 5. **0-RTT is implemented but still needs rejection hardening.** The
    landed code covers packet protection, explicit send opt-in,
    server receive validation, early-data context construction, status
-   reporting, accepted go-quic-peer resumption interop,
+   reporting, accepted and rejected go-quic-peer resumption interop,
    application-visible early-data marking on incoming streams/datagrams,
-   and rejected STREAM/control requeue. Remaining work: public ticket
-   export/import examples, live rejected-resumption interop,
-   transport-parameter mismatch rejection tests, and broader 0-RTT
+   rejected STREAM/control requeue, and deterministic coverage that
+   DATAGRAM remains unreliable across rejection. Remaining work: public
+   ticket export/import examples, transport-parameter mismatch
+   rejection vectors beyond replay-context mismatch, and broader 0-RTT
    datagram/loss scenarios.
 6. **Protocol hardening remains.** Retry, Version Negotiation,
    stateless reset, close/draining state, typed close errors, bounded
@@ -164,6 +169,7 @@ zig build
 
 cd ~/prj/ai-workspace/go-quic-peer
 go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=false -json -timeout 20s
-go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=true -json -timeout 30s
+go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=true -0rtt-expect accepted -json -timeout 30s
+go run ./cmd/quicpeer client -addr 127.0.0.1:4242 -insecure -0rtt=true -0rtt-expect rejected -json -timeout 30s
 go run ./cmd/quicpeer multipath -addr 127.0.0.1:4242 -insecure -json -timeout 20s -cid-len 8
 ```
