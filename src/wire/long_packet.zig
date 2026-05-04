@@ -14,12 +14,15 @@
 //!   - Sample begins at pn_offset + 4 regardless of pn_len (§5.4.2).
 
 const std = @import("std");
+const boringssl = @import("boringssl");
 
 const header = @import("header.zig");
 const packet_number_mod = @import("packet_number.zig");
 const protection = @import("protection.zig");
 const short_packet = @import("short_packet.zig");
 const varint = @import("varint.zig");
+
+const AesGcm128 = boringssl.crypto.aead.AesGcm128;
 
 pub const PacketKeys = short_packet.PacketKeys;
 pub const Suite = short_packet.Suite;
@@ -37,6 +40,31 @@ pub const Error = error{
     /// The packet's payload is too short for the HP sample.
     PayloadTooShort,
 } || protection.Error || header.Error || packet_number_mod.Error || varint.Error;
+
+/// QUIC v1 Retry integrity key/nonce, RFC 9001 §5.8.
+pub const retry_integrity_key_v1: [16]u8 = .{
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+    0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+};
+
+pub const retry_integrity_nonce_v1: [12]u8 = .{
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63,
+    0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+};
+
+const retry_pseudo_packet_max: usize = 4096;
+
+pub const RetrySealOptions = struct {
+    version: u32 = 0x00000001,
+    /// Original Destination Connection ID from the client's first Initial.
+    original_dcid: []const u8,
+    /// Destination CID for the Retry packet: the client's Initial SCID.
+    dcid: []const u8,
+    /// Server-chosen Retry Source CID.
+    scid: []const u8,
+    retry_token: []const u8,
+    unused_bits: u4 = 0,
+};
 
 // -- Initial -------------------------------------------------------------
 
@@ -336,6 +364,57 @@ pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
 
 pub fn openHandshake(pt_dst: []u8, src: []u8, opts: InitialOpenOptions) Error!LongOpenResult {
     return openLongHeader(pt_dst, src, opts.keys, opts.largest_received, .handshake);
+}
+
+// -- Retry ---------------------------------------------------------------
+
+pub fn retryIntegrityTag(original_dcid: []const u8, retry_without_tag: []const u8) Error![16]u8 {
+    if (original_dcid.len > header.max_cid_len) return Error.DcidTooLong;
+    if (1 + original_dcid.len + retry_without_tag.len > retry_pseudo_packet_max) {
+        return Error.OutputTooSmall;
+    }
+
+    var pseudo: [retry_pseudo_packet_max]u8 = undefined;
+    var pos: usize = 0;
+    pseudo[pos] = @intCast(original_dcid.len);
+    pos += 1;
+    @memcpy(pseudo[pos .. pos + original_dcid.len], original_dcid);
+    pos += original_dcid.len;
+    @memcpy(pseudo[pos .. pos + retry_without_tag.len], retry_without_tag);
+    pos += retry_without_tag.len;
+
+    var aead = try AesGcm128.init(&retry_integrity_key_v1);
+    defer aead.deinit();
+    var out: [16]u8 = undefined;
+    const n = try aead.seal(&out, &retry_integrity_nonce_v1, pseudo[0..pos], "");
+    std.debug.assert(n == out.len);
+    return out;
+}
+
+pub fn sealRetry(dst: []u8, opts: RetrySealOptions) Error!usize {
+    if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
+    if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
+
+    const dcid = try header.ConnId.fromSlice(opts.dcid);
+    const scid = try header.ConnId.fromSlice(opts.scid);
+    const zero_tag: [16]u8 = @splat(0);
+    const len = try header.encode(dst, .{ .retry = .{
+        .version = opts.version,
+        .dcid = dcid,
+        .scid = scid,
+        .retry_token = opts.retry_token,
+        .integrity_tag = zero_tag,
+        .unused_bits = opts.unused_bits,
+    } });
+    const tag = try retryIntegrityTag(opts.original_dcid, dst[0 .. len - 16]);
+    @memcpy(dst[len - 16 .. len], &tag);
+    return len;
+}
+
+pub fn validateRetryIntegrity(original_dcid: []const u8, retry_packet: []const u8) Error!bool {
+    if (retry_packet.len < 16) return Error.PayloadTooShort;
+    const expected = try retryIntegrityTag(original_dcid, retry_packet[0 .. retry_packet.len - 16]);
+    return std.mem.eql(u8, &expected, retry_packet[retry_packet.len - 16 ..]);
 }
 
 // -- shared open path ----------------------------------------------------
@@ -654,6 +733,28 @@ test "0-RTT seal/open round-trip" {
     try testing.expectEqualSlices(u8, &dcid, opened.dcid.slice());
     try testing.expectEqualSlices(u8, &scid, opened.scid.slice());
     try testing.expectEqual(len, opened.bytes_consumed);
+}
+
+test "Retry seal validates integrity tag" {
+    const original_dcid: [8]u8 = .{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_scid: [4]u8 = .{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const retry_scid: [8]u8 = .{ 1, 3, 3, 7, 5, 8, 13, 21 };
+    const token = "retry-token";
+
+    var packet: [256]u8 = undefined;
+    const len = try sealRetry(&packet, .{
+        .original_dcid = &original_dcid,
+        .dcid = &client_scid,
+        .scid = &retry_scid,
+        .retry_token = token,
+    });
+
+    try testing.expect(try validateRetryIntegrity(&original_dcid, packet[0..len]));
+    const parsed = try header.parse(packet[0..len], 0);
+    try testing.expect(parsed.header == .retry);
+    try testing.expectEqualSlices(u8, token, parsed.header.retry.retry_token);
+    packet[len - 1] ^= 0x01;
+    try testing.expect(!try validateRetryIntegrity(&original_dcid, packet[0..len]));
 }
 
 test "Handshake and 0-RTT support every negotiated QUIC v1 suite" {

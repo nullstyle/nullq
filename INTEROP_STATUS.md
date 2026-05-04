@@ -14,8 +14,9 @@ Current as of 2026-05-04.
   3x-PTO previous-key discard, local update ACK gating, multipath ACK
   gating, proactive packet-limit updates, AEAD integrity-limit close
   behavior, and AES-128/AES-256/ChaCha packet-protection round-trips,
-  initial 0-RTT packet/receive/rejection unit tests, and the 10%
-  simulated-loss stream exchange.
+  client-side Version Negotiation and Retry integrity/transport
+  parameter tests, initial 0-RTT packet/receive/rejection unit tests,
+  and the 10% simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
 - `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
@@ -54,6 +55,17 @@ Current as of 2026-05-04.
   NEW_CONNECTION_ID/PATH_NEW_CONNECTION_ID. Matching packets enter
   draining without queuing CONNECTION_CLOSE or charging AEAD auth
   failure limits.
+- Client-side Version Negotiation now validates the RFC 9000 CID echo
+  checks, ignores packets that still advertise QUIC v1, and terminally
+  closes with a public close event when no compatible version is
+  offered.
+- Client-side Retry now validates the RFC 9001 integrity tag, enforces
+  the Retry CID constraints, stores the token for the replacement
+  Initial, resets Initial packet number/recovery state, and validates
+  the peer's original/retry source CID transport parameters.
+- Server embedders can write a standards-compliant QUIC v1 Retry packet
+  with `Connection.writeRetry`; token contents and acceptance policy
+  intentionally remain application-owned.
 - Out-of-order CRYPTO receive reassembly remains in place and handles
   the quic-go ClientHello fragmentation shape.
 - Sent-packet metadata now records retransmittable control frames
@@ -208,11 +220,12 @@ Current as of 2026-05-04.
    ticket export/import examples, transport-parameter mismatch
    rejection vectors beyond replay-context mismatch, and broader 0-RTT
    datagram/loss scenarios.
-6. **Protocol hardening remains.** Retry, Version Negotiation, bounded
-   allocation policy, qlog/keylog diagnostics, and full flow-control
-   pacing still need work. Close/draining and stateless reset now have
-   public state and deterministic unit coverage, but still need broader
-   shutdown-path interop with external peers.
+6. **Protocol hardening remains.** Retry and Version Negotiation have
+   deterministic core coverage, but still need live external Retry/VN
+   interop and a first-class server token validation policy. Bounded
+   allocation policy, qlog/keylog diagnostics, full flow-control
+   pacing, and broader shutdown-path interop with external peers still
+   need work.
 
 Note: the passing mock multipath test now validates simultaneous
 two-path transfer inside nullq. The passing `go-quic-peer multipath`

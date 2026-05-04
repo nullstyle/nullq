@@ -16,6 +16,7 @@ const boringssl = @import("boringssl");
 const c = boringssl.raw;
 
 const level_mod = @import("../tls/level.zig");
+const wire_header = @import("../wire/header.zig");
 const short_packet_mod = @import("../wire/short_packet.zig");
 const long_packet_mod = @import("../wire/long_packet.zig");
 const initial_keys_mod = @import("../wire/initial.zig");
@@ -58,6 +59,8 @@ pub const Session = boringssl.tls.Session;
 pub const EarlyDataStatus = boringssl.tls.Conn.EarlyDataStatus;
 
 pub const Role = enum { client, server };
+
+pub const quic_version_1: u32 = 0x00000001;
 
 pub const Error = error{
     OutOfMemory,
@@ -172,6 +175,7 @@ pub const CloseSource = enum {
     peer,
     idle_timeout,
     stateless_reset,
+    version_negotiation,
 };
 
 pub const CloseErrorSpace = enum {
@@ -486,6 +490,16 @@ pub const Connection = struct {
     /// Server side: same value, recovered from that incoming Initial.
     initial_dcid: ConnectionId = .{},
     initial_dcid_set: bool = false,
+    /// Stable copy of the client's first Initial DCID. If Retry is
+    /// accepted, `initial_dcid` changes to the Retry SCID for key
+    /// derivation, while this value remains the Original DCID used for
+    /// Retry integrity and transport-parameter validation.
+    original_initial_dcid: ConnectionId = .{},
+    original_initial_dcid_set: bool = false,
+    retry_source_cid: ConnectionId = .{},
+    retry_source_cid_set: bool = false,
+    retry_accepted: bool = false,
+    retry_token: std.ArrayList(u8) = .empty,
 
     /// Cached Initial-level packet keys. Derived once `initial_dcid`
     /// is set; cleared if `initial_dcid` is rotated (e.g. after
@@ -665,6 +679,7 @@ pub const Connection = struct {
         }
         self.peer_cids.deinit(self.allocator);
         self.local_cids.deinit(self.allocator);
+        self.retry_token.deinit(self.allocator);
         self.pending_stop_sending.deinit(self.allocator);
         self.pending_max_stream_data.deinit(self.allocator);
         self.pending_new_connection_ids.deinit(self.allocator);
@@ -711,6 +726,7 @@ pub const Connection = struct {
             self.multipath_enabled = true;
         }
         try self.installPeerTransportStatelessResetToken();
+        self.validatePeerTransportConnectionIds();
         return params;
     }
 
@@ -1322,6 +1338,50 @@ pub const Connection = struct {
         try self.setTransportParams(params);
     }
 
+    fn initialHeaderCids(bytes: []const u8) Error!struct {
+        dcid: []const u8,
+        scid: []const u8,
+    } {
+        if (bytes.len < 6) return Error.InsufficientBytes;
+        if ((bytes[0] & 0x80) == 0) return Error.NotShortHeader;
+        const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
+        if (long_type_bits != @intFromEnum(wire_header.LongType.initial)) return Error.NotInitialPacket;
+
+        const dcid_len = bytes[5];
+        if (dcid_len > path_mod.max_cid_len) return Error.DcidTooLong;
+        var pos: usize = 6;
+        if (bytes.len < pos + @as(usize, dcid_len) + 1) return Error.InsufficientBytes;
+        const dcid = bytes[pos .. pos + dcid_len];
+        pos += dcid_len;
+        const scid_len = bytes[pos];
+        if (scid_len > path_mod.max_cid_len) return Error.DcidTooLong;
+        pos += 1;
+        if (bytes.len < pos + @as(usize, scid_len)) return Error.InsufficientBytes;
+        const scid = bytes[pos .. pos + scid_len];
+        return .{ .dcid = dcid, .scid = scid };
+    }
+
+    /// Server-side helper: write a QUIC v1 Retry packet in response
+    /// to `client_initial`. Token contents and validation remain
+    /// embedder-owned; nullq handles the Retry header and RFC 9001
+    /// integrity tag.
+    pub fn writeRetry(
+        self: *Connection,
+        dst: []u8,
+        client_initial: []const u8,
+        retry_scid: []const u8,
+        retry_token: []const u8,
+    ) Error!usize {
+        if (self.role != .server) return error.NotServerContext;
+        const cids = try initialHeaderCids(client_initial);
+        return try long_packet_mod.sealRetry(dst, .{
+            .original_dcid = cids.dcid,
+            .dcid = cids.scid,
+            .scid = retry_scid,
+            .retry_token = retry_token,
+        });
+    }
+
     /// Set the original DCID used for Initial-key derivation
     /// (RFC 9001 §5.2). On the client this is the random DCID it
     /// chose for its very first Initial. On the server, it's the
@@ -1330,6 +1390,10 @@ pub const Connection = struct {
     /// always "unset".
     pub fn setInitialDcid(self: *Connection, dcid: []const u8) Error!void {
         if (dcid.len > path_mod.max_cid_len) return Error.DcidTooLong;
+        if (!self.original_initial_dcid_set) {
+            self.original_initial_dcid = ConnectionId.fromSlice(dcid);
+            self.original_initial_dcid_set = true;
+        }
         self.initial_dcid = ConnectionId.fromSlice(dcid);
         self.initial_dcid_set = true;
         self.initial_keys_read = null;
@@ -1875,6 +1939,7 @@ pub const Connection = struct {
             self.multipath_enabled = true;
         }
         try self.installPeerTransportStatelessResetToken();
+        self.validatePeerTransportConnectionIds();
     }
 
     fn peerAckDelayExponent(self: *const Connection) u6 {
@@ -2141,6 +2206,25 @@ pub const Connection = struct {
         self.clearPendingPings();
     }
 
+    fn resetInitialRecoveryForRetry(self: *Connection) Error!void {
+        const idx = EncryptionLevel.initial.idx();
+        try self.crypto_retx[idx].ensureUnusedCapacity(
+            self.allocator,
+            self.sent_crypto[idx].items.len,
+        );
+        for (self.sent_crypto[idx].items) |chunk| {
+            self.crypto_retx[idx].appendAssumeCapacity(.{
+                .offset = chunk.offset,
+                .data = chunk.data,
+            });
+        }
+        self.sent_crypto[idx].clearRetainingCapacity();
+        self.clearSentTracker(&self.sent[0]);
+        self.pn_spaces[0] = .{};
+        self.pto_count[0] = 0;
+        self.pending_ping[0] = false;
+    }
+
     fn canSendEarlyData(self: *Connection) bool {
         if (self.role != .client) return false;
         if (!self.early_data_send_enabled) return false;
@@ -2156,6 +2240,30 @@ pub const Connection = struct {
         if (!self.peer_dcid_set or self.peer_dcid.len == 0) return;
         try self.registerPeerCid(0, 0, 0, self.peer_dcid, token);
         self.peer_transport_reset_token_installed = true;
+    }
+
+    fn validatePeerTransportConnectionIds(self: *Connection) void {
+        const params = self.cached_peer_transport_params orelse return;
+        if (params.original_destination_connection_id) |odcid| {
+            if (self.original_initial_dcid_set and
+                !ConnectionId.eql(odcid, self.original_initial_dcid))
+            {
+                self.close(true, transport_error_protocol_violation, "original destination cid mismatch");
+                return;
+            }
+        }
+        if (self.retry_accepted) {
+            const retry_source = params.retry_source_connection_id orelse {
+                self.close(true, transport_error_protocol_violation, "missing retry source cid");
+                return;
+            };
+            if (!ConnectionId.eql(retry_source, self.retry_source_cid)) {
+                self.close(true, transport_error_protocol_violation, "retry source cid mismatch");
+                return;
+            }
+        } else if (params.retry_source_connection_id != null) {
+            self.close(true, transport_error_protocol_violation, "unexpected retry source cid");
+        }
     }
 
     fn refreshEarlyDataStatus(self: *Connection) Error!void {
@@ -3051,7 +3159,7 @@ pub const Connection = struct {
             .initial => try long_packet_mod.sealInitial(dst, .{
                 .dcid = packet_dcid.slice(),
                 .scid = self.local_scid.slice(),
-                .token = &.{},
+                .token = if (self.role == .client) self.retry_token.items else &.{},
                 .pn = pn,
                 .largest_acked = largest_acked,
                 .payload = pl_buf[0..pl_pos],
@@ -3229,10 +3337,12 @@ pub const Connection = struct {
         if (from) |addr| incoming_path.setPeerAddress(addr);
         var pos: usize = 0;
         while (pos < bytes.len) {
+            const drain_tls_after_packet = shouldDrainTlsAfterPacket(bytes[pos..]);
             const consumed = try self.handleOnePacket(bytes[pos..], now_us);
             if (consumed == 0) break;
             pos += consumed;
             if (self.pending_close != null or self.closed) break;
+            if (!drain_tls_after_packet) break;
             // Drain CRYPTO into TLS BETWEEN packets, not just at
             // the end. A coalesced Initial+Handshake datagram
             // delivers the ServerHello at Initial level — we have
@@ -3244,6 +3354,14 @@ pub const Connection = struct {
         // either succeed (echo arrived) or time out at PTO * 3.
         self.primaryPath().path.validator.tick(now_us);
         if (self.alert) |_| return error.PeerAlerted;
+    }
+
+    fn shouldDrainTlsAfterPacket(bytes: []const u8) bool {
+        if (bytes.len < 1) return false;
+        if ((bytes[0] & 0x80) == 0) return false;
+        if (bytes.len >= 5 and std.mem.readInt(u32, bytes[1..5], .big) == 0) return false;
+        const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
+        return long_type_bits != @intFromEnum(wire_header.LongType.retry);
     }
 
     /// Initiate path validation by queueing a PATH_CHALLENGE on
@@ -3343,6 +3461,30 @@ pub const Connection = struct {
     }
 
     fn finishDraining(self: *Connection) void {
+        self.pending_close = null;
+        self.draining_deadline_us = null;
+        self.closed = true;
+        self.clearRecoveryState();
+    }
+
+    fn enterClosed(
+        self: *Connection,
+        source: CloseSource,
+        error_space: CloseErrorSpace,
+        error_code: u64,
+        frame_type: u64,
+        reason: []const u8,
+        now_us: u64,
+    ) void {
+        self.recordCloseEvent(
+            source,
+            error_space,
+            error_code,
+            frame_type,
+            reason,
+            now_us,
+            null,
+        );
         self.pending_close = null;
         self.draining_deadline_us = null;
         self.closed = true;
@@ -3469,14 +3611,54 @@ pub const Connection = struct {
             return try self.handleShort(bytes, now_us);
         }
 
+        if (bytes.len >= 5 and std.mem.readInt(u32, bytes[1..5], .big) == 0) {
+            return self.handleVersionNegotiation(bytes, now_us);
+        }
+
         const long_type_bits: u2 = @intCast((first >> 4) & 0x03);
         return switch (long_type_bits) {
             0 => try self.handleInitial(bytes, now_us),
             1 => try self.handleZeroRtt(bytes, now_us),
             2 => try self.handleHandshake(bytes, now_us),
-            // 3 = Retry
-            else => bytes.len,
+            3 => try self.handleRetry(bytes, now_us),
         };
+    }
+
+    fn versionListContains(vn: wire_header.VersionNegotiation, version: u32) bool {
+        var i: usize = 0;
+        while (i < vn.versionCount()) : (i += 1) {
+            if (vn.version(i) == version) return true;
+        }
+        return false;
+    }
+
+    fn handleVersionNegotiation(
+        self: *Connection,
+        bytes: []u8,
+        now_us: u64,
+    ) usize {
+        if (self.role != .client or self.inner.handshakeDone()) return bytes.len;
+        const parsed = wire_header.parse(bytes, 0) catch return bytes.len;
+        if (parsed.header != .version_negotiation) return bytes.len;
+        const vn = parsed.header.version_negotiation;
+        if (!self.local_scid_set or !self.initial_dcid_set) return bytes.len;
+        if (!std.mem.eql(u8, vn.dcid.slice(), self.local_scid.slice())) return bytes.len;
+        const odcid = if (self.original_initial_dcid_set)
+            self.original_initial_dcid
+        else
+            self.initial_dcid;
+        if (!std.mem.eql(u8, vn.scid.slice(), odcid.slice())) return bytes.len;
+        if (versionListContains(vn, quic_version_1)) return bytes.len;
+
+        self.enterClosed(
+            .version_negotiation,
+            .transport,
+            0,
+            0,
+            "no compatible QUIC version",
+            now_us,
+        );
+        return bytes.len;
     }
 
     fn handleShort(
@@ -3630,6 +3812,46 @@ pub const Connection = struct {
         self.pnSpaceForLevel(.initial).recordReceived(opened.pn, now_us / 1000);
         try self.dispatchFrames(.initial, opened.payload, now_us);
         return opened.bytes_consumed;
+    }
+
+    fn handleRetry(
+        self: *Connection,
+        bytes: []u8,
+        now_us: u64,
+    ) Error!usize {
+        _ = now_us;
+        if (self.role != .client or self.retry_accepted or self.inner.handshakeDone()) {
+            return bytes.len;
+        }
+        const parsed = wire_header.parse(bytes, 0) catch return bytes.len;
+        if (parsed.header != .retry) return bytes.len;
+        const retry = parsed.header.retry;
+        if (retry.version != quic_version_1) return bytes.len;
+        if (!self.local_scid_set or !self.initial_dcid_set) return bytes.len;
+        if (!std.mem.eql(u8, retry.dcid.slice(), self.local_scid.slice())) return bytes.len;
+
+        const odcid = if (self.original_initial_dcid_set)
+            self.original_initial_dcid
+        else
+            self.initial_dcid;
+        if (std.mem.eql(u8, retry.scid.slice(), odcid.slice())) {
+            return bytes.len;
+        }
+        const retry_valid = long_packet_mod.validateRetryIntegrity(odcid.slice(), bytes) catch return bytes.len;
+        if (!retry_valid) {
+            return bytes.len;
+        }
+
+        try self.retry_token.resize(self.allocator, retry.retry_token.len);
+        @memcpy(self.retry_token.items, retry.retry_token);
+        self.retry_source_cid = ConnectionId.fromSlice(retry.scid.slice());
+        self.retry_source_cid_set = true;
+        self.retry_accepted = true;
+
+        try self.setPeerDcid(retry.scid.slice());
+        try self.setInitialDcid(retry.scid.slice());
+        try self.resetInitialRecoveryForRetry();
+        return bytes.len;
     }
 
     fn handleZeroRtt(
@@ -5155,6 +5377,224 @@ test "stateless reset token closes without CONNECTION_CLOSE" {
     try std.testing.expectEqual(CloseErrorSpace.transport, close_event.error_space);
     try std.testing.expectEqualStrings("stateless reset", close_event.reason);
     try std.testing.expectEqual(@as(u64, 3_000_000), close_event.at_us.?);
+}
+
+test "Version Negotiation with no compatible version closes terminally" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const odcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+    const client_scid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setPeerDcid(&odcid);
+    try conn.setLocalScid(&client_scid);
+
+    const versions = [_]u8{
+        0x6b, 0x33, 0x43, 0xcf,
+        0xff, 0x00, 0x00, 0x20,
+    };
+    var packet: [128]u8 = undefined;
+    const n = try wire_header.encode(&packet, .{ .version_negotiation = .{
+        .dcid = try wire_header.ConnId.fromSlice(&client_scid),
+        .scid = try wire_header.ConnId.fromSlice(&odcid),
+        .versions_bytes = &versions,
+    } });
+
+    try conn.handle(packet[0..n], null, 4_000_000);
+
+    try std.testing.expect(conn.isClosed());
+    try std.testing.expectEqual(CloseState.closed, conn.closeState());
+    const close_event = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.version_negotiation, close_event.source);
+    try std.testing.expectEqualStrings("no compatible QUIC version", close_event.reason);
+}
+
+test "Version Negotiation is ignored when it lists QUIC v1 or has wrong CID echo" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const odcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const client_scid = [_]u8{ 8, 7, 6, 5 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setPeerDcid(&odcid);
+    try conn.setLocalScid(&client_scid);
+
+    const includes_v1 = [_]u8{
+        0x00, 0x00, 0x00, 0x01,
+        0xff, 0x00, 0x00, 0x20,
+    };
+    var packet: [128]u8 = undefined;
+    var n = try wire_header.encode(&packet, .{ .version_negotiation = .{
+        .dcid = try wire_header.ConnId.fromSlice(&client_scid),
+        .scid = try wire_header.ConnId.fromSlice(&odcid),
+        .versions_bytes = &includes_v1,
+    } });
+    try conn.handle(packet[0..n], null, 4_000_000);
+    try std.testing.expectEqual(CloseState.open, conn.closeState());
+
+    const other_versions = [_]u8{ 0x6b, 0x33, 0x43, 0xcf };
+    n = try wire_header.encode(&packet, .{ .version_negotiation = .{
+        .dcid = try wire_header.ConnId.fromSlice(&.{ 0xde, 0xad }),
+        .scid = try wire_header.ConnId.fromSlice(&odcid),
+        .versions_bytes = &other_versions,
+    } });
+    try conn.handle(packet[0..n], null, 4_000_001);
+    try std.testing.expectEqual(CloseState.open, conn.closeState());
+}
+
+test "Retry is accepted once and re-arms Initial crypto with token" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const odcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+    const client_scid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3 };
+    const retry_scid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 };
+    const retry_token = "retry-token";
+    try conn.setInitialDcid(&odcid);
+    try conn.setPeerDcid(&odcid);
+    try conn.setLocalScid(&client_scid);
+
+    var packet: [256]u8 = undefined;
+    const retry_len = try long_packet_mod.sealRetry(&packet, .{
+        .original_dcid = &odcid,
+        .dcid = &client_scid,
+        .scid = &retry_scid,
+        .retry_token = retry_token,
+    });
+
+    const sent_copy = try allocator.dupe(u8, "client hello");
+    try conn.sent_crypto[EncryptionLevel.initial.idx()].append(allocator, .{
+        .pn = 0,
+        .offset = 0,
+        .data = sent_copy,
+    });
+    try conn.sent[0].record(.{
+        .pn = 0,
+        .sent_time_us = 100,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    conn.pn_spaces[0].next_pn = 9;
+
+    try conn.handle(packet[0..retry_len], null, 4_000_000);
+
+    try std.testing.expect(conn.retry_accepted);
+    try std.testing.expectEqualSlices(u8, retry_token, conn.retry_token.items);
+    try std.testing.expectEqualSlices(u8, &retry_scid, conn.peer_dcid.slice());
+    try std.testing.expectEqualSlices(u8, &retry_scid, conn.initial_dcid.slice());
+    try std.testing.expectEqualSlices(u8, &odcid, conn.original_initial_dcid.slice());
+    try std.testing.expectEqual(@as(u64, 0), conn.pn_spaces[0].next_pn);
+    try std.testing.expectEqual(@as(u32, 0), conn.sent[0].count);
+    try std.testing.expectEqual(@as(usize, 1), conn.crypto_retx[EncryptionLevel.initial.idx()].items.len);
+
+    var out: [1500]u8 = undefined;
+    const n = (try conn.pollLevel(.initial, &out, 4_000_001)).?;
+    const parsed = try wire_header.parse(out[0..n], 0);
+    try std.testing.expect(parsed.header == .initial);
+    try std.testing.expectEqualSlices(u8, retry_token, parsed.header.initial.token);
+}
+
+test "Retry with invalid integrity tag is ignored" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const odcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+    const client_scid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3 };
+    const retry_scid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setPeerDcid(&odcid);
+    try conn.setLocalScid(&client_scid);
+
+    var packet: [256]u8 = undefined;
+    const retry_len = try long_packet_mod.sealRetry(&packet, .{
+        .original_dcid = &odcid,
+        .dcid = &client_scid,
+        .scid = &retry_scid,
+        .retry_token = "retry-token",
+    });
+    packet[retry_len - 1] ^= 0x01;
+
+    try conn.handle(packet[0..retry_len], null, 4_000_000);
+
+    try std.testing.expect(!conn.retry_accepted);
+    try std.testing.expectEqualSlices(u8, &odcid, conn.peer_dcid.slice());
+    try std.testing.expectEqual(CloseState.open, conn.closeState());
+}
+
+test "Retry source CID transport parameter is validated" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const odcid = [_]u8{ 1, 1, 2, 3, 5, 8, 13, 21 };
+    const retry_scid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3 };
+    try conn.setInitialDcid(&odcid);
+    conn.retry_accepted = true;
+    conn.retry_source_cid = ConnectionId.fromSlice(&retry_scid);
+    conn.retry_source_cid_set = true;
+
+    conn.cached_peer_transport_params = .{
+        .original_destination_connection_id = ConnectionId.fromSlice(&odcid),
+        .retry_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb }),
+    };
+    conn.validatePeerTransportConnectionIds();
+
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expectEqualStrings("retry source cid mismatch", conn.pending_close.?.reason);
+}
+
+test "server writeRetry emits a Retry addressed to the client Initial SCID" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const odcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+    const client_scid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3 };
+    const retry_scid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3 };
+    const init_keys = try initial_keys_mod.deriveInitialKeys(&odcid, false);
+    const keys = try short_packet_mod.derivePacketKeys(.aes128_gcm_sha256, &init_keys.secret);
+
+    var initial: [256]u8 = undefined;
+    const initial_len = try long_packet_mod.sealInitial(&initial, .{
+        .dcid = &odcid,
+        .scid = &client_scid,
+        .pn = 0,
+        .payload = "CRYPTO",
+        .keys = &keys,
+    });
+
+    var retry: [256]u8 = undefined;
+    const retry_len = try conn.writeRetry(
+        &retry,
+        initial[0..initial_len],
+        &retry_scid,
+        "server-token",
+    );
+
+    const parsed = try wire_header.parse(retry[0..retry_len], 0);
+    try std.testing.expect(parsed.header == .retry);
+    try std.testing.expectEqualSlices(u8, &client_scid, parsed.header.retry.dcid.slice());
+    try std.testing.expectEqualSlices(u8, &retry_scid, parsed.header.retry.scid.slice());
+    try std.testing.expectEqualSlices(u8, "server-token", parsed.header.retry.retry_token);
+    try std.testing.expect(try long_packet_mod.validateRetryIntegrity(&odcid, retry[0..retry_len]));
 }
 
 test "EncryptionLevel idx round-trip" {
