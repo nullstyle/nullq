@@ -163,6 +163,11 @@ Current as of 2026-05-04.
   mid-transfer PATH_ABANDON. The surviving primary path carries the
   retransmissions to completion and the abandoned path retires through
   the 3x-PTO cleanup path.
+- A mock single-path migration transport now exercises NAT rebinding
+  during bidirectional STREAM transfer with deterministic reordering
+  and loss of the first rebound datagram. The endpoint validates the
+  new 4-tuple, sends to the rebound address, and carries both streams
+  to FIN/ACK completion.
 - Multipath draft-21 is explicit in the public surface:
   `multipath_draft_version = 21` and transport parameter
   `initial_max_path_id = 0x3e`.
@@ -249,9 +254,11 @@ Current as of 2026-05-04.
    peer CIDs and ACK/recovery state until the 3x-largest-PTO drain
    window expires. NAT rebinding resets RTT/congestion after validation
    and keeps old-address PATH_RESPONSE traffic off the new path's
-   anti-amplification accounting. Remaining recovery work: broader
-   lossy/reordered interop gates and live migration soak. Pacing, ECN,
-   and advanced congestion controllers remain out of scope for this push.
+   anti-amplification accounting. Local mock transport now covers
+   bidirectional transfer across a lossy/reordered NAT rebinding.
+   Remaining recovery work: external lossy/reordered interop gates and
+   live migration soak. Pacing, ECN, and advanced congestion controllers
+   remain out of scope for this push.
 4. **Key updates need external soak, not core lifecycle work.** The
    current implementation covers previous/current/next read keys,
    3x-PTO old-key discard, local initiation, ACK gating, and cross-suite

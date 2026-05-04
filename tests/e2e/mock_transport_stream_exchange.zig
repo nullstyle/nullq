@@ -21,6 +21,7 @@ const ClientCid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
 const ServerCid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x99 };
 const ClientPath1Cid = [_]u8{ 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28 };
 const ServerPath1Cid = [_]u8{ 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xb0, 0xb1 };
+const Address = nullq.conn.path.Address;
 
 fn handshake(allocator: std.mem.Allocator, client: *nullq.Connection, server: *nullq.Connection) !void {
     var step: u32 = 0;
@@ -58,6 +59,13 @@ const SimPacket = struct {
     bytes: []u8,
     from_client: bool,
     path_id: u32,
+    release_us: u64,
+};
+
+const AddressedPacket = struct {
+    bytes: []u8,
+    from_client: bool,
+    source: Address,
     release_us: u64,
 };
 
@@ -165,6 +173,128 @@ const MultipathNet = struct {
                     try server.handle(pkt.bytes, null, now_us);
                 } else {
                     try client.handle(pkt.bytes, null, now_us);
+                }
+                delivered = true;
+                break;
+            }
+        }
+    }
+};
+
+const RebindingNet = struct {
+    allocator: std.mem.Allocator,
+    queue: std.ArrayList(AddressedPacket) = .empty,
+    client_addr: Address,
+    client_rebound_addr: Address,
+    server_addr: Address,
+    client_rebound: bool = false,
+    c2s_seq: u32 = 0,
+    s2c_seq: u32 = 0,
+    dropped_first_rebound_c2s: bool = false,
+    delivered_rebound_c2s: bool = false,
+    server_sent_to_rebound: bool = false,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        client_addr: Address,
+        client_rebound_addr: Address,
+        server_addr: Address,
+    ) RebindingNet {
+        return .{
+            .allocator = allocator,
+            .client_addr = client_addr,
+            .client_rebound_addr = client_rebound_addr,
+            .server_addr = server_addr,
+        };
+    }
+
+    fn deinit(self: *RebindingNet) void {
+        for (self.queue.items) |pkt| self.allocator.free(pkt.bytes);
+        self.queue.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn clientSource(self: *const RebindingNet) Address {
+        return if (self.client_rebound) self.client_rebound_addr else self.client_addr;
+    }
+
+    fn delayUs(from_client: bool, seq: u32) u64 {
+        if (from_client) return if (seq % 4 == 1) 7_000 else 1_000;
+        return if (seq % 3 == 2) 6_000 else 1_000;
+    }
+
+    fn enqueue(
+        self: *RebindingNet,
+        from_client: bool,
+        datagram: nullq.OutgoingDatagram,
+        bytes: []const u8,
+        now_us: u64,
+    ) !void {
+        const seq = if (from_client) self.c2s_seq else self.s2c_seq;
+        if (from_client) {
+            self.c2s_seq += 1;
+        } else {
+            self.s2c_seq += 1;
+            if (datagram.to) |addr| {
+                if (Address.eql(addr, self.client_rebound_addr)) self.server_sent_to_rebound = true;
+            }
+        }
+
+        const source = if (from_client) self.clientSource() else self.server_addr;
+        if (from_client and
+            self.client_rebound and
+            !self.dropped_first_rebound_c2s)
+        {
+            self.dropped_first_rebound_c2s = true;
+            return;
+        }
+
+        const copy = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(copy);
+        try self.queue.append(self.allocator, .{
+            .bytes = copy,
+            .from_client = from_client,
+            .source = source,
+            .release_us = now_us + delayUs(from_client, seq),
+        });
+    }
+
+    fn pollEndpoint(
+        self: *RebindingNet,
+        from_client: bool,
+        conn: *nullq.Connection,
+        now_us: u64,
+    ) !void {
+        var pkt: [2048]u8 = undefined;
+        if (try conn.pollDatagram(&pkt, now_us)) |datagram| {
+            try self.enqueue(from_client, datagram, pkt[0..datagram.len], now_us);
+        }
+    }
+
+    fn deliverDue(
+        self: *RebindingNet,
+        client: *nullq.Connection,
+        server: *nullq.Connection,
+        now_us: u64,
+    ) !void {
+        var delivered = true;
+        while (delivered) {
+            delivered = false;
+            var i: usize = 0;
+            while (i < self.queue.items.len) {
+                if (self.queue.items[i].release_us > now_us) {
+                    i += 1;
+                    continue;
+                }
+                const pkt = self.queue.orderedRemove(i);
+                defer self.allocator.free(pkt.bytes);
+                if (pkt.from_client) {
+                    if (Address.eql(pkt.source, self.client_rebound_addr)) {
+                        self.delivered_rebound_c2s = true;
+                    }
+                    try server.handle(pkt.bytes, pkt.source, now_us);
+                } else {
+                    try client.handle(pkt.bytes, pkt.source, now_us);
                 }
                 delivered = true;
                 break;
@@ -704,6 +834,111 @@ test "client streams 16 KiB to server with 10% simulated loss" {
     try std.testing.expect(cs.send.fin_acked);
     const ss = server.stream(0).?;
     try std.testing.expect(ss.recv.fin_seen);
+}
+
+test "single-path NAT rebinding survives loss and reordering" {
+    const allocator = std.testing.allocator;
+
+    var server_tls: boringssl.tls.Context = undefined;
+    var client_tls: boringssl.tls.Context = undefined;
+    try buildContexts(&server_tls, &client_tls);
+    defer server_tls.deinit();
+    defer client_tls.deinit();
+
+    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    defer client.deinit();
+    var server = try nullq.Connection.initServer(allocator, server_tls);
+    defer server.deinit();
+
+    try client.bind();
+    try server.bind();
+    client.peer = &server;
+    server.peer = &client;
+
+    const tp: nullq.tls.TransportParams = .{
+        .max_idle_timeout_ms = 30_000,
+        .initial_max_data = 1 << 22,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
+        .initial_max_streams_bidi = 16,
+    };
+    try client.setTransportParams(tp);
+    try server.setTransportParams(tp);
+
+    try handshake(allocator, &client, &server);
+    try configurePrimaryCids(&client, &server);
+
+    var net = RebindingNet.init(
+        allocator,
+        .{ .bytes = .{ 10, 0, 0, 1 } ++ .{0} ** 18 },
+        .{ .bytes = .{ 10, 0, 0, 2 } ++ .{0} ** 18 },
+        .{ .bytes = .{ 10, 0, 0, 99 } ++ .{0} ** 18 },
+    );
+    defer net.deinit();
+
+    const total: usize = 32 * 1024;
+    const client_data = try allocator.alloc(u8, total);
+    defer allocator.free(client_data);
+    const server_data = try allocator.alloc(u8, total);
+    defer allocator.free(server_data);
+    var prng = std.Random.DefaultPrng.init(0x9a7_91);
+    prng.random().bytes(client_data);
+    prng.random().bytes(server_data);
+
+    _ = try client.openBidi(0);
+    _ = try server.openBidi(1);
+    _ = try client.streamWrite(0, client_data);
+    _ = try server.streamWrite(1, server_data);
+    try client.streamFinish(0);
+    try server.streamFinish(1);
+
+    var now_us: u64 = 1_000_000;
+    var client_consumed: usize = 0;
+    var server_consumed: usize = 0;
+    var cbuf: [4096]u8 = undefined;
+    var sbuf: [4096]u8 = undefined;
+    var rebound_started = false;
+    var iters: u32 = 0;
+
+    while (iters < 700_000) : (iters += 1) {
+        try client.tick(now_us);
+        try server.tick(now_us);
+        try net.deliverDue(&client, &server, now_us);
+        try net.pollEndpoint(true, &client, now_us);
+        try net.pollEndpoint(false, &server, now_us);
+
+        try drainExpectedStream(&server, 0, client_data, &server_consumed, &sbuf);
+        try drainExpectedStream(&client, 1, server_data, &client_consumed, &cbuf);
+
+        if (!rebound_started and server_consumed >= total / 4 and client_consumed >= total / 4) {
+            net.client_rebound = true;
+            rebound_started = true;
+        }
+
+        const cstream = client.stream(0).?;
+        const sstream = server.stream(1).?;
+        const done =
+            client_consumed == total and
+            server_consumed == total and
+            cstream.send.ackedFloor() == @as(u64, @intCast(total)) and
+            sstream.send.ackedFloor() == @as(u64, @intCast(total)) and
+            cstream.send.fin_acked and
+            sstream.send.fin_acked and
+            server.pathStats(0).?.validated and
+            net.server_sent_to_rebound;
+        if (done) break;
+
+        now_us += 1_000;
+    }
+
+    try std.testing.expect(iters < 700_000);
+    try std.testing.expect(rebound_started);
+    try std.testing.expect(net.dropped_first_rebound_c2s);
+    try std.testing.expect(net.delivered_rebound_c2s);
+    try std.testing.expect(net.server_sent_to_rebound);
+    try std.testing.expect(server.pathStats(0).?.validated);
+    try std.testing.expectEqual(total, server_consumed);
+    try std.testing.expectEqual(total, client_consumed);
 }
 
 test "multipath concurrent transfer survives reordering loss and path abandon" {
