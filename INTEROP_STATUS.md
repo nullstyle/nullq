@@ -34,6 +34,16 @@ Current as of 2026-05-04.
 
 ## Production work landed
 
+- Applications can now abort the send half of a stream directly with
+  public `Connection.streamReset(stream_id, application_error_code)`.
+  The call uses the existing RESET_STREAM ACK/loss machinery, discards
+  queued STREAM data, and reports the current written byte count as the
+  final size.
+- Embedders now get close/error status without reaching into private
+  state. `Connection.closeEvent()` exposes sticky local, peer, and idle
+  timeout close metadata, while `Connection.pollEvent()` delivers the
+  same close notification once through the public `ConnectionEvent`
+  union.
 - Out-of-order CRYPTO receive reassembly remains in place and handles
   the quic-go ClientHello fragmentation shape.
 - Sent-packet metadata now records retransmittable control frames
@@ -189,9 +199,11 @@ Current as of 2026-05-04.
    rejection vectors beyond replay-context mismatch, and broader 0-RTT
    datagram/loss scenarios.
 6. **Protocol hardening remains.** Retry, Version Negotiation,
-   stateless reset, close/draining state, typed close errors, bounded
-   allocation policy, qlog/keylog diagnostics, and full flow-control
-   pacing still need work.
+   stateless reset, deeper close/draining behavior, bounded allocation
+   policy, qlog/keylog diagnostics, and full flow-control pacing still
+   need work. Close/error details are now surfaced publicly, but the
+   transport still needs broader shutdown-path interop and stateless
+   reset coverage.
 
 Note: the passing mock multipath test now validates simultaneous
 two-path transfer inside nullq. The passing `go-quic-peer multipath`

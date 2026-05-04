@@ -167,6 +167,46 @@ pub const ConnectionCloseInfo = struct {
     reason: []const u8 = &.{},
 };
 
+pub const CloseSource = enum {
+    local,
+    peer,
+    idle_timeout,
+};
+
+pub const CloseErrorSpace = enum {
+    transport,
+    application,
+};
+
+pub const max_close_reason_len: usize = 256;
+
+pub const CloseEvent = struct {
+    source: CloseSource,
+    error_space: CloseErrorSpace,
+    error_code: u64,
+    frame_type: u64 = 0,
+    reason: []const u8 = &.{},
+    reason_truncated: bool = false,
+    at_us: ?u64 = null,
+    draining_deadline_us: ?u64 = null,
+};
+
+pub const ConnectionEvent = union(enum) {
+    close: CloseEvent,
+};
+
+const StoredCloseEvent = struct {
+    source: CloseSource,
+    error_space: CloseErrorSpace,
+    error_code: u64,
+    frame_type: u64 = 0,
+    reason_len: usize = 0,
+    reason_truncated: bool = false,
+    at_us: ?u64 = null,
+    draining_deadline_us: ?u64 = null,
+    delivered: bool = false,
+};
+
 pub const StopSendingItem = struct {
     stream_id: u64,
     application_error_code: u64,
@@ -504,9 +544,14 @@ pub const Connection = struct {
     /// next outgoing packet at the highest available encryption
     /// level emits it.
     pending_close: ?ConnectionCloseInfo = null,
-    /// True once we've sent or received a CONNECTION_CLOSE frame.
-    /// `poll` returns null and `handle` ignores frames after this.
+    /// True once we've sent or received a CONNECTION_CLOSE frame, or
+    /// an idle timeout has entered draining.
     closed: bool = false,
+    /// Sticky close/error status for embedders. The stored event keeps
+    /// offsets into `close_reason_buf` so `Connection` can be moved before
+    /// bind/init without leaving a self-referential slice behind.
+    close_event: ?StoredCloseEvent = null,
+    close_reason_buf: [max_close_reason_len]u8 = undefined,
     /// STOP_SENDING frames we owe the peer (one per stream id).
     pending_stop_sending: std.ArrayList(StopSendingItem) = .empty,
     /// MAX_STREAM_DATA frames we owe after the application drains
@@ -1422,6 +1467,19 @@ pub const Connection = struct {
     pub fn streamFinish(self: *Connection, id: u64) Error!void {
         const s = self.streams.get(id) orelse return Error.StreamNotFound;
         try s.send.finish();
+    }
+
+    /// Convenience: abort the send half of stream `id` with
+    /// RESET_STREAM (RFC 9000 §19.4). Any queued but unsent STREAM data
+    /// is discarded; the final size is the number of bytes already
+    /// accepted by `streamWrite`.
+    pub fn streamReset(
+        self: *Connection,
+        id: u64,
+        application_error_code: u64,
+    ) Error!void {
+        const s = self.streams.get(id) orelse return Error.StreamNotFound;
+        try s.send.resetStream(application_error_code);
     }
 
     /// Queue an RFC 9221 DATAGRAM payload for transmission. The
@@ -2621,7 +2679,9 @@ pub const Connection = struct {
             };
             if (lvl == .application) self.recordApplicationPacketProtected(&close_packet);
             try sent_tracker.record(close_packet);
-            self.draining_deadline_us = now_us + self.drainingDurationUs();
+            const draining_deadline = now_us + self.drainingDurationUs();
+            self.draining_deadline_us = draining_deadline;
+            self.updateCloseEventDrainingDeadline(draining_deadline);
             return n_close;
         }
 
@@ -3162,6 +3222,76 @@ pub const Connection = struct {
         return self.closed;
     }
 
+    fn closeErrorSpace(is_transport: bool) CloseErrorSpace {
+        return if (is_transport) .transport else .application;
+    }
+
+    fn recordCloseEvent(
+        self: *Connection,
+        source: CloseSource,
+        error_space: CloseErrorSpace,
+        error_code: u64,
+        frame_type: u64,
+        reason: []const u8,
+        at_us: ?u64,
+        draining_deadline_us: ?u64,
+    ) void {
+        if (self.close_event != null) return;
+        const reason_len = @min(reason.len, max_close_reason_len);
+        if (reason_len > 0) {
+            @memcpy(self.close_reason_buf[0..reason_len], reason[0..reason_len]);
+        }
+        self.close_event = .{
+            .source = source,
+            .error_space = error_space,
+            .error_code = error_code,
+            .frame_type = frame_type,
+            .reason_len = reason_len,
+            .reason_truncated = reason.len > reason_len,
+            .at_us = at_us,
+            .draining_deadline_us = draining_deadline_us,
+        };
+    }
+
+    fn updateCloseEventDrainingDeadline(self: *Connection, deadline_us: u64) void {
+        if (self.close_event) |*event| {
+            event.draining_deadline_us = deadline_us;
+        }
+    }
+
+    fn closeEventFromStored(self: *const Connection, event: StoredCloseEvent) CloseEvent {
+        return .{
+            .source = event.source,
+            .error_space = event.error_space,
+            .error_code = event.error_code,
+            .frame_type = event.frame_type,
+            .reason = self.close_reason_buf[0..event.reason_len],
+            .reason_truncated = event.reason_truncated,
+            .at_us = event.at_us,
+            .draining_deadline_us = event.draining_deadline_us,
+        };
+    }
+
+    /// Sticky close/error status for embedders. This remains available
+    /// after `pollEvent` consumes the event notification.
+    pub fn closeEvent(self: *const Connection) ?CloseEvent {
+        const event = self.close_event orelse return null;
+        return self.closeEventFromStored(event);
+    }
+
+    /// Poll the next connection-level event. For now the event surface
+    /// exposes close/error notifications; future readable-stream and path
+    /// events can extend this union without disturbing the sticky helpers.
+    pub fn pollEvent(self: *Connection) ?ConnectionEvent {
+        if (self.close_event) |*event| {
+            if (event.delivered) return null;
+            const out = self.closeEventFromStored(event.*);
+            event.delivered = true;
+            return .{ .close = out };
+        }
+        return null;
+    }
+
     /// Queue a CONNECTION_CLOSE frame (RFC 9000 §19.19) for the
     /// next outgoing packet. `is_transport` selects between
     /// transport (0x1c) and application (0x1d) error spaces.
@@ -3171,7 +3301,16 @@ pub const Connection = struct {
         error_code: u64,
         reason: []const u8,
     ) void {
-        if (self.pending_close != null) return;
+        if (self.pending_close != null or self.closed) return;
+        self.recordCloseEvent(
+            .local,
+            closeErrorSpace(is_transport),
+            error_code,
+            0,
+            reason,
+            null,
+            null,
+        );
         self.pending_close = .{
             .is_transport = is_transport,
             .error_code = error_code,
@@ -3506,9 +3645,20 @@ pub const Connection = struct {
                 .max_path_id => |mp| self.handleMaxPathId(mp),
                 .paths_blocked => |pb| self.handlePathsBlocked(pb),
                 .path_cids_blocked => |pcb| self.handlePathCidsBlocked(pcb),
-                .connection_close => {
+                .connection_close => |cc| {
+                    const draining_deadline = now_us + self.drainingDurationUs();
+                    self.recordCloseEvent(
+                        .peer,
+                        closeErrorSpace(cc.is_transport),
+                        cc.error_code,
+                        if (cc.is_transport) cc.frame_type else 0,
+                        cc.reason_phrase,
+                        now_us,
+                        draining_deadline,
+                    );
+                    self.pending_close = null;
                     self.closed = true;
-                    self.draining_deadline_us = now_us + self.drainingDurationUs();
+                    self.draining_deadline_us = draining_deadline;
                 },
                 .retire_connection_id => |rc| self.handleRetireConnectionId(rc),
                 .max_data, .max_stream_data, .max_streams, .data_blocked, .stream_data_blocked, .streams_blocked, .new_token => {},
@@ -4545,8 +4695,18 @@ pub const Connection = struct {
         if (!self.closed) {
             if (self.idleDeadline()) |deadline| {
                 if (now_us >= deadline) {
+                    const draining_deadline = now_us +| self.drainingDurationUs();
+                    self.recordCloseEvent(
+                        .idle_timeout,
+                        .transport,
+                        0,
+                        0,
+                        "idle timeout",
+                        now_us,
+                        draining_deadline,
+                    );
                     self.closed = true;
-                    self.draining_deadline_us = now_us +| self.drainingDurationUs();
+                    self.draining_deadline_us = draining_deadline;
                     return;
                 }
             }
@@ -4731,6 +4891,79 @@ fn installMethod(conn: *Connection) !void {
 }
 
 // -- tests ---------------------------------------------------------------
+
+test "streamReset publicly aborts the send half" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    _ = try conn.openBidi(0);
+    try std.testing.expectEqual(@as(usize, 5), try conn.streamWrite(0, "hello"));
+    try conn.streamReset(0, 0xdead);
+
+    const s = conn.stream(0).?;
+    try std.testing.expectEqual(send_stream_mod.State.reset_sent, s.send.state);
+    try std.testing.expect(s.send.reset != null);
+    try std.testing.expectEqual(@as(u64, 0xdead), s.send.reset.?.error_code);
+    try std.testing.expectEqual(@as(u64, 5), s.send.reset.?.final_size);
+    try std.testing.expectError(send_stream_mod.Error.StreamClosed, conn.streamWrite(0, "late"));
+    try std.testing.expectError(Error.StreamNotFound, conn.streamReset(4, 0));
+}
+
+test "local close is exposed as sticky and pollable event" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.close(false, 0x42, "shutting down");
+
+    const sticky = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.local, sticky.source);
+    try std.testing.expectEqual(CloseErrorSpace.application, sticky.error_space);
+    try std.testing.expectEqual(@as(u64, 0x42), sticky.error_code);
+    try std.testing.expectEqual(@as(u64, 0), sticky.frame_type);
+    try std.testing.expectEqualStrings("shutting down", sticky.reason);
+    try std.testing.expect(!sticky.reason_truncated);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .close);
+    try std.testing.expectEqualStrings("shutting down", event.close.reason);
+    try std.testing.expect(conn.pollEvent() == null);
+    try std.testing.expect(conn.closeEvent() != null);
+}
+
+test "peer close records transport error details" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var payload: [128]u8 = undefined;
+    const n = try frame_mod.encode(&payload, .{
+        .connection_close = .{
+            .is_transport = true,
+            .error_code = 0x0a,
+            .frame_type = 0x08,
+            .reason_phrase = "bad stream frame",
+        },
+    });
+    try conn.dispatchFrames(.application, payload[0..n], 1_000_000);
+
+    const sticky = conn.closeEvent().?;
+    try std.testing.expect(conn.isClosed());
+    try std.testing.expectEqual(CloseSource.peer, sticky.source);
+    try std.testing.expectEqual(CloseErrorSpace.transport, sticky.error_space);
+    try std.testing.expectEqual(@as(u64, 0x0a), sticky.error_code);
+    try std.testing.expectEqual(@as(u64, 0x08), sticky.frame_type);
+    try std.testing.expectEqualStrings("bad stream frame", sticky.reason);
+    try std.testing.expectEqual(@as(u64, 1_000_000), sticky.at_us.?);
+    try std.testing.expect(sticky.draining_deadline_us != null);
+}
 
 test "EncryptionLevel idx round-trip" {
     inline for (level_mod.all) |lvl| {
@@ -6176,4 +6409,9 @@ test "idle timer closes and enters draining" {
     try conn.tick(6_000);
     try std.testing.expect(conn.isClosed());
     try std.testing.expect(conn.draining_deadline_us != null);
+    const close_event = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.idle_timeout, close_event.source);
+    try std.testing.expectEqual(CloseErrorSpace.transport, close_event.error_space);
+    try std.testing.expectEqual(@as(u64, 0), close_event.error_code);
+    try std.testing.expectEqualStrings("idle timeout", close_event.reason);
 }
