@@ -16,9 +16,10 @@ QUIC interop runner.
 - Supports server-side Retry when `TESTCASE=retry`.
 - Enables session tickets / 0-RTT at the TLS layer so external clients
   can exercise `resumption` and `zerortt`.
-- The client role is currently a full-handshake HTTP/0.9 downloader;
-  client-side resumption/0-RTT ticket persistence remains follow-up
-  work.
+- The client role handles normal full-handshake downloads plus QNS
+  `resumption` and `zerortt`: it downloads the first request, captures
+  a session ticket, reconnects for the remaining requests, and sends
+  those second-flight requests as early data for `zerortt`.
 
 The default external matrix targets server-side nullq against the
 current official clients `quic-go`, `ngtcp2`, and `quiche`, using:

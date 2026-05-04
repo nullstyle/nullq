@@ -28,6 +28,51 @@ const ClientOptions = struct {
     server_name: []const u8 = "server",
     downloads: []const u8 = "/downloads",
     requests: []const u8 = "",
+    testcase: []const u8 = "",
+};
+
+const ClientMode = enum {
+    normal,
+    resumption,
+    zerortt,
+};
+
+const ClientConnectionOptions = struct {
+    session: ?boringssl.tls.Session = null,
+    early_data: bool = false,
+    wait_for_ticket: ?*TicketStore = null,
+};
+
+const TicketStore = struct {
+    allocator: std.mem.Allocator,
+    latest: ?[]u8 = null,
+    failed: bool = false,
+
+    fn init(allocator: std.mem.Allocator) TicketStore {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TicketStore) void {
+        if (self.latest) |bytes| self.allocator.free(bytes);
+        self.* = undefined;
+    }
+
+    fn capture(self: *TicketStore, ticket: boringssl.tls.Session) void {
+        var owned = ticket;
+        defer owned.deinit();
+        const bytes = owned.toBytes(self.allocator) catch {
+            self.failed = true;
+            return;
+        };
+        if (self.latest) |old| self.allocator.free(old);
+        self.latest = bytes;
+    }
+
+    fn session(self: *TicketStore, ctx: boringssl.tls.Context) !boringssl.tls.Session {
+        if (self.failed) return error.SessionTicketCaptureFailed;
+        const bytes = self.latest orelse return error.NoSessionTicket;
+        return try boringssl.tls.Session.fromBytes(ctx, bytes);
+    }
 };
 
 const StreamState = struct {
@@ -169,6 +214,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "client")) {
         var opts: ClientOptions = .{};
         if (init.environ_map.get("REQUESTS")) |requests| opts.requests = requests;
+        if (init.environ_map.get("TESTCASE")) |testcase| opts.testcase = testcase;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "-server")) {
                 opts.server = args.next() orelse return error.MissingServerAddress;
@@ -178,6 +224,8 @@ pub fn main(init: std.process.Init) !void {
                 opts.downloads = args.next() orelse return error.MissingDownloadsDirectory;
             } else if (std.mem.eql(u8, arg, "-requests")) {
                 opts.requests = args.next() orelse return error.MissingRequests;
+            } else if (std.mem.eql(u8, arg, "-testcase")) {
+                opts.testcase = args.next() orelse return error.MissingTestcase;
             } else {
                 usage();
                 return error.UnknownArgument;
@@ -195,7 +243,7 @@ fn usage() void {
     std.debug.print(
         \\usage:
         \\  qns-endpoint server [-listen 0.0.0.0:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-retry]
-        \\  qns-endpoint client [-server server:443] [-server-name server] [-downloads /downloads] [-requests "$REQUESTS"]
+        \\  qns-endpoint client [-server server:443] [-server-name server] [-downloads /downloads] [-requests "$REQUESTS"] [-testcase "$TESTCASE"]
         \\
     , .{});
 }
@@ -336,16 +384,6 @@ fn runClient(
     if (downloads.len == 0) return error.NoRequests;
 
     const server_addr = try resolveEndpoint(io, opts.server);
-    const bind_addr: Net.IpAddress = switch (server_addr) {
-        .ip4 => .{ .ip4 = Net.Ip4Address.unspecified(0) },
-        .ip6 => .{ .ip6 = Net.Ip6Address.unspecified(0) },
-    };
-    const sock = try Net.IpAddress.bind(&bind_addr, io, .{
-        .mode = .dgram,
-        .protocol = .udp,
-    });
-    defer sock.close(io);
-
     const protos = [_][]const u8{hq_alpn};
     var client_tls = try boringssl.tls.Context.initClient(.{
         .verify = .none,
@@ -356,10 +394,101 @@ fn runClient(
     });
     defer client_tls.deinit();
 
+    var tickets = TicketStore.init(allocator);
+    defer tickets.deinit();
+    try client_tls.setNewSessionCallback(captureSessionTicket, &tickets);
+
     const server_name_z = try allocator.dupeZ(u8, opts.server_name);
     defer allocator.free(server_name_z);
+
+    const mode = clientMode(opts.testcase);
+    std.debug.print("nullq qns client connecting to {f} testcase={s} requests={d}\n", .{
+        server_addr,
+        if (opts.testcase.len == 0) "default" else opts.testcase,
+        downloads.len,
+    });
+
+    try std.Io.Dir.cwd().createDirPath(io, opts.downloads);
+    var downloads_dir = try openDir(io, opts.downloads);
+    defer downloads_dir.close(io);
+
+    switch (mode) {
+        .normal => try runClientConnection(
+            allocator,
+            io,
+            client_tls,
+            server_name_z,
+            server_addr,
+            downloads_dir,
+            downloads,
+            .{},
+        ),
+        .resumption, .zerortt => {
+            if (downloads.len < 2) return error.ResumptionRequiresMultipleRequests;
+            try runClientConnection(
+                allocator,
+                io,
+                client_tls,
+                server_name_z,
+                server_addr,
+                downloads_dir,
+                downloads[0..1],
+                .{ .wait_for_ticket = &tickets },
+            );
+            var session = try tickets.session(client_tls);
+            defer session.deinit();
+            try runClientConnection(
+                allocator,
+                io,
+                client_tls,
+                server_name_z,
+                server_addr,
+                downloads_dir,
+                downloads[1..],
+                .{
+                    .session = session,
+                    .early_data = mode == .zerortt,
+                },
+            );
+        },
+    }
+}
+
+fn captureSessionTicket(user_data: ?*anyopaque, session: boringssl.tls.Session) void {
+    const store: *TicketStore = @ptrCast(@alignCast(user_data.?));
+    store.capture(session);
+}
+
+fn clientMode(testcase: []const u8) ClientMode {
+    if (std.mem.eql(u8, testcase, "resumption")) return .resumption;
+    if (std.mem.eql(u8, testcase, "zerortt")) return .zerortt;
+    return .normal;
+}
+
+fn runClientConnection(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client_tls: boringssl.tls.Context,
+    server_name_z: [:0]const u8,
+    server_addr: Net.IpAddress,
+    downloads_dir: std.Io.Dir,
+    downloads: []ClientDownload,
+    conn_opts: ClientConnectionOptions,
+) !void {
+    const bind_addr: Net.IpAddress = switch (server_addr) {
+        .ip4 => .{ .ip4 = Net.Ip4Address.unspecified(0) },
+        .ip6 => .{ .ip6 = Net.Ip6Address.unspecified(0) },
+    };
+    const sock = try Net.IpAddress.bind(&bind_addr, io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    });
+    defer sock.close(io);
+
     var conn = try nullq.Connection.initClient(allocator, client_tls, server_name_z);
     defer conn.deinit();
+    if (conn_opts.session) |session| try conn.setSession(session);
+    if (conn_opts.early_data) conn.setEarlyDataEnabled(true);
     try conn.bind();
 
     var initial_dcid: [8]u8 = undefined;
@@ -383,22 +512,22 @@ fn runClient(
         .active_connection_id_limit = 8,
     };
     try conn.setTransportParams(params);
-    try conn.advance();
-
-    try std.Io.Dir.cwd().createDirPath(io, opts.downloads);
-    var downloads_dir = try openDir(io, opts.downloads);
-    defer downloads_dir.close(io);
-
-    std.debug.print("nullq qns client connecting to {f} requests={d}\n", .{ server_addr, downloads.len });
 
     var requests_started = false;
+    if (conn_opts.early_data) {
+        try startClientRequests(allocator, &conn, downloads);
+        requests_started = true;
+    }
+    try conn.advance();
+
     var now_us: u64 = 1_000_000;
     var idle_us: u64 = 0;
     var rx: [64 * 1024]u8 = undefined;
     var tx: [endpoint_udp_payload_size]u8 = undefined;
 
-    while (!allDownloadsComplete(downloads) and !conn.isClosed()) {
+    while ((!allDownloadsComplete(downloads) or !ticketRequirementMet(conn_opts.wait_for_ticket)) and !conn.isClosed()) {
         var progressed = false;
+        const had_ticket = ticketRequirementMet(conn_opts.wait_for_ticket);
 
         const maybe_msg = sock.receiveTimeout(io, &rx, .{
             .duration = .{
@@ -423,6 +552,10 @@ fn runClient(
         if (requests_started) {
             if (try drainClientResponses(allocator, &conn, downloads)) progressed = true;
             try writeCompletedDownloads(io, downloads_dir, downloads);
+        }
+        if (!had_ticket and ticketRequirementMet(conn_opts.wait_for_ticket)) {
+            std.debug.print("captured session ticket\n", .{});
+            progressed = true;
         }
 
         while (try conn.poll(&tx, now_us)) |n| {
@@ -450,6 +583,14 @@ fn runClient(
         }
         return error.ConnectionClosedBeforeDownloadsCompleted;
     }
+    if (!ticketRequirementMet(conn_opts.wait_for_ticket)) return error.NoSessionTicket;
+    if (conn_opts.early_data) {
+        std.debug.print("0-RTT status: {s} ({s})\n", .{
+            @tagName(conn.earlyDataStatus()),
+            conn.earlyDataReason(),
+        });
+    }
+
     conn.close(false, 0, "qns downloads complete");
     var flushes: u8 = 0;
     while (flushes < 8) : (flushes += 1) {
@@ -457,6 +598,11 @@ fn runClient(
         try conn.tick(now_us);
         now_us += 1_000;
     }
+}
+
+fn ticketRequirementMet(ticket_store: ?*TicketStore) bool {
+    const store = ticket_store orelse return true;
+    return store.latest != null;
 }
 
 fn parseRequestList(allocator: std.mem.Allocator, requests: []const u8) ![]ClientDownload {
@@ -808,4 +954,11 @@ test "split endpoint host and port" {
     const ip6 = try splitHostPort("[::1]:8443");
     try std.testing.expectEqualStrings("::1", ip6.host);
     try std.testing.expectEqual(@as(u16, 8443), ip6.port);
+}
+
+test "QNS client mode follows TESTCASE" {
+    try std.testing.expectEqual(ClientMode.normal, clientMode(""));
+    try std.testing.expectEqual(ClientMode.normal, clientMode("transfer"));
+    try std.testing.expectEqual(ClientMode.resumption, clientMode("resumption"));
+    try std.testing.expectEqual(ClientMode.zerortt, clientMode("zerortt"));
 }
