@@ -242,7 +242,29 @@ pub const CloseEvent = struct {
 
 pub const ConnectionEvent = union(enum) {
     close: CloseEvent,
+    flow_blocked: FlowBlockedInfo,
 };
+
+pub const FlowBlockedSource = enum {
+    local,
+    peer,
+};
+
+pub const FlowBlockedKind = enum {
+    data,
+    stream_data,
+    streams,
+};
+
+pub const FlowBlockedInfo = struct {
+    source: FlowBlockedSource,
+    kind: FlowBlockedKind,
+    limit: u64,
+    stream_id: ?u64 = null,
+    bidi: ?bool = null,
+};
+
+pub const max_flow_blocked_events: usize = 16;
 
 const StoredCloseEvent = struct {
     source: CloseSource,
@@ -638,6 +660,8 @@ pub const Connection = struct {
     /// bind/init without leaving a self-referential slice behind.
     close_event: ?StoredCloseEvent = null,
     close_reason_buf: [max_close_reason_len]u8 = undefined,
+    flow_blocked_events: [max_flow_blocked_events]FlowBlockedInfo = undefined,
+    flow_blocked_event_count: usize = 0,
     /// STOP_SENDING frames we owe the peer (one per stream id).
     pending_stop_sending: std.ArrayList(StopSendingItem) = .empty,
     /// MAX_STREAM_DATA frames we owe after the application drains
@@ -648,6 +672,18 @@ pub const Connection = struct {
     pending_max_data: ?u64 = null,
     pending_max_streams_bidi: ?u64 = null,
     pending_max_streams_uni: ?u64 = null,
+    pending_data_blocked: ?u64 = null,
+    pending_stream_data_blocked: std.ArrayList(frame_types.StreamDataBlocked) = .empty,
+    pending_streams_blocked_bidi: ?u64 = null,
+    pending_streams_blocked_uni: ?u64 = null,
+    local_data_blocked_at: ?u64 = null,
+    local_stream_data_blocked: std.ArrayList(frame_types.StreamDataBlocked) = .empty,
+    local_streams_blocked_bidi: ?u64 = null,
+    local_streams_blocked_uni: ?u64 = null,
+    peer_data_blocked_at: ?u64 = null,
+    peer_stream_data_blocked: std.ArrayList(frame_types.StreamDataBlocked) = .empty,
+    peer_streams_blocked_bidi: ?u64 = null,
+    peer_streams_blocked_uni: ?u64 = null,
     /// Bytes the application has drained from all receive streams.
     recv_stream_bytes_read: u64 = 0,
     /// Server/client-issued CIDs to advertise to the peer. This is
@@ -744,6 +780,9 @@ pub const Connection = struct {
         self.retry_token.deinit(self.allocator);
         self.pending_stop_sending.deinit(self.allocator);
         self.pending_max_stream_data.deinit(self.allocator);
+        self.pending_stream_data_blocked.deinit(self.allocator);
+        self.local_stream_data_blocked.deinit(self.allocator);
+        self.peer_stream_data_blocked.deinit(self.allocator);
         self.pending_new_connection_ids.deinit(self.allocator);
         self.pending_path_abandons.deinit(self.allocator);
         self.pending_path_statuses.deinit(self.allocator);
@@ -1648,10 +1687,16 @@ pub const Connection = struct {
         if (idx >= max_stream_count_limit) return Error.InvalidStreamId;
         const next = idx + 1;
         if (streamIsBidi(id)) {
-            if (idx >= self.peer_max_streams_bidi) return Error.StreamLimitExceeded;
+            if (idx >= self.peer_max_streams_bidi) {
+                self.noteStreamsBlocked(true, self.peer_max_streams_bidi);
+                return Error.StreamLimitExceeded;
+            }
             if (next > self.local_opened_streams_bidi) self.local_opened_streams_bidi = next;
         } else {
-            if (idx >= self.peer_max_streams_uni) return Error.StreamLimitExceeded;
+            if (idx >= self.peer_max_streams_uni) {
+                self.noteStreamsBlocked(false, self.peer_max_streams_uni);
+                return Error.StreamLimitExceeded;
+            }
             if (next > self.local_opened_streams_uni) self.local_opened_streams_uni = next;
         }
     }
@@ -1680,14 +1725,15 @@ pub const Connection = struct {
     }
 
     fn limitChunkToSendFlow(
-        self: *const Connection,
+        self: *Connection,
         s: *const Stream,
         chunk: send_stream_mod.Chunk,
-    ) ?send_stream_mod.Chunk {
+    ) Error!?send_stream_mod.Chunk {
         if (!self.localMaySendOnStream(s.id)) return null;
         if (chunk.length == 0) return chunk;
 
         const chunk_end = std.math.add(u64, chunk.offset, chunk.length) catch return null;
+        const wants_new_data = chunk_end > s.send_flow_highest;
         const stream_new_allowance = if (s.send_flow_highest >= s.send_max_data)
             0
         else
@@ -1696,6 +1742,12 @@ pub const Connection = struct {
             0
         else
             self.peer_max_data - self.we_sent_stream_data;
+        if (wants_new_data and stream_new_allowance == 0) {
+            try self.noteStreamDataBlocked(s.id, s.send_max_data);
+        }
+        if (wants_new_data and conn_new_allowance == 0) {
+            self.noteDataBlocked(self.peer_max_data);
+        }
         const new_allowance = @min(stream_new_allowance, conn_new_allowance);
 
         const retransmit_end = if (chunk.offset < s.send_flow_highest)
@@ -1782,6 +1834,32 @@ pub const Connection = struct {
         return s.arrived_in_early_data;
     }
 
+    pub fn localDataBlockedAt(self: *const Connection) ?u64 {
+        return self.local_data_blocked_at;
+    }
+
+    pub fn localStreamDataBlockedAt(self: *const Connection, stream_id: u64) ?u64 {
+        const idx = findStreamBlocked(self.local_stream_data_blocked.items, stream_id) orelse return null;
+        return self.local_stream_data_blocked.items[idx].maximum_stream_data;
+    }
+
+    pub fn localStreamsBlockedAt(self: *const Connection, bidi: bool) ?u64 {
+        return if (bidi) self.local_streams_blocked_bidi else self.local_streams_blocked_uni;
+    }
+
+    pub fn peerDataBlockedAt(self: *const Connection) ?u64 {
+        return self.peer_data_blocked_at;
+    }
+
+    pub fn peerStreamDataBlockedAt(self: *const Connection, stream_id: u64) ?u64 {
+        const idx = findStreamBlocked(self.peer_stream_data_blocked.items, stream_id) orelse return null;
+        return self.peer_stream_data_blocked.items[idx].maximum_stream_data;
+    }
+
+    pub fn peerStreamsBlockedAt(self: *const Connection, bidi: bool) ?u64 {
+        return if (bidi) self.peer_streams_blocked_bidi else self.peer_streams_blocked_uni;
+    }
+
     fn queueMaxStreamData(
         self: *Connection,
         stream_id: u64,
@@ -1790,6 +1868,7 @@ pub const Connection = struct {
         if (self.streams.get(stream_id)) |stream_ptr| {
             stream_ptr.recv_max_data = @max(stream_ptr.recv_max_data, maximum_stream_data);
         }
+        clearStreamBlocked(&self.peer_stream_data_blocked, stream_id, maximum_stream_data);
         for (self.pending_max_stream_data.items) |*item| {
             if (item.stream_id == stream_id) {
                 if (maximum_stream_data > item.maximum_stream_data) {
@@ -1806,6 +1885,9 @@ pub const Connection = struct {
 
     fn queueMaxData(self: *Connection, maximum_data: u64) void {
         if (maximum_data > self.local_max_data) self.local_max_data = maximum_data;
+        if (self.peer_data_blocked_at) |limit| {
+            if (maximum_data > limit) self.peer_data_blocked_at = null;
+        }
         if (self.pending_max_data == null or maximum_data > self.pending_max_data.?) {
             self.pending_max_data = maximum_data;
         }
@@ -1815,11 +1897,17 @@ pub const Connection = struct {
         if (maximum_streams > max_stream_count_limit) return;
         if (bidi) {
             if (maximum_streams > self.local_max_streams_bidi) self.local_max_streams_bidi = maximum_streams;
+            if (self.peer_streams_blocked_bidi) |limit| {
+                if (maximum_streams > limit) self.peer_streams_blocked_bidi = null;
+            }
             if (self.pending_max_streams_bidi == null or maximum_streams > self.pending_max_streams_bidi.?) {
                 self.pending_max_streams_bidi = maximum_streams;
             }
         } else {
             if (maximum_streams > self.local_max_streams_uni) self.local_max_streams_uni = maximum_streams;
+            if (self.peer_streams_blocked_uni) |limit| {
+                if (maximum_streams > limit) self.peer_streams_blocked_uni = null;
+            }
             if (self.pending_max_streams_uni == null or maximum_streams > self.pending_max_streams_uni.?) {
                 self.pending_max_streams_uni = maximum_streams;
             }
@@ -1841,6 +1929,187 @@ pub const Connection = struct {
             self.queueMaxStreams(true, self.local_max_streams_bidi + 1);
         } else {
             self.queueMaxStreams(false, self.local_max_streams_uni + 1);
+        }
+    }
+
+    fn recordFlowBlockedEvent(self: *Connection, info: FlowBlockedInfo) void {
+        var i: usize = 0;
+        while (i < self.flow_blocked_event_count) : (i += 1) {
+            const existing = self.flow_blocked_events[i];
+            if (existing.source == info.source and
+                existing.kind == info.kind and
+                existing.limit == info.limit and
+                existing.stream_id == info.stream_id and
+                existing.bidi == info.bidi)
+            {
+                return;
+            }
+        }
+        if (self.flow_blocked_event_count == max_flow_blocked_events) {
+            std.mem.copyForwards(
+                FlowBlockedInfo,
+                self.flow_blocked_events[0 .. max_flow_blocked_events - 1],
+                self.flow_blocked_events[1..max_flow_blocked_events],
+            );
+            self.flow_blocked_event_count -= 1;
+        }
+        self.flow_blocked_events[self.flow_blocked_event_count] = info;
+        self.flow_blocked_event_count += 1;
+    }
+
+    fn findStreamBlocked(
+        list: []const frame_types.StreamDataBlocked,
+        stream_id: u64,
+    ) ?usize {
+        for (list, 0..) |item, i| {
+            if (item.stream_id == stream_id) return i;
+        }
+        return null;
+    }
+
+    fn upsertStreamBlocked(
+        list: *std.ArrayList(frame_types.StreamDataBlocked),
+        allocator: std.mem.Allocator,
+        item: frame_types.StreamDataBlocked,
+    ) Error!bool {
+        if (findStreamBlocked(list.items, item.stream_id)) |idx| {
+            if (list.items[idx].maximum_stream_data == item.maximum_stream_data) return false;
+            list.items[idx].maximum_stream_data = item.maximum_stream_data;
+            return true;
+        }
+        try list.append(allocator, item);
+        return true;
+    }
+
+    fn clearStreamBlocked(
+        list: *std.ArrayList(frame_types.StreamDataBlocked),
+        stream_id: u64,
+        new_limit: u64,
+    ) void {
+        const idx = findStreamBlocked(list.items, stream_id) orelse return;
+        if (new_limit > list.items[idx].maximum_stream_data) {
+            _ = list.orderedRemove(idx);
+        }
+    }
+
+    fn noteDataBlocked(self: *Connection, maximum_data: u64) void {
+        const changed = self.local_data_blocked_at == null or self.local_data_blocked_at.? != maximum_data;
+        self.local_data_blocked_at = maximum_data;
+        if (changed) {
+            self.pending_data_blocked = maximum_data;
+            self.recordFlowBlockedEvent(.{
+                .source = .local,
+                .kind = .data,
+                .limit = maximum_data,
+            });
+        }
+    }
+
+    fn requeueDataBlocked(self: *Connection, maximum_data: u64) void {
+        self.local_data_blocked_at = maximum_data;
+        self.pending_data_blocked = maximum_data;
+    }
+
+    fn clearLocalDataBlocked(self: *Connection, new_limit: u64) void {
+        if (self.local_data_blocked_at) |limit| {
+            if (new_limit > limit) self.local_data_blocked_at = null;
+        }
+        if (self.pending_data_blocked) |limit| {
+            if (new_limit > limit) self.pending_data_blocked = null;
+        }
+    }
+
+    fn noteStreamDataBlocked(
+        self: *Connection,
+        stream_id: u64,
+        maximum_stream_data: u64,
+    ) Error!void {
+        const item: frame_types.StreamDataBlocked = .{
+            .stream_id = stream_id,
+            .maximum_stream_data = maximum_stream_data,
+        };
+        const changed = try upsertStreamBlocked(&self.local_stream_data_blocked, self.allocator, item);
+        if (changed) {
+            _ = try upsertStreamBlocked(&self.pending_stream_data_blocked, self.allocator, item);
+            self.recordFlowBlockedEvent(.{
+                .source = .local,
+                .kind = .stream_data,
+                .limit = maximum_stream_data,
+                .stream_id = stream_id,
+            });
+        }
+    }
+
+    fn requeueStreamDataBlocked(
+        self: *Connection,
+        item: frame_types.StreamDataBlocked,
+    ) Error!void {
+        _ = try upsertStreamBlocked(&self.local_stream_data_blocked, self.allocator, item);
+        _ = try upsertStreamBlocked(&self.pending_stream_data_blocked, self.allocator, item);
+    }
+
+    fn clearLocalStreamDataBlocked(
+        self: *Connection,
+        stream_id: u64,
+        new_limit: u64,
+    ) void {
+        clearStreamBlocked(&self.local_stream_data_blocked, stream_id, new_limit);
+        clearStreamBlocked(&self.pending_stream_data_blocked, stream_id, new_limit);
+    }
+
+    fn noteStreamsBlocked(self: *Connection, bidi: bool, maximum_streams: u64) void {
+        if (bidi) {
+            const changed = self.local_streams_blocked_bidi == null or self.local_streams_blocked_bidi.? != maximum_streams;
+            self.local_streams_blocked_bidi = maximum_streams;
+            if (changed) {
+                self.pending_streams_blocked_bidi = maximum_streams;
+                self.recordFlowBlockedEvent(.{
+                    .source = .local,
+                    .kind = .streams,
+                    .limit = maximum_streams,
+                    .bidi = true,
+                });
+            }
+        } else {
+            const changed = self.local_streams_blocked_uni == null or self.local_streams_blocked_uni.? != maximum_streams;
+            self.local_streams_blocked_uni = maximum_streams;
+            if (changed) {
+                self.pending_streams_blocked_uni = maximum_streams;
+                self.recordFlowBlockedEvent(.{
+                    .source = .local,
+                    .kind = .streams,
+                    .limit = maximum_streams,
+                    .bidi = false,
+                });
+            }
+        }
+    }
+
+    fn requeueStreamsBlocked(self: *Connection, item: frame_types.StreamsBlocked) void {
+        if (item.bidi) {
+            self.local_streams_blocked_bidi = item.maximum_streams;
+            self.pending_streams_blocked_bidi = item.maximum_streams;
+        } else {
+            self.local_streams_blocked_uni = item.maximum_streams;
+            self.pending_streams_blocked_uni = item.maximum_streams;
+        }
+    }
+
+    fn clearLocalStreamsBlocked(self: *Connection, bidi: bool, new_limit: u64) void {
+        if (bidi) {
+            if (self.local_streams_blocked_bidi) |limit| {
+                if (new_limit > limit) self.local_streams_blocked_bidi = null;
+            }
+            if (self.pending_streams_blocked_bidi) |limit| {
+                if (new_limit > limit) self.pending_streams_blocked_bidi = null;
+            }
+        } else {
+            if (self.local_streams_blocked_uni) |limit| {
+                if (new_limit > limit) self.local_streams_blocked_uni = null;
+            }
+            if (self.pending_streams_blocked_uni) |limit| {
+                if (new_limit > limit) self.pending_streams_blocked_uni = null;
+            }
         }
     }
 
@@ -2951,6 +3220,9 @@ pub const Connection = struct {
         if (self.pending_max_data != null) return true;
         if (self.pending_max_stream_data.items.len > 0) return true;
         if (self.pending_max_streams_bidi != null or self.pending_max_streams_uni != null) return true;
+        if (self.pending_data_blocked != null) return true;
+        if (self.pending_stream_data_blocked.items.len > 0) return true;
+        if (self.pending_streams_blocked_bidi != null or self.pending_streams_blocked_uni != null) return true;
         if (self.pending_new_connection_ids.items.len > 0) return true;
         if (self.pending_stop_sending.items.len > 0) return true;
         if (self.pending_path_response != null) return true;
@@ -3359,6 +3631,60 @@ pub const Connection = struct {
                 ack_eliciting = true;
             }
         }
+        if (!congestion_blocked and lvl == .application and self.pending_data_blocked != null) {
+            const maximum_data = self.pending_data_blocked.?;
+            const overhead_db: usize = 1 + varint.encodedLen(maximum_data);
+            if (max_payload >= pl_pos + overhead_db) {
+                const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
+                    .data_blocked = .{ .maximum_data = maximum_data },
+                });
+                pl_pos += wrote;
+                try sent_packet.addRetransmitFrame(self.allocator, .{
+                    .data_blocked = .{ .maximum_data = maximum_data },
+                });
+                self.pending_data_blocked = null;
+                ack_eliciting = true;
+            }
+        }
+        if (!congestion_blocked and lvl == .application and self.pending_stream_data_blocked.items.len > 0) {
+            const item = self.pending_stream_data_blocked.items[0];
+            const overhead_sdb: usize = 1 +
+                varint.encodedLen(item.stream_id) +
+                varint.encodedLen(item.maximum_stream_data);
+            if (max_payload >= pl_pos + overhead_sdb) {
+                const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
+                    .stream_data_blocked = item,
+                });
+                pl_pos += wrote;
+                try sent_packet.addRetransmitFrame(self.allocator, .{
+                    .stream_data_blocked = item,
+                });
+                _ = self.pending_stream_data_blocked.orderedRemove(0);
+                ack_eliciting = true;
+            }
+        }
+        if (!congestion_blocked and lvl == .application and (self.pending_streams_blocked_bidi != null or self.pending_streams_blocked_uni != null)) {
+            const bidi = self.pending_streams_blocked_bidi != null;
+            const maximum_streams = if (bidi) self.pending_streams_blocked_bidi.? else self.pending_streams_blocked_uni.?;
+            const overhead_sb: usize = 1 + varint.encodedLen(maximum_streams);
+            if (max_payload >= pl_pos + overhead_sb) {
+                const item: frame_types.StreamsBlocked = .{
+                    .bidi = bidi,
+                    .maximum_streams = maximum_streams,
+                };
+                const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
+                    .streams_blocked = item,
+                });
+                pl_pos += wrote;
+                try sent_packet.addRetransmitFrame(self.allocator, .{ .streams_blocked = item });
+                if (bidi) {
+                    self.pending_streams_blocked_bidi = null;
+                } else {
+                    self.pending_streams_blocked_uni = null;
+                }
+                ack_eliciting = true;
+            }
+        }
 
         // 2b) NEW_CONNECTION_ID (application only). Advertise spare
         // CIDs so peers can validate/migrate additional paths.
@@ -3516,7 +3842,7 @@ pub const Connection = struct {
                 if (max_payload <= pl_pos + stream_overhead) break;
                 const budget = max_payload - pl_pos - stream_overhead;
                 const raw_chunk = s.send.peekChunk(budget) orelse continue;
-                const chunk = self.limitChunkToSendFlow(s, raw_chunk) orelse continue;
+                const chunk = (try self.limitChunkToSendFlow(s, raw_chunk)) orelse continue;
                 const data_slice = s.send.chunkBytes(chunk);
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                     .stream = .{
@@ -3916,15 +4242,26 @@ pub const Connection = struct {
         return self.closeEventFromStored(event);
     }
 
-    /// Poll the next connection-level event. For now the event surface
-    /// exposes close/error notifications; future readable-stream and path
-    /// events can extend this union without disturbing the sticky helpers.
+    /// Poll the next connection-level event.
     pub fn pollEvent(self: *Connection) ?ConnectionEvent {
         if (self.close_event) |*event| {
-            if (event.delivered) return null;
-            const out = self.closeEventFromStored(event.*);
-            event.delivered = true;
-            return .{ .close = out };
+            if (!event.delivered) {
+                const out = self.closeEventFromStored(event.*);
+                event.delivered = true;
+                return .{ .close = out };
+            }
+        }
+        if (self.flow_blocked_event_count > 0) {
+            const out = self.flow_blocked_events[0];
+            if (self.flow_blocked_event_count > 1) {
+                std.mem.copyForwards(
+                    FlowBlockedInfo,
+                    self.flow_blocked_events[0 .. self.flow_blocked_event_count - 1],
+                    self.flow_blocked_events[1..self.flow_blocked_event_count],
+                );
+            }
+            self.flow_blocked_event_count -= 1;
+            return .{ .flow_blocked = out };
         }
         return null;
     }
@@ -4372,6 +4709,9 @@ pub const Connection = struct {
                 .max_data => |md| self.handleMaxData(md),
                 .max_stream_data => |msd| self.handleMaxStreamData(msd),
                 .max_streams => |ms| self.handleMaxStreams(ms),
+                .data_blocked => |db| self.handleDataBlocked(db),
+                .stream_data_blocked => |sdb| try self.handleStreamDataBlocked(sdb),
+                .streams_blocked => |sb| self.handleStreamsBlocked(sb),
                 .connection_close => |cc| {
                     self.enterDraining(
                         .peer,
@@ -4383,7 +4723,7 @@ pub const Connection = struct {
                     );
                 },
                 .retire_connection_id => |rc| self.handleRetireConnectionId(rc),
-                .data_blocked, .stream_data_blocked, .streams_blocked, .new_token => {},
+                .new_token => {},
             }
         }
         if (debugFrames() != null) {
@@ -4706,6 +5046,7 @@ pub const Connection = struct {
     fn handleMaxData(self: *Connection, md: frame_types.MaxData) void {
         if (md.maximum_data > self.peer_max_data) {
             self.peer_max_data = md.maximum_data;
+            self.clearLocalDataBlocked(md.maximum_data);
         }
     }
 
@@ -4717,6 +5058,7 @@ pub const Connection = struct {
         const s = self.streams.get(msd.stream_id) orelse return;
         if (msd.maximum_stream_data > s.send_max_data) {
             s.send_max_data = msd.maximum_stream_data;
+            self.clearLocalStreamDataBlocked(msd.stream_id, msd.maximum_stream_data);
         }
     }
 
@@ -4728,12 +5070,51 @@ pub const Connection = struct {
         if (ms.bidi) {
             if (ms.maximum_streams > self.peer_max_streams_bidi) {
                 self.peer_max_streams_bidi = ms.maximum_streams;
+                self.clearLocalStreamsBlocked(true, ms.maximum_streams);
             }
         } else {
             if (ms.maximum_streams > self.peer_max_streams_uni) {
                 self.peer_max_streams_uni = ms.maximum_streams;
+                self.clearLocalStreamsBlocked(false, ms.maximum_streams);
             }
         }
+    }
+
+    fn handleDataBlocked(self: *Connection, db: frame_types.DataBlocked) void {
+        self.peer_data_blocked_at = db.maximum_data;
+        self.recordFlowBlockedEvent(.{
+            .source = .peer,
+            .kind = .data,
+            .limit = db.maximum_data,
+        });
+    }
+
+    fn handleStreamDataBlocked(self: *Connection, sdb: frame_types.StreamDataBlocked) Error!void {
+        _ = try upsertStreamBlocked(&self.peer_stream_data_blocked, self.allocator, sdb);
+        self.recordFlowBlockedEvent(.{
+            .source = .peer,
+            .kind = .stream_data,
+            .limit = sdb.maximum_stream_data,
+            .stream_id = sdb.stream_id,
+        });
+    }
+
+    fn handleStreamsBlocked(self: *Connection, sb: frame_types.StreamsBlocked) void {
+        if (sb.maximum_streams > max_stream_count_limit) {
+            self.close(true, transport_error_frame_encoding, "streams blocked exceeds stream id space");
+            return;
+        }
+        if (sb.bidi) {
+            self.peer_streams_blocked_bidi = sb.maximum_streams;
+        } else {
+            self.peer_streams_blocked_uni = sb.maximum_streams;
+        }
+        self.recordFlowBlockedEvent(.{
+            .source = .peer,
+            .kind = .streams,
+            .limit = sb.maximum_streams,
+            .bidi = sb.bidi,
+        });
     }
 
     fn handleDatagram(
@@ -5228,6 +5609,18 @@ pub const Connection = struct {
                 },
                 .max_streams => |ms| {
                     self.queueMaxStreams(ms.bidi, ms.maximum_streams);
+                    any = true;
+                },
+                .data_blocked => |db| {
+                    self.requeueDataBlocked(db.maximum_data);
+                    any = true;
+                },
+                .stream_data_blocked => |sdb| {
+                    try self.requeueStreamDataBlocked(sdb);
+                    any = true;
+                },
+                .streams_blocked => |sb| {
+                    self.requeueStreamsBlocked(sb);
                     any = true;
                 },
                 .new_connection_id => |nc| {
@@ -7164,16 +7557,145 @@ test "send-side STREAM emission is capped by flow-control allowance" {
     _ = try s.send.write("abcdefgh");
 
     const raw = s.send.peekChunk(64).?;
-    const limited = conn.limitChunkToSendFlow(s, raw).?;
+    const limited = (try conn.limitChunkToSendFlow(s, raw)).?;
     try std.testing.expectEqual(@as(u64, 4), limited.length);
     try std.testing.expect(!limited.fin);
 
     conn.recordStreamFlowSent(s, limited);
     try std.testing.expectEqual(@as(u64, 4), conn.we_sent_stream_data);
     try std.testing.expectEqual(@as(u64, 4), s.send_flow_highest);
-    const retransmit_only = conn.limitChunkToSendFlow(s, raw).?;
+    const retransmit_only = (try conn.limitChunkToSendFlow(s, raw)).?;
     try std.testing.expectEqual(@as(u64, 4), retransmit_only.length);
     try std.testing.expect(!retransmit_only.fin);
+    try std.testing.expectEqual(@as(?u64, 4), conn.localDataBlockedAt());
+    try std.testing.expectEqual(@as(?u64, 4), conn.pending_data_blocked);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .flow_blocked);
+    try std.testing.expectEqual(FlowBlockedSource.local, event.flow_blocked.source);
+    try std.testing.expectEqual(FlowBlockedKind.data, event.flow_blocked.kind);
+    try std.testing.expectEqual(@as(u64, 4), event.flow_blocked.limit);
+
+    conn.handleMaxData(.{ .maximum_data = 16 });
+    try std.testing.expectEqual(@as(?u64, null), conn.localDataBlockedAt());
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_data_blocked);
+}
+
+test "stream flow block queues STREAM_DATA_BLOCKED and clears on MAX_STREAM_DATA" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.peer_max_data = 16;
+    conn.peer_max_streams_bidi = 1;
+    const s = try conn.openBidi(0);
+    s.send_max_data = 4;
+    _ = try s.send.write("abcdefgh");
+
+    const raw = s.send.peekChunk(64).?;
+    const limited = (try conn.limitChunkToSendFlow(s, raw)).?;
+    conn.recordStreamFlowSent(s, limited);
+    _ = (try conn.limitChunkToSendFlow(s, raw)).?;
+
+    try std.testing.expectEqual(@as(?u64, 4), conn.localStreamDataBlockedAt(0));
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_data_blocked.items.len);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .flow_blocked);
+    try std.testing.expectEqual(FlowBlockedKind.stream_data, event.flow_blocked.kind);
+    try std.testing.expectEqual(@as(?u64, 0), event.flow_blocked.stream_id);
+    try std.testing.expectEqual(@as(u64, 4), event.flow_blocked.limit);
+
+    conn.handleMaxStreamData(.{ .stream_id = 0, .maximum_stream_data = 8 });
+    try std.testing.expectEqual(@as(?u64, null), conn.localStreamDataBlockedAt(0));
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_stream_data_blocked.items.len);
+}
+
+test "STREAMS_BLOCKED is queued when local stream opening hits peer limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.peer_max_streams_bidi = 0;
+    try std.testing.expectError(Error.StreamLimitExceeded, conn.openBidi(0));
+    try std.testing.expectEqual(@as(?u64, 0), conn.localStreamsBlockedAt(true));
+    try std.testing.expectEqual(@as(?u64, 0), conn.pending_streams_blocked_bidi);
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .flow_blocked);
+    try std.testing.expectEqual(FlowBlockedSource.local, event.flow_blocked.source);
+    try std.testing.expectEqual(FlowBlockedKind.streams, event.flow_blocked.kind);
+    try std.testing.expectEqual(@as(?bool, true), event.flow_blocked.bidi);
+
+    conn.handleMaxStreams(.{ .bidi = true, .maximum_streams = 1 });
+    try std.testing.expectEqual(@as(?u64, null), conn.localStreamsBlockedAt(true));
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_streams_blocked_bidi);
+}
+
+test "blocked frames emit with retransmit metadata and requeue on loss" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+
+    conn.noteDataBlocked(7);
+    try conn.noteStreamDataBlocked(0, 11);
+    conn.noteStreamsBlocked(true, 3);
+
+    var out: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevel(.application, &out, 1_000)).?;
+    const sent = &conn.primaryPath().sent.packets[0];
+    try std.testing.expectEqual(@as(usize, 3), sent.retransmit_frames.items.len);
+    try std.testing.expect(sent.retransmit_frames.items[0] == .data_blocked);
+    try std.testing.expect(sent.retransmit_frames.items[1] == .stream_data_blocked);
+    try std.testing.expect(sent.retransmit_frames.items[2] == .streams_blocked);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_data_blocked);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_streams_blocked_bidi);
+
+    _ = try conn.dispatchLostControlFrames(sent);
+    try std.testing.expectEqual(@as(?u64, 7), conn.pending_data_blocked);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(?u64, 3), conn.pending_streams_blocked_bidi);
+}
+
+test "inbound blocked frames update peer state and pollable events" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.handleDataBlocked(.{ .maximum_data = 10 });
+    try conn.handleStreamDataBlocked(.{ .stream_id = 4, .maximum_stream_data = 20 });
+    conn.handleStreamsBlocked(.{ .bidi = false, .maximum_streams = 2 });
+
+    try std.testing.expectEqual(@as(?u64, 10), conn.peerDataBlockedAt());
+    try std.testing.expectEqual(@as(?u64, 20), conn.peerStreamDataBlockedAt(4));
+    try std.testing.expectEqual(@as(?u64, 2), conn.peerStreamsBlockedAt(false));
+
+    var event = conn.pollEvent().?;
+    try std.testing.expect(event == .flow_blocked);
+    try std.testing.expectEqual(FlowBlockedSource.peer, event.flow_blocked.source);
+    try std.testing.expectEqual(FlowBlockedKind.data, event.flow_blocked.kind);
+
+    event = conn.pollEvent().?;
+    try std.testing.expect(event == .flow_blocked);
+    try std.testing.expectEqual(FlowBlockedKind.stream_data, event.flow_blocked.kind);
+    try std.testing.expectEqual(@as(?u64, 4), event.flow_blocked.stream_id);
+
+    event = conn.pollEvent().?;
+    try std.testing.expect(event == .flow_blocked);
+    try std.testing.expectEqual(FlowBlockedKind.streams, event.flow_blocked.kind);
+    try std.testing.expectEqual(@as(?bool, false), event.flow_blocked.bidi);
 }
 
 test "draining a peer-initiated stream returns MAX_STREAMS credit" {

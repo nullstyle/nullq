@@ -8,12 +8,15 @@
 const std = @import("std");
 const frame_types = @import("../frame/types.zig");
 
-pub const max_retransmit_frames: usize = 8;
+pub const max_retransmit_frames: usize = 16;
 
 pub const RetransmitFrame = union(enum) {
     max_data: frame_types.MaxData,
     max_stream_data: frame_types.MaxStreamData,
     max_streams: frame_types.MaxStreams,
+    data_blocked: frame_types.DataBlocked,
+    stream_data_blocked: frame_types.StreamDataBlocked,
+    streams_blocked: frame_types.StreamsBlocked,
     new_connection_id: frame_types.NewConnectionId,
     stop_sending: frame_types.StopSending,
     path_response: frame_types.PathResponse,
