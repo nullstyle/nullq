@@ -5,16 +5,20 @@ QUIC interop runner.
 
 ## Current gate
 
-- Builds `qns-endpoint`, a server-side HTTP/0.9 endpoint that speaks
-  ALPN `hq-interop`.
+- Builds `qns-endpoint`, a QNS HTTP/0.9 endpoint that speaks ALPN
+  `hq-interop` in both server and client roles.
 - Serves runner-mounted files from `/www` over bidirectional streams.
+- In client mode, reads QNS `REQUESTS`, downloads each URL over a
+  separate bidirectional stream, and writes the results under
+  `/downloads`.
 - Loads runner-mounted TLS material from `/certs/cert.pem` and
   `/certs/priv.key`.
 - Supports server-side Retry when `TESTCASE=retry`.
 - Enables session tickets / 0-RTT at the TLS layer so external clients
   can exercise `resumption` and `zerortt`.
-- Exits `127` for the official client role. The nullq QNS client is
-  still a follow-up.
+- The client role is currently a full-handshake HTTP/0.9 downloader;
+  client-side resumption/0-RTT ticket persistence remains follow-up
+  work.
 
 The default external matrix targets server-side nullq against the
 current official clients `quic-go`, `ngtcp2`, and `quiche`, using:
@@ -40,9 +44,10 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
 - Docker with the quic-network-simulator base image reachable.
 - A checkout of `quic-interop-runner` next to this repo, or
   `--runner-dir /path/to/quic-interop-runner`.
-- Runner Python dependencies installed for the official runner. nullq's
-  wrapper is Zig-native, but the upstream runner itself still executes
-  `run.py`.
+- `mise install` from the repo root to provision Zig, Python, and `uv`.
+- Runner Python dependencies are managed by `uv run` inside the
+  official runner overlay. nullq's wrapper is Zig-native, but the
+  upstream runner itself still executes `run.py`.
 - Wireshark/tshark new enough for the runner's trace checks.
 
 The wrapper creates local throwaway state under `.zig-cache/` and does
@@ -51,11 +56,11 @@ not mutate the runner checkout.
 ## Useful commands
 
 ```sh
-zig build external-interop -- preflight
-zig build external-interop -- build-image
-zig build external-interop -- runner --dry-run
-zig build external-interop -- runner --clients quic-go --tests H,D,C
-zig build external-interop -- runner --clients quic-go,ngtcp2,quiche --tests core+retry
+mise run interop-preflight
+mise run interop-build-image
+mise exec -- zig build external-interop -- runner --dry-run
+mise exec -- zig build external-interop -- runner --clients quic-go --tests H,D,C
+mise exec -- zig build external-interop -- runner --clients quic-go,ngtcp2,quiche --tests core+retry
 ```
 
 Runner logs land in `interop/logs/`; matrix JSON lands in

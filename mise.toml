@@ -1,3 +1,24 @@
 [tools]
 zig = "0.16.0"
 just = "1.49.0"
+python = "3.14"
+uv = "0.11.3"
+
+[env]
+ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/.zig-global-cache"
+
+[tasks.test]
+description = "Run the nullq Zig test suite"
+run = "zig build test"
+
+[tasks.qns-endpoint]
+description = "Build the QNS endpoint binary"
+run = "zig build qns-endpoint"
+
+[tasks.interop-preflight]
+description = "Check local external interop prerequisites"
+run = "zig build external-interop -- preflight"
+
+[tasks.interop-build-image]
+description = "Build the nullq QNS Docker image"
+run = "zig build external-interop -- build-image"

@@ -264,11 +264,14 @@ Current as of 2026-05-04.
    bounded allocation policy, qlog/keylog diagnostics, full flow-control
    pacing, and broader shutdown-path interop with external peers.
 7. **The official interop runner gate is scaffolded, not complete.**
-   nullq now has a server-side QNS endpoint and wrapper for
-   nullq-as-server matrices against quic-go, ngtcp2, and quiche. It
-   still needs a nullq QNS client role, actual runner execution in a
-   Docker/Wireshark-equipped environment, and fixes from the first real
-   external traces before it can be called a release gate.
+   nullq now has QNS server and client endpoint roles plus a Zig-native
+   wrapper for nullq matrices against quic-go, ngtcp2, and quiche. The
+   client role covers full-handshake HTTP/0.9 downloads and multiplexed
+   requests; it still needs client-side resumption/0-RTT ticket
+   persistence, actual runner execution in a Docker/Wireshark-equipped
+   environment, and fixes from the first real external traces before it
+   can be called a release gate. The runner wrapper invokes upstream
+   Python through `uv run`; repo-local tools are declared in `mise.toml`.
 
 Note: the passing mock multipath test now validates simultaneous
 two-path transfer inside nullq. The passing `go-quic-peer multipath`
@@ -280,9 +283,9 @@ transfer.
 
 ```sh
 cd ~/prj/ai-workspace/nullq
-zig build test
-zig build qns-endpoint
-zig build external-interop -- runner --dry-run
+mise run test
+mise run qns-endpoint
+mise exec -- zig build external-interop -- runner --dry-run
 
 cd ~/prj/ai-workspace/nullq-peer
 zig build

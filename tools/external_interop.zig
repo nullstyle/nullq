@@ -191,7 +191,7 @@ fn preflight(allocator: std.mem.Allocator, io: std.Io, cfg: Config, runner: bool
     if (!cfg.dry_run) {
         try runAndRequireZero(allocator, io, &.{ "docker", "--version" }, null);
         if (runner) {
-            try runAndRequireZero(allocator, io, &.{ "python3", "--version" }, null);
+            try runAndRequireZero(allocator, io, &.{ "uv", "--version" }, null);
         }
     }
     std.debug.print("tools ok; nullq image tag will be {s}\n", .{cfg.image});
@@ -236,8 +236,15 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     try ensureParentDir(io, cfg.log_dir.?);
     try ensureParentDir(io, cfg.json_path.?);
 
-    const cmd = [_][]const u8{
-        "python3",
+    var cmd: std.ArrayList([]const u8) = .empty;
+    defer cmd.deinit(allocator);
+    try cmd.appendSlice(allocator, &.{ "uv", "run" });
+    const requirements = try std.fs.path.join(allocator, &.{ overlay, "requirements.txt" });
+    if (pathExists(io, requirements)) {
+        try cmd.appendSlice(allocator, &.{ "--with-requirements", "requirements.txt" });
+    }
+    try cmd.appendSlice(allocator, &.{
+        "python",
         "run.py",
         "-s",
         "nullq",
@@ -252,8 +259,8 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
         "-m",
         "-i",
         "nullq",
-    };
-    try runCommand(io, &cmd, overlay, cfg.dry_run);
+    });
+    try runCommand(io, cmd.items, overlay, cfg.dry_run);
 }
 
 fn recreateDir(io: std.Io, path: []const u8) !void {
@@ -366,6 +373,11 @@ fn expectPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void 
         std.debug.print("missing: {s}\n", .{path});
         return err;
     };
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
 }
 
 fn ensureParentDir(io: std.Io, path: []const u8) !void {

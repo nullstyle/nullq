@@ -13,6 +13,7 @@ const retry_token_key = [_]u8{
     0x10, 0xe1, 0x44, 0x58, 0x73, 0x88, 0x2b, 0x31,
 };
 const retry_token_lifetime_us: u64 = 30_000_000;
+const endpoint_udp_payload_size = 1350;
 
 const ServerOptions = struct {
     listen: []const u8 = "0.0.0.0:443",
@@ -22,12 +23,34 @@ const ServerOptions = struct {
     retry: bool = false,
 };
 
+const ClientOptions = struct {
+    server: []const u8 = "server:443",
+    server_name: []const u8 = "server",
+    downloads: []const u8 = "/downloads",
+    requests: []const u8 = "",
+};
+
 const StreamState = struct {
     buf: std.ArrayList(u8) = .empty,
     responded: bool = false,
 
     fn deinit(self: *StreamState, allocator: std.mem.Allocator) void {
         self.buf.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ClientDownload = struct {
+    url: []const u8,
+    rel_path: []const u8,
+    stream_id: u64,
+    response: std.ArrayList(u8) = .empty,
+    started: bool = false,
+    complete: bool = false,
+    written: bool = false,
+
+    fn deinit(self: *ClientDownload, allocator: std.mem.Allocator) void {
+        self.response.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -144,8 +167,24 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "client")) {
-        std.debug.print("nullq qns client endpoint is not implemented yet\n", .{});
-        std.process.exit(127);
+        var opts: ClientOptions = .{};
+        if (init.environ_map.get("REQUESTS")) |requests| opts.requests = requests;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "-server")) {
+                opts.server = args.next() orelse return error.MissingServerAddress;
+            } else if (std.mem.eql(u8, arg, "-server-name")) {
+                opts.server_name = args.next() orelse return error.MissingServerName;
+            } else if (std.mem.eql(u8, arg, "-downloads")) {
+                opts.downloads = args.next() orelse return error.MissingDownloadsDirectory;
+            } else if (std.mem.eql(u8, arg, "-requests")) {
+                opts.requests = args.next() orelse return error.MissingRequests;
+            } else {
+                usage();
+                return error.UnknownArgument;
+            }
+        }
+        try runClient(allocator, io, opts);
+        return;
     }
 
     usage();
@@ -156,7 +195,7 @@ fn usage() void {
     std.debug.print(
         \\usage:
         \\  qns-endpoint server [-listen 0.0.0.0:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-retry]
-        \\  qns-endpoint client
+        \\  qns-endpoint client [-server server:443] [-server-name server] [-downloads /downloads] [-requests "$REQUESTS"]
         \\
     , .{});
 }
@@ -210,7 +249,7 @@ fn runServer(
         var retry_source_cid = retrySourceCid();
         var now_us: u64 = 1_000_000;
         var rx: [64 * 1024]u8 = undefined;
-        var tx: [4096]u8 = undefined;
+        var tx: [endpoint_udp_payload_size]u8 = undefined;
 
         while (!conn.isClosed()) {
             const maybe_msg = sock.receiveTimeout(io, &rx, .{
@@ -263,7 +302,7 @@ fn runServer(
                         .initial_max_stream_data_uni = 1024 * 1024,
                         .initial_max_streams_bidi = 128,
                         .initial_max_streams_uni = 16,
-                        .max_udp_payload_size = 1200,
+                        .max_udp_payload_size = endpoint_udp_payload_size,
                         .active_connection_id_limit = 8,
                     };
                     try conn.acceptInitial(msg.data, params);
@@ -282,6 +321,315 @@ fn runServer(
             now_us += 1_000;
         }
     }
+}
+
+fn runClient(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: ClientOptions,
+) !void {
+    const downloads = try parseRequestList(allocator, opts.requests);
+    defer {
+        for (downloads) |*download| download.deinit(allocator);
+        allocator.free(downloads);
+    }
+    if (downloads.len == 0) return error.NoRequests;
+
+    const server_addr = try resolveEndpoint(io, opts.server);
+    const bind_addr: Net.IpAddress = switch (server_addr) {
+        .ip4 => .{ .ip4 = Net.Ip4Address.unspecified(0) },
+        .ip6 => .{ .ip6 = Net.Ip6Address.unspecified(0) },
+    };
+    const sock = try Net.IpAddress.bind(&bind_addr, io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    });
+    defer sock.close(io);
+
+    const protos = [_][]const u8{hq_alpn};
+    var client_tls = try boringssl.tls.Context.initClient(.{
+        .verify = .none,
+        .min_version = boringssl.raw.TLS1_3_VERSION,
+        .max_version = boringssl.raw.TLS1_3_VERSION,
+        .alpn = &protos,
+        .early_data_enabled = true,
+    });
+    defer client_tls.deinit();
+
+    const server_name_z = try allocator.dupeZ(u8, opts.server_name);
+    defer allocator.free(server_name_z);
+    var conn = try nullq.Connection.initClient(allocator, client_tls, server_name_z);
+    defer conn.deinit();
+    try conn.bind();
+
+    var initial_dcid: [8]u8 = undefined;
+    var client_scid: [8]u8 = undefined;
+    io.random(&initial_dcid);
+    io.random(&client_scid);
+    try conn.setLocalScid(&client_scid);
+    try conn.setInitialDcid(&initial_dcid);
+    try conn.setPeerDcid(&initial_dcid);
+
+    const params: nullq.tls.TransportParams = .{
+        .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&client_scid),
+        .max_idle_timeout_ms = 30_000,
+        .initial_max_data = 128 * 1024 * 1024,
+        .initial_max_stream_data_bidi_local = 64 * 1024 * 1024,
+        .initial_max_stream_data_bidi_remote = 1024 * 1024,
+        .initial_max_stream_data_uni = 1024 * 1024,
+        .initial_max_streams_bidi = 256,
+        .initial_max_streams_uni = 16,
+        .max_udp_payload_size = endpoint_udp_payload_size,
+        .active_connection_id_limit = 8,
+    };
+    try conn.setTransportParams(params);
+    try conn.advance();
+
+    try std.Io.Dir.cwd().createDirPath(io, opts.downloads);
+    var downloads_dir = try openDir(io, opts.downloads);
+    defer downloads_dir.close(io);
+
+    std.debug.print("nullq qns client connecting to {f} requests={d}\n", .{ server_addr, downloads.len });
+
+    var requests_started = false;
+    var now_us: u64 = 1_000_000;
+    var idle_us: u64 = 0;
+    var rx: [64 * 1024]u8 = undefined;
+    var tx: [endpoint_udp_payload_size]u8 = undefined;
+
+    while (!allDownloadsComplete(downloads) and !conn.isClosed()) {
+        var progressed = false;
+
+        const maybe_msg = sock.receiveTimeout(io, &rx, .{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(1),
+                .clock = .awake,
+            },
+        }) catch |err| switch (err) {
+            error.Timeout => null,
+            else => return err,
+        };
+        if (maybe_msg) |msg| {
+            try conn.handle(msg.data, null, now_us);
+            progressed = true;
+        }
+
+        if (conn.handshakeDone() and !requests_started) {
+            try startClientRequests(allocator, &conn, downloads);
+            requests_started = true;
+            progressed = true;
+        }
+
+        if (requests_started) {
+            if (try drainClientResponses(allocator, &conn, downloads)) progressed = true;
+            try writeCompletedDownloads(io, downloads_dir, downloads);
+        }
+
+        while (try conn.poll(&tx, now_us)) |n| {
+            try sock.send(io, &server_addr, tx[0..n]);
+            progressed = true;
+        }
+        try conn.tick(now_us);
+
+        if (progressed) {
+            idle_us = 0;
+        } else {
+            idle_us += 1_000;
+            if (idle_us > 120_000_000) return error.ClientTimeout;
+        }
+        now_us += 1_000;
+    }
+
+    if (!allDownloadsComplete(downloads)) {
+        if (conn.closeEvent()) |event| {
+            std.debug.print("connection closed before downloads completed: source={s} code={d} reason={s}\n", .{
+                @tagName(event.source),
+                event.error_code,
+                event.reason,
+            });
+        }
+        return error.ConnectionClosedBeforeDownloadsCompleted;
+    }
+    conn.close(false, 0, "qns downloads complete");
+    var flushes: u8 = 0;
+    while (flushes < 8) : (flushes += 1) {
+        while (try conn.poll(&tx, now_us)) |n| try sock.send(io, &server_addr, tx[0..n]);
+        try conn.tick(now_us);
+        now_us += 1_000;
+    }
+}
+
+fn parseRequestList(allocator: std.mem.Allocator, requests: []const u8) ![]ClientDownload {
+    var list: std.ArrayList(ClientDownload) = .empty;
+    errdefer {
+        for (list.items) |*download| download.deinit(allocator);
+        list.deinit(allocator);
+    }
+
+    var it = std.mem.tokenizeAny(u8, requests, " \t\r\n");
+    var stream_id: u64 = 0;
+    while (it.next()) |url| {
+        const rel_path = try requestPathFromUrl(url);
+        try list.append(allocator, .{
+            .url = url,
+            .rel_path = rel_path,
+            .stream_id = stream_id,
+        });
+        stream_id += 4;
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn requestPathFromUrl(url: []const u8) ![]const u8 {
+    var path = url;
+    if (std.mem.startsWith(u8, path, "https://")) {
+        const rest = path["https://".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidRequestUrl;
+        path = rest[slash + 1 ..];
+    } else if (std.mem.startsWith(u8, path, "http://")) {
+        const rest = path["http://".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidRequestUrl;
+        path = rest[slash + 1 ..];
+    }
+
+    while (std.mem.startsWith(u8, path, "/")) path = path[1..];
+    if (std.mem.indexOfAny(u8, path, "?#")) |end| path = path[0..end];
+    if (path.len == 0) return error.InvalidRequestUrl;
+    if (std.mem.indexOf(u8, path, "..") != null) return error.InvalidRequestUrl;
+    if (std.mem.indexOfScalar(u8, path, '\\') != null) return error.InvalidRequestUrl;
+    return path;
+}
+
+fn resolveEndpoint(io: std.Io, endpoint: []const u8) !Net.IpAddress {
+    if (Net.IpAddress.parseLiteral(endpoint)) |addr| return addr else |_| {}
+
+    const parsed = try splitHostPort(endpoint);
+    if (Net.IpAddress.parse(parsed.host, parsed.port)) |addr| return addr else |_| {}
+
+    const host_name = try Net.HostName.init(parsed.host);
+    var result_buffer: [32]Net.HostName.LookupResult = undefined;
+    var results: std.Io.Queue(Net.HostName.LookupResult) = .init(&result_buffer);
+    try Net.HostName.lookup(host_name, io, &results, .{
+        .port = parsed.port,
+        .family = .ip4,
+    });
+
+    while (results.getOne(io)) |result| {
+        switch (result) {
+            .address => |address| return address,
+            .canonical_name => continue,
+        }
+    } else |err| {
+        switch (err) {
+            error.Closed => {},
+            error.Canceled => |e| return e,
+        }
+    }
+    return error.NoAddressReturned;
+}
+
+const HostPort = struct {
+    host: []const u8,
+    port: u16,
+};
+
+fn splitHostPort(endpoint: []const u8) !HostPort {
+    if (endpoint.len == 0) return error.InvalidServerAddress;
+    if (endpoint[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, endpoint, ']') orelse return error.InvalidServerAddress;
+        const host = endpoint[1..close];
+        if (endpoint.len == close + 1) return .{ .host = host, .port = 443 };
+        if (endpoint.len <= close + 2 or endpoint[close + 1] != ':') return error.InvalidServerAddress;
+        return .{ .host = host, .port = try parsePort(endpoint[close + 2 ..]) };
+    }
+    if (std.mem.lastIndexOfScalar(u8, endpoint, ':')) |colon| {
+        if (std.mem.indexOfScalar(u8, endpoint[0..colon], ':') != null) return error.InvalidServerAddress;
+        return .{ .host = endpoint[0..colon], .port = try parsePort(endpoint[colon + 1 ..]) };
+    }
+    return .{ .host = endpoint, .port = 443 };
+}
+
+fn parsePort(bytes: []const u8) !u16 {
+    if (bytes.len == 0) return error.InvalidServerAddress;
+    return std.fmt.parseInt(u16, bytes, 10) catch return error.InvalidServerAddress;
+}
+
+fn startClientRequests(
+    allocator: std.mem.Allocator,
+    conn: *nullq.Connection,
+    downloads: []ClientDownload,
+) !void {
+    for (downloads) |*download| {
+        if (download.started) continue;
+        _ = try conn.openBidi(download.stream_id);
+        const request = try std.fmt.allocPrint(allocator, "GET /{s}\r\n", .{download.rel_path});
+        defer allocator.free(request);
+        const written = try conn.streamWrite(download.stream_id, request);
+        if (written != request.len) return error.ShortStreamWrite;
+        try conn.streamFinish(download.stream_id);
+        download.started = true;
+    }
+}
+
+fn drainClientResponses(
+    allocator: std.mem.Allocator,
+    conn: *nullq.Connection,
+    downloads: []ClientDownload,
+) !bool {
+    var progressed = false;
+    var tmp: [8192]u8 = undefined;
+    for (downloads) |*download| {
+        if (!download.started or download.complete) continue;
+
+        while (true) {
+            const n = try conn.streamRead(download.stream_id, &tmp);
+            if (n == 0) break;
+            if (download.response.items.len + n > 128 * 1024 * 1024) return error.ResponseTooLarge;
+            try download.response.appendSlice(allocator, tmp[0..n]);
+            progressed = true;
+        }
+
+        const stream = conn.stream(download.stream_id) orelse continue;
+        switch (stream.recv.state) {
+            .data_recvd, .data_read => {
+                download.complete = true;
+                progressed = true;
+            },
+            .reset_recvd, .reset_read => return error.StreamResetByPeer,
+            else => {},
+        }
+    }
+    return progressed;
+}
+
+fn writeCompletedDownloads(
+    io: std.Io,
+    downloads_dir: std.Io.Dir,
+    downloads: []ClientDownload,
+) !void {
+    for (downloads) |*download| {
+        if (!download.complete or download.written) continue;
+        if (std.fs.path.dirname(download.rel_path)) |parent| {
+            if (parent.len > 0) try downloads_dir.createDirPath(io, parent);
+        }
+        try downloads_dir.writeFile(io, .{
+            .sub_path = download.rel_path,
+            .data = download.response.items,
+        });
+        std.debug.print("downloaded {s} -> {s} ({d} bytes)\n", .{
+            download.url,
+            download.rel_path,
+            download.response.items.len,
+        });
+        download.written = true;
+    }
+}
+
+fn allDownloadsComplete(downloads: []const ClientDownload) bool {
+    for (downloads) |download| {
+        if (!download.complete or !download.written) return false;
+    }
+    return true;
 }
 
 fn parseGetPath(request: []const u8) ?[]const u8 {
@@ -440,4 +788,24 @@ test "parse HTTP/0.9 GET path" {
     try std.testing.expectEqualStrings("file", parseGetPath("GET /file\r\n").?);
     try std.testing.expect(parseGetPath("POST /file\r\n") == null);
     try std.testing.expect(parseGetPath("GET /../secret\r\n") == null);
+}
+
+test "parse QNS request URL paths" {
+    try std.testing.expectEqualStrings("index.html", try requestPathFromUrl("https://server:443/index.html"));
+    try std.testing.expectEqualStrings("dir/file", try requestPathFromUrl("/dir/file?ignored=yes"));
+    try std.testing.expectError(error.InvalidRequestUrl, requestPathFromUrl("https://server:443/../secret"));
+}
+
+test "split endpoint host and port" {
+    const hp = try splitHostPort("server:443");
+    try std.testing.expectEqualStrings("server", hp.host);
+    try std.testing.expectEqual(@as(u16, 443), hp.port);
+
+    const default_port = try splitHostPort("server");
+    try std.testing.expectEqualStrings("server", default_port.host);
+    try std.testing.expectEqual(@as(u16, 443), default_port.port);
+
+    const ip6 = try splitHostPort("[::1]:8443");
+    try std.testing.expectEqualStrings("::1", ip6.host);
+    try std.testing.expectEqual(@as(u16, 8443), ip6.port);
 }

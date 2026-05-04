@@ -21,8 +21,7 @@ case "${ROLE:-server}" in
     exec /qns-endpoint server -listen 0.0.0.0:443 -www /www -cert /certs/cert.pem -key /certs/priv.key ${retry_arg}
     ;;
   client)
-    echo "nullq qns client endpoint is not implemented yet" >&2
-    exit 127
+    exec /qns-endpoint client -server "${SERVER:-server:443}" -server-name "${SERVER_NAME:-server}" -downloads /downloads -requests "${REQUESTS:-}"
     ;;
   *)
     echo "unknown ROLE=${ROLE:-unset}" >&2
