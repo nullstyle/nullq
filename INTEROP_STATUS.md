@@ -265,10 +265,11 @@ Current as of 2026-05-04.
    nullq-peer, and Retry address-validation helpers are reusable nullq
    API. Remaining hardening work: add live malformed/replayed Retry
    token probes through the UDP harness, bounded allocation policy,
-   qlog/keylog diagnostics, full flow-control pacing, and broader
-   shutdown-path interop with external peers. VN negative-path vectors
-   now cover supported-version, wrong CID echo, malformed version-list,
-   and server-ignore cases.
+   qlog/keylog diagnostics, send-side blocked-frame pacing, and broader
+   shutdown-path interop with external peers. Receive-side MAX_DATA /
+   MAX_STREAM_DATA updates are now half-window paced, and VN negative
+   path vectors now cover supported-version, wrong CID echo, malformed
+   version-list, and server-ignore cases.
 7. **The official interop runner gate is scaffolded, not complete.**
    nullq now has QNS server and client endpoint roles plus a Zig-native
    wrapper for nullq matrices against quic-go, ngtcp2, and quiche. The

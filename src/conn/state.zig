@@ -1853,8 +1853,20 @@ pub const Connection = struct {
         const n = s.recv.read(dst);
         if (n > 0) {
             self.recv_stream_bytes_read += n;
-            try self.queueMaxStreamData(id, s.recv.read_offset + default_stream_receive_window);
-            self.queueMaxData(self.recv_stream_bytes_read + default_connection_receive_window);
+            if (shouldQueueReceiveCredit(
+                s.recv.read_offset,
+                s.recv_max_data,
+                default_stream_receive_window,
+            )) {
+                try self.queueMaxStreamData(id, s.recv.read_offset +| default_stream_receive_window);
+            }
+            if (shouldQueueReceiveCredit(
+                self.recv_stream_bytes_read,
+                self.local_max_data,
+                default_connection_receive_window,
+            )) {
+                self.queueMaxData(self.recv_stream_bytes_read +| default_connection_receive_window);
+            }
         }
         self.maybeReturnPeerStreamCredit(s);
         return n;
@@ -1924,6 +1936,14 @@ pub const Connection = struct {
         if (self.pending_max_data == null or maximum_data > self.pending_max_data.?) {
             self.pending_max_data = maximum_data;
         }
+    }
+
+    fn shouldQueueReceiveCredit(consumed: u64, advertised: u64, window: u64) bool {
+        if (consumed == 0) return false;
+        const target = consumed +| window;
+        if (target <= advertised) return false;
+        if (consumed >= advertised) return true;
+        return advertised - consumed <= window / 2;
     }
 
     fn queueMaxStreams(self: *Connection, bidi: bool, maximum_streams: u64) void {
@@ -8064,6 +8084,52 @@ test "send-side STREAM emission is capped by flow-control allowance" {
     conn.handleMaxData(.{ .maximum_data = 16 });
     try std.testing.expectEqual(@as(?u64, null), conn.localDataBlockedAt());
     try std.testing.expectEqual(@as(?u64, null), conn.pending_data_blocked);
+}
+
+test "receive flow-control MAX updates are paced by half-window" {
+    try std.testing.expect(!Connection.shouldQueueReceiveCredit(
+        1,
+        default_stream_receive_window,
+        default_stream_receive_window,
+    ));
+    try std.testing.expect(!Connection.shouldQueueReceiveCredit(
+        default_stream_receive_window / 2 - 1,
+        default_stream_receive_window,
+        default_stream_receive_window,
+    ));
+    try std.testing.expect(Connection.shouldQueueReceiveCredit(
+        default_stream_receive_window / 2,
+        default_stream_receive_window,
+        default_stream_receive_window,
+    ));
+    try std.testing.expect(Connection.shouldQueueReceiveCredit(
+        1,
+        16,
+        default_stream_receive_window,
+    ));
+
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try conn.setTransportParams(.{
+        .initial_max_data = default_connection_receive_window,
+        .initial_max_stream_data_bidi_remote = default_stream_receive_window,
+        .initial_max_streams_bidi = 1,
+    });
+    try conn.handleStream(.application, .{
+        .stream_id = 0,
+        .offset = 0,
+        .data = "x",
+        .has_length = true,
+    });
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(0, &buf));
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_max_stream_data.items.len);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_max_data);
 }
 
 test "stream flow block queues STREAM_DATA_BLOCKED and clears on MAX_STREAM_DATA" {
