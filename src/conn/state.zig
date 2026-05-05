@@ -167,6 +167,7 @@ pub const max_pending_datagram_bytes: usize = 64 * 1024;
 /// Bounded reassembly budgets for peer-controlled CRYPTO gaps.
 pub const max_pending_crypto_bytes_per_level: usize = 64 * 1024;
 pub const max_crypto_reassembly_gap: u64 = 64 * 1024;
+pub const application_ack_eliciting_threshold: u8 = 2;
 
 pub const default_stream_receive_window: u64 = 1024 * 1024;
 pub const default_connection_receive_window: u64 = 16 * 1024 * 1024;
@@ -3137,6 +3138,21 @@ pub const Connection = struct {
         return (now_us - largest_at_us) >> shift;
     }
 
+    fn ackDelayDeadlineUs(
+        self: *const Connection,
+        tracker: *const ack_tracker_mod.AckTracker,
+    ) ?u64 {
+        const base_ms = tracker.ackDelayBaseMs() orelse return null;
+        return base_ms * rtt_mod.ms +| self.localMaxAckDelayUs();
+    }
+
+    fn promoteDueAckDelay(self: *Connection, tracker: *ack_tracker_mod.AckTracker, now_us: u64) void {
+        _ = tracker.promoteDelayedAck(
+            now_us / rtt_mod.ms,
+            self.local_transport_params.max_ack_delay_ms,
+        );
+    }
+
     fn idleTimeoutUs(self: *const Connection) ?u64 {
         const local = self.local_transport_params.max_idle_timeout_ms * rtt_mod.ms;
         const peer = if (self.cached_peer_transport_params) |params|
@@ -3820,10 +3836,10 @@ pub const Connection = struct {
 
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
             const tracker = &self.pnSpaceForLevelConst(lvl).received;
-            if (tracker.pending_ack) {
+            if (self.ackDelayDeadlineUs(tracker)) |at_us| {
                 considerDeadline(&best, .{
                     .kind = .ack_delay,
-                    .at_us = tracker.largest_at_ms * rtt_mod.ms +| self.localMaxAckDelayUs(),
+                    .at_us = at_us,
                     .level = lvl,
                 });
             }
@@ -3855,10 +3871,10 @@ pub const Connection = struct {
                 }
             }
             const tracker = &path.app_pn_space.received;
-            if (tracker.pending_ack) {
+            if (self.ackDelayDeadlineUs(tracker)) |at_us| {
                 considerDeadline(&best, .{
                     .kind = .ack_delay,
-                    .at_us = tracker.largest_at_ms * rtt_mod.ms +| self.localMaxAckDelayUs(),
+                    .at_us = at_us,
                     .level = .application,
                     .path_id = path.id,
                 });
@@ -5267,6 +5283,39 @@ pub const Connection = struct {
         return false;
     }
 
+    fn packetPayloadNeedsImmediateAck(payload: []const u8) bool {
+        var it = frame_mod.iter(payload);
+        while (it.next() catch return true) |f| {
+            switch (f) {
+                .stream => |s| if (s.fin) return true,
+                .reset_stream,
+                .stop_sending,
+                => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn recordApplicationReceivedPacket(
+        app_pn_space: *PnSpace,
+        pn: u64,
+        now_us: u64,
+        payload: []const u8,
+    ) void {
+        const ack_eliciting = packetPayloadAckEliciting(payload);
+        if (ack_eliciting and packetPayloadNeedsImmediateAck(payload)) {
+            app_pn_space.recordReceivedPacket(pn, now_us / rtt_mod.ms, true);
+            return;
+        }
+        app_pn_space.recordReceivedPacketDelayed(
+            pn,
+            now_us / rtt_mod.ms,
+            ack_eliciting,
+            application_ack_eliciting_threshold,
+        );
+    }
+
     fn versionListContains(vn: wire_header.VersionNegotiation, version: u32) bool {
         var i: usize = 0;
         while (i < vn.versionCount()) : (i += 1) {
@@ -5342,7 +5391,7 @@ pub const Connection = struct {
         const opened = open_result.opened;
 
         self.last_authenticated_path_id = app_path.id;
-        app_pn_space.recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
+        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
         try self.dispatchFrames(.application, opened.payload, now_us);
         return bytes.len;
     }
@@ -5529,7 +5578,7 @@ pub const Connection = struct {
         };
 
         self.last_authenticated_path_id = app_path.id;
-        app_pn_space.recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
+        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
         try self.dispatchFrames(.early_data, opened.payload, now_us);
         return opened.bytes_consumed;
     }
@@ -6998,6 +7047,14 @@ pub const Connection = struct {
             }
         }
 
+        inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
+            self.promoteDueAckDelay(&self.pnSpaceForLevel(lvl).received, now_us);
+        }
+        for (self.paths.paths.items) |*path| {
+            if (path.path.state == .failed) continue;
+            self.promoteDueAckDelay(&path.app_pn_space.received, now_us);
+        }
+
         try self.detectLossesByTimeThresholdAtLevel(.initial, now_us);
         try self.detectLossesByTimeThresholdAtLevel(.handshake, now_us);
         for (self.paths.paths.items) |*path| {
@@ -7778,6 +7835,40 @@ test "packetPayloadAckEliciting ignores ACK-only payloads" {
     try std.testing.expect(Connection.packetPayloadAckEliciting(buf[0..pos]));
 }
 
+test "packetPayloadNeedsImmediateAck flags stream finality and resets" {
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+
+    pos += try frame_mod.encode(buf[pos..], .{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .data = "x",
+        .has_offset = false,
+        .has_length = true,
+        .fin = false,
+    } });
+    try std.testing.expect(!Connection.packetPayloadNeedsImmediateAck(buf[0..pos]));
+
+    pos = 0;
+    pos += try frame_mod.encode(buf[pos..], .{ .stream = .{
+        .stream_id = 0,
+        .offset = 1,
+        .data = "",
+        .has_offset = true,
+        .has_length = true,
+        .fin = true,
+    } });
+    try std.testing.expect(Connection.packetPayloadNeedsImmediateAck(buf[0..pos]));
+
+    pos = 0;
+    pos += try frame_mod.encode(buf[pos..], .{ .reset_stream = .{
+        .stream_id = 0,
+        .application_error_code = 42,
+        .final_size = 1,
+    } });
+    try std.testing.expect(Connection.packetPayloadNeedsImmediateAck(buf[0..pos]));
+}
+
 test "CRYPTO reassembly: out-of-order fragments delivered in order" {
     // Tests the same shape quic-go sends on the wire: a high-offset
     // fragment first, then the low-offset fragment, then a tiny
@@ -7897,6 +7988,34 @@ test "timer deadline reports ACK delay" {
     try std.testing.expectEqual(TimerKind.ack_delay, deadline.kind);
     try std.testing.expectEqual(EncryptionLevel.application, deadline.level.?);
     try std.testing.expectEqual(@as(u64, 1_010_000), deadline.at_us);
+}
+
+test "application delayed ACK waits for threshold or timer" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setTransportParams(.{ .max_ack_delay_ms = 10 });
+    const tracker = &conn.primaryPath().app_pn_space.received;
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(7, 1000, true, application_ack_eliciting_threshold);
+
+    try std.testing.expect(!tracker.pending_ack);
+    try std.testing.expect(tracker.delayed_ack_armed);
+    const deadline = conn.nextTimerDeadline(1_005_000).?;
+    try std.testing.expectEqual(TimerKind.ack_delay, deadline.kind);
+    try std.testing.expectEqual(@as(u64, 1_010_000), deadline.at_us);
+
+    try conn.tick(1_009_000);
+    try std.testing.expect(!tracker.pending_ack);
+    try conn.tick(1_010_000);
+    try std.testing.expect(tracker.pending_ack);
+
+    tracker.markAckSent();
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(8, 1011, true, application_ack_eliciting_threshold);
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(9, 1012, true, application_ack_eliciting_threshold);
+    try std.testing.expect(tracker.pending_ack);
 }
 
 test "ACK-only application packets do not consume sent tracker slots" {
@@ -9754,7 +9873,8 @@ test "server handles accepted 0-RTT STREAM frames" {
 
     const consumed = try conn.handleOnePacket(packet[0..packet_len], 1_000);
     try std.testing.expectEqual(packet_len, consumed);
-    try std.testing.expect(conn.pnSpaceForLevel(.early_data).received.pending_ack);
+    try std.testing.expect(!conn.pnSpaceForLevel(.early_data).received.pending_ack);
+    try std.testing.expect(conn.pnSpaceForLevel(.early_data).received.delayed_ack_armed);
 
     var buf: [8]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 5), try conn.streamRead(0, &buf));

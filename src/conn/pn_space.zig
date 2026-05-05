@@ -41,6 +41,16 @@ pub const PnSpace = struct {
         self.received.addPacket(pn, now_ms, ack_eliciting);
     }
 
+    pub fn recordReceivedPacketDelayed(
+        self: *PnSpace,
+        pn: u64,
+        now_ms: u64,
+        ack_eliciting: bool,
+        packet_threshold: u8,
+    ) void {
+        self.received.addPacketDelayed(pn, now_ms, ack_eliciting, packet_threshold);
+    }
+
     pub fn onAckReceived(self: *PnSpace, ack_largest_acked: u64) void {
         if (self.largest_acked_sent == null or ack_largest_acked > self.largest_acked_sent.?) {
             self.largest_acked_sent = ack_largest_acked;
@@ -82,6 +92,31 @@ test "recordReceivedPacket can avoid arming an ACK" {
     s.recordReceivedPacket(1, 101, true);
     try std.testing.expectEqual(@as(u8, 1), s.received.range_count);
     try std.testing.expectEqual(@as(?u64, 1), s.received.largest);
+    try std.testing.expect(s.received.pending_ack);
+}
+
+test "recordReceivedPacketDelayed arms then promotes application ACKs" {
+    var s: PnSpace = .{};
+    s.recordReceivedPacketDelayed(0, 100, true, 2);
+    try std.testing.expect(!s.received.pending_ack);
+    try std.testing.expect(s.received.delayed_ack_armed);
+    try std.testing.expectEqual(@as(?u64, 100), s.received.ackDelayBaseMs());
+
+    s.recordReceivedPacketDelayed(1, 101, true, 2);
+    try std.testing.expect(s.received.pending_ack);
+    try std.testing.expect(s.received.delayed_ack_armed);
+
+    s.received.markAckSent();
+    try std.testing.expect(!s.received.pending_ack);
+    try std.testing.expect(!s.received.delayed_ack_armed);
+}
+
+test "recordReceivedPacketDelayed promotes on gaps" {
+    var s: PnSpace = .{};
+    s.recordReceivedPacketDelayed(0, 100, true, 8);
+    try std.testing.expect(!s.received.pending_ack);
+
+    s.recordReceivedPacketDelayed(2, 101, true, 8);
     try std.testing.expect(s.received.pending_ack);
 }
 
