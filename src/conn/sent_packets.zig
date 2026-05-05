@@ -8,9 +8,15 @@
 const std = @import("std");
 const frame_types = @import("../frame/types.zig");
 
+/// Maximum number of control frames a single tracked packet can carry
+/// for retransmission bookkeeping.
 pub const max_retransmit_frames: usize = 16;
+/// Maximum number of STREAM keys a single tracked packet can reference
+/// (one per coalesced STREAM frame inside the packet).
 pub const max_stream_keys_per_packet: usize = 32;
 
+/// Tagged union of control frames the connection may need to
+/// retransmit when the carrying packet is lost.
 pub const RetransmitFrame = union(enum) {
     max_data: frame_types.MaxData,
     max_stream_data: frame_types.MaxStreamData,
@@ -35,12 +41,17 @@ pub const RetransmitFrame = union(enum) {
     path_cids_blocked: frame_types.PathCidsBlocked,
 };
 
+/// Reference to a DATAGRAM frame the application owns. Surfaces
+/// ack/loss outcomes so the app can run its own retry policy
+/// (RFC 9221 §3).
 pub const SentDatagram = struct {
     id: u64,
     len: usize,
     path_id: u32 = 0,
 };
 
+/// Metadata for one packet the connection has put on the wire and
+/// is awaiting an ACK or loss outcome for.
 pub const SentPacket = struct {
     pn: u64,
     /// Send time in microseconds (monotonic clock the caller manages).
@@ -80,6 +91,9 @@ pub const SentPacket = struct {
     /// Key Phase bit used on the wire for a 1-RTT application packet.
     key_phase: ?bool = null,
 
+    /// Append a control frame so loss recovery can re-queue it if the
+    /// packet is declared lost. Errors with `TooManyRetransmittableFrames`
+    /// when capacity is reached.
     pub fn addRetransmitFrame(
         self: *SentPacket,
         allocator: std.mem.Allocator,
@@ -91,6 +105,9 @@ pub const SentPacket = struct {
         try self.retransmit_frames.append(allocator, frame);
     }
 
+    /// Record a STREAM-frame routing key so ack/loss callbacks can
+    /// reach the right `SendStream`. Sets `stream_key` on the first
+    /// call, then appends to `extra_stream_keys`.
     pub fn addStreamKey(self: *SentPacket, allocator: std.mem.Allocator, key: u64) Error!void {
         if (self.stream_key == null) {
             self.stream_key = key;
@@ -102,10 +119,13 @@ pub const SentPacket = struct {
         try self.extra_stream_keys.append(allocator, key);
     }
 
+    /// Iterator over every STREAM key carried by a `SentPacket`
+    /// (the primary `stream_key` first, then `extra_stream_keys`).
     pub const StreamKeyIterator = struct {
         packet: *const SentPacket,
         index: usize = 0,
 
+        /// Yield the next STREAM key, or null when exhausted.
         pub fn next(self: *StreamKeyIterator) ?u64 {
             if (self.index == 0) {
                 self.index = 1;
@@ -118,10 +138,12 @@ pub const SentPacket = struct {
         }
     };
 
+    /// Build an iterator over every STREAM key referenced by this packet.
     pub fn streamKeys(self: *const SentPacket) StreamKeyIterator {
         return .{ .packet = self };
     }
 
+    /// Release the heap-backed retransmit-frame and stream-key arrays.
     pub fn deinit(self: *SentPacket, allocator: std.mem.Allocator) void {
         self.retransmit_frames.deinit(allocator);
         self.extra_stream_keys.deinit(allocator);
@@ -136,12 +158,18 @@ pub const SentPacket = struct {
 /// caller should map to a CONNECTION_CLOSE.
 pub const max_tracked: usize = 4096;
 
+/// Errors raised by the sent-packet tracker.
 pub const Error = error{
+    /// `record` was called when the per-PN-space cap was reached.
     TooManyInFlight,
+    /// `addRetransmitFrame` exceeded `max_retransmit_frames`.
     TooManyRetransmittableFrames,
+    /// `addStreamKey` exceeded `max_stream_keys_per_packet`.
     TooManyStreamFrames,
 } || std.mem.Allocator.Error;
 
+/// RFC 9002 §A.1 sent-packet tracker. Indexed by PN, sorted ascending,
+/// with running totals for in-flight bookkeeping.
 pub const SentPacketTracker = struct {
     /// Sorted ascending by PN. Sent packets are appended at the
     /// high end; ACKs/loss removes from anywhere.

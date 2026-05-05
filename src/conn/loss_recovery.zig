@@ -17,8 +17,9 @@ const granularity_us = @import("rtt.zig").granularity_us;
 
 /// kPacketThreshold from RFC 9002 §6.1.1: 3.
 pub const packet_threshold: u64 = 3;
-/// kTimeThreshold from RFC 9002 §6.1.2: 9/8.
+/// kTimeThreshold numerator from RFC 9002 §6.1.2.
 pub const time_threshold_num: u64 = 9;
+/// kTimeThreshold denominator from RFC 9002 §6.1.2 (threshold = 9/8 of the RTT).
 pub const time_threshold_den: u64 = 8;
 
 /// Outcome of `processAck`. The connection feeds the contained
@@ -84,11 +85,18 @@ pub fn processAck(
     return result;
 }
 
-/// Outcome of `detectLosses`.
+/// Outcome of `detectLosses`. Caller feeds the contained metadata
+/// into the congestion controller's `onPacketLost` and into qlog/loss
+/// observability counters.
 pub const LossResult = struct {
+    /// Sum of `.bytes` for declared-lost packets.
     bytes_lost: u64 = 0,
+    /// Sum of `.bytes` for the in-flight subset.
     in_flight_bytes_lost: u64 = 0,
+    /// Send time of the latest lost packet (microseconds). Drives the
+    /// recovery-period start in `NewReno.onPacketLost`.
     largest_lost_send_time_us: u64 = 0,
+    /// Number of packets declared lost.
     count: u32 = 0,
 };
 

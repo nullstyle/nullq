@@ -12,24 +12,40 @@ const path = @import("path.zig");
 
 const HmacSha256 = boringssl.crypto.hmac.HmacSha256;
 
+/// On-wire format version byte. Bumped if the encoding changes.
 pub const token_format_version: u8 = 1;
+/// HMAC-SHA256 key length in bytes.
 pub const key_len: usize = 32;
+/// HMAC-SHA256 tag length in bytes.
 pub const tag_len: usize = HmacSha256.digest_size;
+/// Token header length: version (1) + version (4) + issued_at (8) + expires_at (8).
 pub const header_len: usize = 1 + 4 + 8 + 8;
+/// Total wire length of a Retry token: header + HMAC tag.
 pub const token_len: usize = header_len + tag_len;
+/// Upper bound on each length-prefixed field bound into the HMAC.
 pub const max_bound_value_len: usize = std.math.maxInt(u16);
 
+/// 32-byte HMAC-SHA256 key. The server must keep this stable across
+/// the token's lifetime so it can validate after a Retry round-trip.
 pub const Key = [key_len]u8;
+/// Fixed-size Retry token (RFC 9000 §8.1.2).
 pub const Token = [token_len]u8;
 
 const domain_separator = "nullq retry token v1";
 
+/// Errors raised by `mint` and (via `validate`) surfaced as `.malformed`.
 pub const Error = error{
+    /// Output buffer passed to `mint` was smaller than `token_len`.
     OutputTooSmall,
+    /// A bound field (e.g. `client_address`) was longer than `max_bound_value_len`.
     ContextTooLong,
+    /// A Connection ID exceeded `path.max_cid_len`.
     DcidTooLong,
 };
 
+/// Inputs to `mint`. The HMAC binds `client_address`, `original_dcid`,
+/// `retry_scid`, `quic_version`, `now_us`, and the expiry derived from
+/// `lifetime_us`.
 pub const MintOptions = struct {
     key: *const Key,
     now_us: u64,
@@ -40,6 +56,8 @@ pub const MintOptions = struct {
     quic_version: u32 = 0x00000001,
 };
 
+/// Inputs to `validate`. Must be byte-equal to the `MintOptions`
+/// values used to issue the token (modulo `now_us`/`max_clock_skew_us`).
 pub const ValidateOptions = struct {
     key: *const Key,
     now_us: u64,
@@ -50,15 +68,25 @@ pub const ValidateOptions = struct {
     max_clock_skew_us: u64 = 0,
 };
 
+/// Outcome of `validate`.
 pub const ValidationResult = enum {
+    /// HMAC matched and timestamps are within the allowed window.
     valid,
+    /// Length, version byte, or bound field shape was wrong.
     malformed,
+    /// The QUIC version field did not match.
     wrong_version,
+    /// `issued_at_us` is in the future beyond `max_clock_skew_us`.
     not_yet_valid,
+    /// `expires_at_us` is in the past beyond `max_clock_skew_us`.
     expired,
+    /// Token is well-formed but the HMAC did not verify.
     invalid,
 };
 
+/// Mint a Retry token into `dst`. Returns the number of bytes written
+/// (always `token_len`). Errors come from oversized bound fields or a
+/// short output buffer.
 pub fn mint(dst: []u8, opts: MintOptions) Error!usize {
     if (dst.len < token_len) return Error.OutputTooSmall;
     try validateBoundInputs(opts.client_address, opts.original_dcid, opts.retry_scid);
@@ -75,12 +103,18 @@ pub fn mint(dst: []u8, opts: MintOptions) Error!usize {
     return token_len;
 }
 
+/// Convenience wrapper around `mint` that returns a fresh `Token`
+/// by-value.
 pub fn minted(opts: MintOptions) Error!Token {
     var token: Token = undefined;
     _ = try mint(&token, opts);
     return token;
 }
 
+/// Validate a Retry token. Returns `.valid` only if the HMAC matches
+/// and the token is within its issue/expiry window (subject to
+/// `max_clock_skew_us`). All failure modes are surfaced as enum
+/// variants — the function never errors.
 pub fn validate(token: []const u8, opts: ValidateOptions) ValidationResult {
     if (token.len != token_len) return .malformed;
     if (token[0] != token_format_version) return .malformed;

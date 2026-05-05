@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+/// Errors raised by the flow-control bookkeeping helpers.
 pub const Error = error{
     /// We tried to send beyond the peer's flow-control limit.
     FlowControlExceeded,
@@ -38,33 +39,46 @@ pub const ConnectionData = struct {
     /// Bytes we have sent to the peer.
     we_sent: u64 = 0,
 
+    /// Construct with the local- and peer-advertised initial limits
+    /// (typically the `initial_max_data` transport parameters).
     pub fn init(local_initial: u64, peer_initial: u64) ConnectionData {
         return .{ .local_max = local_initial, .peer_max = peer_initial };
     }
 
+    /// True iff sending `n` more bytes would still fit under `peer_max`.
     pub fn weCanSend(self: *const ConnectionData, n: u64) bool {
         return self.we_sent + n <= self.peer_max;
     }
 
+    /// Remaining bytes we may send before hitting the peer's limit.
     pub fn allowance(self: *const ConnectionData) u64 {
         if (self.we_sent >= self.peer_max) return 0;
         return self.peer_max - self.we_sent;
     }
 
+    /// Record `n` bytes shipped on the wire. Errors with
+    /// `FlowControlExceeded` if it would overshoot `peer_max`.
     pub fn recordSent(self: *ConnectionData, n: u64) Error!void {
         if (!self.weCanSend(n)) return Error.FlowControlExceeded;
         self.we_sent += n;
     }
 
+    /// Apply an incoming MAX_DATA frame (RFC 9000 §19.9). Monotonic:
+    /// stale/retransmitted MAX_DATA values are ignored.
     pub fn onMaxData(self: *ConnectionData, new_max: u64) void {
         if (new_max > self.peer_max) self.peer_max = new_max;
     }
 
+    /// Charge `n` bytes from the peer against our advertised limit.
+    /// Errors with `PeerExceededLimit` if the peer overran our cap
+    /// (FLOW_CONTROL_ERROR per §4.1).
     pub fn recordPeerSent(self: *ConnectionData, n: u64) Error!void {
         if (self.peer_sent + n > self.local_max) return Error.PeerExceededLimit;
         self.peer_sent += n;
     }
 
+    /// Lift the local advertised limit, e.g. before sending a new
+    /// MAX_DATA frame. Monotonic.
     pub fn raiseLocalMax(self: *ConnectionData, new_max: u64) void {
         if (new_max > self.local_max) self.local_max = new_max;
     }
@@ -81,29 +95,40 @@ pub const StreamData = struct {
     /// What we have sent.
     we_sent: u64 = 0,
 
+    /// Construct with the advertised initial limits for this stream
+    /// (`initial_max_stream_data_*` transport parameters).
     pub fn init(local_initial: u64, peer_initial: u64) StreamData {
         return .{ .local_max = local_initial, .peer_max = peer_initial };
     }
 
+    /// Remaining bytes we may send on this stream before hitting the
+    /// peer's limit.
     pub fn allowance(self: *const StreamData) u64 {
         if (self.we_sent >= self.peer_max) return 0;
         return self.peer_max - self.we_sent;
     }
 
+    /// Charge `n` bytes against the peer's stream limit. Errors with
+    /// `FlowControlExceeded` on overrun.
     pub fn recordSent(self: *StreamData, n: u64) Error!void {
         if (self.we_sent + n > self.peer_max) return Error.FlowControlExceeded;
         self.we_sent += n;
     }
 
+    /// Apply an incoming MAX_STREAM_DATA frame (RFC 9000 §19.10).
+    /// Monotonic.
     pub fn onMaxStreamData(self: *StreamData, new_max: u64) void {
         if (new_max > self.peer_max) self.peer_max = new_max;
     }
 
+    /// Charge `n` bytes from the peer against our advertised stream
+    /// limit. Errors with `PeerExceededLimit` on overrun.
     pub fn recordPeerSent(self: *StreamData, n: u64) Error!void {
         if (self.peer_sent + n > self.local_max) return Error.PeerExceededLimit;
         self.peer_sent += n;
     }
 
+    /// Lift our advertised stream limit. Monotonic.
     pub fn raiseLocalMax(self: *StreamData, new_max: u64) void {
         if (new_max > self.local_max) self.local_max = new_max;
     }
@@ -122,23 +147,33 @@ pub const StreamCount = struct {
     /// Highest stream number the peer has opened (inclusive index).
     peer_opened: u64 = 0,
 
+    /// Construct with the local- and peer-advertised initial maxima
+    /// (the `initial_max_streams_*` transport parameters).
     pub fn init(local_initial: u64, peer_initial: u64) StreamCount {
         return .{ .local_max = local_initial, .peer_max = peer_initial };
     }
 
+    /// True iff the local endpoint may open one more stream of this
+    /// (direction, initiator) pair.
     pub fn weCanOpen(self: *const StreamCount) bool {
         return self.we_opened < self.peer_max;
     }
 
+    /// Account for opening one more stream. Errors with
+    /// `FlowControlExceeded` if `peer_max` is already reached.
     pub fn recordWeOpened(self: *StreamCount) Error!void {
         if (!self.weCanOpen()) return Error.FlowControlExceeded;
         self.we_opened += 1;
     }
 
+    /// Apply an incoming MAX_STREAMS frame (RFC 9000 §19.11). Monotonic.
     pub fn onMaxStreams(self: *StreamCount, new_max: u64) void {
         if (new_max > self.peer_max) self.peer_max = new_max;
     }
 
+    /// Record that the peer opened the given peer-initiated stream
+    /// index. Errors with `PeerExceededLimit` if the peer's stream
+    /// number is at or past our advertised cap (STREAM_LIMIT_ERROR).
     pub fn recordPeerOpened(self: *StreamCount, stream_index: u64) Error!void {
         if (stream_index >= self.local_max) return Error.PeerExceededLimit;
         if (stream_index >= self.peer_opened) self.peer_opened = stream_index + 1;

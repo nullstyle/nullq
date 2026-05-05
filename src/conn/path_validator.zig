@@ -12,6 +12,7 @@
 
 const std = @import("std");
 
+/// Lifecycle of a single path's validation attempt.
 pub const Status = enum {
     /// No challenge in flight, no validation outcome yet.
     idle,
@@ -23,11 +24,14 @@ pub const Status = enum {
     failed,
 };
 
+/// Errors raised by `PathValidator.recordResponse`.
 pub const Error = error{
     /// `recordResponse` was called when no challenge was pending.
     NotPending,
 };
 
+/// RFC 9000 §8.2 path-challenge state machine. Owns just the
+/// (token, deadline, status) tuple; the connection drives I/O.
 pub const PathValidator = struct {
     status: Status = .idle,
     /// Token from the most recent challenge sent. Valid only when
@@ -77,6 +81,7 @@ pub const PathValidator = struct {
         }
     }
 
+    /// True iff this validator is in the `.validated` terminal state.
     pub fn isValidated(self: *const PathValidator) bool {
         return self.status == .validated;
     }

@@ -8,11 +8,15 @@
 const std = @import("std");
 const ack_tracker_mod = @import("ack_tracker.zig");
 
+/// Re-export of the underlying received-PN tracker.
 pub const AckTracker = ack_tracker_mod.AckTracker;
 
 /// Maximum PN value (RFC 9000 §12.3): 2^62 - 1.
 pub const max_pn: u64 = (1 << 62) - 1;
 
+/// One QUIC packet number space. Tracks the next outgoing PN, the
+/// largest PN we've seen acknowledged, and the received-PN bookkeeping
+/// for ACK generation.
 pub const PnSpace = struct {
     /// Next packet number to assign on send.
     next_pn: u64 = 0,
@@ -33,14 +37,22 @@ pub const PnSpace = struct {
         return pn;
     }
 
+    /// Record an ACK-eliciting received PN. Convenience wrapper that
+    /// always treats the packet as ACK-eliciting.
     pub fn recordReceived(self: *PnSpace, pn: u64, now_ms: u64) void {
         self.received.add(pn, now_ms);
     }
 
+    /// Record a received PN with explicit `ack_eliciting` flag. Used
+    /// by Initial/Handshake spaces (no delayed-ACK), or by callers
+    /// that have already promoted to `pending_ack`.
     pub fn recordReceivedPacket(self: *PnSpace, pn: u64, now_ms: u64, ack_eliciting: bool) void {
         self.received.addPacket(pn, now_ms, ack_eliciting);
     }
 
+    /// Record a received PN under application-data delayed-ACK rules
+    /// (RFC 9000 §13.2.1). `packet_threshold` is the count of
+    /// ACK-eliciting packets that forces an immediate ACK (typically 2).
     pub fn recordReceivedPacketDelayed(
         self: *PnSpace,
         pn: u64,
@@ -51,6 +63,9 @@ pub const PnSpace = struct {
         self.received.addPacketDelayed(pn, now_ms, ack_eliciting, packet_threshold);
     }
 
+    /// Update `largest_acked_sent` from an incoming ACK. Out-of-order
+    /// ACKs (smaller `ack_largest_acked` than what we've already seen)
+    /// are ignored.
     pub fn onAckReceived(self: *PnSpace, ack_largest_acked: u64) void {
         if (self.largest_acked_sent == null or ack_largest_acked > self.largest_acked_sent.?) {
             self.largest_acked_sent = ack_largest_acked;

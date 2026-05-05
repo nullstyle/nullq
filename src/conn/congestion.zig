@@ -11,10 +11,13 @@ const std = @import("std");
 /// kPersistentCongestionThreshold from RFC 9002 §7.6.1: 3.
 pub const persistent_congestion_threshold: u8 = 3;
 
-/// kLossReductionFactor from RFC 9002 §B.1: 0.5 (multiplied integer-style).
+/// kLossReductionFactor numerator from RFC 9002 §B.1.
 pub const loss_reduction_factor_num: u64 = 1;
+/// kLossReductionFactor denominator from RFC 9002 §B.1 (factor = 1/2).
 pub const loss_reduction_factor_den: u64 = 2;
 
+/// Tunables for the NewReno controller. Held by-value inside the
+/// controller so each path has independent state.
 pub const Config = struct {
     /// Maximum UDP datagram size we'll send. Conservatively 1200
     /// per the QUIC v1 minimum; raised by PMTU discovery later.
@@ -34,6 +37,9 @@ pub const Config = struct {
     }
 };
 
+/// RFC 9002 NewReno congestion controller. One instance per QUIC
+/// path. Tracks congestion window, slow-start threshold, and the
+/// recovery period; exposes `sendAllowance` for the packet builder.
 pub const NewReno = struct {
     cfg: Config,
     /// Current congestion window in bytes.
@@ -50,15 +56,21 @@ pub const NewReno = struct {
     /// `bytes_acked / cwnd >= max_datagram_size`.
     bytes_acked_in_ca: u64 = 0,
 
+    /// Build a fresh controller with `cfg` and `cwnd = initialWindow()`.
     pub fn init(cfg: Config) NewReno {
         return .{ .cfg = cfg, .cwnd = cfg.initialWindow() };
     }
 
+    /// True iff the controller is currently in recovery and the
+    /// packet sent at `sent_time_us` predates the recovery boundary
+    /// (so its ACK should not grow `cwnd`).
     pub fn isInRecovery(self: *const NewReno, sent_time_us: u64) bool {
         return self.recovery_start_time_us != null and
             sent_time_us <= self.recovery_start_time_us.?;
     }
 
+    /// True while we're in slow start (no `ssthresh` yet, or
+    /// `cwnd < ssthresh`).
     pub fn isSlowStart(self: *const NewReno) bool {
         return self.ssthresh == null or self.cwnd < self.ssthresh.?;
     }
