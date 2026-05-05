@@ -3496,7 +3496,6 @@ pub const Connection = struct {
         }
         self.sent_crypto[idx].clearRetainingCapacity();
         self.clearSentTracker(&self.sent[0]);
-        self.pn_spaces[0] = .{};
         self.pto_count[0] = 0;
         self.pending_ping[0] = false;
     }
@@ -4840,6 +4839,8 @@ pub const Connection = struct {
             // we can decrypt the trailing Handshake packet.
             try self.drainInboxIntoTls();
         }
+        if (self.cryptoInboxQueued()) try self.drainInboxIntoTls();
+
         // PATH_CHALLENGE → record-and-tick; the validator will
         // either succeed (echo arrived) or time out at PTO * 3.
         for (self.paths.paths.items) |*path| {
@@ -6085,6 +6086,13 @@ pub const Connection = struct {
             // No chunk reaches the floor → done.
             break;
         }
+    }
+
+    fn cryptoInboxQueued(self: *const Connection) bool {
+        inline for (level_mod.all) |lvl| {
+            if (self.inbox[lvl.idx()].len > 0) return true;
+        }
+        return false;
     }
 
     fn drainInboxIntoTls(self: *Connection) Error!void {
@@ -7446,7 +7454,7 @@ test "Retry is accepted once and re-arms Initial crypto with token" {
     try std.testing.expectEqualSlices(u8, &retry_scid, conn.peer_dcid.slice());
     try std.testing.expectEqualSlices(u8, &retry_scid, conn.initial_dcid.slice());
     try std.testing.expectEqualSlices(u8, &odcid, conn.original_initial_dcid.slice());
-    try std.testing.expectEqual(@as(u64, 0), conn.pn_spaces[0].next_pn);
+    try std.testing.expectEqual(@as(u64, 9), conn.pn_spaces[0].next_pn);
     try std.testing.expectEqual(@as(u32, 0), conn.sent[0].count);
     try std.testing.expectEqual(@as(usize, 1), conn.crypto_retx[EncryptionLevel.initial.idx()].items.len);
 

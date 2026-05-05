@@ -633,10 +633,10 @@ fn runClientConnection(
     };
     try conn.setTransportParams(params);
 
-    var requests_started = false;
+    var requests_enabled = false;
     if (conn_opts.early_data) {
-        try startClientRequests(allocator, &conn, downloads);
-        requests_started = true;
+        _ = try startClientRequests(allocator, &conn, downloads);
+        requests_enabled = true;
     }
     try conn.advance();
 
@@ -663,13 +663,12 @@ fn runClientConnection(
             progressed = true;
         }
 
-        if (conn.handshakeDone() and !requests_started) {
-            try startClientRequests(allocator, &conn, downloads);
-            requests_started = true;
-            progressed = true;
+        if (conn.handshakeDone() and !requests_enabled) {
+            requests_enabled = true;
         }
 
-        if (requests_started) {
+        if (requests_enabled) {
+            if (try startClientRequests(allocator, &conn, downloads)) progressed = true;
             if (try drainClientResponses(allocator, &conn, downloads)) progressed = true;
             try writeCompletedDownloads(io, downloads_dir, downloads);
         }
@@ -824,17 +823,23 @@ fn startClientRequests(
     allocator: std.mem.Allocator,
     conn: *nullq.Connection,
     downloads: []ClientDownload,
-) !void {
+) !bool {
+    var progressed = false;
     for (downloads) |*download| {
         if (download.started) continue;
-        _ = try conn.openBidi(download.stream_id);
+        _ = conn.openBidi(download.stream_id) catch |err| {
+            if (err == error.StreamLimitExceeded) return progressed;
+            return err;
+        };
         const request = try std.fmt.allocPrint(allocator, "GET /{s}\r\n", .{download.rel_path});
         defer allocator.free(request);
         const written = try conn.streamWrite(download.stream_id, request);
         if (written != request.len) return error.ShortStreamWrite;
         try conn.streamFinish(download.stream_id);
         download.started = true;
+        progressed = true;
     }
+    return progressed;
 }
 
 fn drainClientResponses(
