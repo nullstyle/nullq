@@ -412,6 +412,14 @@ const LossStats = struct {
     in_flight_bytes_lost: u64 = 0,
     earliest_lost_sent_time_us: ?u64 = null,
     largest_lost_sent_time_us: u64 = 0,
+    /// RFC 9002 §7.6.1 mandates that persistent congestion be
+    /// determined only from ack-eliciting packets. We therefore
+    /// track the time bounds of the *ack-eliciting* lost subset
+    /// separately so the unfiltered counters above stay usable
+    /// for cwnd reduction (which doesn't need the filter).
+    ack_eliciting_count: u32 = 0,
+    earliest_ack_eliciting_lost_sent_time_us: ?u64 = null,
+    largest_ack_eliciting_lost_sent_time_us: u64 = 0,
 
     fn add(self: *LossStats, packet: sent_packets_mod.SentPacket) void {
         self.count += 1;
@@ -424,6 +432,17 @@ const LossStats = struct {
         }
         if (packet.sent_time_us > self.largest_lost_sent_time_us) {
             self.largest_lost_sent_time_us = packet.sent_time_us;
+        }
+        if (packet.ack_eliciting) {
+            self.ack_eliciting_count += 1;
+            if (self.earliest_ack_eliciting_lost_sent_time_us == null or
+                packet.sent_time_us < self.earliest_ack_eliciting_lost_sent_time_us.?)
+            {
+                self.earliest_ack_eliciting_lost_sent_time_us = packet.sent_time_us;
+            }
+            if (packet.sent_time_us > self.largest_ack_eliciting_lost_sent_time_us) {
+                self.largest_ack_eliciting_lost_sent_time_us = packet.sent_time_us;
+            }
         }
     }
 };
@@ -6825,9 +6844,19 @@ pub const Connection = struct {
     }
 
     fn isPersistentCongestionFromBasePto(base_pto_us: u64, stats: LossStats) bool {
-        const earliest = stats.earliest_lost_sent_time_us orelse return false;
-        if (stats.count < 2 or stats.largest_lost_sent_time_us <= earliest) return false;
-        const duration = stats.largest_lost_sent_time_us - earliest;
+        // RFC 9002 §7.6.1: persistent congestion is determined from
+        // ack-eliciting packets only. Both the smallest and largest
+        // lost packets in the persistent congestion window MUST be
+        // ack-eliciting. A burst of lost PATH_RESPONSE-only or
+        // PADDING-only packets, for example, is not enough on its
+        // own to collapse cwnd to kMinimumWindow.
+        const earliest = stats.earliest_ack_eliciting_lost_sent_time_us orelse return false;
+        if (stats.ack_eliciting_count < 2 or
+            stats.largest_ack_eliciting_lost_sent_time_us <= earliest)
+        {
+            return false;
+        }
+        const duration = stats.largest_ack_eliciting_lost_sent_time_us - earliest;
         const threshold = base_pto_us *
             congestion_mod.persistent_congestion_threshold;
         return duration >= threshold;
@@ -8564,6 +8593,90 @@ test "persistent congestion resets congestion window to minimum" {
 
     try std.testing.expectEqual(conn.ccForApplication().cfg.minWindow(), conn.congestionWindow());
     try std.testing.expectEqual(@as(u64, 0), conn.congestionBytesInFlight());
+}
+
+test "persistent congestion ignores non-ack-eliciting losses (RFC 9002 §7.6.1)" {
+    // RFC 9002 §7.6.1: "Two ack-eliciting packets ... are declared
+    // lost". A duration spanned only by non-ack-eliciting lost
+    // packets must NOT establish persistent congestion.
+    var stats: LossStats = .{};
+    // Two non-ack-eliciting "lost" packets spanning a wide duration
+    // (300ms). With pto = 30ms and threshold = 3, the unfiltered
+    // earliest/largest range would easily satisfy the old check —
+    // this regression-tests the ack-eliciting filter.
+    stats.add(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    stats.add(.{
+        .pn = 1,
+        .sent_time_us = 300_000,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
+
+    // Adding a single ack-eliciting lost packet still doesn't
+    // qualify — RFC requires *two* ack-eliciting losses bounding
+    // the duration.
+    stats.add(.{
+        .pn = 2,
+        .sent_time_us = 150_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
+
+    // Two ack-eliciting lost packets bounding the duration → fires.
+    stats.add(.{
+        .pn = 3,
+        .sent_time_us = 400_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    // duration (400ms − 150ms) = 250ms ≥ 3 × 30ms = 90ms → fires.
+    try std.testing.expect(Connection.isPersistentCongestionFromBasePto(30_000, stats));
+}
+
+test "persistent congestion duration uses only ack-eliciting bounds" {
+    // Mixed losses: a wide-spanning non-ack-eliciting lost packet
+    // must NOT inflate the duration computed from the narrower
+    // ack-eliciting subset.
+    var stats: LossStats = .{};
+    // Non-ack-eliciting at t=0 (would extend duration to 100ms).
+    stats.add(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    // Two ack-eliciting losses inside a narrower window.
+    stats.add(.{
+        .pn = 1,
+        .sent_time_us = 80_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    stats.add(.{
+        .pn = 2,
+        .sent_time_us = 100_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    // base_pto = 30ms → threshold = 90ms. Ack-eliciting duration is
+    // only 20ms (100ms − 80ms), so persistent congestion must NOT
+    // fire even though the unfiltered duration (100ms) exceeds the
+    // threshold.
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
 }
 
 test "congestionBlocked gates application data but allows PTO probes" {
