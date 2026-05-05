@@ -16,6 +16,7 @@ const std = @import("std");
 /// Maximum packet number value: 2^62 - 1 (per RFC 9000 §12.3).
 pub const max_value: u64 = (1 << 62) - 1;
 
+/// Errors returned by packet-number encode/decode operations.
 pub const Error = error{
     BufferTooSmall,
     InsufficientBytes,

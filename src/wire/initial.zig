@@ -18,6 +18,9 @@ const boringssl = @import("boringssl");
 const HkdfSha256 = boringssl.crypto.kdf.HkdfSha256;
 const HkdfSha384 = boringssl.crypto.kdf.HkdfSha384;
 
+/// HKDF hash function used by `hkdfExpandLabelWithHash`. Initial keys
+/// always use SHA-256; negotiated TLS 1.3 cipher suites can require
+/// SHA-384 for Handshake/Application key derivation.
 pub const HkdfHash = enum {
     sha256,
     sha384,
@@ -45,6 +48,7 @@ pub const Keys = struct {
     hp: [16]u8,
 };
 
+/// Errors returned by HKDF-Expand-Label.
 pub const Error = error{
     LabelTooLong,
     ContextTooLong,

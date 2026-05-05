@@ -30,6 +30,7 @@ pub const sample_len: usize = 16;
 /// to 4 bytes of PN).
 pub const mask_len: usize = 5;
 
+/// Errors returned by header- and packet-protection routines.
 pub const Error = error{
     InsufficientCiphertext,
     InvalidPnLength,
@@ -95,6 +96,9 @@ pub fn chacha20HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) [mas
     return chacha20.quicHpMask(hp_key, sample);
 }
 
+/// Whether a packet uses the long-header or short-header form. Drives
+/// how many low bits of the first byte are masked by header
+/// protection (RFC 9001 §5.4.1).
 pub const HeaderForm = enum {
     /// Long header: mask the low 4 bits of the first byte (reserved +
     /// PN length).

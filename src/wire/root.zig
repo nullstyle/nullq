@@ -14,12 +14,19 @@
 //!  - `initial`, `protection`, `short_packet`, `long_packet` —
 //!    AEAD-aware packet protection, including Retry integrity.
 
+/// RFC 9000 §16 variable-length integer encoding.
 pub const varint = @import("varint.zig");
+/// RFC 9000 §17.1 packet-number truncation and recovery.
 pub const packet_number = @import("packet_number.zig");
+/// QUIC v1 long- and short-header parse/encode plus variant types.
 pub const header = @import("header.zig");
+/// RFC 9001 §5.2 Initial-key derivation and HKDF-Expand-Label helper.
 pub const initial = @import("initial.zig");
+/// AEAD packet protection and header-protection masks (RFC 9001 §5).
 pub const protection = @import("protection.zig");
+/// 1-RTT short-header packet seal/open.
 pub const short_packet = @import("short_packet.zig");
+/// Initial / 0-RTT / Handshake / Retry long-header packet seal/open.
 pub const long_packet = @import("long_packet.zig");
 
 test {
