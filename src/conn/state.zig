@@ -412,6 +412,14 @@ const LossStats = struct {
     in_flight_bytes_lost: u64 = 0,
     earliest_lost_sent_time_us: ?u64 = null,
     largest_lost_sent_time_us: u64 = 0,
+    /// RFC 9002 §7.6.1 mandates that persistent congestion be
+    /// determined only from ack-eliciting packets. We therefore
+    /// track the time bounds of the *ack-eliciting* lost subset
+    /// separately so the unfiltered counters above stay usable
+    /// for cwnd reduction (which doesn't need the filter).
+    ack_eliciting_count: u32 = 0,
+    earliest_ack_eliciting_lost_sent_time_us: ?u64 = null,
+    largest_ack_eliciting_lost_sent_time_us: u64 = 0,
 
     fn add(self: *LossStats, packet: sent_packets_mod.SentPacket) void {
         self.count += 1;
@@ -424,6 +432,17 @@ const LossStats = struct {
         }
         if (packet.sent_time_us > self.largest_lost_sent_time_us) {
             self.largest_lost_sent_time_us = packet.sent_time_us;
+        }
+        if (packet.ack_eliciting) {
+            self.ack_eliciting_count += 1;
+            if (self.earliest_ack_eliciting_lost_sent_time_us == null or
+                packet.sent_time_us < self.earliest_ack_eliciting_lost_sent_time_us.?)
+            {
+                self.earliest_ack_eliciting_lost_sent_time_us = packet.sent_time_us;
+            }
+            if (packet.sent_time_us > self.largest_ack_eliciting_lost_sent_time_us) {
+                self.largest_ack_eliciting_lost_sent_time_us = packet.sent_time_us;
+            }
         }
     }
 };
@@ -1482,6 +1501,12 @@ pub const Connection = struct {
             if (path.path.local_cid.len == 0 or sequence_number == 0) {
                 path.path.local_cid = cid;
                 if (path_id == 0) self.local_scid = cid;
+            }
+            // Keep the per-path high watermark of issued CID sequences.
+            // RFC 9000 §19.16 requires us to reject RETIRE_CONNECTION_ID
+            // whose sequence is greater than any we ever assigned.
+            if (sequence_number >= path.next_local_cid_seq) {
+                path.next_local_cid_seq = sequence_number + 1;
             }
         }
     }
@@ -4130,7 +4155,13 @@ pub const Connection = struct {
             const short_overhead: usize = 1 + dcid_len + 4 + 16;
             const overhead: usize = if (lvl == .application) short_overhead else long_overhead;
             var packet_capacity = @min(self.mtu, dst.len);
-            if ((lvl == .application or lvl == .early_data) and !app_path.path.isValidated()) {
+            // RFC 9000 §8.1: anti-amplification applies to ALL bytes the
+            // endpoint sends on an unvalidated path, not just 1-RTT.
+            // Initial and Handshake bytes count too — otherwise an off-path
+            // attacker can spoof a small Initial and force us to emit a
+            // full-MTU Initial+Handshake response (a >10x amplification
+            // factor when the spoofed Initial is unpadded).
+            if (!app_path.path.isValidated()) {
                 const allowance = u64ToUsizeClamped(app_path.path.antiAmpAllowance());
                 packet_capacity = @min(packet_capacity, allowance);
                 if (packet_capacity <= overhead) return null;
@@ -5960,6 +5991,16 @@ pub const Connection = struct {
         self: *Connection,
         rc: frame_types.RetireConnectionId,
     ) void {
+        // RFC 9000 §19.16: a sequence number greater than any we ever
+        // sent is a PROTOCOL_VIOLATION. Without this gate, an off-path
+        // attacker (or a misbehaving peer) could spam RETIRE_CONNECTION_ID
+        // for fabricated sequences and waste server processing per packet.
+        if (self.paths.getConst(0)) |path| {
+            if (rc.sequence_number >= path.next_local_cid_seq) {
+                self.close(true, transport_error_protocol_violation, "retire_connection_id sequence not yet issued");
+                return;
+            }
+        }
         self.retireLocalCidFromPeer(0, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(0, rc.sequence_number);
     }
@@ -6016,6 +6057,15 @@ pub const Connection = struct {
         self: *Connection,
         rc: frame_types.PathRetireConnectionId,
     ) void {
+        // Multipath analogue of RFC 9000 §19.16. Same DoS surface — a
+        // peer that walks ahead of the issued sequence forces us to do
+        // a lookup-and-discard per frame.
+        if (self.paths.getConst(rc.path_id)) |path| {
+            if (rc.sequence_number >= path.next_local_cid_seq) {
+                self.close(true, transport_error_protocol_violation, "path_retire_connection_id sequence not yet issued");
+                return;
+            }
+        }
         self.retireLocalCidFromPeer(rc.path_id, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(rc.path_id, rc.sequence_number);
     }
@@ -6424,6 +6474,16 @@ pub const Connection = struct {
         // side-table is the obvious next optimization.
         const pn_space = self.pnSpaceForLevel(lvl);
         const sent = self.sentForLevel(lvl);
+        // RFC 9000 §13.1 / RFC 9002 §A.3: an ACK that claims a packet
+        // number we never sent (largest_acked >= next_pn) is a
+        // PROTOCOL_VIOLATION. We must reject it before updating
+        // largest_acked_sent — otherwise the bogus value would
+        // poison packet-threshold loss detection on legitimate
+        // in-flight packets.
+        if (a.largest_acked >= pn_space.next_pn) {
+            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
+            return;
+        }
         pn_space.onAckReceived(a.largest_acked);
         var largest_acked_send_time_us: ?u64 = null;
         var largest_acked_ack_eliciting = false;
@@ -6490,6 +6550,12 @@ pub const Connection = struct {
         a: frame_types.Ack,
         now_us: u64,
     ) Error!void {
+        // RFC 9000 §13.1 / RFC 9002 §A.3: reject ACKs claiming PNs
+        // we never sent on this path.
+        if (a.largest_acked >= path.app_pn_space.next_pn) {
+            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
+            return;
+        }
         path.app_pn_space.onAckReceived(a.largest_acked);
         var largest_acked_send_time_us: ?u64 = null;
         var largest_acked_ack_eliciting = false;
@@ -6809,9 +6875,19 @@ pub const Connection = struct {
     }
 
     fn isPersistentCongestionFromBasePto(base_pto_us: u64, stats: LossStats) bool {
-        const earliest = stats.earliest_lost_sent_time_us orelse return false;
-        if (stats.count < 2 or stats.largest_lost_sent_time_us <= earliest) return false;
-        const duration = stats.largest_lost_sent_time_us - earliest;
+        // RFC 9002 §7.6.1: persistent congestion is determined from
+        // ack-eliciting packets only. Both the smallest and largest
+        // lost packets in the persistent congestion window MUST be
+        // ack-eliciting. A burst of lost PATH_RESPONSE-only or
+        // PADDING-only packets, for example, is not enough on its
+        // own to collapse cwnd to kMinimumWindow.
+        const earliest = stats.earliest_ack_eliciting_lost_sent_time_us orelse return false;
+        if (stats.ack_eliciting_count < 2 or
+            stats.largest_ack_eliciting_lost_sent_time_us <= earliest)
+        {
+            return false;
+        }
+        const duration = stats.largest_ack_eliciting_lost_sent_time_us - earliest;
         const threshold = base_pto_us *
             congestion_mod.persistent_congestion_threshold;
         return duration >= threshold;
@@ -8355,6 +8431,7 @@ test "ACK of ack-eliciting packet resets PTO count and updates RTT" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    conn.pnSpaceForLevel(.application).next_pn = 12;
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 11,
         .ack_delay = 0,
@@ -8367,6 +8444,92 @@ test "ACK of ack-eliciting packet resets PTO count and updates RTT" {
     try std.testing.expectEqual(@as(u32, 0), conn.ptoCountForLevel(.application).*);
     try std.testing.expectEqual(@as(u64, 50_000), conn.rttForLevel(.application).latest_rtt_us);
     try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.application).count);
+}
+
+test "ACK with largest_acked >= next_pn is a PROTOCOL_VIOLATION" {
+    // RFC 9000 §13.1 / RFC 9002 §A.3: "Receipt of an acknowledgment
+    // for a packet that was not sent ... MUST be treated as a
+    // connection error of type PROTOCOL_VIOLATION." A peer that
+    // claims to have acked a PN we never sent is either buggy or
+    // hostile; we must close the connection rather than poison
+    // packet-threshold loss detection on our legitimate in-flight
+    // packets.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // We have two in-flight packets at PNs 0 and 1.
+    try conn.sentForLevel(.application).record(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    try conn.sentForLevel(.application).record(.{
+        .pn = 1,
+        .sent_time_us = 1_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    conn.pnSpaceForLevel(.application).next_pn = 2;
+
+    // Peer claims an ACK for PN 7 — well beyond next_pn = 2.
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 7,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 100_000);
+
+    // Connection must be closing with PROTOCOL_VIOLATION.
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    const sticky = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.local, sticky.source);
+    try std.testing.expectEqual(CloseErrorSpace.transport, sticky.error_space);
+    try std.testing.expectEqual(transport_error_protocol_violation, sticky.error_code);
+
+    // Critically, our in-flight packets must NOT have been declared
+    // lost or had their largest_acked_sent updated to the bogus 7.
+    try std.testing.expectEqual(@as(u32, 2), conn.sentForLevel(.application).count);
+    try std.testing.expectEqual(@as(?u64, null), conn.pnSpaceForLevel(.application).largest_acked_sent);
+}
+
+test "ACK with largest_acked == next_pn is a PROTOCOL_VIOLATION" {
+    // Boundary case: next_pn is the *next* PN to assign on send,
+    // so an ACK whose largest_acked equals next_pn is also illegal.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.sentForLevel(.application).record(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    conn.pnSpaceForLevel(.application).next_pn = 1;
+
+    // ACK claims PN 1, but next_pn is 1 (we've never sent PN 1).
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 100_000);
+
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.closeEvent().?.error_code);
 }
 
 test "ACKed in-flight packets grow congestion window" {
@@ -8384,6 +8547,7 @@ test "ACKed in-flight packets grow congestion window" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    conn.pnSpaceForLevel(.application).next_pn = 2;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 1,
@@ -8416,6 +8580,7 @@ test "packet-threshold loss reduces congestion window" {
             .in_flight = true,
         });
     }
+    conn.pnSpaceForLevel(.application).next_pn = 5;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 4,
@@ -8459,6 +8624,90 @@ test "persistent congestion resets congestion window to minimum" {
 
     try std.testing.expectEqual(conn.ccForApplication().cfg.minWindow(), conn.congestionWindow());
     try std.testing.expectEqual(@as(u64, 0), conn.congestionBytesInFlight());
+}
+
+test "persistent congestion ignores non-ack-eliciting losses (RFC 9002 §7.6.1)" {
+    // RFC 9002 §7.6.1: "Two ack-eliciting packets ... are declared
+    // lost". A duration spanned only by non-ack-eliciting lost
+    // packets must NOT establish persistent congestion.
+    var stats: LossStats = .{};
+    // Two non-ack-eliciting "lost" packets spanning a wide duration
+    // (300ms). With pto = 30ms and threshold = 3, the unfiltered
+    // earliest/largest range would easily satisfy the old check —
+    // this regression-tests the ack-eliciting filter.
+    stats.add(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    stats.add(.{
+        .pn = 1,
+        .sent_time_us = 300_000,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
+
+    // Adding a single ack-eliciting lost packet still doesn't
+    // qualify — RFC requires *two* ack-eliciting losses bounding
+    // the duration.
+    stats.add(.{
+        .pn = 2,
+        .sent_time_us = 150_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
+
+    // Two ack-eliciting lost packets bounding the duration → fires.
+    stats.add(.{
+        .pn = 3,
+        .sent_time_us = 400_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    // duration (400ms − 150ms) = 250ms ≥ 3 × 30ms = 90ms → fires.
+    try std.testing.expect(Connection.isPersistentCongestionFromBasePto(30_000, stats));
+}
+
+test "persistent congestion duration uses only ack-eliciting bounds" {
+    // Mixed losses: a wide-spanning non-ack-eliciting lost packet
+    // must NOT inflate the duration computed from the narrower
+    // ack-eliciting subset.
+    var stats: LossStats = .{};
+    // Non-ack-eliciting at t=0 (would extend duration to 100ms).
+    stats.add(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    // Two ack-eliciting losses inside a narrower window.
+    stats.add(.{
+        .pn = 1,
+        .sent_time_us = 80_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    stats.add(.{
+        .pn = 2,
+        .sent_time_us = 100_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    // base_pto = 30ms → threshold = 90ms. Ack-eliciting duration is
+    // only 20ms (100ms − 80ms), so persistent congestion must NOT
+    // fire even though the unfiltered duration (100ms) exceeds the
+    // threshold.
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
 }
 
 test "congestionBlocked gates application data but allows PTO probes" {
@@ -8639,6 +8888,7 @@ test "PATH_ACK routes ACK processing to the indicated application path" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    path.app_pn_space.next_pn = 1;
 
     try conn.handlePathAck(.{
         .path_id = path_id,
@@ -9909,6 +10159,9 @@ test "0-RTT STREAM packet-threshold loss requeues early bytes" {
     _ = (try conn.pollLevel(.early_data, &out, 1_000)).?;
     try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.early_data).count);
     try std.testing.expect(s.send.peekChunk(64) == null);
+    // Pretend three more 1-RTT packets were sent at the application
+    // layer so the ACK for PN 3 is legitimate (RFC 9000 §13.1).
+    conn.pnSpaceForLevel(.application).next_pn = 4;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 3,
@@ -10347,6 +10600,81 @@ test "unvalidated rebound path obeys anti-amplification before polling" {
     try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
 }
 
+test "unvalidated path enforces anti-amplification on Initial sends" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Force the primary path to be unvalidated and simulate the peer
+    // having sent us only a small Initial. RFC 9000 §8.1 caps the
+    // server's send budget at 3x bytes_received until validation
+    // succeeds — and that applies to Initial and Handshake bytes too,
+    // not just 1-RTT.
+    const path = conn.primaryPath();
+    path.path.validated = false;
+    path.path.validator = .{};
+    path.path.bytes_received = 100;
+    path.path.bytes_sent = 0;
+
+    // Plant retransmittable Initial CRYPTO bytes so pollLevel actually
+    // wants to emit a packet. Without anti-amp, sealInitial would
+    // happily fill an MTU-sized datagram.
+    const odcid: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setLocalScid(&.{0xc1});
+    try conn.setPeerDcid(&odcid);
+
+    const crypto_bytes = try allocator.dupe(u8, &([_]u8{0xab} ** 800));
+    try conn.crypto_retx[EncryptionLevel.initial.idx()].append(allocator, .{
+        .offset = 0,
+        .data = crypto_bytes,
+    });
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const result = try conn.pollLevel(.initial, &packet_buf, 1_000_000);
+
+    if (result) |n| {
+        // Anti-amp says we must not send more than 3 * 100 = 300 bytes.
+        try std.testing.expect(n <= 300);
+    }
+    try std.testing.expect(path.path.antiAmpAllowance() <= 300);
+}
+
+test "validated path is not constrained by anti-amplification" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Default primary path is born validated, so even a tiny
+    // bytes_received does not gate Initial sends — keep the existing
+    // behavior intact for the validated case.
+    const path = conn.primaryPath();
+    try std.testing.expect(path.path.isValidated());
+    path.path.bytes_received = 50;
+    path.path.bytes_sent = 0;
+
+    const odcid: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setLocalScid(&.{0xc1});
+    try conn.setPeerDcid(&odcid);
+
+    const crypto_bytes = try allocator.dupe(u8, &([_]u8{0xab} ** 800));
+    try conn.crypto_retx[EncryptionLevel.initial.idx()].append(allocator, .{
+        .offset = 0,
+        .data = crypto_bytes,
+    });
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevel(.initial, &packet_buf, 1_000_000)).?;
+    // Allowance is unbounded for a validated path, so we should be
+    // able to send well over 3 * 50 = 150 bytes.
+    try std.testing.expect(n > 150);
+}
+
 test "failed NAT rebinding validation rolls back to the previous address" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -10612,6 +10940,50 @@ test "RETIRE_CONNECTION_ID surfaces replacement CID budget to embedders" {
     try std.testing.expectEqual(@as(usize, 1), queued);
     try std.testing.expectEqual(@as(usize, 0), conn.localConnectionIdIssueBudget(0));
     try std.testing.expect(conn.pollEvent() == null);
+}
+
+test "RETIRE_CONNECTION_ID with sequence we never issued is a PROTOCOL_VIOLATION" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 4 };
+    // We've issued sequences 0, 1, and 2 to the peer.
+    try conn.setLocalScid(&.{0xa0});
+    try conn.queueNewConnectionId(1, 0, &.{0xa1}, @splat(0xa1));
+    try conn.queueNewConnectionId(2, 0, &.{0xa2}, @splat(0xa2));
+
+    // A peer that retires a sequence we never assigned (RFC 9000 §19.16)
+    // is committing a PROTOCOL_VIOLATION. Without this gate an attacker
+    // could spam fabricated retire frames to force expensive list walks.
+    conn.handleRetireConnectionId(.{ .sequence_number = 99 });
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "RETIRE_CONNECTION_ID for an already-retired sequence is allowed" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 4 };
+    try conn.setLocalScid(&.{0xa0});
+    try conn.queueNewConnectionId(1, 0, &.{0xa1}, @splat(0xa1));
+    try conn.queueNewConnectionId(2, 0, &.{0xa2}, @splat(0xa2));
+
+    // First retire of seq 1: legitimate.
+    conn.handleRetireConnectionId(.{ .sequence_number = 1 });
+    try std.testing.expect(conn.pending_close == null);
+    // Second retire of seq 1 (could happen if we received a duplicate or
+    // a delayed retransmission): still legitimate because seq 1 was issued
+    // at some point. Only sequences strictly above the high watermark are
+    // rejected.
+    conn.handleRetireConnectionId(.{ .sequence_number = 1 });
+    try std.testing.expect(conn.pending_close == null);
 }
 
 test "retiring CID sequence 0 does not change long-header source CID" {

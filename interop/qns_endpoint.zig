@@ -434,6 +434,16 @@ fn runServer(
     });
     defer sock.close(io);
 
+    // Grow the kernel UDP buffers so a single connection can
+    // absorb a burst of ~3000 1350-byte datagrams (a multiplexing
+    // stream open or a flight of stream data) without dropping
+    // packets at the OS layer. The default of ~200 KiB on Linux
+    // and ~9 KiB on macOS holds far fewer than that, and any
+    // packet the kernel discards looks like ordinary loss to
+    // QUIC — triggering retransmits and obscuring real congestion
+    // signals.
+    tuneServerSocket(sock.handle);
+
     const cert_pem = try readWholeFile(io, allocator, opts.cert, 1024 * 1024);
     defer allocator.free(cert_pem);
     const key_pem = try readWholeFile(io, allocator, opts.key, 1024 * 1024);
@@ -722,6 +732,12 @@ fn runClientConnection(
         .protocol = .udp,
     });
     defer sock.close(io);
+
+    // Same rationale as runServer: grow OS buffers so bursty
+    // server responses (e.g. the multiplexing test's 1999
+    // concurrent streams) do not get dropped before we can read
+    // them.
+    tuneServerSocket(sock.handle);
 
     var conn = try nullq.Connection.initClient(allocator, client_tls, server_name_z);
     defer conn.deinit();
@@ -1041,6 +1057,28 @@ fn openDir(io: std.Io, path: []const u8) !std.Io.Dir {
 
 fn readWholeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
+}
+
+/// Apply nullq's recommended UDP buffer tuning to a freshly bound
+/// socket. Errors are reported but not fatal — a tiny CI box that
+/// rejects 4 MiB buffers can still run the QNS endpoint, just with
+/// the OS-default risk of receive-buffer overflow during bursts.
+fn tuneServerSocket(handle: std.posix.socket_t) void {
+    nullq.transport.applyServerTuning(handle, .{}) catch |err| {
+        std.debug.print(
+            "warning: could not tune QNS UDP socket buffers ({s}); falling back to OS defaults\n",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    if (nullq.transport.getRecvBufferSize(handle)) |rcv| {
+        if (nullq.transport.getSendBufferSize(handle)) |snd| {
+            std.debug.print(
+                "tuned QNS UDP socket: SO_RCVBUF={} bytes, SO_SNDBUF={} bytes\n",
+                .{ rcv, snd },
+            );
+        } else |_| {}
+    } else |_| {}
 }
 
 fn findServerConn(conns: []const *ServerConn, bytes: []const u8, from: Net.IpAddress) ?*ServerConn {
