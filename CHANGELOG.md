@@ -21,9 +21,12 @@ breaking changes; see notes per release.
   server (Config / Slot / feed / poll / tick / reap / iterator).
   See `src/server.zig` and the `README.md` "Embed nullq as a server"
   section.
-- Public-API doc comments across `src/root.zig`, `src/conn/root.zig`,
-  `src/wire/root.zig`, `src/frame/root.zig`, `src/tls/root.zig`, and
-  ~25 of the embedder-facing methods on `Connection`.
+- Public-API documentation pass: every `pub fn` / `pub const` /
+  `pub var` in `src/conn/`, `src/frame/`, `src/tls/`, `src/transport/`,
+  and `src/wire/` (713 declarations) now carries a 1-3 line `///`
+  doc comment, with RFC section references where the declaration
+  implements a specific protocol requirement (RFC 9000, 9001, 9002,
+  9221, draft-ietf-quic-multipath-21).
 - 14 new qlog event variants (`packet_sent` / `packet_received` /
   `packet_dropped` / `packet_lost`, `loss_detected`,
   `congestion_state_updated`, `metrics_updated`, `parameters_set`,
