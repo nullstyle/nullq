@@ -1,9 +1,18 @@
 //! nullq.wire — pure-Zig encoders and decoders for the QUIC wire format.
 //!
-//! Everything in this namespace operates on byte slices and is free of
-//! BoringSSL or I/O dependencies. Crypto-aware layers (header
-//! protection, AEAD packet protection) live in `wire/protection.zig`
-//! and `wire/initial.zig` once those phases land.
+//! Everything here is byte-slice in / byte-slice out and free of
+//! BoringSSL, I/O, or allocator dependencies. The few crypto-touching
+//! pieces (header protection, AEAD packet protection, Initial-key
+//! derivation) wrap BoringSSL primitives but stay confined to the
+//! `protection`, `initial`, `short_packet`, and `long_packet`
+//! submodules so the rest can be exercised in tight unit tests.
+//!
+//! Submodules:
+//!  - `varint` — RFC 9000 §16 variable-length integers.
+//!  - `packet_number` — RFC 9000 §17.1 truncation/expansion.
+//!  - `header` — long/short-header parse/encode + variant types.
+//!  - `initial`, `protection`, `short_packet`, `long_packet` —
+//!    AEAD-aware packet protection, including Retry integrity.
 
 pub const varint = @import("varint.zig");
 pub const packet_number = @import("packet_number.zig");

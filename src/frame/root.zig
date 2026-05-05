@@ -1,7 +1,16 @@
 //! nullq.frame — QUIC frame encoders, decoders, and types (RFC 9000 §19).
 //!
-//! All 20 frame types are implemented: 18 fixed-shape frames plus
-//! ACK (range-encoded) and STREAM (FIN/LEN/OFF flag bits).
+//! All v1 frame types are implemented: PADDING, PING, ACK (range-
+//! encoded with optional ECN counts), RESET_STREAM, STOP_SENDING,
+//! CRYPTO, NEW_TOKEN, STREAM (FIN/LEN/OFF variants), MAX_DATA /
+//! MAX_STREAM_DATA / MAX_STREAMS, the matching DATA_BLOCKED /
+//! STREAM_DATA_BLOCKED / STREAMS_BLOCKED, NEW_CONNECTION_ID,
+//! RETIRE_CONNECTION_ID, PATH_CHALLENGE / PATH_RESPONSE,
+//! CONNECTION_CLOSE (transport + application), HANDSHAKE_DONE,
+//! DATAGRAM (RFC 9221), and the draft-21 multipath family.
+//!
+//! `decode` parses a single frame; `iter` walks a packet payload.
+//! `encode` is the symmetric writer.
 
 const std = @import("std");
 
