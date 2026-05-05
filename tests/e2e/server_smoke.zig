@@ -83,5 +83,55 @@ test "Server.feed rejects long-header packets when the table is full" {
     // rejected because the cap is 0.
     var bytes = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
     const outcome = try srv.feed(&bytes, null, 0);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.table_full, outcome);
+}
+
+test "Server source rate limiter trips after the configured cap" {
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_initials_per_source_per_window = 3,
+        .source_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    // A long-header byte sequence that passes `isInitialLongHeader`
+    // (long header bit set, version 1, type=Initial) but fails
+    // inside `openSlotFromInitial` because the declared DCID length
+    // (21) exceeds the QUIC max of 20. The rate limiter still ticks
+    // for each call.
+    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0xab) };
+
+    // First three from this source: each consumes a token, openSlot
+    // fails internally, returns generic .dropped.
+    for (0..3) |i| {
+        const o = try srv.feed(&initial, addr, @intCast(i));
+        try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, o);
+    }
+
+    // Fourth call from same source: rate limiter fires before
+    // openSlot is even attempted.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.rate_limited,
+        try srv.feed(&initial, addr, 4),
+    );
+
+    // Different source: still has its own budget.
+    const other_addr = nullq.conn.path.Address{ .bytes = @splat(0xcd) };
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.dropped,
+        try srv.feed(&initial, other_addr, 5),
+    );
+
+    // After the window elapses, the original source's budget resets.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.dropped,
+        try srv.feed(&initial, addr, 1_500_000),
+    );
 }

@@ -2190,6 +2190,40 @@ pub const Connection = struct {
         return self.nextLocalCidSequence(path_id);
     }
 
+    /// Number of currently-active local SCIDs across all paths
+    /// (initial SCID plus every still-unretired SCID issued via
+    /// NEW_CONNECTION_ID). Used by embedders that maintain a
+    /// CID-to-connection routing table outside the connection
+    /// (the canonical caller is `nullq.Server`).
+    pub fn localScidCount(self: *const Connection) usize {
+        return self.local_cids.items.len;
+    }
+
+    /// Snapshot the currently-active local SCIDs into `dst`.
+    /// Returns the number of CIDs actually written (`min(dst.len,
+    /// localScidCount())`). Caller is responsible for sizing `dst`
+    /// large enough; oversize is fine, undersize silently truncates.
+    /// CIDs are returned in arbitrary order.
+    pub fn localScids(self: *const Connection, dst: []ConnectionId) usize {
+        const n = @min(dst.len, self.local_cids.items.len);
+        for (0..n) |i| dst[i] = self.local_cids.items[i].cid;
+        return n;
+    }
+
+    /// Returns true if `dcid` matches one of this connection's
+    /// currently-active local SCIDs. Per RFC 9000 §5.1, peers can
+    /// migrate to any CID we have advertised via NEW_CONNECTION_ID
+    /// at any time, so embedders that route by CID outside the
+    /// connection MUST treat any of those SCIDs as valid routing
+    /// keys, not just the initial one.
+    pub fn ownsLocalCid(self: *const Connection, dcid: []const u8) bool {
+        for (self.local_cids.items) |item| {
+            if (item.cid.len != dcid.len) continue;
+            if (std.mem.eql(u8, item.cid.bytes[0..item.cid.len], dcid)) return true;
+        }
+        return false;
+    }
+
     fn localCidSequenceExists(
         self: *const Connection,
         path_id: u32,
