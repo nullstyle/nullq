@@ -66,9 +66,10 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   `✓(H,DC,C20,S,R,Z,M)`. The `chacha20` client testcase uses the
   `boringssl-zig` AES-hardware testing override so BoringSSL prefers
   ChaCha on AES-capable hosts.
-- The runner may print `At least one QUIC packet could not be
-  decrypted` during trace processing even when the QNS result is green;
-  keep an eye on that warning while expanding the gate.
+- When both endpoints expose valid keylogs, nullq's wrapper merges them
+  in the throwaway runner overlay before trace analysis. This keeps
+  0-RTT decryption clean when the selected client keylog lacks
+  `CLIENT_EARLY_TRAFFIC_SECRET` but the server keylog has it.
 
 ## Requirements
 

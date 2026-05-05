@@ -283,6 +283,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     const overlay = try std.fs.path.join(allocator, &.{ cfg.repo, ".zig-cache", "interop-runner-overlay" });
     try recreateDir(io, overlay);
     try copyTree(allocator, io, runner_dir, overlay);
+    try patchRunnerKeylogSelection(allocator, io, overlay);
     try injectNullqImplementation(allocator, io, overlay, cfg.image, @tagName(cfg.role));
     const trace_tools_dir = try prepareTraceTools(allocator, io, cfg, overlay);
 
@@ -493,6 +494,69 @@ fn injectNullqImplementation(
     const rendered = try std.fmt.allocPrint(allocator, "{f}\n", .{std.json.fmt(parsed.value, .{ .whitespace = .indent_2 })});
     defer allocator.free(rendered);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = impl_path, .data = rendered });
+}
+
+fn patchRunnerKeylogSelection(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    overlay: []const u8,
+) !void {
+    const testcase_path = try std.fs.path.join(allocator, &.{ overlay, "testcase.py" });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, testcase_path, allocator, .limited(2 * 1024 * 1024));
+    defer allocator.free(bytes);
+
+    const needle =
+        \\    def _keylog_file(self) -> str:
+        \\        if self._is_valid_keylog(self._client_keylog_file):
+        \\            logging.debug("Using the client's key log file.")
+        \\            return self._client_keylog_file
+        \\        elif self._is_valid_keylog(self._server_keylog_file):
+        \\            logging.debug("Using the server's key log file.")
+        \\            return self._server_keylog_file
+        \\        logging.debug("No key log file found.")
+    ;
+    const replacement =
+        \\    def _keylog_file(self) -> str:
+        \\        client_valid = self._is_valid_keylog(self._client_keylog_file)
+        \\        server_valid = self._is_valid_keylog(self._server_keylog_file)
+        \\        if client_valid and server_valid:
+        \\            merged = self._client_keylog_file + ".combined"
+        \\            try:
+        \\                if (
+        \\                    not os.path.isfile(merged)
+        \\                    or os.path.getmtime(merged)
+        \\                    < max(
+        \\                        os.path.getmtime(self._client_keylog_file),
+        \\                        os.path.getmtime(self._server_keylog_file),
+        \\                    )
+        \\                ):
+        \\                    with open(merged, "w") as out:
+        \\                        with open(self._client_keylog_file, "r") as client:
+        \\                            shutil.copyfileobj(client, out)
+        \\                        out.write("\n")
+        \\                        with open(self._server_keylog_file, "r") as server:
+        \\                            shutil.copyfileobj(server, out)
+        \\                logging.debug("Using combined client/server key log file.")
+        \\                return merged
+        \\            except OSError as e:
+        \\                logging.debug("Failed to merge key log files: %s", e)
+        \\        if client_valid:
+        \\            logging.debug("Using the client's key log file.")
+        \\            return self._client_keylog_file
+        \\        elif server_valid:
+        \\            logging.debug("Using the server's key log file.")
+        \\            return self._server_keylog_file
+        \\        logging.debug("No key log file found.")
+    ;
+
+    if (std.mem.indexOf(u8, bytes, replacement) != null) return;
+    const idx = std.mem.indexOf(u8, bytes, needle) orelse return error.UnsupportedRunnerKeylogMethod;
+    var patched: std.ArrayList(u8) = .empty;
+    defer patched.deinit(allocator);
+    try patched.appendSlice(allocator, bytes[0..idx]);
+    try patched.appendSlice(allocator, replacement);
+    try patched.appendSlice(allocator, bytes[idx + needle.len ..]);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = testcase_path, .data = patched.items });
 }
 
 fn expandCases(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {

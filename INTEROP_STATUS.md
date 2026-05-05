@@ -75,9 +75,10 @@ Current as of 2026-05-04.
   handshake and transfer: `✓(H,DC)`.
 - Official QUIC interop-runner QNS server gate, quic-go feature matrix:
   `zig build external-interop -- runner --runner-dir ../quic-interop-runner --clients quic-go --tests H,D,C,S,R,Z,M`
-  is passing: `✓(H,DC,C20,S,R,Z,M)`. The current runner still emits an
-  occasional trace-analysis warning that one packet could not be
-  decrypted, but the QNS result is green.
+  is passing: `✓(H,DC,C20,S,R,Z,M)`. The wrapper now merges valid client
+  and server keylog files in its throwaway runner overlay so 0-RTT trace
+  analysis can decrypt packets whose early-data secret is only present
+  in the server-side keylog.
 - Official QUIC interop-runner QNS client gate, basic matrix:
   `zig build external-interop -- runner --role client --runner-dir ../quic-interop-runner --servers quic-go,ngtcp2,quiche --tests H,D`
   is passing with `quic-go`, `ngtcp2`, and `quiche` all green for
@@ -390,11 +391,11 @@ Current as of 2026-05-04.
    against quic-go, ngtcp2, and quiche, and passes the quic-go feature
    matrix for chacha20, retry, resumption, 0-RTT, and multiplexing in
    both roles. Remaining gate work is automated CI packaging,
-   lossy/reordered runner scenarios, trace-warning cleanup, broader
-   client-role feature matrices against non-quic-go servers where
-   applicable, and any available external draft-21 multipath runner
-   peer. The runner wrapper invokes upstream Python through `uv run`;
-   repo-local tools are declared in `mise.toml`.
+   lossy/reordered runner scenarios, broader client-role feature
+   matrices against non-quic-go servers where applicable, and any
+   available external draft-21 multipath runner peer. The runner wrapper
+   invokes upstream Python through `uv run`; repo-local tools are
+   declared in `mise.toml`.
 
 Note: the passing mock multipath test validates simultaneous two-path
 transfer inside nullq. The passing `go-quic-peer multipath` gate now
