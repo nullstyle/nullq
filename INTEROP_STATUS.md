@@ -52,11 +52,17 @@ Current as of 2026-05-04.
   recorded `primary=951 writes/1068259 bytes` and
   `secondary=34 writes/36339 bytes` during the upload window.
 - `zig build qns-endpoint` in `nullq`: passing for the first official
-  QUIC interop-runner endpoint binary. The endpoint is currently
-  server-side only, speaks HTTP/0.9 ALPN `hq-interop`, serves `/www`,
-  loads `/certs` material, supports server-side Retry, and is wrapped
+  QUIC interop-runner endpoint binary and installs the binary at
+  `zig-out/bin/qns-endpoint`. The endpoint speaks HTTP/0.9 ALPN
+  `hq-interop` in server and client roles, serves `/www`, downloads QNS
+  client requests into `/downloads`, loads `/certs` material, supports
+  server-side Retry, resumption and 0-RTT client modes, and is wrapped
   by the Zig-native `external-interop` helper plus
   `interop/qns/Dockerfile`.
+- Local QNS-style loopback smoke against `qns-endpoint`: passing for
+  server/client HTTP/0.9 transfer with `SSLKEYLOGFILE` and `QLOGDIR`
+  enabled. The smoke verified the downloaded file, Wireshark-compatible
+  TLS key log lines, and nullq qlog-style key lifecycle JSONL output.
 - `zig build external-interop -- preflight` and
   `zig build external-interop -- build-image --dry-run` in `nullq`:
   passing. The helper stages a throwaway Docker context under
@@ -100,7 +106,9 @@ Current as of 2026-05-04.
   `zig build external-interop -- ...` builds a local Docker endpoint,
   overlays a `nullq` server entry into a throwaway runner copy, and
   runs nullq-as-server against selected external clients without
-  mutating the external checkout.
+  mutating the external checkout. The `qns-endpoint` build step now
+  installs the endpoint directly, so Docker images can build the
+  selective target instead of the full install step.
 - The public `retry_token` helper can mint and validate stateless
   HMAC-SHA256 Retry tokens bound to caller-supplied client address
   bytes, original DCID, Retry SCID, QUIC version, issue time, and
@@ -253,6 +261,9 @@ Current as of 2026-05-04.
   or CID state from them. Peer transport-parameter limit and CID
   validation failures now use the QUIC `TRANSPORT_PARAMETER_ERROR`
   close code instead of a generic protocol error.
+- QNS trace plumbing now honors `SSLKEYLOGFILE` and `QLOGDIR` in both
+  endpoint roles. The key log file uses standard SSLKEYLOGFILE lines;
+  the qlog directory receives nullq key-lifecycle JSONL traces.
 
 ## Still not production-grade
 
@@ -345,7 +356,10 @@ Current as of 2026-05-04.
    client role covers full-handshake HTTP/0.9 downloads, multiplexed
    requests, QNS resumption, and QNS 0-RTT by capturing a session
    ticket, reconnecting, and sending second-flight requests as early
-   data. It still needs actual runner execution in a
+   data. The endpoint now also installs through the selective
+   `qns-endpoint` build step and emits keylog/qlog-style trace files
+   when the runner provides `SSLKEYLOGFILE` and `QLOGDIR`. It still
+   needs actual runner execution in a
    Docker/Wireshark-equipped environment and fixes from the first real
    external traces before it can be called a release gate. The runner
    wrapper invokes upstream Python through `uv run`; repo-local tools

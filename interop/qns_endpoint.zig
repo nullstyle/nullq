@@ -14,12 +14,17 @@ const retry_token_key = [_]u8{
 };
 const retry_token_lifetime_us: u64 = 30_000_000;
 const endpoint_udp_payload_size = 1350;
+const endpoint_connection_receive_window: u64 = 16 * 1024 * 1024;
+const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
+const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
 
 const ServerOptions = struct {
     listen: []const u8 = "0.0.0.0:443",
     www: []const u8 = "/www",
     cert: []const u8 = "/certs/cert.pem",
     key: []const u8 = "/certs/priv.key",
+    keylog_file: ?[]const u8 = null,
+    qlog_dir: ?[]const u8 = null,
     retry: bool = false,
 };
 
@@ -29,6 +34,8 @@ const ClientOptions = struct {
     downloads: []const u8 = "/downloads",
     requests: []const u8 = "",
     testcase: []const u8 = "",
+    keylog_file: ?[]const u8 = null,
+    qlog_dir: ?[]const u8 = null,
 };
 
 const ClientMode = enum {
@@ -41,6 +48,56 @@ const ClientConnectionOptions = struct {
     session: ?boringssl.tls.Session = null,
     early_data: bool = false,
     wait_for_ticket: ?*TicketStore = null,
+    qlog_sink: ?*QlogSink = null,
+};
+
+var keylog_io: ?std.Io = null;
+var keylog_file: ?std.Io.File = null;
+
+const QlogSink = struct {
+    io: std.Io,
+    file: std.Io.File,
+
+    fn init(io: std.Io, dir: []const u8, role: []const u8) !QlogSink {
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/nullq-{s}.jsonl", .{ dir, role });
+        const file = try createTraceFile(io, path, true);
+        return .{ .io = io, .file = file };
+    }
+
+    fn deinit(self: *QlogSink) void {
+        self.file.close(self.io);
+        self.* = undefined;
+    }
+
+    fn callback(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
+        const self: *QlogSink = @ptrCast(@alignCast(user_data.?));
+        self.write(event) catch {};
+    }
+
+    fn write(self: *QlogSink, event: nullq.QlogEvent) !void {
+        const key_epoch: i128 = if (event.key_epoch) |v| @intCast(v) else -1;
+        const key_phase: i8 = if (event.key_phase) |v| if (v) 1 else 0 else -1;
+        const packet_number: i128 = if (event.packet_number) |v| @intCast(v) else -1;
+        const discard_deadline: i128 = if (event.discard_deadline_us) |v| @intCast(v) else -1;
+        var buf: [512]u8 = undefined;
+        const line = try std.fmt.bufPrint(
+            &buf,
+            "{{\"name\":\"{s}\",\"at_us\":{},\"level\":\"{s}\",\"key_epoch\":{},\"key_phase\":{},\"packet_number\":{},\"discard_deadline_us\":{}}}",
+            .{
+                @tagName(event.name),
+                event.at_us,
+                @tagName(event.level),
+                key_epoch,
+                key_phase,
+                packet_number,
+                discard_deadline,
+            },
+        );
+        try self.file.writeStreamingAll(self.io, line);
+        try self.file.writeStreamingAll(self.io, "\n");
+    }
 };
 
 const TicketStore = struct {
@@ -191,6 +248,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "server")) {
         var opts: ServerOptions = .{};
+        if (init.environ_map.get("SSLKEYLOGFILE")) |path| opts.keylog_file = path;
+        if (init.environ_map.get("QLOGDIR")) |path| opts.qlog_dir = path;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "-listen")) {
                 opts.listen = args.next() orelse return error.MissingListenAddress;
@@ -200,6 +259,10 @@ pub fn main(init: std.process.Init) !void {
                 opts.cert = args.next() orelse return error.MissingCertificatePath;
             } else if (std.mem.eql(u8, arg, "-key")) {
                 opts.key = args.next() orelse return error.MissingKeyPath;
+            } else if (std.mem.eql(u8, arg, "-keylog-file")) {
+                opts.keylog_file = args.next() orelse return error.MissingKeylogPath;
+            } else if (std.mem.eql(u8, arg, "-qlog-dir")) {
+                opts.qlog_dir = args.next() orelse return error.MissingQlogDirectory;
             } else if (std.mem.eql(u8, arg, "-retry")) {
                 opts.retry = true;
             } else {
@@ -215,6 +278,8 @@ pub fn main(init: std.process.Init) !void {
         var opts: ClientOptions = .{};
         if (init.environ_map.get("REQUESTS")) |requests| opts.requests = requests;
         if (init.environ_map.get("TESTCASE")) |testcase| opts.testcase = testcase;
+        if (init.environ_map.get("SSLKEYLOGFILE")) |path| opts.keylog_file = path;
+        if (init.environ_map.get("QLOGDIR")) |path| opts.qlog_dir = path;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "-server")) {
                 opts.server = args.next() orelse return error.MissingServerAddress;
@@ -226,6 +291,10 @@ pub fn main(init: std.process.Init) !void {
                 opts.requests = args.next() orelse return error.MissingRequests;
             } else if (std.mem.eql(u8, arg, "-testcase")) {
                 opts.testcase = args.next() orelse return error.MissingTestcase;
+            } else if (std.mem.eql(u8, arg, "-keylog-file")) {
+                opts.keylog_file = args.next() orelse return error.MissingKeylogPath;
+            } else if (std.mem.eql(u8, arg, "-qlog-dir")) {
+                opts.qlog_dir = args.next() orelse return error.MissingQlogDirectory;
             } else {
                 usage();
                 return error.UnknownArgument;
@@ -242,10 +311,41 @@ pub fn main(init: std.process.Init) !void {
 fn usage() void {
     std.debug.print(
         \\usage:
-        \\  qns-endpoint server [-listen 0.0.0.0:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-retry]
-        \\  qns-endpoint client [-server server:443] [-server-name server] [-downloads /downloads] [-requests "$REQUESTS"] [-testcase "$TESTCASE"]
+        \\  qns-endpoint server [-listen 0.0.0.0:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-keylog-file path] [-qlog-dir dir] [-retry]
+        \\  qns-endpoint client [-server server:443] [-server-name server] [-downloads /downloads] [-requests "$REQUESTS"] [-testcase "$TESTCASE"] [-keylog-file path] [-qlog-dir dir]
         \\
     , .{});
+}
+
+fn createTraceFile(io: std.Io, path: []const u8, truncate: bool) !std.Io.File {
+    if (std.fs.path.dirname(path)) |parent| {
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
+    const flags: std.Io.Dir.CreateFileOptions = .{ .truncate = truncate };
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.createFileAbsolute(io, path, flags)
+    else
+        try std.Io.Dir.cwd().createFile(io, path, flags);
+}
+
+fn enableKeylog(io: std.Io, ctx: *boringssl.tls.Context, path: []const u8) !void {
+    closeKeylog(io);
+    keylog_file = try createTraceFile(io, path, false);
+    keylog_io = io;
+    try ctx.setKeylogCallback(writeKeylogLine);
+}
+
+fn closeKeylog(io: std.Io) void {
+    if (keylog_file) |file| file.close(io);
+    keylog_file = null;
+    keylog_io = null;
+}
+
+fn writeKeylogLine(line: []const u8) void {
+    const file = keylog_file orelse return;
+    const io = keylog_io orelse return;
+    file.writeStreamingAll(io, line) catch return;
+    file.writeStreamingAll(io, "\n") catch return;
 }
 
 fn runServer(
@@ -275,12 +375,19 @@ fn runServer(
     });
     defer server_tls.deinit();
     try server_tls.loadCertChainAndKey(cert_pem, key_pem);
+    if (opts.keylog_file) |path| try enableKeylog(io, &server_tls, path);
+    defer closeKeylog(io);
+
+    var qlog_sink: ?QlogSink = null;
+    if (opts.qlog_dir) |dir| qlog_sink = try QlogSink.init(io, dir, "server");
+    defer if (qlog_sink) |*sink| sink.deinit();
 
     std.debug.print("nullq qns endpoint listening on {f} www={s} retry={}\n", .{ bind_addr, opts.www, opts.retry });
 
     while (true) {
         var conn = try nullq.Connection.initServer(allocator, server_tls);
         defer conn.deinit();
+        if (qlog_sink) |*sink| conn.setQlogCallback(QlogSink.callback, sink);
         try conn.bind();
         try conn.setLocalScid(&server_cid);
 
@@ -344,10 +451,10 @@ fn runServer(
                         .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&server_cid),
                         .retry_source_connection_id = retry_source,
                         .max_idle_timeout_ms = 30_000,
-                        .initial_max_data = 64 * 1024 * 1024,
-                        .initial_max_stream_data_bidi_local = 16 * 1024 * 1024,
-                        .initial_max_stream_data_bidi_remote = 16 * 1024 * 1024,
-                        .initial_max_stream_data_uni = 1024 * 1024,
+                        .initial_max_data = endpoint_connection_receive_window,
+                        .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
+                        .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
+                        .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
                         .initial_max_streams_bidi = 128,
                         .initial_max_streams_uni = 16,
                         .max_udp_payload_size = endpoint_udp_payload_size,
@@ -393,6 +500,8 @@ fn runClient(
         .early_data_enabled = true,
     });
     defer client_tls.deinit();
+    if (opts.keylog_file) |path| try enableKeylog(io, &client_tls, path);
+    defer closeKeylog(io);
 
     var tickets = TicketStore.init(allocator);
     defer tickets.deinit();
@@ -412,6 +521,10 @@ fn runClient(
     var downloads_dir = try openDir(io, opts.downloads);
     defer downloads_dir.close(io);
 
+    var qlog_sink: ?QlogSink = null;
+    if (opts.qlog_dir) |dir| qlog_sink = try QlogSink.init(io, dir, "client");
+    defer if (qlog_sink) |*sink| sink.deinit();
+
     switch (mode) {
         .normal => try runClientConnection(
             allocator,
@@ -421,7 +534,7 @@ fn runClient(
             server_addr,
             downloads_dir,
             downloads,
-            .{},
+            .{ .qlog_sink = if (qlog_sink) |*sink| sink else null },
         ),
         .resumption, .zerortt => {
             if (downloads.len < 2) return error.ResumptionRequiresMultipleRequests;
@@ -433,7 +546,10 @@ fn runClient(
                 server_addr,
                 downloads_dir,
                 downloads[0..1],
-                .{ .wait_for_ticket = &tickets },
+                .{
+                    .wait_for_ticket = &tickets,
+                    .qlog_sink = if (qlog_sink) |*sink| sink else null,
+                },
             );
             var session = try tickets.session(client_tls);
             defer session.deinit();
@@ -448,6 +564,7 @@ fn runClient(
                 .{
                     .session = session,
                     .early_data = mode == .zerortt,
+                    .qlog_sink = if (qlog_sink) |*sink| sink else null,
                 },
             );
         },
@@ -487,6 +604,7 @@ fn runClientConnection(
 
     var conn = try nullq.Connection.initClient(allocator, client_tls, server_name_z);
     defer conn.deinit();
+    if (conn_opts.qlog_sink) |sink| conn.setQlogCallback(QlogSink.callback, sink);
     if (conn_opts.session) |session| try conn.setSession(session);
     if (conn_opts.early_data) conn.setEarlyDataEnabled(true);
     try conn.bind();
@@ -502,10 +620,10 @@ fn runClientConnection(
     const params: nullq.tls.TransportParams = .{
         .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&client_scid),
         .max_idle_timeout_ms = 30_000,
-        .initial_max_data = 128 * 1024 * 1024,
-        .initial_max_stream_data_bidi_local = 64 * 1024 * 1024,
-        .initial_max_stream_data_bidi_remote = 1024 * 1024,
-        .initial_max_stream_data_uni = 1024 * 1024,
+        .initial_max_data = endpoint_connection_receive_window,
+        .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
+        .initial_max_stream_data_bidi_remote = endpoint_uni_stream_receive_window,
+        .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
         .initial_max_streams_bidi = 256,
         .initial_max_streams_uni = 16,
         .max_udp_payload_size = endpoint_udp_payload_size,

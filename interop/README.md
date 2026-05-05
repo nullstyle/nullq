@@ -20,6 +20,9 @@ QUIC interop runner.
   `resumption` and `zerortt`: it downloads the first request, captures
   a session ticket, reconnects for the remaining requests, and sends
   those second-flight requests as early data for `zerortt`.
+- Honors the runner's `SSLKEYLOGFILE` and `QLOGDIR` environment
+  variables. `SSLKEYLOGFILE` receives Wireshark-compatible TLS secrets;
+  `QLOGDIR` receives nullq qlog-style key lifecycle JSONL traces.
 
 The default external matrix targets server-side nullq against the
 current official clients `quic-go`, `ngtcp2`, and `quiche`, using:
@@ -59,6 +62,7 @@ not mutate the runner checkout.
 ```sh
 mise run interop-preflight
 mise run interop-build-image
+mise exec -- zig build qns-endpoint -Doptimize=ReleaseSafe
 mise exec -- zig build external-interop -- runner --dry-run
 mise exec -- zig build external-interop -- runner --clients quic-go --tests H,D,C
 mise exec -- zig build external-interop -- runner --clients quic-go,ngtcp2,quiche --tests core+retry

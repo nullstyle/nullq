@@ -49,14 +49,15 @@ pub fn build(b: *std.Build) void {
         .name = "qns-endpoint",
         .root_module = qns_mod,
     });
-    b.installArtifact(qns_exe);
+    const qns_install = b.addInstallArtifact(qns_exe, .{});
+    b.getInstallStep().dependOn(&qns_install.step);
 
     const qns_tests = b.addTest(.{ .root_module = qns_mod });
     const run_qns_tests = b.addRunArtifact(qns_tests);
     test_step.dependOn(&run_qns_tests.step);
 
     const qns_step = b.step("qns-endpoint", "Build the QUIC interop-runner endpoint");
-    qns_step.dependOn(&qns_exe.step);
+    qns_step.dependOn(&qns_install.step);
 
     const interop_tool_mod = b.createModule(.{
         .root_source_file = b.path("tools/external_interop.zig"),
