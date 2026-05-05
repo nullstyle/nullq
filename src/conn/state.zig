@@ -412,6 +412,14 @@ const LossStats = struct {
     in_flight_bytes_lost: u64 = 0,
     earliest_lost_sent_time_us: ?u64 = null,
     largest_lost_sent_time_us: u64 = 0,
+    /// RFC 9002 §7.6.1 mandates that persistent congestion be
+    /// determined only from ack-eliciting packets. We therefore
+    /// track the time bounds of the *ack-eliciting* lost subset
+    /// separately so the unfiltered counters above stay usable
+    /// for cwnd reduction (which doesn't need the filter).
+    ack_eliciting_count: u32 = 0,
+    earliest_ack_eliciting_lost_sent_time_us: ?u64 = null,
+    largest_ack_eliciting_lost_sent_time_us: u64 = 0,
 
     fn add(self: *LossStats, packet: sent_packets_mod.SentPacket) void {
         self.count += 1;
@@ -424,6 +432,17 @@ const LossStats = struct {
         }
         if (packet.sent_time_us > self.largest_lost_sent_time_us) {
             self.largest_lost_sent_time_us = packet.sent_time_us;
+        }
+        if (packet.ack_eliciting) {
+            self.ack_eliciting_count += 1;
+            if (self.earliest_ack_eliciting_lost_sent_time_us == null or
+                packet.sent_time_us < self.earliest_ack_eliciting_lost_sent_time_us.?)
+            {
+                self.earliest_ack_eliciting_lost_sent_time_us = packet.sent_time_us;
+            }
+            if (packet.sent_time_us > self.largest_ack_eliciting_lost_sent_time_us) {
+                self.largest_ack_eliciting_lost_sent_time_us = packet.sent_time_us;
+            }
         }
     }
 };
@@ -6455,6 +6474,16 @@ pub const Connection = struct {
         // side-table is the obvious next optimization.
         const pn_space = self.pnSpaceForLevel(lvl);
         const sent = self.sentForLevel(lvl);
+        // RFC 9000 §13.1 / RFC 9002 §A.3: an ACK that claims a packet
+        // number we never sent (largest_acked >= next_pn) is a
+        // PROTOCOL_VIOLATION. We must reject it before updating
+        // largest_acked_sent — otherwise the bogus value would
+        // poison packet-threshold loss detection on legitimate
+        // in-flight packets.
+        if (a.largest_acked >= pn_space.next_pn) {
+            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
+            return;
+        }
         pn_space.onAckReceived(a.largest_acked);
         var largest_acked_send_time_us: ?u64 = null;
         var largest_acked_ack_eliciting = false;
@@ -6521,6 +6550,12 @@ pub const Connection = struct {
         a: frame_types.Ack,
         now_us: u64,
     ) Error!void {
+        // RFC 9000 §13.1 / RFC 9002 §A.3: reject ACKs claiming PNs
+        // we never sent on this path.
+        if (a.largest_acked >= path.app_pn_space.next_pn) {
+            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
+            return;
+        }
         path.app_pn_space.onAckReceived(a.largest_acked);
         var largest_acked_send_time_us: ?u64 = null;
         var largest_acked_ack_eliciting = false;
@@ -6840,9 +6875,19 @@ pub const Connection = struct {
     }
 
     fn isPersistentCongestionFromBasePto(base_pto_us: u64, stats: LossStats) bool {
-        const earliest = stats.earliest_lost_sent_time_us orelse return false;
-        if (stats.count < 2 or stats.largest_lost_sent_time_us <= earliest) return false;
-        const duration = stats.largest_lost_sent_time_us - earliest;
+        // RFC 9002 §7.6.1: persistent congestion is determined from
+        // ack-eliciting packets only. Both the smallest and largest
+        // lost packets in the persistent congestion window MUST be
+        // ack-eliciting. A burst of lost PATH_RESPONSE-only or
+        // PADDING-only packets, for example, is not enough on its
+        // own to collapse cwnd to kMinimumWindow.
+        const earliest = stats.earliest_ack_eliciting_lost_sent_time_us orelse return false;
+        if (stats.ack_eliciting_count < 2 or
+            stats.largest_ack_eliciting_lost_sent_time_us <= earliest)
+        {
+            return false;
+        }
+        const duration = stats.largest_ack_eliciting_lost_sent_time_us - earliest;
         const threshold = base_pto_us *
             congestion_mod.persistent_congestion_threshold;
         return duration >= threshold;
@@ -8386,6 +8431,7 @@ test "ACK of ack-eliciting packet resets PTO count and updates RTT" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    conn.pnSpaceForLevel(.application).next_pn = 12;
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 11,
         .ack_delay = 0,
@@ -8398,6 +8444,92 @@ test "ACK of ack-eliciting packet resets PTO count and updates RTT" {
     try std.testing.expectEqual(@as(u32, 0), conn.ptoCountForLevel(.application).*);
     try std.testing.expectEqual(@as(u64, 50_000), conn.rttForLevel(.application).latest_rtt_us);
     try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.application).count);
+}
+
+test "ACK with largest_acked >= next_pn is a PROTOCOL_VIOLATION" {
+    // RFC 9000 §13.1 / RFC 9002 §A.3: "Receipt of an acknowledgment
+    // for a packet that was not sent ... MUST be treated as a
+    // connection error of type PROTOCOL_VIOLATION." A peer that
+    // claims to have acked a PN we never sent is either buggy or
+    // hostile; we must close the connection rather than poison
+    // packet-threshold loss detection on our legitimate in-flight
+    // packets.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // We have two in-flight packets at PNs 0 and 1.
+    try conn.sentForLevel(.application).record(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    try conn.sentForLevel(.application).record(.{
+        .pn = 1,
+        .sent_time_us = 1_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    conn.pnSpaceForLevel(.application).next_pn = 2;
+
+    // Peer claims an ACK for PN 7 — well beyond next_pn = 2.
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 7,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 100_000);
+
+    // Connection must be closing with PROTOCOL_VIOLATION.
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    const sticky = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.local, sticky.source);
+    try std.testing.expectEqual(CloseErrorSpace.transport, sticky.error_space);
+    try std.testing.expectEqual(transport_error_protocol_violation, sticky.error_code);
+
+    // Critically, our in-flight packets must NOT have been declared
+    // lost or had their largest_acked_sent updated to the bogus 7.
+    try std.testing.expectEqual(@as(u32, 2), conn.sentForLevel(.application).count);
+    try std.testing.expectEqual(@as(?u64, null), conn.pnSpaceForLevel(.application).largest_acked_sent);
+}
+
+test "ACK with largest_acked == next_pn is a PROTOCOL_VIOLATION" {
+    // Boundary case: next_pn is the *next* PN to assign on send,
+    // so an ACK whose largest_acked equals next_pn is also illegal.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.sentForLevel(.application).record(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    conn.pnSpaceForLevel(.application).next_pn = 1;
+
+    // ACK claims PN 1, but next_pn is 1 (we've never sent PN 1).
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 100_000);
+
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.closeEvent().?.error_code);
 }
 
 test "ACKed in-flight packets grow congestion window" {
@@ -8415,6 +8547,7 @@ test "ACKed in-flight packets grow congestion window" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    conn.pnSpaceForLevel(.application).next_pn = 2;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 1,
@@ -8447,6 +8580,7 @@ test "packet-threshold loss reduces congestion window" {
             .in_flight = true,
         });
     }
+    conn.pnSpaceForLevel(.application).next_pn = 5;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 4,
@@ -8490,6 +8624,90 @@ test "persistent congestion resets congestion window to minimum" {
 
     try std.testing.expectEqual(conn.ccForApplication().cfg.minWindow(), conn.congestionWindow());
     try std.testing.expectEqual(@as(u64, 0), conn.congestionBytesInFlight());
+}
+
+test "persistent congestion ignores non-ack-eliciting losses (RFC 9002 §7.6.1)" {
+    // RFC 9002 §7.6.1: "Two ack-eliciting packets ... are declared
+    // lost". A duration spanned only by non-ack-eliciting lost
+    // packets must NOT establish persistent congestion.
+    var stats: LossStats = .{};
+    // Two non-ack-eliciting "lost" packets spanning a wide duration
+    // (300ms). With pto = 30ms and threshold = 3, the unfiltered
+    // earliest/largest range would easily satisfy the old check —
+    // this regression-tests the ack-eliciting filter.
+    stats.add(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    stats.add(.{
+        .pn = 1,
+        .sent_time_us = 300_000,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
+
+    // Adding a single ack-eliciting lost packet still doesn't
+    // qualify — RFC requires *two* ack-eliciting losses bounding
+    // the duration.
+    stats.add(.{
+        .pn = 2,
+        .sent_time_us = 150_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
+
+    // Two ack-eliciting lost packets bounding the duration → fires.
+    stats.add(.{
+        .pn = 3,
+        .sent_time_us = 400_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    // duration (400ms − 150ms) = 250ms ≥ 3 × 30ms = 90ms → fires.
+    try std.testing.expect(Connection.isPersistentCongestionFromBasePto(30_000, stats));
+}
+
+test "persistent congestion duration uses only ack-eliciting bounds" {
+    // Mixed losses: a wide-spanning non-ack-eliciting lost packet
+    // must NOT inflate the duration computed from the narrower
+    // ack-eliciting subset.
+    var stats: LossStats = .{};
+    // Non-ack-eliciting at t=0 (would extend duration to 100ms).
+    stats.add(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    // Two ack-eliciting losses inside a narrower window.
+    stats.add(.{
+        .pn = 1,
+        .sent_time_us = 80_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    stats.add(.{
+        .pn = 2,
+        .sent_time_us = 100_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    // base_pto = 30ms → threshold = 90ms. Ack-eliciting duration is
+    // only 20ms (100ms − 80ms), so persistent congestion must NOT
+    // fire even though the unfiltered duration (100ms) exceeds the
+    // threshold.
+    try std.testing.expect(!Connection.isPersistentCongestionFromBasePto(30_000, stats));
 }
 
 test "congestionBlocked gates application data but allows PTO probes" {
@@ -8670,6 +8888,7 @@ test "PATH_ACK routes ACK processing to the indicated application path" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    path.app_pn_space.next_pn = 1;
 
     try conn.handlePathAck(.{
         .path_id = path_id,
@@ -9940,6 +10159,9 @@ test "0-RTT STREAM packet-threshold loss requeues early bytes" {
     _ = (try conn.pollLevel(.early_data, &out, 1_000)).?;
     try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.early_data).count);
     try std.testing.expect(s.send.peekChunk(64) == null);
+    // Pretend three more 1-RTT packets were sent at the application
+    // layer so the ACK for PN 3 is legitimate (RFC 9000 §13.1).
+    conn.pnSpaceForLevel(.application).next_pn = 4;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 3,
