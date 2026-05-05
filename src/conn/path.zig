@@ -184,6 +184,13 @@ pub const Path = struct {
     }
 };
 
+pub const CongestionState = enum {
+    slow_start,
+    recovery,
+    application_limited,
+    congestion_avoidance,
+};
+
 pub const PathStats = struct {
     path_id: u32,
     state: State,
@@ -200,6 +207,29 @@ pub const PathStats = struct {
     pending_ping: bool,
     peer_prefers_backup: bool,
     peer_status_sequence_number: ?u64,
+
+    // -- new observability fields --
+    /// Total UDP payload bytes the connection has sent across this path.
+    /// (`bytes_sent` above counts against anti-amp and resets on migration;
+    /// this counter does not.)
+    total_bytes_sent: u64 = 0,
+    /// Total UDP payload bytes the connection has received across this path.
+    /// (`bytes_received` resets on migration; this counter does not.)
+    total_bytes_received: u64 = 0,
+    /// Number of QUIC packets sent on the connection.
+    packets_sent: u64 = 0,
+    /// Number of QUIC packets received and authenticated on the connection.
+    packets_received: u64 = 0,
+    /// Number of QUIC packets declared lost on the connection.
+    packets_lost: u64 = 0,
+    /// RFC 9002 §5 RTT estimator snapshot (microseconds).
+    srtt_us: u64 = 0,
+    rttvar_us: u64 = 0,
+    min_rtt_us: u64 = 0,
+    /// Slow-start threshold in bytes; null = infinity (slow start active).
+    ssthresh: ?u64 = null,
+    /// Current congestion-control phase.
+    congestion_window_state: CongestionState = .slow_start,
 };
 
 pub const MigrationRollback = struct {
@@ -352,6 +382,13 @@ pub const PathState = struct {
     }
 
     pub fn stats(self: *const PathState) PathStats {
+        const cc = &self.path.cc;
+        const rtt = &self.path.rtt;
+        const phase: CongestionState = blk: {
+            if (cc.recovery_start_time_us != null) break :blk .recovery;
+            if (cc.ssthresh == null or cc.cwnd < cc.ssthresh.?) break :blk .slow_start;
+            break :blk .congestion_avoidance;
+        };
         return .{
             .path_id = self.id,
             .state = self.path.state,
@@ -361,13 +398,18 @@ pub const PathState = struct {
             .bytes_sent = self.path.bytes_sent,
             .bytes_in_flight = self.sent.bytes_in_flight,
             .ack_eliciting_in_flight = self.sent.ack_eliciting_in_flight,
-            .cwnd = self.path.cc.cwnd,
-            .smoothed_rtt_us = self.path.rtt.smoothed_rtt_us,
-            .latest_rtt_us = self.path.rtt.latest_rtt_us,
+            .cwnd = cc.cwnd,
+            .smoothed_rtt_us = rtt.smoothed_rtt_us,
+            .latest_rtt_us = rtt.latest_rtt_us,
             .pto_count = self.pto_count,
             .pending_ping = self.pending_ping,
             .peer_prefers_backup = self.peer_prefers_backup,
             .peer_status_sequence_number = self.peer_status_sequence_number,
+            .srtt_us = rtt.smoothed_rtt_us,
+            .rttvar_us = rtt.rtt_var_us,
+            .min_rtt_us = rtt.min_rtt_us,
+            .ssthresh = cc.ssthresh,
+            .congestion_window_state = phase,
         };
     }
 
