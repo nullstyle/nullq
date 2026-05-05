@@ -19,6 +19,7 @@ pub const RetransmitFrame = union(enum) {
     streams_blocked: frame_types.StreamsBlocked,
     new_connection_id: frame_types.NewConnectionId,
     retire_connection_id: frame_types.RetireConnectionId,
+    handshake_done: frame_types.HandshakeDone,
     stop_sending: frame_types.StopSending,
     path_response: frame_types.PathResponse,
     path_challenge: frame_types.PathChallenge,

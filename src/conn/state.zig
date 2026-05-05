@@ -749,6 +749,11 @@ pub const Connection = struct {
     /// next outgoing packet at the highest available encryption
     /// level emits it.
     pending_close: ?ConnectionCloseInfo = null,
+    /// Server-only HANDSHAKE_DONE delivery. The frame is ack-eliciting
+    /// and must be retransmitted on loss until the client confirms the
+    /// handshake.
+    pending_handshake_done: bool = false,
+    handshake_done_queued_once: bool = false,
     /// True once we've sent or received a CONNECTION_CLOSE frame, or
     /// an idle timeout has entered draining.
     closed: bool = false,
@@ -1041,6 +1046,14 @@ pub const Connection = struct {
 
     pub fn handshakeDone(self: *Connection) bool {
         return self.inner.handshakeDone();
+    }
+
+    fn queueHandshakeDoneIfReady(self: *Connection) void {
+        if (self.role != .server) return;
+        if (!self.inner.handshakeDone()) return;
+        if (self.handshake_done_queued_once) return;
+        self.pending_handshake_done = true;
+        self.handshake_done_queued_once = true;
     }
 
     pub fn isQuic(self: *Connection) bool {
@@ -3866,6 +3879,7 @@ pub const Connection = struct {
         if (self.pending_close != null) return true;
         if (self.closed) return false;
         if (self.anyPendingPing()) return true;
+        if (self.pending_handshake_done) return true;
         inline for (level_mod.all) |lvl| {
             const level_idx = lvl.idx();
             if (self.outbox[level_idx].len > 0) return true;
@@ -3923,6 +3937,7 @@ pub const Connection = struct {
         now_us: u64,
     ) Error!?OutgoingDatagram {
         if (self.closed) return null;
+        self.queueHandshakeDoneIfReady();
         try self.refreshEarlyDataStatus();
         self.poll_addr_override = null;
         var pos: usize = 0;
@@ -4203,6 +4218,19 @@ pub const Connection = struct {
             );
             pl_pos += ping_len;
             pending_ping.* = false;
+            ack_eliciting = true;
+        }
+
+        // 1b) Server handshake confirmation. HANDSHAKE_DONE is
+        // application-level, ack-eliciting, and retransmittable.
+        if (!app_control_blocked and lvl == .application and self.pending_handshake_done and pl_pos + 1 <= max_payload) {
+            const wrote = try frame_mod.encode(
+                pl_buf[pl_pos..max_payload],
+                .{ .handshake_done = .{} },
+            );
+            pl_pos += wrote;
+            try sent_packet.addRetransmitFrame(self.allocator, .{ .handshake_done = .{} });
+            self.pending_handshake_done = false;
             ack_eliciting = true;
         }
 
@@ -6111,6 +6139,7 @@ pub const Connection = struct {
         }
         if (!self.inner.handshakeDone()) try self.advanceHandshake();
         if (self.inner.handshakeDone()) try self.cachePeerTransportParams();
+        self.queueHandshakeDoneIfReady();
         try self.refreshEarlyDataStatus();
     }
 
@@ -6498,6 +6527,10 @@ pub const Connection = struct {
                 },
                 .retire_connection_id => |rc| {
                     try self.queueRetireConnectionId(rc.sequence_number);
+                    any = true;
+                },
+                .handshake_done => {
+                    self.pending_handshake_done = true;
                     any = true;
                 },
                 .stop_sending => |ss| {
@@ -6925,6 +6958,7 @@ pub const Connection = struct {
         }
         if (!self.inner.handshakeDone()) try self.advanceHandshake();
         if (self.inner.handshakeDone()) try self.cachePeerTransportParams();
+        self.queueHandshakeDoneIfReady();
         try self.refreshEarlyDataStatus();
         // Phase-4 in-process compatibility: shuttle outbox→peer.inbox
         // so the existing handshake test still works while the real
@@ -10429,6 +10463,41 @@ test "RETIRE_CONNECTION_ID emits with retransmit metadata and requeues on loss" 
     _ = try conn.dispatchLostControlFrames(sent);
     try std.testing.expectEqual(@as(usize, 1), conn.pending_retire_connection_ids.items.len);
     try std.testing.expectEqual(@as(u64, 7), conn.pending_retire_connection_ids.items[0].sequence_number);
+}
+
+test "server HANDSHAKE_DONE emits with retransmit metadata and requeues on loss" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    conn.primaryPath().path.markValidated();
+    conn.pending_handshake_done = true;
+    try std.testing.expect(conn.canSend());
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevel(.application, &packet_buf, 1_000_000)).?;
+    try std.testing.expect(!conn.pending_handshake_done);
+
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..n], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+    });
+    const decoded = try frame_mod.decode(opened.payload);
+    try std.testing.expect(decoded.frame == .handshake_done);
+
+    const sent = &conn.primaryPath().sent.packets[0];
+    try std.testing.expectEqual(@as(usize, 1), sent.retransmit_frames.items.len);
+    try std.testing.expect(sent.retransmit_frames.items[0] == .handshake_done);
+
+    _ = try conn.dispatchLostControlFrames(sent);
+    try std.testing.expect(conn.pending_handshake_done);
 }
 
 test "PATHS_BLOCKED below current local limit is ignored" {
