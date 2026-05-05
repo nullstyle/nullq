@@ -173,6 +173,8 @@ pub const max_application_ack_ranges_bytes: usize = 128;
 pub const default_stream_receive_window: u64 = 1024 * 1024;
 pub const default_connection_receive_window: u64 = 16 * 1024 * 1024;
 pub const max_stream_count_limit: u64 = @as(u64, 1) << 60;
+pub const min_stream_credit_return_batch: u64 = 16;
+pub const stream_credit_return_divisor: u64 = 8;
 
 /// Implementation allocation policy. QUIC's wire limits are intentionally
 /// enormous; nullq caps the resources it advertises and tracks so peer input
@@ -2237,12 +2239,27 @@ pub const Connection = struct {
         }
         s.stream_count_credit_returned = true;
         if (streamIsBidi(s.id)) {
-            if (self.local_max_streams_bidi >= max_streams_per_connection) return;
-            self.queueMaxStreams(true, self.local_max_streams_bidi + 1);
+            self.maybeQueueBatchedMaxStreams(true);
         } else {
-            if (self.local_max_streams_uni >= max_streams_per_connection) return;
-            self.queueMaxStreams(false, self.local_max_streams_uni + 1);
+            self.maybeQueueBatchedMaxStreams(false);
         }
+    }
+
+    fn maybeQueueBatchedMaxStreams(self: *Connection, bidi: bool) void {
+        const current = if (bidi) self.local_max_streams_bidi else self.local_max_streams_uni;
+        if (current >= max_streams_per_connection) return;
+
+        const opened = if (bidi) self.peer_opened_streams_bidi else self.peer_opened_streams_uni;
+        const remaining = current -| opened;
+        const batch = streamCreditReturnBatch(current);
+        if (remaining > batch / 2) return;
+
+        const grant = @min(batch, max_streams_per_connection - current);
+        self.queueMaxStreams(bidi, current + grant);
+    }
+
+    fn streamCreditReturnBatch(current_limit: u64) u64 {
+        return @max(min_stream_credit_return_batch, current_limit / stream_credit_return_divisor);
     }
 
     fn recordFlowBlockedEvent(self: *Connection, info: FlowBlockedInfo) void {
@@ -9615,8 +9632,8 @@ test "draining a peer-initiated stream returns MAX_STREAMS credit" {
 
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(0, &buf));
-    try std.testing.expectEqual(@as(?u64, 2), conn.pending_max_streams_bidi);
-    try std.testing.expectEqual(@as(u64, 2), conn.local_max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, 17), conn.pending_max_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 17), conn.local_max_streams_bidi);
 }
 
 test "draining at stream cap does not queue duplicate MAX_STREAMS" {
