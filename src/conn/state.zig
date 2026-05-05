@@ -168,6 +168,7 @@ pub const max_pending_datagram_bytes: usize = 64 * 1024;
 pub const max_pending_crypto_bytes_per_level: usize = 64 * 1024;
 pub const max_crypto_reassembly_gap: u64 = 64 * 1024;
 pub const application_ack_eliciting_threshold: u8 = 2;
+pub const max_application_ack_ranges_bytes: usize = 128;
 
 pub const default_stream_receive_window: u64 = 1024 * 1024;
 pub const default_connection_receive_window: u64 = 16 * 1024 * 1024;
@@ -4209,6 +4210,9 @@ pub const Connection = struct {
             var ranges_buf: [default_mtu]u8 = undefined;
             const available = max_payload - pl_pos;
             var ranges_budget: usize = @min(ranges_buf.len, available);
+            if (lvl == .application) {
+                ranges_budget = @min(ranges_budget, max_application_ack_ranges_bytes);
+            }
             while (true) {
                 const ack_frame = try recv_tracker.toAckFrameLimited(
                     self.ackDelayScaled(recv_tracker, now_us),
@@ -10016,6 +10020,37 @@ test "pollLevel caps ACK ranges to packet budget" {
     try std.testing.expect(decoded.frame == .ack);
     try std.testing.expectEqual(@as(u64, 198), decoded.frame.ack.largest_acked);
     try std.testing.expect(decoded.frame.ack.range_count < tracked_lower_ranges);
+}
+
+test "application ACK ranges use bounded emission budget" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    try std.testing.expect(conn.markPathValidated(0));
+
+    const tracker = &conn.primaryPath().app_pn_space.received;
+    var pn: u64 = 0;
+    while (pn < 400) : (pn += 2) tracker.add(pn, 1_000);
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevel(.application, &packet_buf, 1_001_000)).?;
+
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..n], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+    });
+    const decoded = try frame_mod.decode(opened.payload);
+    try std.testing.expect(decoded.frame == .ack);
+    try std.testing.expect(decoded.frame.ack.ranges_bytes.len <= max_application_ack_ranges_bytes);
+    try std.testing.expect(decoded.frame.ack.range_count < @as(u64, tracker.range_count - 1));
 }
 
 test "pollLevel coalesces multiple STREAM frames with distinct loss keys" {
