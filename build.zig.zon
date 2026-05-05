@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .boringssl_zig = .{
-            .path = "../boringssl-zig",
+            .url = "https://github.com/nullstyle/boringssl-zig/archive/8c47b6ecd535e723396a47fa5fe58b88f395d114.tar.gz",
+            .hash = "boringssl_zig-0.5.0-4iEdPC5zAQAeTsYlhxJ28J1P6HUCBKQJIQZyUS2PaQqj",
         },
     },
     .paths = .{
