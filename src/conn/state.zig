@@ -3205,6 +3205,7 @@ pub const Connection = struct {
         const matched = path.path.validator.recordResponse(token) catch return;
         if (!matched) return;
         path.path.validated = true;
+        self.clearQueuedPathChallengeForPath(path_id);
         if (path.pending_migration_reset) {
             self.resetPathRecoveryAfterMigration(path);
         }
@@ -7029,6 +7030,38 @@ test "local close is exposed as sticky and pollable event" {
     try std.testing.expect(conn.closeEvent() != null);
 }
 
+test "local close truncates long reason and keeps sticky event" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var reason: [max_close_reason_len + 32]u8 = undefined;
+    @memset(&reason, 'x');
+    conn.close(true, 0x1337, reason[0..]);
+
+    const sticky = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.local, sticky.source);
+    try std.testing.expectEqual(CloseErrorSpace.transport, sticky.error_space);
+    try std.testing.expectEqual(@as(u64, 0x1337), sticky.error_code);
+    try std.testing.expectEqual(max_close_reason_len, sticky.reason.len);
+    try std.testing.expect(sticky.reason_truncated);
+    for (sticky.reason) |byte| {
+        try std.testing.expectEqual(@as(u8, 'x'), byte);
+    }
+
+    const event = conn.pollEvent().?;
+    try std.testing.expect(event == .close);
+    try std.testing.expectEqual(max_close_reason_len, event.close.reason.len);
+    try std.testing.expect(event.close.reason_truncated);
+    try std.testing.expect(conn.pollEvent() == null);
+
+    const after_poll = conn.closeEvent().?;
+    try std.testing.expectEqual(max_close_reason_len, after_poll.reason.len);
+    try std.testing.expect(after_poll.reason_truncated);
+}
+
 test "closing and draining ignore incoming datagrams" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -7131,6 +7164,39 @@ test "stateless reset token closes without CONNECTION_CLOSE" {
     try std.testing.expectEqual(CloseErrorSpace.transport, close_event.error_space);
     try std.testing.expectEqualStrings("stateless reset", close_event.reason);
     try std.testing.expectEqual(@as(u64, 3_000_000), close_event.at_us.?);
+}
+
+test "stateless reset matcher requires short packet with known token" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const token: [16]u8 = .{
+        0x20, 0x21, 0x22, 0x23,
+        0x24, 0x25, 0x26, 0x27,
+        0x28, 0x29, 0x2a, 0x2b,
+        0x2c, 0x2d, 0x2e, 0x2f,
+    };
+    conn.cached_peer_transport_params = .{ .stateless_reset_token = token };
+    try conn.setPeerDcid(&.{0xaa});
+
+    var long_packet = [_]u8{0} ** 24;
+    long_packet[0] = 0xc0;
+    @memcpy(long_packet[long_packet.len - 16 ..], &token);
+    try std.testing.expect(!conn.isKnownStatelessReset(long_packet[0..]));
+
+    var unknown_short = [_]u8{0} ** 24;
+    unknown_short[0] = 0x40;
+    const unknown_token: [16]u8 = @splat(0xee);
+    @memcpy(unknown_short[unknown_short.len - 16 ..], &unknown_token);
+    try std.testing.expect(!conn.isKnownStatelessReset(unknown_short[0..]));
+
+    var short_packet = [_]u8{0} ** 24;
+    short_packet[0] = 0x40;
+    @memcpy(short_packet[short_packet.len - 16 ..], &token);
+    try std.testing.expect(conn.isKnownStatelessReset(short_packet[0..]));
 }
 
 test "Version Negotiation with no compatible version closes terminally" {
@@ -8255,6 +8321,46 @@ test "automatic write key update happens before configured packet limit" {
     try std.testing.expectEqual(@as(u64, 1), status.write_packets_protected);
 }
 
+test "application packet limit counts across paths before proactive key update" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    conn.setApplicationKeyUpdateLimitsForTesting(.{
+        .confidentiality_limit = 8,
+        .proactive_update_threshold = 2,
+        .integrity_limit = 8,
+    });
+    markTestMultipathNegotiated(&conn, 1);
+    try conn.setPeerDcid(&.{0xaa});
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_000_000)).?;
+    var status = conn.keyUpdateStatus();
+    try std.testing.expectEqual(@as(?u64, 0), status.write_epoch);
+    try std.testing.expectEqual(@as(u64, 1), status.write_packets_protected);
+
+    const path = conn.paths.get(path_id).?;
+    path.pending_ping = true;
+    _ = (try conn.pollLevelOnPath(.application, path_id, &packet_buf, 1_001_000)).?;
+    status = conn.keyUpdateStatus();
+    try std.testing.expectEqual(@as(?u64, 0), status.write_epoch);
+    try std.testing.expectEqual(@as(u64, 2), status.write_packets_protected);
+
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_002_000)).?;
+    status = conn.keyUpdateStatus();
+    try std.testing.expectEqual(@as(?u64, 1), status.write_epoch);
+    try std.testing.expect(status.write_update_pending_ack);
+    try std.testing.expectEqual(@as(u64, 1), status.write_packets_protected);
+}
+
 test "non-zero path ACK clears local key update gate" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -8322,6 +8428,37 @@ test "qlog callback records application key update lifecycle" {
     const discard_deadline = conn.app_read_previous.?.discard_deadline_us.?;
     try conn.tick(discard_deadline);
     try std.testing.expect(recorder.contains(.application_read_key_discarded));
+}
+
+test "qlog records AEAD confidentiality-limit close" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+    try installTestApplicationWriteSecret(&conn);
+    conn.setApplicationKeyUpdateLimitsForTesting(.{
+        .confidentiality_limit = 1,
+        .proactive_update_threshold = 99,
+        .integrity_limit = 99,
+    });
+    try conn.setPeerDcid(&.{});
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_000_000)).?;
+    try std.testing.expect(!recorder.contains(.aead_confidentiality_limit_reached));
+
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_001_000)).?;
+    try std.testing.expect(recorder.contains(.aead_confidentiality_limit_reached));
+    const close_event = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.local, close_event.source);
+    try std.testing.expectEqual(transport_error_aead_limit_reached, close_event.error_code);
+    try std.testing.expectEqual(CloseState.draining, conn.closeState());
 }
 
 test "AEAD authentication failure limit closes the connection" {
@@ -9212,6 +9349,43 @@ test "0-RTT DATAGRAM packet-threshold loss carries early-data metadata" {
     try std.testing.expectEqual(@as(u32, 2), conn.sentForLevel(.early_data).count);
 }
 
+test "0-RTT STREAM packet-threshold loss requeues early bytes" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.setPeerDcid(&.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try conn.setLocalScid(&.{ 9, 9, 9, 9 });
+    installTestEarlyDataWriteSecret(&conn);
+    conn.setEarlyDataEnabled(true);
+
+    const s = try conn.openBidi(0);
+    _ = try s.send.write("early-loss");
+
+    var out: [256]u8 = undefined;
+    _ = (try conn.pollLevel(.early_data, &out, 1_000)).?;
+    try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.early_data).count);
+    try std.testing.expect(s.send.peekChunk(64) == null);
+
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 3,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 2_000);
+
+    try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.early_data).count);
+    const chunk = s.send.peekChunk(64).?;
+    try std.testing.expectEqual(@as(u64, 0), chunk.offset);
+    try std.testing.expectEqual(@as(u64, 10), chunk.length);
+    try std.testing.expectEqualSlices(u8, "early-loss", s.send.chunkBytes(chunk));
+    try std.testing.expect(conn.pollEvent() == null);
+}
+
 test "server handles accepted 0-RTT STREAM frames" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initServer(.{});
@@ -9503,6 +9677,7 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
     try std.testing.expectEqual(@as(u64, 0), path.path.rtt.latest_rtt_us);
     const expected_cwnd = (congestion_mod.Config{ .max_datagram_size = default_mtu }).initialWindow();
     try std.testing.expectEqual(expected_cwnd, path.path.cc.cwnd);
+    try std.testing.expect(conn.pending_path_challenge == null);
 }
 
 test "unvalidated rebound path obeys anti-amplification before polling" {

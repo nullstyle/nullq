@@ -13,11 +13,15 @@ Current as of 2026-05-04.
   key-update lifecycle tests for previous/current/next read keys,
   3x-PTO previous-key discard, local update ACK gating, multipath ACK
   gating, proactive packet-limit updates, AEAD integrity-limit close
-  behavior, and AES-128/AES-256/ChaCha packet-protection round-trips,
+  behavior, AEAD confidentiality-limit close diagnostics, and
+  AES-128/AES-256/ChaCha packet-protection round-trips,
   client-side Version Negotiation and Retry integrity/transport
   parameter tests, stateless Retry-token validation and negative-path
-  tests, initial 0-RTT packet/receive/rejection unit tests, and the
-  10% simulated-loss stream exchange.
+  tests, shutdown/stateless-reset edge tests, initial 0-RTT
+  packet/receive/rejection/loss unit tests, deterministic
+  parser/property fuzz smokes for varints, frames, transport params,
+  packet headers, ACK ranges, and CRYPTO/STREAM reassembly, and the 10%
+  simulated-loss stream exchange.
 - `zig build` in `nullq-peer`: passing.
 - `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
@@ -254,20 +258,28 @@ Current as of 2026-05-04.
    peer CIDs and ACK/recovery state until the 3x-largest-PTO drain
    window expires. NAT rebinding resets RTT/congestion after validation
    and keeps old-address PATH_RESPONSE traffic off the new path's
-   anti-amplification accounting. Local mock transport now covers
-   bidirectional transfer across a lossy/reordered NAT rebinding.
+   anti-amplification accounting. A matching PATH_RESPONSE now also
+   clears any queued-but-unsent validation PATH_CHALLENGE for that path.
+   Local mock transport now covers bidirectional transfer across a
+   lossy/reordered NAT rebinding, and unit coverage exercises failed
+   rollback, old-address traffic during pending rebinding, old-address
+   PATH_RESPONSE routing, and validation cleanup.
    Remaining recovery work: external lossy/reordered interop gates and
    live migration soak. Pacing, ECN, and advanced congestion controllers
    remain out of scope for this push.
 4. **Key updates need external soak, not core lifecycle work.** The
    current implementation covers previous/current/next read keys,
    3x-PTO old-key discard, local initiation, ACK gating, and cross-suite
-   AEAD packet/authentication limits across all Application paths. Remaining
-   confidence work is external delayed-old-phase interop, long-running
-   packet-limit soak with realistic thresholds, and external qlog/keylog
-   trace review. nullq now exposes an opt-in qlog-style callback for
-   Application key install/update/ACK/discard events, and re-exports the
-   BoringSSL keylog callback type for TLS-context key logging.
+   AEAD packet/authentication limits across all Application paths. Unit
+   coverage now confirms proactive packet-limit updates count packets
+   emitted on non-zero multipath paths and that confidentiality-limit
+   closes are surfaced through the qlog callback. Remaining confidence
+   work is external delayed-old-phase interop, long-running packet-limit
+   soak with realistic thresholds, and external qlog/keylog trace
+   review. nullq now exposes an opt-in qlog-style callback for
+   Application key install/update/ACK/discard/AEAD-limit events, and
+   re-exports the BoringSSL keylog callback type for TLS-context key
+   logging.
 5. **0-RTT is implemented but still needs rejection hardening.** The
    landed code covers packet protection, explicit send opt-in,
    server receive validation, early-data context construction, status
@@ -279,21 +291,25 @@ Current as of 2026-05-04.
    `Session.fromBytes` path, replay-context tests cover every
    replay-relevant transport parameter that nullq records, and normal
    0-RTT DATAGRAM ACK/loss paths preserve app-visible early-data
-   metadata. Remaining work: end-to-end peer rejection probes for
+   metadata. Packet-threshold loss also requeues sent 0-RTT STREAM
+   bytes. Remaining work: end-to-end peer rejection probes for
    individual transport-parameter changes and broader lossy external
    0-RTT scenarios.
 6. **Protocol hardening remains.** Retry and Version Negotiation now
    have deterministic core coverage plus live quic-go interop through
    nullq-peer, and Retry address-validation helpers are reusable nullq
-   API. Remaining hardening work: bounded allocation policy and broader
-   shutdown-path interop with external peers. Local endpoint probes now
-   cover malformed, replayed-address, replayed-CID, expired, and
-   wrong-version Retry tokens; send-side blocked-frame loss requeue now
-   skips stale DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED
-   frames after the peer raises limits; receive-side MAX_DATA /
-   MAX_STREAM_DATA updates are half-window paced; and VN negative path
-   vectors cover supported-version, wrong CID echo, malformed
-   version-list, and server-ignore cases.
+   API. Bounded allocation policy and deterministic parser/property
+   smoke coverage have landed. Local endpoint probes now cover
+   malformed, replayed-address, replayed-CID, expired, and wrong-version
+   Retry tokens; send-side blocked-frame loss requeue now skips stale
+   DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED frames after the
+   peer raises limits; receive-side MAX_DATA / MAX_STREAM_DATA updates
+   are half-window paced; VN negative path vectors cover
+   supported-version, wrong CID echo, malformed version-list, and
+   server-ignore cases; and shutdown coverage exercises long close
+   reason truncation plus stateless-reset false-positive filtering.
+   Remaining hardening work: broader shutdown-path interop with external
+   peers.
 7. **The official interop runner gate is scaffolded, not complete.**
    nullq now has QNS server and client endpoint roles plus a Zig-native
    wrapper for nullq matrices against quic-go, ngtcp2, and quiche. The
