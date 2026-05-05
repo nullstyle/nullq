@@ -24,8 +24,6 @@ const endpoint_active_connection_id_limit: u64 = 2;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
 const max_qns_server_connections = 128;
 const qns_time_base_us: u64 = 1_000_000;
-const incomplete_request_ping_interval_us: u64 = 10_000;
-const incomplete_request_ping_budget: u32 = 128;
 
 const ServerOptions = struct {
     listen: []const u8 = "0.0.0.0:443",
@@ -151,19 +149,6 @@ const StreamState = struct {
     }
 };
 
-const IncompleteRequestStats = struct {
-    count: usize = 0,
-    bytes: usize = 0,
-
-    fn isEmpty(self: IncompleteRequestStats) bool {
-        return self.count == 0;
-    }
-
-    fn eql(a: IncompleteRequestStats, b: IncompleteRequestStats) bool {
-        return a.count == b.count and a.bytes == b.bytes;
-    }
-};
-
 const ClientDownload = struct {
     url: []const u8,
     rel_path: []const u8,
@@ -206,20 +191,6 @@ const Http09App = struct {
         while (it.next()) |entry| {
             try self.processStream(conn, entry.key_ptr.*);
         }
-    }
-
-    fn incompleteRequestStats(self: *Http09App, conn: *const nullq.Connection) IncompleteRequestStats {
-        var stats: IncompleteRequestStats = .{};
-        var it = self.streams.iterator();
-        while (it.next()) |entry| {
-            const state = entry.value_ptr;
-            if (state.responded or state.buf.items.len == 0) continue;
-            const stream = conn.stream(entry.key_ptr.*) orelse continue;
-            if (stream.recv.state == .data_recvd or stream.recv.state == .data_read) continue;
-            stats.count += 1;
-            stats.bytes +|= state.buf.items.len;
-        }
-        return stats;
     }
 
     fn stateFor(self: *Http09App, stream_id: u64) !*StreamState {
@@ -280,9 +251,6 @@ const ServerConn = struct {
     initial_server_cid: [server_cid_len]u8,
     next_cid_seq: u8 = 1,
     last_activity_us: u64,
-    last_incomplete_request_ping_us: u64 = 0,
-    incomplete_request_ping_count: u32 = 0,
-    last_incomplete_request_stats: IncompleteRequestStats = .{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -311,9 +279,6 @@ const ServerConn = struct {
         self.retry_source_cid = retrySourceCid(&self.initial_server_cid);
         self.next_cid_seq = 1;
         self.last_activity_us = now_us;
-        self.last_incomplete_request_ping_us = 0;
-        self.incomplete_request_ping_count = 0;
-        self.last_incomplete_request_stats = .{};
 
         if (qlog_sink) |sink| self.conn.setQlogCallback(QlogSink.callback, sink);
         try self.conn.bind();
@@ -339,33 +304,6 @@ const ServerConn = struct {
             if (std.mem.eql(u8, cid, &issued)) return true;
         }
         return false;
-    }
-
-    fn nudgeIncompleteRequests(self: *ServerConn, now_us: u64) void {
-        if (!self.conn.handshakeDone()) return;
-
-        const stats = self.app.incompleteRequestStats(&self.conn);
-        if (stats.isEmpty()) {
-            self.last_incomplete_request_ping_us = 0;
-            self.incomplete_request_ping_count = 0;
-            self.last_incomplete_request_stats = .{};
-            return;
-        }
-
-        if (!stats.eql(self.last_incomplete_request_stats)) {
-            self.incomplete_request_ping_count = 0;
-            self.last_incomplete_request_stats = stats;
-        }
-        if (self.incomplete_request_ping_count >= incomplete_request_ping_budget) return;
-        if (self.last_incomplete_request_ping_us != 0 and
-            now_us - self.last_incomplete_request_ping_us < incomplete_request_ping_interval_us)
-        {
-            return;
-        }
-
-        self.conn.requestPing();
-        self.last_incomplete_request_ping_us = now_us;
-        self.incomplete_request_ping_count += 1;
     }
 };
 
@@ -636,7 +574,6 @@ fn runServer(
             const sc = conns.items[i];
             if (sc.conn.handshakeDone()) try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, endpoint_server_cid_desired_last_seq, &sc.initial_server_cid);
             try sc.app.process(&sc.conn);
-            sc.nudgeIncompleteRequests(now_us);
             while (try sc.conn.poll(&tx, now_us)) |n| {
                 try sock.send(io, &sc.peer, tx[0..n]);
             }
