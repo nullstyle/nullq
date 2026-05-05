@@ -78,4 +78,42 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_interop_tool.addArgs(args);
     const external_interop_step = b.step("external-interop", "Run the external QUIC interop gate helper");
     external_interop_step.dependOn(&run_interop_tool.step);
+
+    // Microbenchmarks. Always built with ReleaseFast (Debug-mode
+    // numbers are meaningless), regardless of the user's
+    // -Doptimize choice for the rest of the tree.
+    //
+    // We re-instantiate the nullq and boringssl modules under
+    // ReleaseFast because BoringSSL compiled in Debug links UBSan
+    // runtime symbols that the ReleaseFast linker won't resolve.
+    const bench_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+    const bench_boringssl_dep = b.dependency("boringssl_zig", .{
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    const bench_boringssl_mod = bench_boringssl_dep.module("boringssl");
+
+    const bench_nullq_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    bench_nullq_mod.addImport("boringssl", bench_boringssl_mod);
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    bench_mod.addImport("nullq", bench_nullq_mod);
+    bench_mod.addImport("boringssl", bench_boringssl_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "nullq-bench",
+        .root_module = bench_mod,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run nullq microbenchmarks");
+    bench_step.dependOn(&run_bench.step);
 }
