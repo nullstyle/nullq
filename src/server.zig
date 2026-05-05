@@ -42,9 +42,9 @@
 //! deterministic CID prefix); embedders without those constraints
 //! should reach for `Server` first.
 //!
-//! TODO(api): client-side `Client.connect` helper, optional built-in
-//! Retry token issuance & validation, optional version negotiation,
-//! optional `std.Io` socket loop helper.
+//! TODO(api): optional built-in Retry token issuance & validation,
+//! optional version negotiation, optional `std.Io` socket loop
+//! helper.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
