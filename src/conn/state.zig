@@ -37,32 +37,56 @@ const congestion_mod = @import("congestion.zig");
 const rtt_mod = @import("rtt.zig");
 const flow_control_mod = @import("flow_control.zig");
 
+/// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
+/// Read or write half-direction selector for keying material.
 pub const Direction = level_mod.Direction;
+/// Derived AEAD packet protection keys for a single direction.
 pub const PacketKeys = short_packet_mod.PacketKeys;
+/// Negotiated TLS cipher suite mapped to QUIC AEAD parameters.
 pub const Suite = short_packet_mod.Suite;
+/// Send half of a QUIC stream (RFC 9000 §3) — owns offset, flow credit, retransmit queue.
 pub const SendStream = send_stream_mod.SendStream;
+/// Receive half of a QUIC stream — owns reassembly buffer and flow-control window.
 pub const RecvStream = recv_stream_mod.RecvStream;
+/// Per-encryption-level packet number space (RFC 9000 §12.3).
 pub const PnSpace = pn_space_mod.PnSpace;
+/// In-flight packet bookkeeping for ACK processing and loss recovery.
 pub const SentPacketTracker = sent_packets_mod.SentPacketTracker;
+/// One network path (4-tuple plus DCID/SCID) — RFC 9000 §9 / multipath draft-21.
 pub const Path = path_mod.Path;
+/// Container holding all paths a connection currently knows about.
 pub const PathSet = path_mod.PathSet;
+/// Per-path validation/availability state machine.
 pub const PathState = path_mod.PathState;
+/// Per-path counters (datagrams sent/received, loss, RTT inputs).
 pub const PathStats = path_mod.PathStats;
+/// Multipath scheduler that picks which path an outgoing datagram uses.
 pub const Scheduler = path_mod.Scheduler;
+/// QUIC connection ID — variable-length opaque identifier (RFC 9000 §5.1).
 pub const ConnectionId = path_mod.ConnectionId;
+/// IP address + port pair used as a path endpoint.
 pub const Address = path_mod.Address;
+/// PATH_CHALLENGE / PATH_RESPONSE state machine (RFC 9000 §8.2).
 pub const PathValidator = path_mod.PathValidator;
+/// Smoothed RTT / RTT-variance estimator (RFC 9002 §5).
 pub const RttEstimator = rtt_mod.RttEstimator;
+/// Decoded peer transport parameters from the TLS handshake (RFC 9000 §18).
 pub const TransportParams = transport_params_mod.Params;
+/// Default congestion controller — NewReno from RFC 9002 §7.
 pub const NewReno = congestion_mod.NewReno;
+/// BoringSSL TLS session ticket handle, used for 0-RTT resumption.
 pub const Session = boringssl.tls.Session;
+/// 0-RTT acceptance/rejection status reported by BoringSSL.
 pub const EarlyDataStatus = boringssl.tls.Conn.EarlyDataStatus;
 
+/// Whether this Connection is the QUIC client or server endpoint.
 pub const Role = enum { client, server };
 
+/// Wire version code for QUIC v1 (RFC 9000 §15).
 pub const quic_version_1: u32 = 0x00000001;
 
+/// Aggregate error set returned from any Connection operation.
 pub const Error = error{
     OutOfMemory,
     HandshakeFailed,
@@ -110,6 +134,8 @@ pub const SecretMaterial = struct {
     secret_len: u8 = 0,
 };
 
+/// Read+write traffic-secret material for one TLS encryption level.
+/// Either half can be `null` until BoringSSL installs that direction.
 pub const PerLevelState = struct {
     read: ?SecretMaterial = null,
     write: ?SecretMaterial = null,
@@ -156,35 +182,56 @@ const transport_error_aead_limit_reached: u64 = 0x0f;
 /// implementation deliberately advertises and enforces the same 4 KiB
 /// UDP payload budget so packet protection can stay stack-backed.
 pub const max_recv_plaintext: usize = 4096;
+/// Largest UDP payload size we will advertise to the peer in transport params.
 pub const max_supported_udp_payload_size: usize = max_recv_plaintext;
+/// Wire-mandated minimum UDP payload size for Initial packets (RFC 9000 §14).
 pub const min_quic_udp_payload_size: usize = default_mtu;
 
 /// Bounded queue budgets for RFC 9221 DATAGRAM payloads.
 pub const max_outbound_datagram_payload_size: usize = default_mtu - 9;
+/// Maximum number of unsent outbound DATAGRAM frames buffered at once.
 pub const max_pending_datagram_count: usize = 64;
+/// Maximum total byte volume of unsent outbound DATAGRAM frames buffered at once.
 pub const max_pending_datagram_bytes: usize = 64 * 1024;
 
 /// Bounded reassembly budgets for peer-controlled CRYPTO gaps.
 pub const max_pending_crypto_bytes_per_level: usize = 64 * 1024;
+/// Largest gap (in bytes) we will tolerate between in-order CRYPTO data and a
+/// future fragment before treating the peer's stream as malicious.
 pub const max_crypto_reassembly_gap: u64 = 64 * 1024;
+/// Number of ack-eliciting application packets we accept before forcing an
+/// ACK frame (RFC 9000 §13.2.2).
 pub const application_ack_eliciting_threshold: u8 = 1;
+/// Hard cap on total bytes spent on ACK ranges in any single application packet.
 pub const max_application_ack_ranges_bytes: usize = 128;
+/// Hard cap on the number of additional (non-largest) ACK ranges per application packet.
 pub const max_application_ack_lower_ranges: u64 = 16;
 
+/// Default per-stream receive credit advertised in transport params.
 pub const default_stream_receive_window: u64 = 1024 * 1024;
+/// Default connection-level receive credit advertised in transport params.
 pub const default_connection_receive_window: u64 = 16 * 1024 * 1024;
+/// Hard ceiling on `initial_max_streams_*` we will ever advertise.
 pub const max_stream_count_limit: u64 = @as(u64, 1) << 60;
+/// Minimum number of stream credits to accumulate before sending MAX_STREAMS.
 pub const min_stream_credit_return_batch: u64 = 16;
+/// Divisor controlling the watermark at which MAX_STREAMS replenishment fires.
 pub const stream_credit_return_divisor: u64 = 1;
 
 /// Implementation allocation policy. QUIC's wire limits are intentionally
 /// enormous; nullq caps the resources it advertises and tracks so peer input
 /// cannot force unbounded stream/path/CID state.
 pub const max_streams_per_connection: u64 = 4096;
+/// Largest QUIC multipath path identifier we accept (draft-ietf-quic-multipath-21).
 pub const max_supported_path_id: u32 = 255;
+/// Hard cap on the `active_connection_id_limit` we honour from the peer.
 pub const max_supported_active_connection_id_limit: u64 = 16;
+/// Maximum unique (stream_id, offset) pairs we remember for STREAM_DATA_BLOCKED
+/// dedupe before refusing to track more.
 pub const max_tracked_stream_data_blocked: usize = 8192;
+/// Upper bound on `initial_max_data` we accept from peer transport params.
 pub const max_initial_connection_receive_window: u64 = default_connection_receive_window;
+/// Upper bound on `initial_max_stream_data_*` we accept from peer transport params.
 pub const max_initial_stream_receive_window: u64 = recv_stream_mod.default_max_buffered_span;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -201,6 +248,9 @@ pub const CryptoChunk = struct {
     data: []u8,
 };
 
+/// One CRYPTO fragment that has been written into a sent packet and is
+/// awaiting acknowledgement. Tracks the packet number it rode in so the
+/// ACK / loss path can match it back to a retransmission queue.
 pub const SentCryptoChunk = struct {
     pn: u64,
     offset: u64,
@@ -227,6 +277,7 @@ pub const ConnectionCloseInfo = struct {
     reason: []const u8 = &.{},
 };
 
+/// Origin of a connection-close event surfaced through `nextEvent`.
 pub const CloseSource = enum {
     local,
     peer,
@@ -235,11 +286,14 @@ pub const CloseSource = enum {
     version_negotiation,
 };
 
+/// QUIC distinguishes transport-level (RFC 9000 §20.1) from application-level
+/// (RFC 9000 §20.2) errors; this enum tags which space `error_code` lives in.
 pub const CloseErrorSpace = enum {
     transport,
     application,
 };
 
+/// High-level connection lifecycle state — RFC 9000 §10 (closing/draining).
 pub const CloseState = enum {
     open,
     closing,
@@ -247,8 +301,12 @@ pub const CloseState = enum {
     closed,
 };
 
+/// Maximum length of a CONNECTION_CLOSE reason phrase we will record/emit.
 pub const max_close_reason_len: usize = 256;
 
+/// Snapshot of a close event delivered to the embedder via `nextEvent`.
+/// Captures source, error space/code and (optionally) the wire-level frame
+/// type that triggered the close. RFC 9000 §10.
 pub const CloseEvent = struct {
     source: CloseSource,
     error_space: CloseErrorSpace,
@@ -260,6 +318,9 @@ pub const CloseEvent = struct {
     draining_deadline_us: ?u64 = null,
 };
 
+/// Tagged-union of all connection-level events the embedder polls via `nextEvent`.
+/// Each variant carries enough context for the embedder to react without re-querying
+/// Connection state.
 pub const ConnectionEvent = union(enum) {
     close: CloseEvent,
     flow_blocked: FlowBlockedInfo,
@@ -268,17 +329,22 @@ pub const ConnectionEvent = union(enum) {
     datagram_lost: DatagramSendEvent,
 };
 
+/// Whether a flow-control block was hit on the local side or reported by the peer.
 pub const FlowBlockedSource = enum {
     local,
     peer,
 };
 
+/// Which flow-control axis ran out of credit — connection data, per-stream data,
+/// or stream-count (RFC 9000 §4 / §19.12-§19.14).
 pub const FlowBlockedKind = enum {
     data,
     stream_data,
     streams,
 };
 
+/// One flow-control block event delivered to the embedder via `nextEvent`. Carries
+/// the limit that was hit and (for stream-data) which stream tripped it.
 pub const FlowBlockedInfo = struct {
     source: FlowBlockedSource,
     kind: FlowBlockedKind,
@@ -287,13 +353,17 @@ pub const FlowBlockedInfo = struct {
     bidi: ?bool = null,
 };
 
+/// Maximum buffered FlowBlockedInfo events before older entries are dropped.
 pub const max_flow_blocked_events: usize = 16;
 
+/// Why the connection is asking the embedder to issue more local connection IDs.
 pub const ConnectionIdReplenishReason = enum {
     retired,
     path_cids_blocked,
 };
 
+/// Embedder-visible snapshot of CID-issuance state when the active count drops
+/// below the peer's `active_connection_id_limit` (RFC 9000 §5.1.1).
 pub const ConnectionIdReplenishInfo = struct {
     path_id: u32,
     reason: ConnectionIdReplenishReason,
@@ -304,8 +374,11 @@ pub const ConnectionIdReplenishInfo = struct {
     blocked_next_sequence_number: ?u64 = null,
 };
 
+/// Maximum buffered CID replenish events before older entries are dropped.
 pub const max_connection_id_events: usize = 16;
 
+/// One ACK or loss event for a previously-sent RFC 9221 DATAGRAM frame, returned
+/// to the embedder so it can reconcile its outbound queue.
 pub const DatagramSendEvent = struct {
     id: u64,
     len: usize,
@@ -315,6 +388,7 @@ pub const DatagramSendEvent = struct {
     arrived_in_early_data: bool = false,
 };
 
+/// Maximum buffered datagram ack/loss events before older entries are dropped.
 pub const max_datagram_send_events: usize = 64;
 
 const StoredDatagramSendEvent = union(enum) {
@@ -334,16 +408,20 @@ const StoredCloseEvent = struct {
     delivered: bool = false,
 };
 
+/// One queued STOP_SENDING frame (RFC 9000 §19.5) with its application error code.
 pub const StopSendingItem = struct {
     stream_id: u64,
     application_error_code: u64,
 };
 
+/// One queued MAX_STREAM_DATA frame (RFC 9000 §19.10) with the new credit value.
 pub const MaxStreamDataItem = struct {
     stream_id: u64,
     maximum_stream_data: u64,
 };
 
+/// One queued NEW_CONNECTION_ID frame (RFC 9000 §19.15) the embedder has handed
+/// to the connection and is awaiting transmission.
 pub const PendingNewConnectionId = struct {
     sequence_number: u64,
     retire_prior_to: u64,
@@ -351,29 +429,38 @@ pub const PendingNewConnectionId = struct {
     stateless_reset_token: [16]u8,
 };
 
+/// Embedder-supplied bundle when calling `provideConnectionId`/`provisionPathConnectionId`
+/// to install a fresh local CID and its stateless reset token.
 pub const ConnectionIdProvision = struct {
     connection_id: []const u8,
     stateless_reset_token: [16]u8,
     retire_prior_to: u64 = 0,
 };
 
+/// Snapshot reported when peer-issued CIDs for a path run dry — used to drive
+/// PATH_CIDS_BLOCKED frames on the multipath extension.
 pub const PathCidsBlockedInfo = struct {
     path_id: u32,
     next_sequence_number: u64,
 };
 
+/// One queued PATH_AVAILABLE / PATH_BACKUP frame from draft-ietf-quic-multipath-21.
 pub const PendingPathStatus = struct {
     path_id: u32,
     sequence_number: u64,
     available: bool,
 };
 
+/// Header-only descriptor returned from `pollDatagram` — paired with the bytes
+/// the caller wrote into the supplied buffer.
 pub const OutgoingDatagram = struct {
     len: usize,
     to: ?Address = null,
     path_id: u32 = 0,
 };
 
+/// Embedder-visible descriptor for a peer datagram received via `handleDatagram`.
+/// `arrived_in_early_data` propagates the 0-RTT-vs-1-RTT distinction up to the app.
 pub const IncomingDatagram = struct {
     len: usize,
     arrived_in_early_data: bool = false,
@@ -389,6 +476,9 @@ const PendingSendDatagram = struct {
     data: []u8,
 };
 
+/// Distinct timers the Connection drives. The embedder only ever sees one at
+/// a time via `nextTimer` — the earliest pending — but the kind disambiguates
+/// what `tick` will do when it fires.
 pub const TimerKind = enum {
     ack_delay,
     loss_detection,
@@ -399,6 +489,9 @@ pub const TimerKind = enum {
     key_discard,
 };
 
+/// One pending timer expiry returned from `nextTimer`. `level` and `path_id`
+/// are populated for kinds that are scoped (e.g. key_discard / path_retirement);
+/// the embedder treats them as opaque and just feeds `at_us` back into `tick`.
 pub const TimerDeadline = struct {
     kind: TimerKind,
     at_us: u64,
@@ -447,6 +540,10 @@ const LossStats = struct {
     }
 };
 
+/// Tunables governing automatic 1-RTT key updates. Defaults follow the
+/// RFC 9001 §6.6 confidentiality / integrity limits and an early proactive
+/// rotation point so the connection never has to spend its last legal packet
+/// on CONNECTION_CLOSE.
 pub const ApplicationKeyUpdateLimits = struct {
     /// RFC 9001 §6.6 gives AES-GCM a 2^23 packet confidentiality limit.
     /// ChaCha20-Poly1305 does not force a lower update point, so the
@@ -460,6 +557,9 @@ pub const ApplicationKeyUpdateLimits = struct {
     integrity_limit: u64 = @as(u64, 1) << 36,
 };
 
+/// Read-only snapshot of 1-RTT key update bookkeeping returned from
+/// `applicationKeyUpdateStatus()`. Useful for tests, qlog, and embedders
+/// that want to surface key-rotation telemetry.
 pub const ApplicationKeyUpdateStatus = struct {
     read_epoch: ?u64 = null,
     read_key_phase: bool = false,
@@ -473,6 +573,9 @@ pub const ApplicationKeyUpdateStatus = struct {
     auth_failures: u64 = 0,
 };
 
+/// Tag identifying a qlog event (modeled on draft-ietf-quic-qlog-quic-events).
+/// Used when the connection invokes its `qlog_callback` so consumers can route
+/// the event without parsing arbitrary strings.
 pub const QlogEventName = enum {
     application_read_key_installed,
     application_read_key_updated,
@@ -526,6 +629,8 @@ pub const QlogEventName = enum {
     key_updated,
 };
 
+/// QUIC packet type as it appears in qlog `packet_sent` / `packet_received` /
+/// `packet_lost` events.
 pub const QlogPacketKind = enum {
     initial,
     handshake,
@@ -535,6 +640,8 @@ pub const QlogPacketKind = enum {
     version_negotiation,
 };
 
+/// Why a packet was dropped before frame dispatch — populates the qlog
+/// `packet_dropped` event.
 pub const QlogPacketDropReason = enum {
     /// Packet was too short or had a malformed header.
     header_decode_failure,
@@ -554,12 +661,14 @@ pub const QlogPacketDropReason = enum {
     other,
 };
 
+/// Packet number space tag carried in qlog packet/loss events.
 pub const QlogPnSpace = enum {
     initial,
     handshake,
     application,
 };
 
+/// Stream lifecycle state reported via the qlog `stream_state_updated` event.
 pub const QlogStreamState = enum {
     open,
     half_closed_local,
@@ -568,6 +677,7 @@ pub const QlogStreamState = enum {
     reset,
 };
 
+/// Congestion-controller phase reported via qlog `congestion_state_updated`.
 pub const QlogCongestionState = enum {
     slow_start,
     recovery,
@@ -575,6 +685,8 @@ pub const QlogCongestionState = enum {
     congestion_avoidance,
 };
 
+/// Why a packet was declared lost — populates qlog `loss_detected` /
+/// `packet_lost` events. Mirrors RFC 9002 §6 loss detection branches.
 pub const QlogLossReason = enum {
     /// RFC 9002 §6.1.1 packet-threshold loss detection.
     packet_threshold,
@@ -643,6 +755,9 @@ pub const QlogEvent = struct {
     peer_max_datagram_frame_size: ?u64 = null,
 };
 
+/// Embedder-supplied qlog sink. The Connection synchronously calls this with
+/// each emitted `QlogEvent`; the callback must not call back into the same
+/// Connection.
 pub const QlogCallback = *const fn (user_data: ?*anyopaque, event: QlogEvent) void;
 
 const ApplicationKeyEpoch = struct {
@@ -675,12 +790,17 @@ pub const CryptoBuffer = struct {
     buf: [16384]u8 = undefined,
     len: usize = 0,
 
+    /// Append bytes BoringSSL produced via `add_handshake_data`.
+    /// Returns `error.InboxOverflow` if the fixed-size buffer is full.
     pub fn append(self: *CryptoBuffer, data: []const u8) !void {
         if (self.len + data.len > self.buf.len) return error.InboxOverflow;
         @memcpy(self.buf[self.len .. self.len + data.len], data);
         self.len += data.len;
     }
 
+    /// Returns the buffered bytes and resets the buffer to empty. The
+    /// returned slice aliases the internal storage and is valid only
+    /// until the next `append`.
     pub fn drain(self: *CryptoBuffer) []const u8 {
         const out = self.buf[0..self.len];
         self.len = 0;
@@ -688,6 +808,14 @@ pub const CryptoBuffer = struct {
     }
 };
 
+/// Per-QUIC-connection state machine and embedder-facing API.
+///
+/// The Connection owns the TLS handshake (`inner`), packet number spaces,
+/// flow-control accounting, the stream table, path set, congestion controller,
+/// loss detector, and timers. Embedders feed peer datagrams in through
+/// `handleDatagram` / `handleClientInitial` / `handleStatelessReset`, drive
+/// time forward with `tick`, pull outgoing datagrams via `pollDatagram`, and
+/// observe lifecycle changes through `nextEvent` / `nextTimer`.
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     role: Role,
@@ -1780,6 +1908,9 @@ pub const Connection = struct {
         return status;
     }
 
+    /// Override the AEAD confidentiality / integrity / proactive-update
+    /// thresholds. Test-only — production embedders should accept the
+    /// RFC 9001 §6.6 defaults.
     pub fn setApplicationKeyUpdateLimitsForTesting(
         self: *Connection,
         limits: ApplicationKeyUpdateLimits,
@@ -2791,6 +2922,10 @@ pub const Connection = struct {
         return self.multipathNegotiated() and path_id <= self.local_max_path_id;
     }
 
+    /// Snapshot of how many local CIDs are active on `path_id`, the peer's
+    /// limit, and the embedder's remaining issuance budget. Returns `null`
+    /// when `path_id` does not name a manageable path. Embedders use this to
+    /// drive `provideConnectionId` proactively (RFC 9000 §5.1.1).
     pub fn connectionIdReplenishInfo(
         self: *const Connection,
         path_id: u32,
@@ -3372,6 +3507,9 @@ pub const Connection = struct {
         return st;
     }
 
+    /// Queue a PATH_ABANDON frame for the given multipath path. Coalesces
+    /// repeated calls for the same `path_id` (last `error_code` wins).
+    /// draft-ietf-quic-multipath-21 §6.1.
     pub fn queuePathAbandon(
         self: *Connection,
         path_id: u32,
@@ -3389,6 +3527,10 @@ pub const Connection = struct {
         });
     }
 
+    /// Queue a PATH_AVAILABLE / PATH_BACKUP frame announcing a status
+    /// change for `path_id`. Coalesces with any existing entry for the
+    /// same path, preferring the higher sequence number.
+    /// draft-ietf-quic-multipath-21 §6.2.
     pub fn queuePathStatus(
         self: *Connection,
         path_id: u32,
@@ -3411,6 +3553,10 @@ pub const Connection = struct {
         });
     }
 
+    /// Queue a PATH_NEW_CONNECTION_ID frame for the multipath path-scoped
+    /// CID issuance flow. Validates `cid` length, issuance budget, and
+    /// uniqueness; remembers the local CID so packets bearing it can be
+    /// authenticated. draft-ietf-quic-multipath-21 §6.3.
     pub fn queuePathNewConnectionId(
         self: *Connection,
         path_id: u32,
@@ -3443,6 +3589,9 @@ pub const Connection = struct {
         self.refreshConnectionIdEventsForPath(path_id);
     }
 
+    /// Queue a PATH_RETIRE_CONNECTION_ID frame asking the peer to drop the
+    /// `(path_id, sequence_number)` CID. Idempotent — duplicate retires for
+    /// the same pair are coalesced. draft-ietf-quic-multipath-21 §6.4.
     pub fn queuePathRetireConnectionId(
         self: *Connection,
         path_id: u32,
@@ -3457,6 +3606,9 @@ pub const Connection = struct {
         });
     }
 
+    /// Queue a MAX_PATH_ID frame raising our advertised path-id ceiling.
+    /// `maximum_path_id` is clamped to `max_supported_path_id`; lower values
+    /// than the current limit are ignored. draft-ietf-quic-multipath-21 §6.5.
     pub fn queueMaxPathId(self: *Connection, maximum_path_id: u32) void {
         const bounded_maximum_path_id = @min(maximum_path_id, max_supported_path_id);
         if (bounded_maximum_path_id > self.local_max_path_id) {
@@ -3467,12 +3619,18 @@ pub const Connection = struct {
         }
     }
 
+    /// Queue a PATHS_BLOCKED frame telling the peer we have run out of
+    /// path-id headroom at `maximum_path_id`. Coalesces by keeping the
+    /// largest pending value. draft-ietf-quic-multipath-21 §6.6.
     pub fn queuePathsBlocked(self: *Connection, maximum_path_id: u32) void {
         if (self.pending_paths_blocked == null or maximum_path_id > self.pending_paths_blocked.?) {
             self.pending_paths_blocked = maximum_path_id;
         }
     }
 
+    /// Queue a PATH_CIDS_BLOCKED frame on `path_id`. Sent when the peer's
+    /// CID issuance budget for this path is exhausted at
+    /// `next_sequence_number`. draft-ietf-quic-multipath-21 §6.7.
     pub fn queuePathCidsBlocked(
         self: *Connection,
         path_id: u32,
@@ -3484,6 +3642,9 @@ pub const Connection = struct {
         };
     }
 
+    /// Returns the pending peer-side PATH_CIDS_BLOCKED report we have
+    /// received, or `null` if the peer is not currently blocked. Drives
+    /// proactive CID issuance via `provideConnectionId`.
     pub fn pendingPathCidsBlocked(self: *const Connection) ?PathCidsBlockedInfo {
         const path_id = self.peer_path_cids_blocked_path_id orelse return null;
         return .{
@@ -3492,6 +3653,10 @@ pub const Connection = struct {
         };
     }
 
+    /// Clear a peer-side PATH_CIDS_BLOCKED report after the embedder has
+    /// issued enough fresh CIDs to satisfy it. The arguments must match the
+    /// `(path_id, next_sequence_number)` from `pendingPathCidsBlocked`;
+    /// mismatches are no-ops to avoid races with newer reports.
     pub fn clearPendingPathCidsBlocked(
         self: *Connection,
         path_id: u32,
@@ -3512,6 +3677,9 @@ pub const Connection = struct {
         }
     }
 
+    /// Bulk-issue local CIDs on the default path (path_id 0) by emitting
+    /// NEW_CONNECTION_ID frames for each `ConnectionIdProvision`. Returns
+    /// the number of provisions actually accepted. RFC 9000 §19.15.
     pub fn replenishConnectionIds(
         self: *Connection,
         provisions: []const ConnectionIdProvision,
@@ -3519,6 +3687,10 @@ pub const Connection = struct {
         return self.replenishLocalConnectionIds(0, provisions);
     }
 
+    /// Multipath variant of `replenishConnectionIds` — bulk-issues local
+    /// CIDs on `path_id` via PATH_NEW_CONNECTION_ID frames. Validates that
+    /// the path-id is permitted before queuing any frames.
+    /// draft-ietf-quic-multipath-21 §6.3.
     pub fn replenishPathConnectionIds(
         self: *Connection,
         path_id: u32,
