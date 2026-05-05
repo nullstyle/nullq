@@ -24,9 +24,14 @@ const varint = @import("varint.zig");
 
 const AesGcm128 = boringssl.crypto.aead.AesGcm128;
 
+/// Re-export of `short_packet.PacketKeys` so callers don't need to
+/// reach across modules for long-header seal/open.
 pub const PacketKeys = short_packet.PacketKeys;
+/// Re-export of `short_packet.Suite` for the same reason as
+/// `PacketKeys`.
 pub const Suite = short_packet.Suite;
 
+/// Errors returned by long-header seal/open and Retry helpers.
 pub const Error = error{
     OutputTooSmall,
     NotInitialPacket,
@@ -47,6 +52,8 @@ pub const retry_integrity_key_v1: [16]u8 = .{
     0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
 };
 
+/// QUIC v1 Retry integrity nonce (RFC 9001 §5.8). Companion to
+/// `retry_integrity_key_v1`.
 pub const retry_integrity_nonce_v1: [12]u8 = .{
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63,
     0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
@@ -54,6 +61,8 @@ pub const retry_integrity_nonce_v1: [12]u8 = .{
 
 const retry_pseudo_packet_max: usize = 4096;
 
+/// Inputs to `sealRetry`. Server-side construction of a Retry packet
+/// per RFC 9000 §17.2.5; the integrity tag is computed automatically.
 pub const RetrySealOptions = struct {
     version: u32 = 0x00000001,
     /// Original Destination Connection ID from the client's first Initial.
@@ -68,6 +77,9 @@ pub const RetrySealOptions = struct {
 
 // -- Initial -------------------------------------------------------------
 
+/// Inputs to `sealInitial`. Builds an unprotected Initial header,
+/// AEAD-seals the payload, and applies header protection per
+/// RFC 9000 §17.2.2 + RFC 9001 §5.
 pub const InitialSealOptions = struct {
     /// QUIC version. Defaults to v1.
     version: u32 = 0x00000001,
@@ -96,6 +108,9 @@ pub const InitialSealOptions = struct {
     pn_length_override: ?u8 = null,
 };
 
+/// Build a fully-protected Initial packet into `dst`. Returns total
+/// bytes written. Errors with `OutputTooSmall` if `dst` cannot fit
+/// the header + AEAD ciphertext + tag (and any padding).
 pub fn sealInitial(dst: []u8, opts: InitialSealOptions) Error!usize {
     if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
@@ -194,6 +209,8 @@ pub fn sealInitial(dst: []u8, opts: InitialSealOptions) Error!usize {
     return total_len;
 }
 
+/// Result of opening a long-header packet. `payload` is a slice into
+/// the caller's plaintext buffer; the CIDs and token are cheap copies.
 pub const LongOpenResult = struct {
     pn: u64,
     payload: []u8,
@@ -213,17 +230,25 @@ pub const LongOpenResult = struct {
     token: []const u8,
 };
 
+/// Inputs to `openInitial` / `openZeroRtt` / `openHandshake`. Same
+/// shape across the three variants: the peer's keys plus the largest
+/// PN we've already opened in this PN space.
 pub const InitialOpenOptions = struct {
     keys: *const PacketKeys,
     largest_received: u64 = 0,
 };
 
+/// Open a protected Initial packet from `src`, writing plaintext into
+/// `pt_dst`. Returns the recovered PN, plaintext slice, CIDs, token,
+/// and `bytes_consumed` for advancing through coalesced datagrams.
 pub fn openInitial(pt_dst: []u8, src: []u8, opts: InitialOpenOptions) Error!LongOpenResult {
     return openLongHeader(pt_dst, src, opts.keys, opts.largest_received, .initial);
 }
 
 // -- 0-RTT ---------------------------------------------------------------
 
+/// Inputs to `sealZeroRtt`. Builds an unprotected 0-RTT header and
+/// applies AEAD + header protection per RFC 9000 §17.2.3.
 pub const ZeroRttSealOptions = struct {
     version: u32 = 0x00000001,
     dcid: []const u8,
@@ -235,6 +260,8 @@ pub const ZeroRttSealOptions = struct {
     pn_length_override: ?u8 = null,
 };
 
+/// Build a fully-protected 0-RTT packet into `dst`. Returns total
+/// bytes written.
 pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
     if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
@@ -290,12 +317,16 @@ pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
     return total_len;
 }
 
+/// Open a protected 0-RTT packet from `src`. See `openInitial` for
+/// the shared semantics.
 pub fn openZeroRtt(pt_dst: []u8, src: []u8, opts: InitialOpenOptions) Error!LongOpenResult {
     return openLongHeader(pt_dst, src, opts.keys, opts.largest_received, .zero_rtt);
 }
 
 // -- Handshake -----------------------------------------------------------
 
+/// Inputs to `sealHandshake`. Builds an unprotected Handshake header
+/// and applies AEAD + header protection per RFC 9000 §17.2.4.
 pub const HandshakeSealOptions = struct {
     version: u32 = 0x00000001,
     dcid: []const u8,
@@ -307,6 +338,8 @@ pub const HandshakeSealOptions = struct {
     pn_length_override: ?u8 = null,
 };
 
+/// Build a fully-protected Handshake packet into `dst`. Returns total
+/// bytes written.
 pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
     if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
@@ -362,12 +395,17 @@ pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
     return total_len;
 }
 
+/// Open a protected Handshake packet from `src`. See `openInitial`
+/// for the shared semantics.
 pub fn openHandshake(pt_dst: []u8, src: []u8, opts: InitialOpenOptions) Error!LongOpenResult {
     return openLongHeader(pt_dst, src, opts.keys, opts.largest_received, .handshake);
 }
 
 // -- Retry ---------------------------------------------------------------
 
+/// Compute the 16-byte Retry integrity tag (RFC 9001 §5.8) over the
+/// pseudo-packet formed from the Original DCID length, the ODCID
+/// bytes, and the Retry packet bytes preceding the tag.
 pub fn retryIntegrityTag(original_dcid: []const u8, retry_without_tag: []const u8) Error![16]u8 {
     if (original_dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (1 + original_dcid.len + retry_without_tag.len > retry_pseudo_packet_max) {
@@ -391,6 +429,8 @@ pub fn retryIntegrityTag(original_dcid: []const u8, retry_without_tag: []const u
     return out;
 }
 
+/// Build a Retry packet into `dst`, computing and appending the
+/// 16-byte integrity tag. Returns total bytes written.
 pub fn sealRetry(dst: []u8, opts: RetrySealOptions) Error!usize {
     if (opts.dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (opts.scid.len > header.max_cid_len) return Error.ScidTooLong;
@@ -411,6 +451,8 @@ pub fn sealRetry(dst: []u8, opts: RetrySealOptions) Error!usize {
     return len;
 }
 
+/// Verify the Retry integrity tag on `retry_packet` against the
+/// client's original DCID. Returns true on a match, false otherwise.
 pub fn validateRetryIntegrity(original_dcid: []const u8, retry_packet: []const u8) Error!bool {
     if (retry_packet.len < 16) return Error.PayloadTooShort;
     const expected = try retryIntegrityTag(original_dcid, retry_packet[0 .. retry_packet.len - 16]);

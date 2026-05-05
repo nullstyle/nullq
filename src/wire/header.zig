@@ -37,6 +37,8 @@ pub const PnLength = enum(u8) {
     three = 3,
     four = 4,
 
+    /// Decode the raw 2-bit PN-length field (N-1 encoding) from a
+    /// post-HP first byte.
     pub fn fromTwoBits(bits: u2) PnLength {
         return switch (bits) {
             0 => .one,
@@ -46,10 +48,12 @@ pub const PnLength = enum(u8) {
         };
     }
 
+    /// Encode this length as the 2-bit (N-1) field for the first byte.
     pub fn toTwoBits(self: PnLength) u2 {
         return @intCast(@intFromEnum(self) - 1);
     }
 
+    /// Length in bytes (1..4).
     pub fn bytes(self: PnLength) u8 {
         return @intFromEnum(self);
     }
@@ -60,6 +64,8 @@ pub const ConnId = struct {
     bytes: [max_cid_len]u8 = @splat(0),
     len: u8 = 0,
 
+    /// Build a `ConnId` from a byte slice. Returns `ConnIdTooLong` if
+    /// the slice exceeds the QUIC v1 maximum of 20 bytes.
     pub fn fromSlice(src: []const u8) Error!ConnId {
         if (src.len > max_cid_len) return Error.ConnIdTooLong;
         var c: ConnId = .{ .len = @intCast(src.len) };
@@ -67,11 +73,15 @@ pub const ConnId = struct {
         return c;
     }
 
+    /// Borrow a view of the active CID bytes (length-bounded).
     pub fn slice(self: *const ConnId) []const u8 {
         return self.bytes[0..self.len];
     }
 };
 
+/// Initial long-header packet (RFC 9000 §17.2.2). Carries an
+/// address-validation token in addition to the standard long-header
+/// fields.
 pub const Initial = struct {
     version: u32,
     dcid: ConnId,
@@ -91,6 +101,8 @@ pub const Initial = struct {
     reserved_bits: u2 = 0,
 };
 
+/// 0-RTT long-header packet (RFC 9000 §17.2.3). Sent by clients to
+/// resume early data after a prior session.
 pub const ZeroRtt = struct {
     version: u32,
     dcid: ConnId,
@@ -101,6 +113,8 @@ pub const ZeroRtt = struct {
     reserved_bits: u2 = 0,
 };
 
+/// Handshake long-header packet (RFC 9000 §17.2.4). Carries TLS
+/// handshake CRYPTO frames after Initial keys are established.
 pub const Handshake = struct {
     version: u32,
     dcid: ConnId,
@@ -111,6 +125,9 @@ pub const Handshake = struct {
     reserved_bits: u2 = 0,
 };
 
+/// Retry long-header packet (RFC 9000 §17.2.5). Server-issued
+/// challenge that forces the client to re-send its first Initial
+/// with an attached token.
 pub const Retry = struct {
     version: u32,
     dcid: ConnId,
@@ -122,6 +139,8 @@ pub const Retry = struct {
     unused_bits: u4 = 0,
 };
 
+/// 1-RTT short-header packet (RFC 9000 §17.3). Carries
+/// application-data frames once the handshake completes.
 pub const OneRtt = struct {
     /// For short headers the DCID length isn't carried on the wire;
     /// both endpoints know it from configuration. Caller-supplied at
@@ -134,6 +153,9 @@ pub const OneRtt = struct {
     pn_truncated: u64,
 };
 
+/// Version Negotiation packet (RFC 8999 §6). Sent by a server that
+/// does not support the version requested in the client's first
+/// Initial, listing supported versions for the client to retry with.
 pub const VersionNegotiation = struct {
     /// First-byte bits 6-0 are unspecified per RFC 8999 — preserve.
     unused_bits: u7 = 0,
@@ -143,16 +165,20 @@ pub const VersionNegotiation = struct {
     /// Borrowed from the input slice on parse.
     versions_bytes: []const u8,
 
+    /// Number of supported-version entries in `versions_bytes`.
     pub fn versionCount(self: VersionNegotiation) usize {
         return self.versions_bytes.len / 4;
     }
 
+    /// Read the supported-version u32 at `index` from `versions_bytes`.
     pub fn version(self: VersionNegotiation, index: usize) u32 {
         const offset = index * 4;
         return std.mem.readInt(u32, self.versions_bytes[offset..][0..4], .big);
     }
 };
 
+/// Tagged union over every QUIC v1 header type. The active variant
+/// determines which RFC 9000 §17 layout was parsed or will be encoded.
 pub const Header = union(enum) {
     initial: Initial,
     zero_rtt: ZeroRtt,
@@ -161,6 +187,8 @@ pub const Header = union(enum) {
     one_rtt: OneRtt,
     version_negotiation: VersionNegotiation,
 
+    /// Return the Destination Connection ID carried by any header
+    /// variant — useful for connection demultiplexing.
     pub fn dcid(self: Header) ConnId {
         return switch (self) {
             .initial => |h| h.dcid,
@@ -173,6 +201,8 @@ pub const Header = union(enum) {
     }
 };
 
+/// Result of `parse`: the decoded header plus the offset of its PN
+/// bytes (for header-protection sample extraction).
 pub const Parsed = struct {
     header: Header,
     /// Byte offset within the input slice at which the (possibly
@@ -181,6 +211,7 @@ pub const Parsed = struct {
     pn_offset: usize,
 };
 
+/// Errors returned by header parse/encode operations.
 pub const Error = varint.Error || packet_number.Error || error{
     ConnIdTooLong,
     InvalidVersionNegotiation,
@@ -400,6 +431,8 @@ fn parseRetryTail(src: []const u8, common: LongCommon, unused_bits: u4) Error!Pa
 
 // -- encode --------------------------------------------------------------
 
+/// Serialize `header` into the start of `dst`. Returns bytes written.
+/// Errors with `BufferTooSmall` if `dst` cannot hold the encoded form.
 pub fn encode(dst: []u8, header: Header) Error!usize {
     return switch (header) {
         .initial => |h| encodeInitial(dst, h),

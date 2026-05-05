@@ -44,6 +44,7 @@ pub const Suite = enum {
         };
     }
 
+    /// AEAD key length in bytes for this suite.
     pub fn keyLen(self: Suite) u8 {
         return switch (self) {
             .aes128_gcm_sha256 => 16,
@@ -53,11 +54,13 @@ pub const Suite = enum {
         };
     }
 
+    /// IV length in bytes for this suite. Always 12 in QUIC v1.
     pub fn ivLen(self: Suite) u8 {
         _ = self;
         return 12;
     }
 
+    /// Header-protection key length in bytes for this suite.
     pub fn hpLen(self: Suite) u8 {
         return switch (self) {
             .aes128_gcm_sha256 => 16,
@@ -67,6 +70,8 @@ pub const Suite = enum {
         };
     }
 
+    /// TLS 1.3 traffic-secret length in bytes for this suite (matches
+    /// the suite's HKDF hash digest length).
     pub fn secretLen(self: Suite) u8 {
         return switch (self) {
             .aes128_gcm_sha256 => 32,
@@ -75,6 +80,8 @@ pub const Suite = enum {
         };
     }
 
+    /// HKDF hash function for this suite, suitable for
+    /// `initial.hkdfExpandLabelWithHash`.
     pub fn hkdfHash(self: Suite) initial_mod.HkdfHash {
         return switch (self) {
             .aes128_gcm_sha256,
@@ -85,7 +92,11 @@ pub const Suite = enum {
     }
 };
 
+/// Largest traffic-secret length across QUIC v1 suites (SHA-384 = 48
+/// bytes; rounded up to 64 to keep alignment-friendly).
 pub const max_traffic_secret_len: usize = 64;
+/// Fixed-size buffer big enough for any QUIC v1 traffic secret. The
+/// active prefix length is `Suite.secretLen()`.
 pub const TrafficSecret = [max_traffic_secret_len]u8;
 
 /// Per-direction packet protection keys — derived from a TLS
@@ -97,17 +108,21 @@ pub const PacketKeys = struct {
     iv: [12]u8 = @splat(0),
     hp: [32]u8 = @splat(0),
 
+    /// Borrow the AEAD key slice trimmed to the suite's `keyLen()`.
     pub fn keySlice(self: *const PacketKeys) []const u8 {
         return self.key[0..self.suite.keyLen()];
     }
+    /// Borrow the 12-byte AEAD IV by pointer.
     pub fn ivSlice(self: *const PacketKeys) *const [12]u8 {
         return &self.iv;
     }
+    /// Borrow the header-protection key slice trimmed to `hpLen()`.
     pub fn hpSlice(self: *const PacketKeys) []const u8 {
         return self.hp[0..self.suite.hpLen()];
     }
 };
 
+/// Errors returned by 1-RTT seal/open and key-derivation routines.
 pub const Error = error{
     /// `secret.len` doesn't match `suite.secretLen()`.
     SecretWrongLength,
@@ -162,6 +177,8 @@ pub fn deriveNextTrafficSecret(suite: Suite, secret: []const u8) Error!TrafficSe
     return next;
 }
 
+/// Compute the 5-byte header-protection mask using the suite-specific
+/// algorithm (RFC 9001 §5.4.3 / §5.4.4).
 pub fn headerProtectionMask(keys: *const PacketKeys, sample: *const [protection.sample_len]u8) [protection.mask_len]u8 {
     return switch (keys.suite) {
         .aes128_gcm_sha256 => protection.aesHpMask(@ptrCast(keys.hp[0..16]), sample),
@@ -170,6 +187,10 @@ pub fn headerProtectionMask(keys: *const PacketKeys, sample: *const [protection.
     };
 }
 
+/// AEAD-seal `plaintext` for a packet with `packet_header` as AAD.
+/// Selects the AEAD primitive matching `keys.suite`. Writes
+/// ciphertext+tag into `dst` and returns total bytes written. When
+/// `multipath_path_id` is set, uses the draft-21 path-aware nonce.
 pub fn sealPayloadWithKeys(
     keys: *const PacketKeys,
     multipath_path_id: ?u32,
@@ -227,6 +248,9 @@ fn sealPayloadWithAead(
         );
 }
 
+/// AEAD-open `ciphertext` (which includes the 16-byte tag) for a
+/// packet with `packet_header` as AAD. Reverse of
+/// `sealPayloadWithKeys`. Returns plaintext bytes written into `dst`.
 pub fn openPayloadWithKeys(
     keys: *const PacketKeys,
     multipath_path_id: ?u32,
@@ -297,6 +321,8 @@ fn chooseShortPnLength(pn: u64, largest_acked: ?u64) u8 {
     return 4;
 }
 
+/// Inputs to `seal1Rtt`. The DCID is what the peer expects on the
+/// wire; the keys carry per-direction AEAD/HP material.
 pub const SealOptions = struct {
     /// Destination connection ID (the peer's CID — what they expect
     /// to see on the wire).
@@ -393,6 +419,8 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
     return total_len;
 }
 
+/// Result of a successful `open1Rtt`: reconstructed PN, key-phase
+/// flag, and plaintext slice within the caller's output buffer.
 pub const Open1RttResult = struct {
     /// Reconstructed full 64-bit packet number.
     pn: u64,
@@ -419,6 +447,10 @@ pub const OpenOptions = struct {
     multipath_path_id: ?u32 = null,
 };
 
+/// Open a protected 1-RTT packet from `src`, writing plaintext into
+/// `pt_dst`. `src` is read but not modified — header protection is
+/// stripped into a small local AAD copy. Errors with `NotShortHeader`
+/// if the first bit indicates a long header.
 pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult {
     if (src.len < 1) return Error.NotShortHeader;
     if (src[0] & 0x80 != 0) return Error.NotShortHeader;

@@ -17,6 +17,7 @@ pub const max_value: u64 = (1 << 62) - 1;
 /// Maximum bytes a varint can occupy.
 pub const max_len: u8 = 8;
 
+/// Errors returned by varint encode/decode operations.
 pub const Error = error{
     BufferTooSmall,
     InsufficientBytes,
@@ -75,6 +76,8 @@ pub fn encodeFixed(dst: []u8, value: u64, length: u8) Error!usize {
     return length;
 }
 
+/// Result of a successful varint decode: the integer value and the
+/// number of bytes consumed from the input.
 pub const Decoded = struct {
     value: u64,
     bytes_read: u8,
