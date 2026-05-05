@@ -17,10 +17,21 @@ breaking changes; see notes per release.
   against quic-go, quiche, ngtcp2). Marked `continue-on-error` since
   interop is environment-sensitive and not a hard merge gate.
 - This `CHANGELOG.md`.
-- `nullq.Server` convenience wrapper for embedding nullq as a UDP
-  server (Config / Slot / feed / poll / tick / reap / iterator).
-  See `src/server.zig` and the `README.md` "Embed nullq as a server"
-  section.
+- `nullq.Server` production-grade convenience wrapper for embedding
+  nullq as a UDP server. Owns the TLS context and a CID-to-slot
+  routing table; the embedder owns the socket and clock. Config /
+  Slot / feed / poll / tick / reap / iterator. The router resyncs
+  each slot's CID set from `Connection.localScids` after every
+  `feed`, so NEW_CONNECTION_ID-issued SCIDs route from the next
+  datagram on (RFC 9000 §5.1.1). Lookup is `std.AutoHashMap` O(1).
+  Per-source-address Initial-acceptance rate limiter is opt-in via
+  `Config.max_initials_per_source_per_window` and surfaces a
+  distinct `FeedOutcome.rate_limited` variant. See `src/server.zig`
+  and the `README.md` "Embed nullq as a server" section.
+- `Connection.localScidCount`, `Connection.localScids`, and
+  `Connection.ownsLocalCid` for embedders that maintain a
+  CID-to-connection routing table outside the connection
+  (`nullq.Server` is the canonical caller).
 - Public-API documentation pass: every `pub fn` / `pub const` /
   `pub var` in `src/conn/`, `src/frame/`, `src/tls/`, `src/transport/`,
   and `src/wire/` (713 declarations) now carries a 1-3 line `///`
