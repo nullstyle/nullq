@@ -6424,6 +6424,16 @@ pub const Connection = struct {
         // side-table is the obvious next optimization.
         const pn_space = self.pnSpaceForLevel(lvl);
         const sent = self.sentForLevel(lvl);
+        // RFC 9000 §13.1 / RFC 9002 §A.3: an ACK that claims a packet
+        // number we never sent (largest_acked >= next_pn) is a
+        // PROTOCOL_VIOLATION. We must reject it before updating
+        // largest_acked_sent — otherwise the bogus value would
+        // poison packet-threshold loss detection on legitimate
+        // in-flight packets.
+        if (a.largest_acked >= pn_space.next_pn) {
+            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
+            return;
+        }
         pn_space.onAckReceived(a.largest_acked);
         var largest_acked_send_time_us: ?u64 = null;
         var largest_acked_ack_eliciting = false;
@@ -6490,6 +6500,12 @@ pub const Connection = struct {
         a: frame_types.Ack,
         now_us: u64,
     ) Error!void {
+        // RFC 9000 §13.1 / RFC 9002 §A.3: reject ACKs claiming PNs
+        // we never sent on this path.
+        if (a.largest_acked >= path.app_pn_space.next_pn) {
+            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
+            return;
+        }
         path.app_pn_space.onAckReceived(a.largest_acked);
         var largest_acked_send_time_us: ?u64 = null;
         var largest_acked_ack_eliciting = false;
@@ -8355,6 +8371,7 @@ test "ACK of ack-eliciting packet resets PTO count and updates RTT" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    conn.pnSpaceForLevel(.application).next_pn = 12;
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 11,
         .ack_delay = 0,
@@ -8367,6 +8384,92 @@ test "ACK of ack-eliciting packet resets PTO count and updates RTT" {
     try std.testing.expectEqual(@as(u32, 0), conn.ptoCountForLevel(.application).*);
     try std.testing.expectEqual(@as(u64, 50_000), conn.rttForLevel(.application).latest_rtt_us);
     try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.application).count);
+}
+
+test "ACK with largest_acked >= next_pn is a PROTOCOL_VIOLATION" {
+    // RFC 9000 §13.1 / RFC 9002 §A.3: "Receipt of an acknowledgment
+    // for a packet that was not sent ... MUST be treated as a
+    // connection error of type PROTOCOL_VIOLATION." A peer that
+    // claims to have acked a PN we never sent is either buggy or
+    // hostile; we must close the connection rather than poison
+    // packet-threshold loss detection on our legitimate in-flight
+    // packets.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // We have two in-flight packets at PNs 0 and 1.
+    try conn.sentForLevel(.application).record(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    try conn.sentForLevel(.application).record(.{
+        .pn = 1,
+        .sent_time_us = 1_000,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    conn.pnSpaceForLevel(.application).next_pn = 2;
+
+    // Peer claims an ACK for PN 7 — well beyond next_pn = 2.
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 7,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 100_000);
+
+    // Connection must be closing with PROTOCOL_VIOLATION.
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    const sticky = conn.closeEvent().?;
+    try std.testing.expectEqual(CloseSource.local, sticky.source);
+    try std.testing.expectEqual(CloseErrorSpace.transport, sticky.error_space);
+    try std.testing.expectEqual(transport_error_protocol_violation, sticky.error_code);
+
+    // Critically, our in-flight packets must NOT have been declared
+    // lost or had their largest_acked_sent updated to the bogus 7.
+    try std.testing.expectEqual(@as(u32, 2), conn.sentForLevel(.application).count);
+    try std.testing.expectEqual(@as(?u64, null), conn.pnSpaceForLevel(.application).largest_acked_sent);
+}
+
+test "ACK with largest_acked == next_pn is a PROTOCOL_VIOLATION" {
+    // Boundary case: next_pn is the *next* PN to assign on send,
+    // so an ACK whose largest_acked equals next_pn is also illegal.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try conn.sentForLevel(.application).record(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    conn.pnSpaceForLevel(.application).next_pn = 1;
+
+    // ACK claims PN 1, but next_pn is 1 (we've never sent PN 1).
+    try conn.handleAckAtLevel(.application, .{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 100_000);
+
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.closeEvent().?.error_code);
 }
 
 test "ACKed in-flight packets grow congestion window" {
@@ -8384,6 +8487,7 @@ test "ACKed in-flight packets grow congestion window" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    conn.pnSpaceForLevel(.application).next_pn = 2;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 1,
@@ -8416,6 +8520,7 @@ test "packet-threshold loss reduces congestion window" {
             .in_flight = true,
         });
     }
+    conn.pnSpaceForLevel(.application).next_pn = 5;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 4,
@@ -8639,6 +8744,7 @@ test "PATH_ACK routes ACK processing to the indicated application path" {
         .ack_eliciting = true,
         .in_flight = true,
     });
+    path.app_pn_space.next_pn = 1;
 
     try conn.handlePathAck(.{
         .path_id = path_id,
@@ -9909,6 +10015,9 @@ test "0-RTT STREAM packet-threshold loss requeues early bytes" {
     _ = (try conn.pollLevel(.early_data, &out, 1_000)).?;
     try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.early_data).count);
     try std.testing.expect(s.send.peekChunk(64) == null);
+    // Pretend three more 1-RTT packets were sent at the application
+    // layer so the ACK for PN 3 is legitimate (RFC 9000 §13.1).
+    conn.pnSpaceForLevel(.application).next_pn = 4;
 
     try conn.handleAckAtLevel(.application, .{
         .largest_acked = 3,
