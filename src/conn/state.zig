@@ -5808,7 +5808,10 @@ pub const Connection = struct {
     }
 
     fn tokenEql(a: [16]u8, b: [16]u8) bool {
-        return std.mem.eql(u8, a[0..], b[0..]);
+        // RFC 9000 §10.3 — stateless reset tokens MUST be compared in
+        // constant time. A peer that observes timing differences across
+        // mismatching prefixes can incrementally guess valid tokens.
+        return std.crypto.timing_safe.eql([16]u8, a, b);
     }
 
     fn statelessResetTokenFromDatagram(bytes: []const u8) ?[16]u8 {
@@ -7567,6 +7570,40 @@ test "stateless reset matcher requires short packet with known token" {
     short_packet[0] = 0x40;
     @memcpy(short_packet[short_packet.len - 16 ..], &token);
     try std.testing.expect(conn.isKnownStatelessReset(short_packet[0..]));
+}
+
+test "tokenEql matches std.mem.eql across boundary cases" {
+    // Constant-time compare must agree with std.mem.eql for the
+    // ordinary (non-adversarial) cases: equal tokens, fully different
+    // tokens, and tokens differing in only one byte at varying
+    // positions. RFC 9000 §10.3 mandates CT compare; this test ensures
+    // we did not accidentally weaken correctness while doing so.
+    const a: [16]u8 = .{
+        0x00, 0x01, 0x02, 0x03,
+        0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b,
+        0x0c, 0x0d, 0x0e, 0x0f,
+    };
+    try std.testing.expectEqual(std.mem.eql(u8, &a, &a), Connection.tokenEql(a, a));
+
+    const b: [16]u8 = @splat(0xff);
+    try std.testing.expectEqual(std.mem.eql(u8, &a, &b), Connection.tokenEql(a, b));
+
+    var differ: [16]u8 = a;
+    inline for (.{ 0, 1, 7, 8, 14, 15 }) |i| {
+        differ = a;
+        differ[i] ^= 0x01;
+        try std.testing.expectEqual(
+            std.mem.eql(u8, &a, &differ),
+            Connection.tokenEql(a, differ),
+        );
+    }
+
+    // All-zero tokens must compare equal (the default-initialized
+    // value of an unfilled cached entry — guard against accidentally
+    // returning false for zero arrays).
+    const zero: [16]u8 = @splat(0);
+    try std.testing.expect(Connection.tokenEql(zero, zero));
 }
 
 test "Version Negotiation with no compatible version closes terminally" {
