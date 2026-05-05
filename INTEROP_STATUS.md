@@ -43,7 +43,12 @@ Current as of 2026-05-04.
   0-RTT rejection, and the scenario retries the request as 1-RTT.
 - `go-quic-peer multipath` against `nullq-peer`: passing for secondary
   socket add, PATH_CHALLENGE/PATH_RESPONSE probe, path switch, echo,
-  upload after switch, and DATAGRAM after switch.
+  DATAGRAM after switch, a 1 MiB upload that remains open while the
+  active path switches back, explicit upload-window traffic counters on
+  both UDP sockets, PATH_ABANDON/secondary close, concurrent bidi
+  streams, and DATAGRAM after secondary close. The latest local run
+  recorded `primary=951 writes/1068259 bytes` and
+  `secondary=34 writes/36339 bytes` during the upload window.
 - `zig build qns-endpoint` in `nullq`: passing for the first official
   QUIC interop-runner endpoint binary. The endpoint is currently
   server-side only, speaks HTTP/0.9 ALPN `hq-interop`, serves `/www`,
@@ -243,14 +248,20 @@ Current as of 2026-05-04.
    construction, CID-based incoming path mapping, concurrent mock
    transfer under loss/reordering, unused path-ID CID pre-provisioning,
    common path-ID open gating, replacement-CID replenishment events,
-   local CID uniqueness, and core CID/limit validation exist. Remaining
-   confidence work is external draft-21 peer validation.
+   local CID uniqueness, and core CID/limit validation exist. quic-go
+   v0.59.0 public-API interop now validates draft-21 path management,
+   probing, active-path switching, PATH_ABANDON, and live transfer
+   across both UDP sockets during an open upload. Remaining confidence
+   work is true external simultaneous multi-active-path transfer against
+   a peer with scheduler/distribution controls.
 2. **Multipath frame emission is locally complete but needs peer soak.**
    Draft-21 multipath control frames can be queued, coalesced into
    Application packets, ACKed, and requeued on loss, and PATH_ACK is
    generated for non-zero path ACK trackers including retiring paths.
-   Remaining confidence work: pacing behavior under live traffic and
-   external draft-21 peer validation.
+   quic-go interop now covers live PATH_CHALLENGE/PATH_RESPONSE and
+   PATH_ABANDON flows with traffic continuity across a path switch.
+   Remaining confidence work: pacing behavior under live traffic and a
+   true external draft-21 concurrent-transfer peer.
 3. **Recovery is path-aware but not fully hardened.** Packet-threshold,
    time-threshold, PTO, ACK-delay, idle, draining, NewReno loss/ACK
    feedback, persistent congestion, and basic PTO probe selection are
@@ -322,11 +333,12 @@ Current as of 2026-05-04.
    wrapper invokes upstream Python through `uv run`; repo-local tools
    are declared in `mise.toml`.
 
-Note: the passing mock multipath test now validates simultaneous
-two-path transfer inside nullq. The passing `go-quic-peer multipath`
-smoke test still validates secondary socket probing and path switching
-against nullq-peer, not external full draft-21 simultaneous multipath
-transfer.
+Note: the passing mock multipath test validates simultaneous two-path
+transfer inside nullq. The passing `go-quic-peer multipath` gate now
+validates quic-go public draft-21 path management plus an upload window
+with outgoing traffic observed on both client UDP sockets, but quic-go
+v0.59.0 still does not expose a public scheduler for true simultaneous
+multi-active-path stream/DATAGRAM distribution.
 
 ## Useful commands
 
