@@ -21,6 +21,32 @@
 //! deterministic CID prefix); embedders without those constraints
 //! should reach for `Server` first.
 //!
+//! Known limitations (do not use this type for open-internet
+//! deployments without addressing these — the QNS endpoint at
+//! `interop/qns_endpoint.zig` is currently the production-grade
+//! reference):
+//!
+//!   * **CID rotation**: `findSlotForDatagram` only matches the
+//!     initial DCID and the single SCID returned in `acceptInitial`.
+//!     If the `Connection` issues additional SCIDs via
+//!     `NEW_CONNECTION_ID`, datagrams whose DCID is one of those
+//!     newly-issued values will not route. RFC 9000 §5.1.1 allows
+//!     peers to migrate to any issued CID. Fix requires either a
+//!     CID-issuance event hook or a per-slot CID list refreshed
+//!     from `Connection` on every dispatch.
+//!   * **Slot lookup is linear**: O(n) over `self.slots` per
+//!     datagram. Fine for small servers; replace with a CID -> slot
+//!     `HashMap` once the table grows past a few hundred peers.
+//!   * **No source-address rate limiting**: any peer with a
+//!     well-formed Initial gets a slot up to `max_concurrent_connections`.
+//!     A flood from one source can exhaust the table. Per-source
+//!     accept caps belong here, not in `Connection`.
+//!   * **Same Initial bytes are processed twice** — once in
+//!     `acceptInitial` (during slot creation) and once in the
+//!     immediately-following `handle` call. Verify whether this is
+//!     intended before relying on it for performance-sensitive
+//!     workloads.
+//!
 //! TODO(api): client-side `Client.connect` helper, optional built-in
 //! Retry token issuance & validation, optional version negotiation,
 //! and optional `std.Io` socket loop helper. The current surface is
@@ -306,29 +332,30 @@ pub const Server = struct {
     }
 
     /// Drive time-based recovery on every live slot. Idempotent and
-    /// cheap — call it on every loop iteration.
+    /// cheap — call it on every loop iteration. Closed slots are
+    /// skipped; call `reap` periodically to reclaim them.
     pub fn tick(self: *Server, now_us: u64) Connection.Error!void {
         for (self.slots.items) |slot| {
+            if (slot.conn.isClosed()) continue;
             try slot.conn.tick(now_us);
         }
     }
 
     /// Reap any closed slots from the table. Returns the number of
-    /// slots reclaimed.
+    /// slots reclaimed. Iterates back-to-front and uses
+    /// `swapRemove`, so reaping N closed slots is O(N), not O(N²).
     pub fn reap(self: *Server) usize {
-        var i: usize = 0;
         var reaped: usize = 0;
-        while (i < self.slots.items.len) {
+        var i: usize = self.slots.items.len;
+        while (i > 0) {
+            i -= 1;
             const slot = self.slots.items[i];
-            if (slot.conn.isClosed()) {
-                slot.conn.deinit();
-                self.allocator.destroy(slot.conn);
-                self.allocator.destroy(slot);
-                _ = self.slots.orderedRemove(i);
-                reaped += 1;
-                continue;
-            }
-            i += 1;
+            if (!slot.conn.isClosed()) continue;
+            slot.conn.deinit();
+            self.allocator.destroy(slot.conn);
+            self.allocator.destroy(slot);
+            _ = self.slots.swapRemove(i);
+            reaped += 1;
         }
         return reaped;
     }
