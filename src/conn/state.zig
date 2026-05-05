@@ -3488,7 +3488,10 @@ pub const Connection = struct {
 
     fn clearPendingPings(self: *Connection) void {
         self.pending_ping = .{ false, false };
-        for (self.paths.paths.items) |*p| p.pending_ping = false;
+        for (self.paths.paths.items) |*p| {
+            p.pending_ping = false;
+            p.pto_probe_count = 0;
+        }
     }
 
     fn clearSentTracker(self: *Connection, tracker: *SentPacketTracker) void {
@@ -3506,6 +3509,7 @@ pub const Connection = struct {
         for (self.paths.paths.items) |*path| {
             self.clearSentTracker(&path.sent);
             path.pending_ping = false;
+            path.pto_probe_count = 0;
             path.pto_count = 0;
         }
         self.clearPendingPings();
@@ -3786,6 +3790,7 @@ pub const Connection = struct {
         if (lvl != .application and lvl != .early_data) return false;
         const path = self.primaryPathConst();
         if (path.pending_ping) return false;
+        if (path.pto_probe_count > 0) return false;
         return path.path.cc.sendAllowance(path.sent.bytes_in_flight) == 0;
     }
 
@@ -3797,6 +3802,7 @@ pub const Connection = struct {
         _ = self;
         if (lvl != .application and lvl != .early_data) return false;
         if (app_path.pending_ping) return false;
+        if (app_path.pto_probe_count > 0) return false;
         return app_path.path.cc.sendAllowance(app_path.sent.bytes_in_flight) == 0;
     }
 
@@ -4729,6 +4735,11 @@ pub const Connection = struct {
         if (retx_crypto_index) |idx| {
             const old = self.crypto_retx[out_idx].orderedRemove(idx);
             self.allocator.free(old.data);
+        }
+        if ((lvl == .application or lvl == .early_data) and
+            ack_eliciting and app_path.pto_probe_count > 0)
+        {
+            app_path.pto_probe_count -= 1;
         }
 
         return n;
@@ -6901,6 +6912,7 @@ pub const Connection = struct {
             self.onApplicationPathPacketsLost(path, stats);
 
             path.pending_ping = !requeued;
+            if (requeued and path.pto_probe_count < 2) path.pto_probe_count += 1;
             path.pto_count +|= 1;
             return true;
         }
@@ -7895,6 +7907,7 @@ test "PTO requeues application stream data and arms a probe" {
 
     try std.testing.expectEqual(@as(u32, 0), app_sent.count);
     try std.testing.expect(!conn.pendingPingForLevel(.application).*);
+    try std.testing.expectEqual(@as(u8, 1), conn.primaryPath().pto_probe_count);
     try std.testing.expectEqual(@as(u32, 1), conn.ptoCountForLevel(.application).*);
     const resent = s.send.peekChunk(100).?;
     try std.testing.expectEqual(@as(u64, 0), resent.offset);
@@ -8219,6 +8232,9 @@ test "congestionBlocked gates application data but allows PTO probes" {
     try std.testing.expect(conn.congestionBlocked(.application));
     try std.testing.expect(!conn.congestionBlocked(.initial));
     conn.pendingPingForLevel(.application).* = true;
+    try std.testing.expect(!conn.congestionBlocked(.application));
+    conn.pendingPingForLevel(.application).* = false;
+    conn.primaryPath().pto_probe_count = 1;
     try std.testing.expect(!conn.congestionBlocked(.application));
 }
 
@@ -10747,6 +10763,7 @@ test "PTO requeues retransmittable controls on non-zero application path" {
 
     try std.testing.expectEqual(@as(u32, 0), path.sent.count);
     try std.testing.expect(!path.pending_ping);
+    try std.testing.expectEqual(@as(u8, 1), path.pto_probe_count);
     try std.testing.expectEqual(@as(u32, 1), path.pto_count);
     try std.testing.expectEqual(@as(usize, 1), conn.pending_path_abandons.items.len);
     try std.testing.expectEqual(path_id, conn.pending_path_abandons.items[0].path_id);

@@ -221,6 +221,7 @@ pub const PathState = struct {
     sent: SentPacketTracker = .{},
     pto_count: u32 = 0,
     pending_ping: bool = false,
+    pto_probe_count: u8 = 0,
     pmtu: usize = 1200,
     peer_addr_set: bool = false,
     local_addr_set: bool = false,
@@ -260,6 +261,7 @@ pub const PathState = struct {
         self.sent = .{};
         self.app_pn_space.received = .{};
         self.pending_ping = false;
+        self.pto_probe_count = 0;
         self.pto_count = 0;
     }
 
@@ -270,6 +272,7 @@ pub const PathState = struct {
         self.path.rtt = .{};
         self.path.cc = NewReno.init(cc_cfg);
         self.pending_ping = false;
+        self.pto_probe_count = 0;
         self.pto_count = 0;
         self.pending_migration_reset = false;
         self.migration_rollback = null;
