@@ -7526,6 +7526,43 @@ test "CRYPTO reassembly: duplicate fragment is silently ignored" {
     try std.testing.expectEqualSlices(u8, "abcdefGHI", conn.inbox[idx].buf[0..9]);
 }
 
+test "CRYPTO reassembly: deterministic shuffled fragment smoke" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const lvl: EncryptionLevel = .initial;
+    const idx = lvl.idx();
+    const total: usize = 4096;
+    const chunk: usize = 64;
+    const chunks = total / chunk;
+
+    var data: [total]u8 = undefined;
+    var indices: [chunks]usize = undefined;
+    var prng = std.Random.DefaultPrng.init(0xc274_7074_6f66_757a);
+    const rng = prng.random();
+    rng.bytes(&data);
+    for (&indices, 0..) |*slot, i| slot.* = i;
+    rng.shuffle(usize, &indices);
+
+    for (indices, 0..) |chunk_idx, order| {
+        const off = chunk_idx * chunk;
+        const bytes = data[off..][0..chunk];
+        try conn.handleCrypto(lvl, .{ .offset = @intCast(off), .data = bytes });
+        if ((order % 9) == 0) {
+            try conn.handleCrypto(lvl, .{ .offset = @intCast(off), .data = bytes });
+        }
+    }
+
+    try std.testing.expectEqual(@as(u64, total), conn.crypto_recv_offset[idx]);
+    try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending[idx].items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending_bytes[idx]);
+    try std.testing.expectEqual(total, conn.inbox[idx].len);
+    try std.testing.expectEqualSlices(u8, &data, conn.inbox[idx].buf[0..total]);
+}
+
 test "timer deadline reports ACK delay" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});

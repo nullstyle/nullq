@@ -26,7 +26,9 @@ QUIC v1 TLS suites:
 `TLS_CHACHA20_POLY1305_SHA256`. The receive side now has an explicit
 bounded allocation policy for advertised receive windows, stream counts,
 path IDs, CID fanout, DATAGRAM queues, CRYPTO gaps, and advisory blocked
-frame tracking. 0-RTT now has early STREAM/DATAGRAM
+frame tracking. `zig build test` also runs deterministic parser/property
+fuzz smokes for varints, frames, transport parameters, packet headers,
+ACK ranges, and CRYPTO/STREAM reassembly. 0-RTT now has early STREAM/DATAGRAM
 transport plumbing plus accepted and rejected go-quic-peer resumption
 smokes, while deeper mismatch/loss hardening still needs work. Multipath
 also has embedder-driven path CID replenishment, abandoned-path 3x-PTO
