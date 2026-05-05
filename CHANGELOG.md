@@ -28,6 +28,24 @@ breaking changes; see notes per release.
   `Config.max_initials_per_source_per_window` and surfaces a
   distinct `FeedOutcome.rate_limited` variant. See `src/server.zig`
   and the `README.md` "Embed nullq as a server" section.
+- `nullq.Server` Version Negotiation and stateless Retry gates,
+  surfaced through new `FeedOutcome.version_negotiated` /
+  `FeedOutcome.retry_sent` variants and a new
+  `Server.drainStatelessResponse` method. Version Negotiation is
+  unconditional (RFC 9000 §6 / RFC 8999 §6) — any long-header
+  packet with version != `nullq.QUIC_VERSION_1` queues a VN
+  response listing QUIC v1. Retry is opt-in via
+  `Config.retry_token_key` (32-byte HMAC-SHA256 key); when set,
+  the first Initial from a peer earns a stateless Retry packet
+  bound to (peer_addr, original_dcid, retry_scid, mint_time) per
+  RFC 9000 §8.1.2, and no `Connection` is allocated until the
+  peer echoes back a valid token. `Config.retry_token_lifetime_us`
+  defaults to 10 s. Stateless responses queue on the `Server` and
+  the embedder drains them via `drainStatelessResponse`; the queue
+  is bounded at 64 entries with oldest-evicted-on-overflow. The
+  legacy QNS endpoint loop at `interop/qns_endpoint.zig` retains
+  its bespoke version of these flows for interop fixtures, but new
+  embedders can rely on `Server` for both.
 - `Connection.localScidCount`, `Connection.localScids`, and
   `Connection.ownsLocalCid` for embedders that maintain a
   CID-to-connection routing table outside the connection

@@ -28,23 +28,50 @@
 //!
 //! DoS posture
 //! -----------
-//! `Config.max_initials_per_source_per_window` (off by default)
-//! enables a per-source-address token bucket on Initial-driven slot
-//! creation. When the cap is exceeded, fresh Initials from that
-//! source are dropped without state, so an attacker spraying
-//! Initials from a single address cannot exhaust the slot table or
-//! the TLS context. Set it for any deployment exposed to the open
-//! internet.
+//! Three opt-in gates harden Initial-driven slot creation; each is
+//! null in `Config` by default and surfaces a distinct
+//! `FeedOutcome` variant when it fires.
+//!
+//! 1. `Config.max_initials_per_source_per_window` enables a
+//!    per-source-address token bucket. When the cap is exceeded,
+//!    fresh Initials from that source are dropped without state, so
+//!    an attacker spraying Initials from a single address cannot
+//!    exhaust the slot table or the TLS context.
+//! 2. `Config.retry_token_key` enables stateless Retry-based source
+//!    validation (RFC 9000 §8.1.2). The first Initial from a peer
+//!    earns a Retry packet bound to its address; until the peer
+//!    echoes a valid token in a follow-up Initial, no `Connection`
+//!    is allocated. Set this to gate the 3x amplification window
+//!    behind a proof-of-address round trip.
+//! 3. Long-header packets carrying any version other than
+//!    `nullq.QUIC_VERSION_1` always trigger a Version Negotiation
+//!    response (RFC 9000 §6 / RFC 8999 §6); this is unconditional
+//!    and requires no `Config` opt-in.
+//!
+//! Stateless responses (Retry, Version Negotiation) are queued on
+//! the `Server` and surfaced via `drainStatelessResponse`. The
+//! embedder's I/O loop polls for these in addition to per-slot
+//! `poll` output and forwards them on the same UDP socket. The
+//! queue is bounded — when full, the oldest queued response is
+//! dropped to keep ingest latency bounded.
+//!
+//! All three gates require an embedder-supplied `from` address
+//! when calling `feed`. When `from` is null (the embedder didn't
+//! capture the peer 4-tuple), the gates degrade to pass-through:
+//! the rate limiter does not track the source, no Retry is
+//! attempted, and a Version Negotiation response cannot be queued
+//! because there is no destination to send it to (the datagram is
+//! `dropped` instead). Passing `from` is strongly recommended for
+//! any internet-facing deployment.
 //!
 //! For an example loop, see the README. The QNS endpoint at
 //! `interop/qns_endpoint.zig` keeps its own bespoke loop because it
-//! has interop-specific quirks (Retry, version negotiation,
-//! deterministic CID prefix); embedders without those constraints
-//! should reach for `Server` first.
+//! has interop-specific quirks (deterministic CID prefix,
+//! per-testcase wiring); general-purpose embedders should reach for
+//! `Server` first.
 //!
-//! TODO(api): client-side `Client.connect` helper, optional built-in
-//! Retry token issuance & validation, optional version negotiation,
-//! optional `std.Io` socket loop helper.
+//! TODO(api): client-side `Client.connect` helper, optional
+//! `std.Io` socket loop helper.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
@@ -52,12 +79,66 @@ const boringssl = @import("boringssl");
 const conn_mod = @import("conn/root.zig");
 const tls_mod = @import("tls/root.zig");
 const wire = @import("wire/root.zig");
+const retry_token_mod = conn_mod.retry_token;
 
 const Connection = conn_mod.Connection;
 const TransportParams = tls_mod.TransportParams;
 const ConnectionId = conn_mod.path.ConnectionId;
 const Address = conn_mod.path.Address;
 const QlogCallback = conn_mod.QlogCallback;
+const RetryTokenKey = conn_mod.RetryTokenKey;
+const QUIC_VERSION_1: u32 = 0x00000001;
+
+/// Maximum byte size of a single queued stateless response (Version
+/// Negotiation or Retry). Both packet types fit comfortably inside
+/// this bound: VN is ~16 bytes plus 4 bytes per advertised version
+/// (max 16), and Retry is ~32 bytes plus the token (53 bytes).
+const max_stateless_response_bytes: usize = 256;
+
+/// Bound on the stateless-response queue. Reached only when the
+/// embedder is feeding faster than they drain; on overflow the
+/// oldest entry is evicted to keep latency bounded.
+const stateless_response_queue_capacity: usize = 64;
+
+/// One queued stateless server response (VN or Retry), held by
+/// value so the embedder can drain across multiple `feed` calls.
+/// Re-exported as `Server.StatelessResponse`.
+const StatelessResponseImpl = struct {
+    /// Where to send the response. Always set — `feed` only queues
+    /// stateless responses when `from` is non-null because there is
+    /// no destination to send to otherwise.
+    dst: Address,
+    /// Length of the valid bytes prefix in `bytes`.
+    len: usize,
+    bytes: [max_stateless_response_bytes]u8 = @splat(0),
+
+    /// Borrowed view of the encoded packet. Valid until the next
+    /// `drainStatelessResponse` call returns this entry by value.
+    pub fn slice(self: *const StatelessResponseImpl) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// Per-source Retry bookkeeping. Created when the server queues a
+/// Retry packet for a source; consulted on the next Initial from
+/// that source to decide whether to validate the echoed token or
+/// re-send Retry. Bound on the table size mirrors the rate-limit
+/// table so a flood of distinct addresses cannot grow this
+/// unbounded.
+const RetryStateEntry = struct {
+    /// Server-issued SCID embedded in the Retry packet — the peer
+    /// must echo this DCID in subsequent Initials and the token
+    /// HMAC binds it.
+    retry_scid: [20]u8 = @splat(0),
+    retry_scid_len: u8 = 0,
+    /// The DCID from the client's first Initial — the
+    /// `original_destination_connection_id` transport parameter
+    /// must reflect this on the post-Retry connection.
+    original_dcid: ConnectionId = .{},
+    /// Wall-clock microseconds when the Retry was minted; used to
+    /// evict stale entries on overflow.
+    minted_at_us: u64 = 0,
+};
 
 /// Maximum number of routing CIDs a slot tracks at once. Bounded
 /// by the peer's `active_connection_id_limit` (default 8 in nullq);
@@ -156,6 +237,30 @@ const ConfigImpl = struct {
     /// tracks at once. Excess sources rotate out the oldest entry.
     /// Only consulted when the limiter is enabled.
     source_rate_table_capacity: u32 = 4096,
+
+    /// 32-byte HMAC key used to mint and validate stateless Retry
+    /// tokens (RFC 9000 §8.1.2). When null, Retry is disabled and
+    /// every well-formed Initial is accepted directly. When set,
+    /// the first Initial from a peer is answered with a Retry
+    /// packet; the connection is only allocated once the peer
+    /// echoes back a valid token in a follow-up Initial.
+    ///
+    /// The key must be stable across the token lifetime so a Retry
+    /// minted on one packet can be validated on the next. Embedders
+    /// fronting multiple servers behind a load balancer should
+    /// share one key across the pool.
+    retry_token_key: ?RetryTokenKey = null,
+    /// Lifetime of a minted Retry token in microseconds. Tokens
+    /// older than this validate as `expired` and are dropped.
+    /// Default is 10 seconds — the QNS-recommended ceiling, large
+    /// enough to absorb a slow-handshake client and small enough
+    /// that a stolen token expires before it can be replayed.
+    retry_token_lifetime_us: u64 = 10_000_000,
+    /// Maximum number of distinct source addresses for which the
+    /// server holds Retry-pending state at once. Excess sources
+    /// evict the oldest entry. Only consulted when
+    /// `retry_token_key` is non-null.
+    retry_state_table_capacity: u32 = 4096,
 };
 
 /// One slot in the server's per-connection table. The `Connection`
@@ -189,8 +294,9 @@ const SlotImpl = struct {
 
 /// Outcome of feeding a single datagram to the server. Re-exported
 /// as `Server.FeedOutcome`. The variants distinguish reasons an
-/// embedder might want to alert on (`rate_limited`, `table_full`)
-/// from the generic drop bucket (`dropped`).
+/// embedder might want to alert on (`rate_limited`, `table_full`,
+/// `version_negotiated`, `retry_sent`) from the generic drop bucket
+/// (`dropped`).
 const FeedOutcomeImpl = enum {
     /// The datagram was routed to an existing connection and
     /// processed.
@@ -199,8 +305,9 @@ const FeedOutcomeImpl = enum {
     /// `Slot` is at the back of `Server.slots`.
     accepted,
     /// Generic drop — empty datagram, unroutable bytes that aren't
-    /// an Initial, or `openSlotFromInitial` failed (malformed
-    /// header, TLS hiccup). Silently dropped per RFC 9000 §10.3.
+    /// an Initial, malformed header, expired or invalid Retry token,
+    /// or `openSlotFromInitial` failed (malformed header, TLS
+    /// hiccup). Silently dropped per RFC 9000 §10.3.
     dropped,
     /// Per-source rate limiter rejected this Initial; the source's
     /// recent budget is exhausted within the configured window.
@@ -211,6 +318,19 @@ const FeedOutcomeImpl = enum {
     /// full; new Initials are dropped until existing slots are
     /// reaped.
     table_full,
+    /// The datagram carried a long-header packet with a version
+    /// other than `nullq.QUIC_VERSION_1`. A Version Negotiation
+    /// response was queued for the embedder to drain via
+    /// `drainStatelessResponse`. No `Connection` was created.
+    /// RFC 9000 §6 / RFC 8999 §6.
+    version_negotiated,
+    /// `Config.retry_token_key` is set and this Initial either
+    /// carried no token or carried one that is not the one we
+    /// would have minted for this source. A fresh Retry packet was
+    /// queued for the embedder to drain. RFC 9000 §8.1.2. No
+    /// `Connection` was created — the peer must echo the Retry's
+    /// SCID and token in a subsequent Initial to proceed.
+    retry_sent,
 };
 
 /// Errors produced by `Server.init` and `Server.feed`. `feed` only
@@ -241,12 +361,13 @@ const ErrorImpl = error{
 ///      `deinit` reclaims memory.
 pub const Server = struct {
     /// Re-exports of the helper types so `Server.Config`,
-    /// `Server.Slot`, `Server.FeedOutcome`, and `Server.Error` all
-    /// resolve from the public API surface. The top-level
-    /// definitions remain authoritative.
+    /// `Server.Slot`, `Server.FeedOutcome`, `Server.StatelessResponse`,
+    /// and `Server.Error` all resolve from the public API surface.
+    /// The top-level definitions remain authoritative.
     pub const Config = ConfigImpl;
     pub const Slot = SlotImpl;
     pub const FeedOutcome = FeedOutcomeImpl;
+    pub const StatelessResponse = StatelessResponseImpl;
     pub const Error = ErrorImpl;
 
     allocator: std.mem.Allocator,
@@ -276,6 +397,22 @@ pub const Server = struct {
     source_rate_window_us: u64,
     source_rate_table_capacity: u32,
 
+    /// Per-source Retry bookkeeping. Empty when Retry is disabled.
+    /// One entry per peer that earned a Retry packet, dropped once
+    /// the peer either successfully validates and a Slot opens
+    /// (post-Retry SCID rotates into `cid_table`) or the entry is
+    /// evicted on table overflow.
+    retry_state_table: std.AutoHashMapUnmanaged(Address, RetryStateEntry) = .empty,
+    retry_token_key: ?RetryTokenKey,
+    retry_token_lifetime_us: u64,
+    retry_state_table_capacity: u32,
+
+    /// Bounded FIFO of stateless responses (VN, Retry) queued for
+    /// the embedder to drain via `drainStatelessResponse`. Bounded
+    /// at `stateless_response_queue_capacity`; on overflow the
+    /// oldest entry is evicted to keep ingest latency bounded.
+    stateless_responses: std.ArrayList(StatelessResponse) = .empty,
+
     /// Random source used to mint server SCIDs. Embedders that need
     /// deterministic CIDs (interop fixtures, fuzzers) can swap this.
     random: std.Random,
@@ -289,6 +426,10 @@ pub const Server = struct {
             if (cap == 0) return Error.InvalidConfig;
             if (config.source_rate_window_us == 0) return Error.InvalidConfig;
             if (config.source_rate_table_capacity == 0) return Error.InvalidConfig;
+        }
+        if (config.retry_token_key != null) {
+            if (config.retry_token_lifetime_us == 0) return Error.InvalidConfig;
+            if (config.retry_state_table_capacity == 0) return Error.InvalidConfig;
         }
 
         var tls_ctx: boringssl.tls.Context = undefined;
@@ -353,6 +494,11 @@ pub const Server = struct {
             .max_initials_per_source = config.max_initials_per_source_per_window,
             .source_rate_window_us = config.source_rate_window_us,
             .source_rate_table_capacity = config.source_rate_table_capacity,
+            .retry_state_table = .empty,
+            .retry_token_key = config.retry_token_key,
+            .retry_token_lifetime_us = config.retry_token_lifetime_us,
+            .retry_state_table_capacity = config.retry_state_table_capacity,
+            .stateless_responses = .empty,
             .random = prng.random(),
             .rng_state = prng,
         };
@@ -367,6 +513,8 @@ pub const Server = struct {
         self.slots.deinit(self.allocator);
         self.cid_table.deinit(self.allocator);
         self.source_rate_table.deinit(self.allocator);
+        self.retry_state_table.deinit(self.allocator);
+        self.stateless_responses.deinit(self.allocator);
         if (self.owns_tls) self.tls_ctx.deinit();
         self.* = undefined;
     }
@@ -393,6 +541,11 @@ pub const Server = struct {
     /// one for fresh long-header Initials. `now_us` is the monotonic
     /// clock in microseconds (any monotonic origin works as long as
     /// it's consistent across calls).
+    ///
+    /// Stateless responses (Version Negotiation, Retry) are queued
+    /// internally; the embedder must drain them via
+    /// `drainStatelessResponse` and forward them on the same UDP
+    /// socket the datagram came in on.
     pub fn feed(
         self: *Server,
         bytes: []u8,
@@ -410,20 +563,58 @@ pub const Server = struct {
             return .routed;
         }
 
+        // Long-header packets reach the version-negotiation gate
+        // first: any long-header packet whose declared version is
+        // not QUIC v1 earns a VN response, regardless of the
+        // long-type bits. Per RFC 9000 §6 this catches non-Initial
+        // long-header probes (0-RTT, Handshake) too.
+        if (peekLongHeaderIds(bytes)) |ids| {
+            if (ids.version != QUIC_VERSION_1) {
+                if (from) |addr| {
+                    self.queueVersionNegotiation(addr, bytes) catch return .dropped;
+                    return .version_negotiated;
+                }
+                // No destination address — we can't send a VN, so
+                // the datagram is dropped per the documented
+                // pass-through behavior.
+                return .dropped;
+            }
+        }
+
         // New connection candidate: must be a long-header Initial.
         if (!isInitialLongHeader(bytes)) return .dropped;
         if (self.slots.items.len >= self.max_concurrent_connections) return .table_full;
 
-        // Source-rate gate runs *before* TLS / Connection setup so
-        // an attacker spraying Initials from one address can't burn
-        // server CPU minting state we'll throw away.
+        // Source-rate gate runs *before* Retry / TLS / Connection
+        // setup so an attacker spraying Initials from one address
+        // can't burn server CPU minting state we'll throw away.
         if (self.max_initials_per_source) |cap| {
             if (from) |addr| {
                 if (!self.acceptSourceRate(addr, cap, now_us)) return .rate_limited;
             }
         }
 
-        const slot = self.openSlotFromInitial(bytes, from, now_us) catch |err| switch (err) {
+        // Retry-token gate runs before the Connection is allocated.
+        // Returns `.retry_sent` after queuing a Retry, `.dropped` for
+        // an invalid echoed token, or null when validation passed
+        // (i.e. proceed to slot creation with the post-Retry context).
+        var retry_ctx: ?RetryEcho = null;
+        if (self.retry_token_key) |_| {
+            if (from) |addr| {
+                switch (try self.applyRetryGate(addr, bytes, now_us)) {
+                    .sent => return .retry_sent,
+                    .drop => return .dropped,
+                    .none => {},
+                    .echo => |echo| retry_ctx = echo,
+                }
+            }
+            // No `from`: pass-through to the legacy accept path so
+            // that null-address feed still works for in-process
+            // tests; production embedders are expected to pass
+            // `from` to engage Retry.
+        }
+
+        const slot = self.openSlotFromInitial(bytes, from, now_us, retry_ctx) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
             // Anything else (TLS init, malformed Initial, Connection
             // setup) is a per-peer hiccup — drop the datagram and
@@ -431,9 +622,31 @@ pub const Server = struct {
             // so cid_table stays clean.
             else => return .dropped,
         };
+        // Successful Retry round-trip: clear the per-source bucket
+        // so the next Initial from this address (e.g. a new
+        // connection) starts fresh.
+        if (retry_ctx != null) {
+            if (from) |addr| _ = self.retry_state_table.remove(addr);
+        }
         self.dispatchToSlot(slot, bytes, from, now_us);
         try self.resyncSlotCids(slot);
         return .accepted;
+    }
+
+    /// Drain the next stateless response the server has queued, if
+    /// any. The returned `StatelessResponse` carries an owned copy
+    /// of the encoded bytes plus the destination address — the
+    /// embedder forwards it on the same UDP socket the source
+    /// datagram came in on. Returns null when the queue is empty.
+    pub fn drainStatelessResponse(self: *Server) ?StatelessResponse {
+        if (self.stateless_responses.items.len == 0) return null;
+        return self.stateless_responses.orderedRemove(0);
+    }
+
+    /// Number of stateless responses currently queued. Useful for
+    /// tests and metrics.
+    pub fn statelessResponseCount(self: *const Server) usize {
+        return self.stateless_responses.items.len;
     }
 
     /// Poll one outgoing datagram for `slot` into `dst`. Returns the
@@ -504,6 +717,7 @@ pub const Server = struct {
         bytes: []const u8,
         from: ?Address,
         now_us: u64,
+        retry_ctx: ?RetryEcho,
     ) !*Slot {
         const ids = peekLongHeaderIds(bytes) orelse return error.InvalidInitial;
 
@@ -519,20 +733,44 @@ pub const Server = struct {
         try conn_ptr.bind();
         if (self.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, self.qlog_user_data);
 
+        // Post-Retry connections use the SCID we minted in the Retry
+        // packet — that SCID was bound into the token HMAC and is
+        // the DCID the peer is actually addressing. Pre-Retry (or
+        // Retry-disabled) connections use a fresh random SCID.
         var server_scid: [20]u8 = undefined;
-        self.random.bytes(server_scid[0..self.local_cid_len]);
-        try conn_ptr.setLocalScid(server_scid[0..self.local_cid_len]);
+        var local_scid: []const u8 = undefined;
+        if (retry_ctx) |echo| {
+            local_scid = echo.retry_scid[0..echo.retry_scid_len];
+            @memcpy(server_scid[0..echo.retry_scid_len], local_scid);
+            local_scid = server_scid[0..echo.retry_scid_len];
+        } else {
+            self.random.bytes(server_scid[0..self.local_cid_len]);
+            local_scid = server_scid[0..self.local_cid_len];
+        }
+        try conn_ptr.setLocalScid(local_scid);
 
-        const original_dcid = ConnectionId.fromSlice(ids.dcid);
+        // The original DCID for the transport-parameter binding is
+        // the *first* Initial's DCID. Pre-Retry that's the DCID on
+        // this datagram; post-Retry that was captured before we
+        // emitted the Retry and the on-wire DCID here is our
+        // server-issued retry_scid.
+        const original_dcid = if (retry_ctx) |echo| echo.original_dcid else ConnectionId.fromSlice(ids.dcid);
+        // The DCID the peer is addressing on the wire — which is
+        // also the routing key — is what the Initial header
+        // currently carries.
+        const initial_dcid = ConnectionId.fromSlice(ids.dcid);
 
         var params = self.transport_params;
         params.original_destination_connection_id = original_dcid;
-        params.initial_source_connection_id = ConnectionId.fromSlice(server_scid[0..self.local_cid_len]);
+        params.initial_source_connection_id = ConnectionId.fromSlice(local_scid);
+        if (retry_ctx) |_| {
+            params.retry_source_connection_id = ConnectionId.fromSlice(local_scid);
+        }
         try conn_ptr.acceptInitial(bytes, params);
 
         slot.* = .{
             .conn = conn_ptr,
-            .initial_dcid = original_dcid,
+            .initial_dcid = initial_dcid,
             .peer_addr = from,
             .last_activity_us = now_us,
         };
@@ -540,8 +778,8 @@ pub const Server = struct {
         // Reserve a slot in the CID table for the initial DCID. If
         // this fails, the slot was never made visible to the router
         // and the deferred errdefer will tear down the Connection.
-        try self.cid_table.put(self.allocator, cidKeyFromConnectionId(original_dcid), slot);
-        errdefer _ = self.cid_table.remove(cidKeyFromConnectionId(original_dcid));
+        try self.cid_table.put(self.allocator, cidKeyFromConnectionId(initial_dcid), slot);
+        errdefer _ = self.cid_table.remove(cidKeyFromConnectionId(initial_dcid));
 
         try self.slots.append(self.allocator, slot);
         return slot;
@@ -699,6 +937,215 @@ pub const Server = struct {
         }
         if (oldest_addr) |addr| _ = self.source_rate_table.remove(addr);
     }
+
+    // -- Version Negotiation -------------------------------------------
+
+    /// Encode a Version Negotiation packet into the response queue.
+    /// Errors propagate from the encoder (`InsufficientBytes`) or
+    /// the queue allocator (`OutOfMemory`); on either, `feed` falls
+    /// back to `.dropped`. The encoder mirrors the QNS endpoint's
+    /// `writeVersionNegotiation` (line 1149): supported_versions is
+    /// the single-element list `{QUIC_VERSION_1}`, the response
+    /// echoes the client's CIDs swapped, and the unused bits are
+    /// left as the encoder default per RFC 8999 §6.
+    fn queueVersionNegotiation(
+        self: *Server,
+        dst_addr: Address,
+        client_packet: []const u8,
+    ) !void {
+        const ids = peekLongHeaderIds(client_packet) orelse return error.InvalidVersionNegotiation;
+        var entry: StatelessResponse = .{ .dst = dst_addr, .len = 0 };
+
+        // Single supported version: QUIC v1. We encode through the
+        // wire-level helper directly so we don't have to keep a
+        // long-lived Connection just for this side-channel.
+        var versions_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, versions_bytes[0..4], QUIC_VERSION_1, .big);
+
+        const written = try wire.header.encode(&entry.bytes, .{ .version_negotiation = .{
+            .dcid = try wire.header.ConnId.fromSlice(ids.scid),
+            .scid = try wire.header.ConnId.fromSlice(ids.dcid),
+            .versions_bytes = versions_bytes[0..],
+        } });
+        entry.len = written;
+        try self.queueStatelessResponse(entry);
+    }
+
+    // -- Retry ----------------------------------------------------------
+
+    /// What `applyRetryGate` decided. `none` means proceed with the
+    /// normal accept path (this Initial carried no token and Retry
+    /// is disabled, or the source already passed validation in a
+    /// prior datagram). `sent` means we queued a Retry. `drop` means
+    /// the echoed token was malformed/expired/wrong-source. `echo`
+    /// means the token validated and the caller should accept this
+    /// Initial as the post-Retry continuation.
+    const RetryDecision = union(enum) {
+        none,
+        sent,
+        drop,
+        echo: RetryEcho,
+    };
+
+    /// Captured server-side context for an Initial that successfully
+    /// echoed a Retry token. The slot opener uses these to set the
+    /// post-Retry transport parameters.
+    const RetryEcho = struct {
+        retry_scid: [20]u8,
+        retry_scid_len: u8,
+        original_dcid: ConnectionId,
+    };
+
+    /// Run the Retry-token gate for an Initial from `addr`. Either
+    /// queues a Retry (and returns `.sent`), validates an echoed
+    /// token (and returns `.echo` with the per-source context), or
+    /// returns `.drop` for a malformed/expired/wrong-source token.
+    /// Returns `.none` only if Retry is disabled (caller checks
+    /// before invoking).
+    fn applyRetryGate(
+        self: *Server,
+        addr: Address,
+        bytes: []const u8,
+        now_us: u64,
+    ) Error!RetryDecision {
+        const key_ptr = if (self.retry_token_key) |*k| k else return .none;
+        const ids = peekLongHeaderIds(bytes) orelse return .drop;
+
+        const token = peekInitialToken(bytes);
+        const existing = self.retry_state_table.get(addr);
+
+        // No echoed token: the peer is on its first Initial. Mint a
+        // Retry, queue it, and require the next Initial to echo.
+        if (token == null or token.?.len == 0) {
+            self.mintAndQueueRetry(addr, ids, now_us, key_ptr) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .drop,
+            };
+            return .sent;
+        }
+
+        // Echoed token but no per-source state: stale (we evicted on
+        // overflow, restarted, etc.). Re-mint a fresh Retry; the peer
+        // will retry with a new round-trip.
+        const state = existing orelse {
+            self.mintAndQueueRetry(addr, ids, now_us, key_ptr) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .drop,
+            };
+            return .sent;
+        };
+
+        // Echoed token: validate against the per-source retry_scid
+        // we minted. The SCID binding ties the token to a specific
+        // Retry round-trip — a token minted for some other peer
+        // can't be replayed here even if the source IP collides.
+        var addr_buf: [22]u8 = undefined;
+        const ctx = addressContext(&addr_buf, addr);
+        const result = retry_token_mod.validate(token.?, .{
+            .key = key_ptr,
+            .now_us = now_us,
+            .client_address = ctx,
+            .original_dcid = state.original_dcid.slice(),
+            .retry_scid = state.retry_scid[0..state.retry_scid_len],
+        });
+        if (result != .valid) return .drop;
+
+        // Validated: bubble up the per-source context so the slot
+        // opener knows which SCID to bind and which odcid to set in
+        // transport params.
+        return .{ .echo = .{
+            .retry_scid = state.retry_scid,
+            .retry_scid_len = state.retry_scid_len,
+            .original_dcid = state.original_dcid,
+        } };
+    }
+
+    /// Sentinel returned from `mintAndQueueRetry` when token mint or
+    /// Retry seal fails for a reason that isn't peer-induced (DCID
+    /// length already bounded by `peekLongHeaderIds`, address ctx
+    /// is fixed-size, dst buf is fixed-size). Any peer-reachable
+    /// path that lands here means an invariant slipped, so the
+    /// caller drops the datagram silently.
+    const RetryMintError = Error || error{RetryEncodeFailed};
+
+    fn mintAndQueueRetry(
+        self: *Server,
+        addr: Address,
+        ids: LongHeaderIds,
+        now_us: u64,
+        key_ptr: *const RetryTokenKey,
+    ) RetryMintError!void {
+        // Lazy eviction when the retry-state table is at capacity,
+        // mirroring the source-rate limiter pattern.
+        if (self.retry_state_table.count() >= self.retry_state_table_capacity) {
+            self.evictOldestRetryState();
+        }
+
+        // Pick a fresh server-issued SCID for this Retry. The peer
+        // will echo this DCID in its post-Retry Initial, and the
+        // token HMAC binds to it so a replayed Retry can't authorize
+        // a different connection.
+        var retry_scid: [20]u8 = @splat(0);
+        const retry_scid_len = self.local_cid_len;
+        self.random.bytes(retry_scid[0..retry_scid_len]);
+
+        var addr_buf: [22]u8 = undefined;
+        const ctx = addressContext(&addr_buf, addr);
+        var token: retry_token_mod.Token = undefined;
+        _ = retry_token_mod.mint(&token, .{
+            .key = key_ptr,
+            .now_us = now_us,
+            .lifetime_us = self.retry_token_lifetime_us,
+            .client_address = ctx,
+            .original_dcid = ids.dcid,
+            .retry_scid = retry_scid[0..retry_scid_len],
+        }) catch return error.RetryEncodeFailed;
+
+        var entry: StatelessResponse = .{ .dst = addr, .len = 0 };
+        const written = wire.long_packet.sealRetry(&entry.bytes, .{
+            .original_dcid = ids.dcid,
+            .dcid = ids.scid,
+            .scid = retry_scid[0..retry_scid_len],
+            .retry_token = &token,
+        }) catch return error.RetryEncodeFailed;
+        entry.len = written;
+
+        try self.queueStatelessResponse(entry);
+
+        // Record the retry state so we can validate the echoed
+        // token in the peer's next Initial.
+        const gop = try self.retry_state_table.getOrPut(self.allocator, addr);
+        gop.value_ptr.* = .{
+            .retry_scid = retry_scid,
+            .retry_scid_len = retry_scid_len,
+            .original_dcid = ConnectionId.fromSlice(ids.dcid),
+            .minted_at_us = now_us,
+        };
+    }
+
+    fn evictOldestRetryState(self: *Server) void {
+        var it = self.retry_state_table.iterator();
+        var oldest_addr: ?Address = null;
+        var oldest_us: u64 = std.math.maxInt(u64);
+        while (it.next()) |entry| {
+            if (entry.value_ptr.minted_at_us < oldest_us) {
+                oldest_us = entry.value_ptr.minted_at_us;
+                oldest_addr = entry.key_ptr.*;
+            }
+        }
+        if (oldest_addr) |a| _ = self.retry_state_table.remove(a);
+    }
+
+    // -- stateless response queue --------------------------------------
+
+    fn queueStatelessResponse(self: *Server, entry: StatelessResponse) Error!void {
+        // Bound the queue: drop the oldest entry on overflow so
+        // ingest latency doesn't stall on a slow draining embedder.
+        if (self.stateless_responses.items.len >= stateless_response_queue_capacity) {
+            _ = self.stateless_responses.orderedRemove(0);
+        }
+        try self.stateless_responses.append(self.allocator, entry);
+    }
 };
 
 // -- header-peek helpers ------------------------------------------------
@@ -755,6 +1202,30 @@ fn containsConnectionId(haystack: []const ConnectionId, needle: ConnectionId) bo
         if (ConnectionId.eql(cid, needle)) return true;
     }
     return false;
+}
+
+/// Extract the token slice from an Initial header, or null if the
+/// packet didn't parse cleanly as one. The bytes returned are
+/// borrowed from `bytes`.
+fn peekInitialToken(bytes: []const u8) ?[]const u8 {
+    const parsed = wire.header.parse(bytes, 0) catch return null;
+    return switch (parsed.header) {
+        .initial => |initial| initial.token,
+        else => null,
+    };
+}
+
+/// Canonicalize an `Address` into the byte string the Retry-token
+/// HMAC binds against. The current `Address` type is a fixed 22-byte
+/// blob, so the canonical form is just the full 22 bytes — both
+/// peers are using the same in-memory shape, and any zero-padding is
+/// part of the binding. This stays stable under future Address
+/// extensions: as long as `Address.eql` is byte-equality on
+/// `Address.bytes`, the HMAC binding remains tight.
+fn addressContext(dst: []u8, addr: Address) []const u8 {
+    std.debug.assert(dst.len >= addr.bytes.len);
+    @memcpy(dst[0..addr.bytes.len], &addr.bytes);
+    return dst[0..addr.bytes.len];
 }
 
 // -- tests --------------------------------------------------------------
