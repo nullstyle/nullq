@@ -7,6 +7,7 @@ const std = @import("std");
 const varint = @import("../wire/varint.zig");
 const frame_types = @import("../frame/types.zig");
 
+/// One inclusive interval of received packet numbers.
 pub const Range = struct {
     smallest: u64,
     largest: u64,
@@ -20,11 +21,17 @@ pub const Range = struct {
 /// upper bound that fits in a u8 range_count.
 pub const max_ranges: u8 = 255;
 
+/// Errors raised by the ACK frame builders.
 pub const Error = error{
+    /// `toAckFrame*` was called with no PNs recorded.
     Empty,
+    /// The encode buffer was too small to hold the requested ranges.
     BufferTooSmall,
 } || varint.Error;
 
+/// RFC 9000 §13.2 received-PN bookkeeping. Tracks disjoint inclusive
+/// PN ranges and the delayed-ACK scheduling state used by ACK frame
+/// emission.
 pub const AckTracker = struct {
     ranges: [max_ranges]Range = undefined,
     range_count: u8 = 0,
@@ -128,12 +135,17 @@ pub const AckTracker = struct {
         self.ack_eliciting_since_ack = 0;
     }
 
+    /// Receive timestamp (ms) used to compute the `ack_delay` field
+    /// of the next outgoing ACK frame, or null if no ACK is scheduled.
     pub fn ackDelayBaseMs(self: *const AckTracker) ?u64 {
         if (self.delayed_ack_armed) return self.delayed_ack_start_ms;
         if (self.pending_ack) return self.largest_at_ms;
         return null;
     }
 
+    /// Promote an armed delayed ACK to `pending_ack` if `max_ack_delay_ms`
+    /// has elapsed since the first ACK-eliciting packet of the epoch.
+    /// Returns true iff the promotion fired.
     pub fn promoteDelayedAck(self: *AckTracker, now_ms: u64, max_ack_delay_ms: u64) bool {
         if (self.pending_ack or !self.delayed_ack_armed) return false;
         const deadline_ms = self.delayed_ack_start_ms +| max_ack_delay_ms;

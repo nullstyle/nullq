@@ -84,11 +84,18 @@ pub fn processAck(
     return result;
 }
 
-/// Outcome of `detectLosses`.
+/// Outcome of `detectLosses`. Caller feeds the contained metadata
+/// into the congestion controller's `onPacketLost` and into qlog/loss
+/// observability counters.
 pub const LossResult = struct {
+    /// Sum of `.bytes` for declared-lost packets.
     bytes_lost: u64 = 0,
+    /// Sum of `.bytes` for the in-flight subset.
     in_flight_bytes_lost: u64 = 0,
+    /// Send time of the latest lost packet (microseconds). Drives the
+    /// recovery-period start in `NewReno.onPacketLost`.
     largest_lost_send_time_us: u64 = 0,
+    /// Number of packets declared lost.
     count: u32 = 0,
 };
 

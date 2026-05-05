@@ -7,8 +7,11 @@
 
 const std = @import("std");
 
+/// One microsecond expressed in this module's time units.
 pub const us: u64 = 1;
+/// One millisecond expressed in this module's time units (1000 µs).
 pub const ms: u64 = 1_000;
+/// One second expressed in this module's time units (1_000_000 µs).
 pub const sec: u64 = 1_000_000;
 
 /// kInitialRtt from RFC 9002 §6.2.2: 333 ms.
@@ -16,6 +19,9 @@ pub const initial_rtt_us: u64 = 333 * ms;
 /// kGranularity from RFC 9002 §6.1.2: 1 ms.
 pub const granularity_us: u64 = 1 * ms;
 
+/// RFC 9002 §5 RTT estimator. Produces `smoothed_rtt`, `rtt_var`,
+/// and `min_rtt` from per-ACK samples; consumed by loss detection
+/// (PTO) and ACK delay processing.
 pub const RttEstimator = struct {
     /// Most recently observed RTT sample (post ack-delay adjustment).
     /// Zero before the first sample.

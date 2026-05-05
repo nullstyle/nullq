@@ -18,6 +18,7 @@
 
 const std = @import("std");
 
+/// Errors raised by `recv` and `resetStream`.
 pub const Error = error{
     /// Peer sent bytes past a previously-locked final size
     /// (RFC 9000 §4.5 / FINAL_SIZE_ERROR).
@@ -50,20 +51,25 @@ pub const State = enum {
     reset_read,
 };
 
+/// Half-open interval `[offset, end)` of received stream bytes.
 pub const Range = struct {
     offset: u64,
     end: u64,
 
+    /// Length of the range in bytes.
     pub fn len(self: Range) u64 {
         return self.end - self.offset;
     }
 };
 
+/// State recorded when the peer sends RESET_STREAM (RFC 9000 §19.4).
 pub const ResetInfo = struct {
     error_code: u64,
     final_size: u64,
 };
 
+/// One stream's receive half: STREAM-frame buffering, in-order
+/// reassembly, RESET_STREAM and FIN handling.
 pub const RecvStream = struct {
     allocator: std.mem.Allocator,
 
@@ -92,10 +98,12 @@ pub const RecvStream = struct {
 
     state: State = .recv,
 
+    /// Construct an empty receive buffer that owns its allocations.
     pub fn init(allocator: std.mem.Allocator) RecvStream {
         return .{ .allocator = allocator };
     }
 
+    /// Free the reassembly buffer and range list.
     pub fn deinit(self: *RecvStream) void {
         self.bytes.deinit(self.allocator);
         self.ranges.deinit(self.allocator);

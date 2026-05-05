@@ -25,6 +25,7 @@
 
 const std = @import("std");
 
+/// Errors raised by send-side stream operations.
 pub const Error = error{
     /// `write` was called after `finish` or `resetStream`.
     StreamClosed,
@@ -54,12 +55,14 @@ pub const State = enum {
     reset_recvd,
 };
 
+/// Half-open interval `[offset, end)` of stream bytes.
 pub const Range = struct {
     offset: u64,
     /// Inclusive end. A 0-length range cannot be represented; use
     /// the `pending` list's `count == 0` instead.
     end: u64,
 
+    /// Length of the range in bytes.
     pub fn len(self: Range) u64 {
         return self.end - self.offset;
     }
@@ -74,6 +77,7 @@ pub const Chunk = struct {
     fin: bool,
 };
 
+/// State for a locally-initiated RESET_STREAM (RFC 9000 §19.4).
 pub const ResetInfo = struct {
     /// Application-supplied error code (RFC 9000 §19.4).
     error_code: u64,
@@ -85,6 +89,8 @@ pub const ResetInfo = struct {
     acked: bool = false,
 };
 
+/// One stream's send half: app-side write queue, in-flight tracking,
+/// FIN/RESET state machine.
 pub const SendStream = struct {
     allocator: std.mem.Allocator,
 
@@ -120,10 +126,12 @@ pub const SendStream = struct {
 
     state: State = .ready,
 
+    /// Construct an empty send buffer that owns its allocations.
     pub fn init(allocator: std.mem.Allocator) SendStream {
         return .{ .allocator = allocator };
     }
 
+    /// Free the byte buffer, pending/acked range lists, and the in-flight map.
     pub fn deinit(self: *SendStream) void {
         self.bytes.deinit(self.allocator);
         self.pending.deinit(self.allocator);
@@ -290,7 +298,8 @@ pub const SendStream = struct {
         }
     }
 
-    /// Process ACK/loss for a RESET_STREAM frame carried by a packet.
+    /// Process ACK for a RESET_STREAM frame carried by a packet.
+    /// Marks the reset as acknowledged and advances toward `reset_recvd`.
     pub fn onResetAcked(self: *SendStream) void {
         if (self.reset) |*r| {
             r.acked = true;
@@ -298,6 +307,8 @@ pub const SendStream = struct {
         }
     }
 
+    /// Process loss for a RESET_STREAM frame. Clears the `queued`
+    /// flag so the connection re-emits the frame on the next send pass.
     pub fn onResetLost(self: *SendStream) void {
         if (self.reset) |*r| {
             if (!r.acked) r.queued = false;

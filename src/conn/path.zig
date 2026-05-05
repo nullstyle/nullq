@@ -25,19 +25,29 @@ const path_validator_mod = @import("path_validator.zig");
 const rtt_mod = @import("rtt.zig");
 const sent_packets_mod = @import("sent_packets.zig");
 
+/// Re-export of the per-path NewReno congestion controller.
 pub const NewReno = congestion_mod.NewReno;
+/// Re-export of the QUIC packet number space type.
 pub const PnSpace = pn_space_mod.PnSpace;
+/// Re-export of the RFC 9000 §8.2 path validator.
 pub const PathValidator = path_validator_mod.PathValidator;
+/// Re-export of the RFC 9002 RTT estimator.
 pub const RttEstimator = rtt_mod.RttEstimator;
+/// Re-export of the per-path sent-packet tracker.
 pub const SentPacketTracker = sent_packets_mod.SentPacketTracker;
 
 /// QUIC connection IDs are between 0 and 20 bytes (RFC 9000 §17.2).
 pub const max_cid_len: usize = 20;
 
+/// Inline-storage QUIC connection ID. Holds 0..20 bytes of CID
+/// material plus an explicit length, avoiding a heap allocation for
+/// each path.
 pub const ConnectionId = struct {
     bytes: [max_cid_len]u8 = @splat(0),
     len: u8 = 0,
 
+    /// Build a ConnectionId from the given slice. `s.len` must not
+    /// exceed `max_cid_len` (asserted in debug builds).
     pub fn fromSlice(s: []const u8) ConnectionId {
         std.debug.assert(s.len <= max_cid_len);
         var cid: ConnectionId = .{};
@@ -46,10 +56,12 @@ pub const ConnectionId = struct {
         return cid;
     }
 
+    /// View of the active CID bytes (length `len`).
     pub fn slice(self: *const ConnectionId) []const u8 {
         return self.bytes[0..self.len];
     }
 
+    /// Byte-equality of two CIDs (length plus content).
     pub fn eql(a: ConnectionId, b: ConnectionId) bool {
         if (a.len != b.len) return false;
         return std.mem.eql(u8, a.slice(), b.slice());
@@ -62,6 +74,7 @@ pub const ConnectionId = struct {
 pub const Address = struct {
     bytes: [22]u8 = @splat(0),
 
+    /// Byte-wise equality (full 22-byte buffer, including padding).
     pub fn eql(a: Address, b: Address) bool {
         return std.mem.eql(u8, &a.bytes, &b.bytes);
     }
@@ -89,11 +102,17 @@ pub const State = enum {
 /// historical single-path behavior; the other policies are available
 /// for embedders once multiple validated paths are registered.
 pub const Scheduler = enum {
+    /// Always send on the active (or primary) path.
     primary,
+    /// Round-robin across sendable paths in registration order.
     round_robin,
+    /// Pick the sendable path with the lowest RTT and free CWND.
     lowest_rtt_cwnd,
 };
 
+/// One QUIC path: a 4-tuple plus the per-path state (CIDs, anti-amp,
+/// validator, RTT, congestion). Most connections have one Path; phase
+/// 9/10 add more for migration and multipath.
 pub const Path = struct {
     peer_addr: Address,
     local_addr: Address,
@@ -118,6 +137,9 @@ pub const Path = struct {
 
     state: State = .fresh,
 
+    /// Construct a fresh `Path` with the given 4-tuple/CID pair and
+    /// a NewReno controller seeded from `cc_cfg`. The path starts
+    /// `fresh` and unvalidated.
     pub fn init(
         peer_addr: Address,
         local_addr: Address,
@@ -184,13 +206,21 @@ pub const Path = struct {
     }
 };
 
+/// Phase the per-path congestion controller is currently in. Surfaced
+/// to qlog and `PathStats`.
 pub const CongestionState = enum {
+    /// Below `ssthresh` — `cwnd` grows by `bytes_acked` per ACK.
     slow_start,
+    /// Currently in a recovery period after a loss event.
     recovery,
+    /// `cwnd` has headroom but no data is queued to send.
     application_limited,
+    /// Above `ssthresh` — `cwnd` grows by ~one MSS per RTT.
     congestion_avoidance,
 };
 
+/// Snapshot of one path's observability counters. Returned by
+/// `PathState.stats` / `PathSet.stats`.
 pub const PathStats = struct {
     path_id: u32,
     state: State,
@@ -232,6 +262,9 @@ pub const PathStats = struct {
     congestion_window_state: CongestionState = .slow_start,
 };
 
+/// Snapshot of pre-migration path state, kept until the new 4-tuple
+/// is validated. `rollbackFailedMigration` restores from this if
+/// validation fails.
 pub const MigrationRollback = struct {
     peer_addr: Address,
     peer_addr_set: bool,
@@ -270,6 +303,8 @@ pub const PathState = struct {
     /// issued via PATH_NEW_CONNECTION_ID.
     next_local_cid_seq: u64 = 0,
 
+    /// Build a fresh `PathState` wrapping a `Path` initialized with
+    /// the given 4-tuple, CIDs, and CC config.
     pub fn init(
         id: u32,
         peer_addr: Address,
@@ -284,6 +319,8 @@ pub const PathState = struct {
         };
     }
 
+    /// Free per-packet retransmit-frame and stream-key allocations.
+    /// The `PathState` itself is not freed.
     pub fn deinit(self: *PathState, allocator: std.mem.Allocator) void {
         var i: u32 = 0;
         while (i < self.sent.count) : (i += 1) {
@@ -291,6 +328,9 @@ pub const PathState = struct {
         }
     }
 
+    /// Drop every tracked sent packet, clear the received-PN tracker,
+    /// and zero PTO/ping state. Used on key-update boundaries and
+    /// migration where in-flight bookkeeping is no longer meaningful.
     pub fn clearRecovery(self: *PathState, allocator: std.mem.Allocator) void {
         var i: u32 = 0;
         while (i < self.sent.count) : (i += 1) {
@@ -303,6 +343,9 @@ pub const PathState = struct {
         self.pto_count = 0;
     }
 
+    /// Reset RTT, congestion control, and PTO state after a successful
+    /// migration. RFC 9000 §9.4 requires the sender to start over once
+    /// the new 4-tuple is in use.
     pub fn resetRecoveryAfterMigration(
         self: *PathState,
         cc_cfg: congestion_mod.Config,
@@ -316,6 +359,10 @@ pub const PathState = struct {
         self.migration_rollback = null;
     }
 
+    /// Begin a migration to `peer_addr`. Snapshots current state into
+    /// `migration_rollback` (if not already snapshotted), zeros the
+    /// anti-amp counters, drops validation, and credits the triggering
+    /// datagram against anti-amp.
     pub fn beginMigration(
         self: *PathState,
         peer_addr: Address,
@@ -341,6 +388,8 @@ pub const PathState = struct {
         self.pending_migration_reset = true;
     }
 
+    /// Restore the snapshot saved by `beginMigration` after path
+    /// validation fails. Returns true iff a rollback was applied.
     pub fn rollbackFailedMigration(self: *PathState) bool {
         const rollback = self.migration_rollback orelse return false;
         self.path.peer_addr = rollback.peer_addr;
@@ -356,31 +405,40 @@ pub const PathState = struct {
         return true;
     }
 
+    /// Current peer address, or null if it hasn't been observed yet.
     pub fn peerAddress(self: *const PathState) ?Address {
         if (!self.peer_addr_set) return null;
         return self.path.peer_addr;
     }
 
+    /// True iff `addr` matches the live peer address or the
+    /// pre-migration snapshot. Used to dispatch incoming datagrams
+    /// during the validation window.
     pub fn matchesPeerAddress(self: *const PathState, addr: Address) bool {
         if (self.peer_addr_set and Address.eql(self.path.peer_addr, addr)) return true;
         return self.matchesMigrationRollbackAddress(addr);
     }
 
+    /// True iff `addr` matches the pre-migration peer address kept
+    /// in `migration_rollback`.
     pub fn matchesMigrationRollbackAddress(self: *const PathState, addr: Address) bool {
         const rollback = self.migration_rollback orelse return false;
         return rollback.peer_addr_set and Address.eql(rollback.peer_addr, addr);
     }
 
+    /// Set or update the peer address for this path and mark it observed.
     pub fn setPeerAddress(self: *PathState, addr: Address) void {
         self.path.peer_addr = addr;
         self.peer_addr_set = true;
     }
 
+    /// Set or update the local address for this path and mark it observed.
     pub fn setLocalAddress(self: *PathState, addr: Address) void {
         self.path.local_addr = addr;
         self.local_addr_set = true;
     }
 
+    /// Build a `PathStats` snapshot of the current observability counters.
     pub fn stats(self: *const PathState) PathStats {
         const cc = &self.path.cc;
         const rtt = &self.path.rtt;
@@ -413,6 +471,9 @@ pub const PathState = struct {
         };
     }
 
+    /// Apply an incoming PATH_AVAILABLE / PATH_BACKUP frame
+    /// (draft-ietf-quic-multipath-21). Stale sequence numbers are
+    /// ignored; an `available` flag wakes a `fresh` path into `active`.
     pub fn recordPeerStatus(self: *PathState, available: bool, sequence_number: u64) void {
         if (self.peer_status_sequence_number) |old| {
             if (sequence_number <= old) return;
@@ -423,6 +484,9 @@ pub const PathState = struct {
     }
 };
 
+/// Collection of `PathState` entries belonging to one Connection.
+/// Owns scheduling cursors and the primary/active ids that select
+/// where each outgoing packet ships.
 pub const PathSet = struct {
     paths: std.ArrayList(PathState) = .empty,
     primary_id: u32 = 0,
@@ -431,6 +495,8 @@ pub const PathSet = struct {
     scheduler: Scheduler = .primary,
     rr_cursor: usize = 0,
 
+    /// Lazily install the primary path (id 0) on first use. No-op if
+    /// the set already has paths.
     pub fn ensurePrimary(
         self: *PathSet,
         allocator: std.mem.Allocator,
@@ -443,12 +509,14 @@ pub const PathSet = struct {
         try self.paths.append(allocator, p);
     }
 
+    /// Free every contained `PathState` and the path list itself.
     pub fn deinit(self: *PathSet, allocator: std.mem.Allocator) void {
         for (self.paths.items) |*p| p.deinit(allocator);
         self.paths.deinit(allocator);
         self.* = .{};
     }
 
+    /// Look up a mutable path by id. Returns null if no path matches.
     pub fn get(self: *PathSet, id: u32) ?*PathState {
         for (self.paths.items) |*p| {
             if (p.id == id) return p;
@@ -456,6 +524,7 @@ pub const PathSet = struct {
         return null;
     }
 
+    /// Look up an immutable path by id. Returns null if no path matches.
     pub fn getConst(self: *const PathSet, id: u32) ?*const PathState {
         for (self.paths.items) |*p| {
             if (p.id == id) return p;
@@ -463,6 +532,8 @@ pub const PathSet = struct {
         return null;
     }
 
+    /// Mutable handle to the primary path (id `primary_id`). The
+    /// primary path is guaranteed to exist after `ensurePrimary`.
     pub fn primary(self: *PathSet) *PathState {
         // invariant: primary_id is set in init() before any caller
         // can observe a PathSet, and openPath/abandon never remove
@@ -470,29 +541,37 @@ pub const PathSet = struct {
         return self.get(self.primary_id) orelse unreachable;
     }
 
+    /// Immutable handle to the primary path.
     pub fn primaryConst(self: *const PathSet) *const PathState {
         // invariant: see primary(). Not peer-reachable.
         return self.getConst(self.primary_id) orelse unreachable;
     }
 
+    /// Mutable handle to the active path (the one new application data
+    /// goes on). Falls back to primary if `active_id` is stale.
     pub fn active(self: *PathSet) *PathState {
         return self.get(self.active_id) orelse self.primary();
     }
 
+    /// Immutable handle to the active path.
     pub fn activeConst(self: *const PathSet) *const PathState {
         return self.getConst(self.active_id) orelse self.primaryConst();
     }
 
+    /// Promote `id` to active. Returns false if no such path exists.
     pub fn setActive(self: *PathSet, id: u32) bool {
         if (self.get(id) == null) return false;
         self.active_id = id;
         return true;
     }
 
+    /// Switch the multipath scheduler policy.
     pub fn setScheduler(self: *PathSet, scheduler: Scheduler) void {
         self.scheduler = scheduler;
     }
 
+    /// Allocate a new path id and append a `PathState` for the given
+    /// 4-tuple/CID pair. Returns the new id.
     pub fn openPath(
         self: *PathSet,
         allocator: std.mem.Allocator,
@@ -511,6 +590,9 @@ pub const PathSet = struct {
         return id;
     }
 
+    /// Mark the given path as retiring and bounce active to primary
+    /// if it was active. Returns false if the id is unknown or the
+    /// path is already failed.
     pub fn abandon(self: *PathSet, id: u32) bool {
         const p = self.get(id) orelse return false;
         if (p.path.state == .failed) return false;
@@ -519,11 +601,14 @@ pub const PathSet = struct {
         return true;
     }
 
+    /// Snapshot stats for the path with `id`, or null if unknown.
     pub fn stats(self: *const PathSet, id: u32) ?PathStats {
         const p = self.getConst(id) orelse return null;
         return p.stats();
     }
 
+    /// Pick the next path to send on according to the active
+    /// `Scheduler`. Returns the active/primary path as a fallback.
     pub fn selectForSending(self: *PathSet) *PathState {
         return switch (self.scheduler) {
             .primary => self.active(),
