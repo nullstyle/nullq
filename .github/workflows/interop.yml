@@ -1,0 +1,109 @@
+name: interop
+
+on:
+  schedule:
+    # Sunday 06:00 UTC. Interop is environment-sensitive and slow,
+    # so we run it weekly rather than on every push.
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "QNS test letters (comma-separated)"
+        required: false
+        default: "H,DC,M"
+      clients:
+        description: "Client matrix"
+        required: false
+        default: "quic-go,quiche,ngtcp2"
+
+# Interop runs are intentionally tolerant: a regression here is a
+# signal to investigate, not a hard merge gate. The test workflow
+# (test.yml) is the actual CI gate.
+jobs:
+  qns-server:
+    name: QNS interop (nullq as server)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    env:
+      NULLQ_IMAGE: nullq-qns:local
+      TESTS: ${{ github.event.inputs.tests || 'H,DC,M' }}
+      CLIENTS: ${{ github.event.inputs.clients || 'quic-go,quiche,ngtcp2' }}
+    steps:
+      - name: Checkout nullq
+        uses: actions/checkout@v4
+        with:
+          path: nullq
+
+      - name: Checkout boringssl-zig (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: nullstyle/boringssl-zig
+          ref: main
+          path: boringssl-zig
+
+      - name: Checkout nullq-qns
+        uses: actions/checkout@v4
+        with:
+          repository: nullstyle/nullq-qns
+          ref: main
+          path: nullq-qns
+
+      - name: Checkout quic-interop-runner
+        uses: actions/checkout@v4
+        with:
+          repository: quic-interop/quic-interop-runner
+          ref: master
+          path: quic-interop-runner
+
+      - name: Set up Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runner deps
+        working-directory: quic-interop-runner
+        run: pip install -r requirements.txt
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build nullq-qns image
+        working-directory: nullq-qns
+        env:
+          NULLQ_DIR: ${{ github.workspace }}/nullq
+          BORINGSSL_ZIG_DIR: ${{ github.workspace }}/boringssl-zig
+        run: |
+          # `make build-local` archives both repos and feeds them in
+          # as Docker build contexts (see nullq-qns/Makefile and
+          # Dockerfile.local). LOCALTAG=local matches NULLQ_IMAGE.
+          make build-local LOCALTAG=local
+
+      - name: Run QNS interop (server role)
+        working-directory: nullq
+        env:
+          RUNNER_DIR: ${{ github.workspace }}/quic-interop-runner
+        run: |
+          zig build external-interop -- runner \
+            --role server \
+            --runner-dir "${RUNNER_DIR}" \
+            --image "${NULLQ_IMAGE}" \
+            --clients "${CLIENTS}" \
+            --tests "${TESTS}" \
+            --log-dir "${{ github.workspace }}/interop-logs" \
+            --json "${{ github.workspace }}/interop-logs/result.json"
+
+      - name: Upload interop logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs-${{ github.run_id }}
+          path: |
+            interop-logs/**
+          if-no-files-found: warn
+          retention-days: 14
