@@ -250,7 +250,9 @@ Current as of 2026-05-04.
   parameters (`original_destination_connection_id`,
   `stateless_reset_token`, `preferred_address`, and
   `retry_source_connection_id`) before installing any peer reset token
-  or CID state from them.
+  or CID state from them. Peer transport-parameter limit and CID
+  validation failures now use the QUIC `TRANSPORT_PARAMETER_ERROR`
+  close code instead of a generic protocol error.
 
 ## Still not production-grade
 
@@ -325,7 +327,8 @@ Current as of 2026-05-04.
    smoke coverage have landed. Transport-parameter parsing now includes
    duplicate-parameter rejection plus typed `preferred_address`
    encode/decode/validation, and server connections reject client-sent
-   server-only transport parameters. Local endpoint probes now cover
+   server-only transport parameters with `TRANSPORT_PARAMETER_ERROR`.
+   Local endpoint probes now cover
    malformed, replayed-address, replayed-CID, expired, and wrong-version
    Retry tokens; send-side blocked-frame loss requeue now skips stale
    DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED frames after the

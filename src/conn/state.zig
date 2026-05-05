@@ -149,6 +149,7 @@ const transport_error_stream_limit: u64 = 0x04;
 const transport_error_stream_state: u64 = 0x05;
 const transport_error_final_size: u64 = 0x06;
 const transport_error_frame_encoding: u64 = 0x07;
+const transport_error_transport_parameter: u64 = 0x08;
 const transport_error_aead_limit_reached: u64 = 0x0f;
 
 /// Upper bound on AEAD plaintext for a single received packet. This
@@ -3015,13 +3016,13 @@ pub const Connection = struct {
     fn validatePeerTransportLimits(self: *Connection) void {
         const params = self.cached_peer_transport_params orelse return;
         if (params.max_udp_payload_size < min_quic_udp_payload_size) {
-            self.close(true, transport_error_protocol_violation, "peer max udp payload below minimum");
+            self.close(true, transport_error_transport_parameter, "peer max udp payload below minimum");
             return;
         }
         if (params.initial_max_streams_bidi > max_stream_count_limit or
             params.initial_max_streams_uni > max_stream_count_limit)
         {
-            self.close(true, transport_error_frame_encoding, "peer stream count exceeds maximum");
+            self.close(true, transport_error_transport_parameter, "peer stream count exceeds maximum");
             return;
         }
         const peer_udp_limit: usize = @intCast(@min(params.max_udp_payload_size, max_supported_udp_payload_size));
@@ -3036,19 +3037,19 @@ pub const Connection = struct {
         if (self.role != .server) return;
         const params = self.cached_peer_transport_params orelse return;
         if (params.original_destination_connection_id != null) {
-            self.close(true, transport_error_protocol_violation, "client sent original destination cid");
+            self.close(true, transport_error_transport_parameter, "client sent original destination cid");
             return;
         }
         if (params.stateless_reset_token != null) {
-            self.close(true, transport_error_protocol_violation, "client sent stateless reset token");
+            self.close(true, transport_error_transport_parameter, "client sent stateless reset token");
             return;
         }
         if (params.preferred_address != null) {
-            self.close(true, transport_error_protocol_violation, "client sent preferred address");
+            self.close(true, transport_error_transport_parameter, "client sent preferred address");
             return;
         }
         if (params.retry_source_connection_id != null) {
-            self.close(true, transport_error_protocol_violation, "client sent retry source cid");
+            self.close(true, transport_error_transport_parameter, "client sent retry source cid");
             return;
         }
     }
@@ -3508,21 +3509,21 @@ pub const Connection = struct {
             if (self.original_initial_dcid_set and
                 !ConnectionId.eql(odcid, self.original_initial_dcid))
             {
-                self.close(true, transport_error_protocol_violation, "original destination cid mismatch");
+                self.close(true, transport_error_transport_parameter, "original destination cid mismatch");
                 return;
             }
         }
         if (self.retry_accepted) {
             const retry_source = params.retry_source_connection_id orelse {
-                self.close(true, transport_error_protocol_violation, "missing retry source cid");
+                self.close(true, transport_error_transport_parameter, "missing retry source cid");
                 return;
             };
             if (!ConnectionId.eql(retry_source, self.retry_source_cid)) {
-                self.close(true, transport_error_protocol_violation, "retry source cid mismatch");
+                self.close(true, transport_error_transport_parameter, "retry source cid mismatch");
                 return;
             }
         } else if (params.retry_source_connection_id != null) {
-            self.close(true, transport_error_protocol_violation, "unexpected retry source cid");
+            self.close(true, transport_error_transport_parameter, "unexpected retry source cid");
         }
     }
 
@@ -7466,7 +7467,7 @@ test "Retry source CID transport parameter is validated" {
     conn.validatePeerTransportConnectionIds();
 
     try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
     try std.testing.expectEqualStrings("retry source cid mismatch", conn.pending_close.?.reason);
 }
 
@@ -7481,7 +7482,7 @@ fn expectServerOnlyPeerTransportParamRejected(params: TransportParams, reason: [
     conn.validatePeerTransportRole();
 
     try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
     try std.testing.expectEqualStrings(reason, conn.pending_close.?.reason);
 }
 
@@ -8605,6 +8606,32 @@ test "setTransportParams advertises bounded UDP payload limits" {
     try std.testing.expectEqual(@as(u64, max_supported_udp_payload_size), conn.local_transport_params.max_datagram_frame_size);
 
     try std.testing.expectError(error.InvalidValue, conn.setTransportParams(.{ .max_udp_payload_size = default_mtu - 1 }));
+}
+
+test "peer transport parameter limit violations use transport parameter error" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+
+    {
+        var conn = try Connection.initClient(allocator, ctx, "x");
+        defer conn.deinit();
+        conn.cached_peer_transport_params = .{ .max_udp_payload_size = min_quic_udp_payload_size - 1 };
+        conn.validatePeerTransportLimits();
+        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
+        try std.testing.expectEqualStrings("peer max udp payload below minimum", conn.pending_close.?.reason);
+    }
+
+    {
+        var conn = try Connection.initClient(allocator, ctx, "x");
+        defer conn.deinit();
+        conn.cached_peer_transport_params = .{ .initial_max_streams_bidi = max_stream_count_limit + 1 };
+        conn.validatePeerTransportLimits();
+        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
+        try std.testing.expectEqualStrings("peer stream count exceeds maximum", conn.pending_close.?.reason);
+    }
 }
 
 test "handle rejects UDP datagrams above local payload limit before path credit" {
