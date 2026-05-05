@@ -209,8 +209,7 @@ const Http09App = struct {
         }
 
         const stream = conn.stream(stream_id) orelse return;
-        const stream_finished = stream.recv.state == .data_recvd or stream.recv.state == .data_read;
-        if (!stream_finished and !requestLineComplete(state.buf.items)) return;
+        if (!(stream.recv.state == .data_recvd or stream.recv.state == .data_read)) return;
 
         const rel = parseGetPath(state.buf.items) orelse {
             _ = try conn.streamWrite(stream_id, "400");
@@ -1021,11 +1020,6 @@ fn allDownloadsComplete(downloads: []const ClientDownload) bool {
     return true;
 }
 
-fn requestLineComplete(request: []const u8) bool {
-    return std.mem.indexOfScalar(u8, request, '\n') != null or
-        std.mem.indexOfScalar(u8, request, '\r') != null;
-}
-
 fn parseGetPath(request: []const u8) ?[]const u8 {
     const trimmed = std.mem.trimEnd(u8, request, " \r\n");
     if (!std.mem.startsWith(u8, trimmed, "GET ")) return null;
@@ -1345,11 +1339,7 @@ fn peekLongHeaderIds(bytes: []const u8) ?LongHeaderIds {
 }
 
 test "parse HTTP/0.9 GET path" {
-    try std.testing.expect(requestLineComplete("GET /file\r"));
-    try std.testing.expect(requestLineComplete("GET /file\n"));
-    try std.testing.expect(!requestLineComplete("GET /file"));
     try std.testing.expectEqualStrings("file", parseGetPath("GET /file\r\n").?);
-    try std.testing.expectEqualStrings("file", parseGetPath("GET /file\r").?);
     try std.testing.expect(parseGetPath("POST /file\r\n") == null);
     try std.testing.expect(parseGetPath("GET /../secret\r\n") == null);
 }
