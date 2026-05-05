@@ -246,6 +246,11 @@ Current as of 2026-05-04.
 - Transport-parameter parsing now rejects duplicate parameters, even
   for unknown extension IDs, and exposes the full RFC 9000
   `preferred_address` structure as a typed parameter.
+- The connection layer now rejects client-sent server-only transport
+  parameters (`original_destination_connection_id`,
+  `stateless_reset_token`, `preferred_address`, and
+  `retry_source_connection_id`) before installing any peer reset token
+  or CID state from them.
 
 ## Still not production-grade
 
@@ -319,7 +324,8 @@ Current as of 2026-05-04.
    API. Bounded allocation policy and deterministic parser/property
    smoke coverage have landed. Transport-parameter parsing now includes
    duplicate-parameter rejection plus typed `preferred_address`
-   encode/decode/validation. Local endpoint probes now cover
+   encode/decode/validation, and server connections reject client-sent
+   server-only transport parameters. Local endpoint probes now cover
    malformed, replayed-address, replayed-CID, expired, and wrong-version
    Retry tokens; send-side blocked-frame loss requeue now skips stale
    DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED frames after the

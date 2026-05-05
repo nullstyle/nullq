@@ -973,6 +973,9 @@ pub const Connection = struct {
             self.multipath_enabled = true;
         }
         self.validatePeerTransportLimits();
+        if (self.pending_close != null or self.closed) return params;
+        self.validatePeerTransportRole();
+        if (self.pending_close != null or self.closed) return params;
         try self.installPeerTransportStatelessResetToken();
         self.validatePeerTransportConnectionIds();
         return params;
@@ -3002,6 +3005,9 @@ pub const Connection = struct {
             self.multipath_enabled = true;
         }
         self.validatePeerTransportLimits();
+        if (self.pending_close != null or self.closed) return;
+        self.validatePeerTransportRole();
+        if (self.pending_close != null or self.closed) return;
         try self.installPeerTransportStatelessResetToken();
         self.validatePeerTransportConnectionIds();
     }
@@ -3024,6 +3030,27 @@ pub const Connection = struct {
             path.pmtu = @min(path.pmtu, peer_udp_limit);
         }
         self.applyPeerFlowTransportParams(params);
+    }
+
+    fn validatePeerTransportRole(self: *Connection) void {
+        if (self.role != .server) return;
+        const params = self.cached_peer_transport_params orelse return;
+        if (params.original_destination_connection_id != null) {
+            self.close(true, transport_error_protocol_violation, "client sent original destination cid");
+            return;
+        }
+        if (params.stateless_reset_token != null) {
+            self.close(true, transport_error_protocol_violation, "client sent stateless reset token");
+            return;
+        }
+        if (params.preferred_address != null) {
+            self.close(true, transport_error_protocol_violation, "client sent preferred address");
+            return;
+        }
+        if (params.retry_source_connection_id != null) {
+            self.close(true, transport_error_protocol_violation, "client sent retry source cid");
+            return;
+        }
     }
 
     fn applyPeerFlowTransportParams(self: *Connection, params: TransportParams) void {
@@ -7441,6 +7468,48 @@ test "Retry source CID transport parameter is validated" {
     try std.testing.expect(conn.pending_close != null);
     try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
     try std.testing.expectEqualStrings("retry source cid mismatch", conn.pending_close.?.reason);
+}
+
+fn expectServerOnlyPeerTransportParamRejected(params: TransportParams, reason: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = params;
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expectEqualStrings(reason, conn.pending_close.?.reason);
+}
+
+test "server rejects client-sent server-only transport parameters" {
+    const reset_token: [16]u8 = .{
+        0, 1, 2,  3,  4,  5,  6,  7,
+        8, 9, 10, 11, 12, 13, 14, 15,
+    };
+
+    try expectServerOnlyPeerTransportParamRejected(.{
+        .original_destination_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb }),
+    }, "client sent original destination cid");
+    try expectServerOnlyPeerTransportParamRejected(.{
+        .stateless_reset_token = reset_token,
+    }, "client sent stateless reset token");
+    try expectServerOnlyPeerTransportParamRejected(.{
+        .preferred_address = .{
+            .ipv4_address = .{ 192, 0, 2, 1 },
+            .ipv4_port = 4433,
+            .ipv6_address = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+            .ipv6_port = 4433,
+            .connection_id = ConnectionId.fromSlice(&.{ 0xc0, 0xc1 }),
+            .stateless_reset_token = reset_token,
+        },
+    }, "client sent preferred address");
+    try expectServerOnlyPeerTransportParamRejected(.{
+        .retry_source_connection_id = ConnectionId.fromSlice(&.{ 0xcc, 0xdd }),
+    }, "client sent retry source cid");
 }
 
 test "server writeRetry emits a Retry addressed to the client Initial SCID" {
