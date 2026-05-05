@@ -13,6 +13,13 @@ const case_aliases = [_]CaseAlias{
     .{ .short = "R", .long = "resumption" },
     .{ .short = "Z", .long = "zerortt" },
     .{ .short = "M", .long = "multiplexing" },
+    .{ .short = "B", .long = "blackhole" },
+    .{ .short = "L1", .long = "handshakeloss" },
+    .{ .short = "L2", .long = "transferloss" },
+    .{ .short = "C1", .long = "handshakecorruption" },
+    .{ .short = "C2", .long = "transfercorruption" },
+    .{ .short = "BP", .long = "rebind-port" },
+    .{ .short = "U", .long = "keyupdate" },
 };
 
 const CaseAlias = struct {
@@ -37,6 +44,7 @@ const Config = struct {
     log_dir: ?[]const u8 = null,
     json_path: ?[]const u8 = null,
     build_image: bool = false,
+    scenario: ?[]const u8 = null,
 };
 
 const RunnerRole = enum {
@@ -100,7 +108,7 @@ fn usage() void {
         \\usage:
         \\  zig build external-interop -- preflight [--image nullq-interop:local] [--dry-run]
         \\  zig build external-interop -- build-image [--image nullq-interop:local] [--zig-version 0.16.0] [--dry-run]
-        \\  zig build external-interop -- runner [--role server|client] [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--servers quic-go,ngtcp2,quiche] [--tests core+retry] [--python 3.12] [--wireshark-image nullq-interop-wireshark:local] [--dry-run]
+        \\  zig build external-interop -- runner [--role server|client] [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--servers quic-go,ngtcp2,quiche] [--tests core+retry] [--scenario "drop-rate ..."] [--python 3.12] [--wireshark-image nullq-interop-wireshark:local] [--dry-run]
         \\
     , .{});
 }
@@ -183,6 +191,11 @@ fn parseRunner(allocator: std.mem.Allocator, args: []const []const u8, cfg: *Con
             i += 1;
         } else if (std.mem.eql(u8, arg, "--build-image")) {
             cfg.build_image = true;
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--scenario")) {
+            i += 1;
+            if (i >= args.len) return error.MissingScenario;
+            cfg.scenario = args[i];
             i += 1;
         } else {
             std.debug.print("unknown runner argument: {s}\n", .{arg});
@@ -284,6 +297,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     try recreateDir(io, overlay);
     try copyTree(allocator, io, runner_dir, overlay);
     try patchRunnerKeylogSelection(allocator, io, overlay);
+    if (cfg.scenario != null) try patchRunnerScenarioOverride(allocator, io, overlay);
     try injectNullqImplementation(allocator, io, overlay, cfg.image, @tagName(cfg.role));
     const trace_tools_dir = try prepareTraceTools(allocator, io, cfg, overlay);
 
@@ -293,12 +307,18 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
 
     var cmd: std.ArrayList([]const u8) = .empty;
     defer cmd.deinit(allocator);
-    if (trace_tools_dir) |dir| {
-        const env_path = if (cfg.path_env.len > 0)
-            try std.fmt.allocPrint(allocator, "PATH={s}:{s}", .{ dir, cfg.path_env })
-        else
-            try std.fmt.allocPrint(allocator, "PATH={s}", .{dir});
-        try cmd.appendSlice(allocator, &.{ "/usr/bin/env", env_path });
+    if (trace_tools_dir != null or cfg.scenario != null) {
+        try cmd.append(allocator, "/usr/bin/env");
+        if (trace_tools_dir) |dir| {
+            const env_path = if (cfg.path_env.len > 0)
+                try std.fmt.allocPrint(allocator, "PATH={s}:{s}", .{ dir, cfg.path_env })
+            else
+                try std.fmt.allocPrint(allocator, "PATH={s}", .{dir});
+            try cmd.append(allocator, env_path);
+        }
+        if (cfg.scenario) |scenario| {
+            try cmd.append(allocator, try std.fmt.allocPrint(allocator, "NULLQ_INTEROP_SCENARIO={s}", .{scenario}));
+        }
     }
     try cmd.appendSlice(allocator, &.{ "uv", "run", "--python", cfg.runner_python });
     const requirements = try std.fs.path.join(allocator, &.{ overlay, "requirements.txt" });
@@ -559,12 +579,46 @@ fn patchRunnerKeylogSelection(
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = testcase_path, .data = patched.items });
 }
 
+fn patchRunnerScenarioOverride(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    overlay: []const u8,
+) !void {
+    const interop_path = try std.fs.path.join(allocator, &.{ overlay, "interop.py" });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, interop_path, allocator, .limited(2 * 1024 * 1024));
+    defer allocator.free(bytes);
+
+    const needle =
+        \\        ).format(test.scenario())
+    ;
+    const replacement =
+        \\        ).format(os.environ.get("NULLQ_INTEROP_SCENARIO", test.scenario()))
+    ;
+    if (std.mem.indexOf(u8, bytes, replacement) != null) return;
+    const idx = std.mem.indexOf(u8, bytes, needle) orelse return error.UnsupportedRunnerScenarioFormat;
+    var patched: std.ArrayList(u8) = .empty;
+    defer patched.deinit(allocator);
+    try patched.appendSlice(allocator, bytes[0..idx]);
+    try patched.appendSlice(allocator, replacement);
+    try patched.appendSlice(allocator, bytes[idx + needle.len ..]);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = interop_path, .data = patched.items });
+}
+
 fn expandCases(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
     if (std.mem.eql(u8, spec, "core")) {
         return try allocator.dupe(u8, "handshake,transfer,chacha20,resumption,zerortt,multiplexing");
     }
     if (std.mem.eql(u8, spec, "core+retry")) {
         return try allocator.dupe(u8, "handshake,transfer,chacha20,retry,resumption,zerortt,multiplexing");
+    }
+    if (std.mem.eql(u8, spec, "loss")) {
+        return try allocator.dupe(u8, "handshakeloss,transferloss");
+    }
+    if (std.mem.eql(u8, spec, "loss+corruption")) {
+        return try allocator.dupe(u8, "handshakeloss,transferloss,handshakecorruption,transfercorruption");
+    }
+    if (std.mem.eql(u8, spec, "recovery")) {
+        return try allocator.dupe(u8, "handshakeloss,transferloss,blackhole,rebind-port");
     }
 
     var out: std.ArrayList(u8) = .empty;
@@ -656,6 +710,14 @@ test "case expansion supports presets and aliases" {
     const preset = try expandCases(allocator, "core+retry");
     defer allocator.free(preset);
     try std.testing.expect(std.mem.indexOf(u8, preset, "retry") != null);
+
+    const loss = try expandCases(allocator, "loss");
+    defer allocator.free(loss);
+    try std.testing.expectEqualStrings("handshakeloss,transferloss", loss);
+
+    const recovery = try expandCases(allocator, "L1,L2,B,BP");
+    defer allocator.free(recovery);
+    try std.testing.expectEqualStrings("handshakeloss,transferloss,blackhole,rebind-port", recovery);
 }
 
 test "runner paths are normalized to absolute paths" {
@@ -671,6 +733,8 @@ test "runner paths are normalized to absolute paths" {
         "interop/logs",
         "--json",
         "interop/results/out.json",
+        "--scenario",
+        "drop-rate --delay=15ms",
     };
     try parseRunner(allocator, &args, &cfg);
     defer allocator.free(cfg.runner_dir.?);
@@ -683,6 +747,7 @@ test "runner paths are normalized to absolute paths" {
     try std.testing.expect(std.mem.endsWith(u8, cfg.runner_dir.?, "quic-interop-runner"));
     try std.testing.expect(std.mem.endsWith(u8, cfg.log_dir.?, "interop/logs"));
     try std.testing.expect(std.mem.endsWith(u8, cfg.json_path.?, "interop/results/out.json"));
+    try std.testing.expectEqualStrings("drop-rate --delay=15ms", cfg.scenario.?);
 }
 
 test "runner client role defaults to client result path" {

@@ -4,7 +4,7 @@ set -eu
 /setup.sh
 
 case "${TESTCASE:-}" in
-  ""|handshake|transfer|longrtt|chacha20|multiplexing|retry|resumption|zerortt|keyupdate|blackhole|handshakeloss|transferloss|handshakecorruption|transfercorruption)
+  ""|handshake|transfer|longrtt|chacha20|multiplexing|retry|resumption|zerortt|keyupdate|blackhole|handshakeloss|transferloss|handshakecorruption|transfercorruption|multiconnect)
     ;;
   *)
     echo "nullq qns endpoint does not support TESTCASE=${TESTCASE:-unset}" >&2
@@ -31,6 +31,10 @@ case "${ROLE:-server}" in
     exec "$@"
     ;;
   client)
+    if [ "${TESTCASE:-}" = "multiconnect" ]; then
+      echo "nullq qns client does not support TESTCASE=${TESTCASE}" >&2
+      exit 127
+    fi
     server_arg="${SERVER:-}"
     if [ -z "${server_arg}" ] && [ -n "${REQUESTS:-}" ]; then
       first_request=${REQUESTS%% *}
