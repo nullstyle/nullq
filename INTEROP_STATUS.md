@@ -20,8 +20,10 @@ Current as of 2026-05-04.
   tests, shutdown/stateless-reset edge tests, initial 0-RTT
   packet/receive/rejection/loss unit tests, deterministic
   parser/property fuzz smokes for varints, frames, transport params,
-  packet headers, ACK ranges, and CRYPTO/STREAM reassembly, and the 10%
-  simulated-loss stream exchange.
+  packet headers, ACK ranges, and CRYPTO/STREAM reassembly, typed
+  `preferred_address` transport-parameter codec coverage, duplicate
+  transport-parameter rejection, and the 10% simulated-loss stream
+  exchange.
 - `zig build` in `nullq-peer`: passing.
 - `go test ./cmd/quicpeer ./internal/interop` in `go-quic-peer`: passing.
 - `go-quic-peer client` against `nullq-peer`: passing for handshake,
@@ -237,8 +239,13 @@ Current as of 2026-05-04.
 - The 0-RTT replay-context builder now excludes per-connection
   identifiers/tokens while retaining replay-relevant transport limits,
   so valid resumption does not reject solely because the new Initial
-  uses a different original destination CID. Incoming streams and
-  DATAGRAMs also expose `arrived_in_early_data` metadata.
+  uses a different original destination CID. It also deliberately
+  excludes `preferred_address`, which is a server migration hint rather
+  than an early-data send constraint. Incoming streams and DATAGRAMs
+  expose `arrived_in_early_data` metadata.
+- Transport-parameter parsing now rejects duplicate parameters, even
+  for unknown extension IDs, and exposes the full RFC 9000
+  `preferred_address` structure as a typed parameter.
 
 ## Still not production-grade
 
@@ -310,7 +317,9 @@ Current as of 2026-05-04.
    have deterministic core coverage plus live quic-go interop through
    nullq-peer, and Retry address-validation helpers are reusable nullq
    API. Bounded allocation policy and deterministic parser/property
-   smoke coverage have landed. Local endpoint probes now cover
+   smoke coverage have landed. Transport-parameter parsing now includes
+   duplicate-parameter rejection plus typed `preferred_address`
+   encode/decode/validation. Local endpoint probes now cover
    malformed, replayed-address, replayed-CID, expired, and wrong-version
    Retry tokens; send-side blocked-frame loss requeue now skips stale
    DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED frames after the

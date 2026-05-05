@@ -52,10 +52,11 @@ pub fn buildForTransportParams(
 fn updateTransportParams(h: *boringssl.crypto.hash.Sha256, p: Params) void {
     // Deliberately exclude connection-instance identifiers and tokens
     // such as original_destination_connection_id, stateless_reset_token,
-    // initial_source_connection_id, and retry_source_connection_id. Those
-    // vary for each connection attempt and would make every otherwise
-    // valid resumption reject 0-RTT. The context below covers the
-    // transport and application settings that constrain early bytes.
+    // preferred_address, initial_source_connection_id, and
+    // retry_source_connection_id. Those vary by connection attempt or
+    // migration hint and would make otherwise valid resumption reject
+    // 0-RTT. The context below covers the transport and application
+    // settings that constrain early bytes.
     updateU64(h, p.max_idle_timeout_ms);
     updateU64(h, p.max_udp_payload_size);
     updateU64(h, p.initial_max_data);
@@ -247,6 +248,14 @@ test "context ignores connection-instance identifiers" {
             .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 5, 6, 7, 8 }),
             .retry_source_connection_id = path.ConnectionId.fromSlice(&.{ 9, 10, 11, 12 }),
             .stateless_reset_token = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+            .preferred_address = .{
+                .ipv4_address = .{ 192, 0, 2, 1 },
+                .ipv4_port = 4433,
+                .ipv6_address = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+                .ipv6_port = 4433,
+                .connection_id = path.ConnectionId.fromSlice(&.{ 0xa0, 0xa1 }),
+                .stateless_reset_token = .{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf },
+            },
             .initial_max_data = 1024,
         },
     });
@@ -256,6 +265,14 @@ test "context ignores connection-instance identifiers" {
             .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 0xcc, 0xdd }),
             .retry_source_connection_id = path.ConnectionId.fromSlice(&.{ 0xee, 0xff }),
             .stateless_reset_token = .{ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 },
+            .preferred_address = .{
+                .ipv4_address = .{ 198, 51, 100, 9 },
+                .ipv4_port = 8443,
+                .ipv6_address = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9 },
+                .ipv6_port = 8443,
+                .connection_id = path.ConnectionId.fromSlice(&.{ 0xb0, 0xb1, 0xb2 }),
+                .stateless_reset_token = .{ 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf },
+            },
             .initial_max_data = 1024,
         },
     });

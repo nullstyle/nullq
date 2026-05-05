@@ -220,11 +220,28 @@ test "fuzz smoke: transport parameter codec canonicalizes generated params" {
     var cid_a: [nullq.conn.path.max_cid_len]u8 = undefined;
     var cid_b: [nullq.conn.path.max_cid_len]u8 = undefined;
     var cid_c: [nullq.conn.path.max_cid_len]u8 = undefined;
+    var cid_d: [nullq.conn.path.max_cid_len]u8 = undefined;
 
     var i: usize = 0;
     while (i < 512) : (i += 1) {
         var token: [16]u8 = undefined;
         rng.bytes(&token);
+        const preferred_address: ?transport_params.PreferredAddress = if ((rng.int(u8) & 1) == 0) null else blk: {
+            var ipv4: [4]u8 = undefined;
+            var ipv6: [16]u8 = undefined;
+            var preferred_token: [16]u8 = undefined;
+            rng.bytes(&ipv4);
+            rng.bytes(&ipv6);
+            rng.bytes(&preferred_token);
+            break :blk .{
+                .ipv4_address = ipv4,
+                .ipv4_port = rng.int(u16),
+                .ipv6_address = ipv6,
+                .ipv6_port = rng.int(u16),
+                .connection_id = makeRandomTransportCid(rng, &cid_d),
+                .stateless_reset_token = preferred_token,
+            };
+        };
         const params: transport_params.Params = .{
             .original_destination_connection_id = if ((rng.int(u8) & 1) == 0) null else makeRandomTransportCid(rng, &cid_a),
             .max_idle_timeout_ms = randomVarint(rng) % 60_000,
@@ -239,6 +256,7 @@ test "fuzz smoke: transport parameter codec canonicalizes generated params" {
             .ack_delay_exponent = randomVarint(rng) % 21,
             .max_ack_delay_ms = randomVarint(rng) % ((@as(u64, 1) << 14) - 1),
             .disable_active_migration = (rng.int(u8) & 1) == 0,
+            .preferred_address = preferred_address,
             .active_connection_id_limit = 2 + (randomVarint(rng) % 15),
             .initial_source_connection_id = if ((rng.int(u8) & 1) == 0) null else makeRandomTransportCid(rng, &cid_b),
             .retry_source_connection_id = if ((rng.int(u8) & 1) == 0) null else makeRandomTransportCid(rng, &cid_c),

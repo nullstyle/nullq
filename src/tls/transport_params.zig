@@ -95,7 +95,11 @@ pub const Params = struct {
     /// 0x0c — zero-length flag.
     disable_active_migration: bool = false,
 
-    // 0x0d preferred_address — not implemented yet (complex composite).
+    /// 0x0d — server-only preferred address for clients that support
+    /// migration (RFC 9000 §18.2). The codec keeps the complete wire
+    /// structure so embedders can advertise or inspect it without
+    /// treating the parameter as an opaque extension.
+    preferred_address: ?PreferredAddress = null,
 
     /// 0x0e — number of CIDs the peer is willing to store. Min 2; default 2.
     active_connection_id_limit: u64 = 2,
@@ -157,6 +161,9 @@ pub const Params = struct {
         if (self.disable_active_migration) {
             pos += try writeFlag(dst, pos, Id.disable_active_migration);
         }
+        if (self.preferred_address) |addr| {
+            pos += try writePreferredAddress(dst, pos, addr);
+        }
         if (self.active_connection_id_limit != 2) {
             pos += try writeVarint(dst, pos, Id.active_connection_id_limit, self.active_connection_id_limit);
         }
@@ -182,6 +189,7 @@ pub const Params = struct {
         var p: Params = .{};
         var pos: usize = 0;
         while (pos < src.len) {
+            const param_start = pos;
             const id_d = try varint.decode(src[pos..]);
             pos += id_d.bytes_read;
             const len_d = try varint.decode(src[pos..]);
@@ -190,10 +198,22 @@ pub const Params = struct {
             const value_len: usize = @intCast(len_d.value);
             const value = src[pos .. pos + value_len];
             pos += value_len;
+            if (try hasParameterId(src[0..param_start], id_d.value)) {
+                return Error.DuplicateParameter;
+            }
             try setOne(&p, id_d.value, value);
         }
         return p;
     }
+};
+
+pub const PreferredAddress = struct {
+    ipv4_address: [4]u8 = @splat(0),
+    ipv4_port: u16 = 0,
+    ipv6_address: [16]u8 = @splat(0),
+    ipv6_port: u16 = 0,
+    connection_id: ConnectionId = .{},
+    stateless_reset_token: [16]u8 = @splat(0),
 };
 
 fn writeVarint(dst: []u8, pos: usize, id: u64, value: u64) Error!usize {
@@ -222,6 +242,40 @@ fn writeFlag(dst: []u8, pos: usize, id: u64) Error!usize {
     written += try varint.encode(dst[pos..], id);
     written += try varint.encode(dst[pos + written ..], 0);
     return written;
+}
+
+fn writePreferredAddress(dst: []u8, pos: usize, addr: PreferredAddress) Error!usize {
+    const cid_len = addr.connection_id.len;
+    const value_len: usize = 4 + 2 + 16 + 2 + 1 + cid_len + 16;
+    var written: usize = 0;
+    written += try varint.encode(dst[pos..], Id.preferred_address);
+    written += try varint.encode(dst[pos + written ..], value_len);
+    if (dst.len < pos + written + value_len) return Error.BufferTooSmall;
+
+    const value_start = pos + written;
+    @memcpy(dst[value_start .. value_start + 4], &addr.ipv4_address);
+    std.mem.writeInt(u16, dst[value_start + 4 ..][0..2], addr.ipv4_port, .big);
+    @memcpy(dst[value_start + 6 .. value_start + 22], &addr.ipv6_address);
+    std.mem.writeInt(u16, dst[value_start + 22 ..][0..2], addr.ipv6_port, .big);
+    dst[value_start + 24] = cid_len;
+    @memcpy(dst[value_start + 25 .. value_start + 25 + cid_len], addr.connection_id.slice());
+    @memcpy(dst[value_start + 25 + cid_len .. value_start + 41 + cid_len], &addr.stateless_reset_token);
+    written += value_len;
+    return written;
+}
+
+fn hasParameterId(src: []const u8, needle: u64) Error!bool {
+    var pos: usize = 0;
+    while (pos < src.len) {
+        const id_d = try varint.decode(src[pos..]);
+        pos += id_d.bytes_read;
+        const len_d = try varint.decode(src[pos..]);
+        pos += len_d.bytes_read;
+        if (len_d.value > src.len - pos) return Error.InvalidValue;
+        if (id_d.value == needle) return true;
+        pos += @intCast(len_d.value);
+    }
+    return false;
 }
 
 fn setOne(p: *Params, id: u64, value: []const u8) Error!void {
@@ -258,6 +312,7 @@ fn setOne(p: *Params, id: u64, value: []const u8) Error!void {
             if (value.len != 0) return Error.InvalidValue;
             p.disable_active_migration = true;
         },
+        Id.preferred_address => p.preferred_address = try decodePreferredAddress(value),
         Id.active_connection_id_limit => {
             const v = try decodeVarintValue(value);
             if (v < 2) return Error.InvalidValue;
@@ -279,6 +334,24 @@ fn setOne(p: *Params, id: u64, value: []const u8) Error!void {
         },
         else => {}, // unknown ids are ignored per §18
     }
+}
+
+fn decodePreferredAddress(value: []const u8) Error!PreferredAddress {
+    if (value.len < 41) return Error.InvalidValue;
+    const cid_len = value[24];
+    if (cid_len > path_mod.max_cid_len) return Error.InvalidValue;
+    const expected_len: usize = 41 + @as(usize, cid_len);
+    if (value.len != expected_len) return Error.InvalidValue;
+
+    var addr: PreferredAddress = .{
+        .ipv4_port = std.mem.readInt(u16, value[4..][0..2], .big),
+        .ipv6_port = std.mem.readInt(u16, value[22..][0..2], .big),
+        .connection_id = ConnectionId.fromSlice(value[25 .. 25 + cid_len]),
+    };
+    @memcpy(&addr.ipv4_address, value[0..4]);
+    @memcpy(&addr.ipv6_address, value[6..22]);
+    @memcpy(&addr.stateless_reset_token, value[25 + cid_len .. expected_len]);
+    return addr;
 }
 
 fn decodeVarintValue(value: []const u8) Error!u64 {
@@ -349,10 +422,79 @@ test "server-only fields round-trip" {
     try testing.expect(got.disable_active_migration);
 }
 
+test "preferred_address round-trips" {
+    const cid = ConnectionId.fromSlice(&.{ 0xca, 0xfe, 0xba, 0xbe });
+    const reset_tok: [16]u8 = .{
+        0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+        0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+    };
+    const preferred: PreferredAddress = .{
+        .ipv4_address = .{ 192, 0, 2, 1 },
+        .ipv4_port = 4433,
+        .ipv6_address = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .ipv6_port = 8443,
+        .connection_id = cid,
+        .stateless_reset_token = reset_tok,
+    };
+    const sent: Params = .{ .preferred_address = preferred };
+
+    var buf: [128]u8 = undefined;
+    const n = try sent.encode(&buf);
+    const got = (try Params.decode(buf[0..n])).preferred_address.?;
+
+    try testing.expectEqualSlices(u8, &preferred.ipv4_address, &got.ipv4_address);
+    try testing.expectEqual(preferred.ipv4_port, got.ipv4_port);
+    try testing.expectEqualSlices(u8, &preferred.ipv6_address, &got.ipv6_address);
+    try testing.expectEqual(preferred.ipv6_port, got.ipv6_port);
+    try testing.expectEqualSlices(u8, preferred.connection_id.slice(), got.connection_id.slice());
+    try testing.expectEqualSlices(u8, &preferred.stateless_reset_token, &got.stateless_reset_token);
+}
+
+test "decode rejects malformed preferred_address" {
+    var short_buf: [64]u8 = @splat(0);
+    var pos: usize = 0;
+    pos += try varint.encode(short_buf[pos..], Id.preferred_address);
+    pos += try varint.encode(short_buf[pos..], 40);
+    pos += 40;
+    try testing.expectError(Error.InvalidValue, Params.decode(short_buf[0..pos]));
+
+    var long_cid_buf: [96]u8 = @splat(0);
+    pos = 0;
+    pos += try varint.encode(long_cid_buf[pos..], Id.preferred_address);
+    pos += try varint.encode(long_cid_buf[pos..], 62);
+    long_cid_buf[pos + 24] = path_mod.max_cid_len + 1;
+    pos += 62;
+    try testing.expectError(Error.InvalidValue, Params.decode(long_cid_buf[0..pos]));
+
+    var trailing_buf: [64]u8 = @splat(0);
+    pos = 0;
+    pos += try varint.encode(trailing_buf[pos..], Id.preferred_address);
+    pos += try varint.encode(trailing_buf[pos..], 42);
+    trailing_buf[pos + 24] = 0;
+    pos += 42;
+    try testing.expectError(Error.InvalidValue, Params.decode(trailing_buf[0..pos]));
+}
+
 test "decode rejects oversized stateless_reset_token" {
     // id=0x02 (stateless_reset_token), len=8 (must be 16) — invalid.
     const blob = [_]u8{ 0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
     try testing.expectError(Error.InvalidValue, Params.decode(&blob));
+}
+
+test "decode rejects duplicate transport parameters" {
+    const known = [_]u8{
+        0x04, 0x01, 0x05,
+        0x04, 0x01, 0x06,
+    };
+    try testing.expectError(Error.DuplicateParameter, Params.decode(&known));
+
+    var unknown: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += try varint.encode(unknown[pos..], 0x1234);
+    pos += try varint.encode(unknown[pos..], 0);
+    pos += try varint.encode(unknown[pos..], 0x1234);
+    pos += try varint.encode(unknown[pos..], 0);
+    try testing.expectError(Error.DuplicateParameter, Params.decode(unknown[0..pos]));
 }
 
 test "decode rejects active_connection_id_limit < 2" {
