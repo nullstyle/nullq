@@ -78,6 +78,16 @@ Current as of 2026-05-04.
   is passing: `✓(H,DC,C20,S,R,Z,M)`. The current runner still emits an
   occasional trace-analysis warning that one packet could not be
   decrypted, but the QNS result is green.
+- Official QUIC interop-runner QNS client gate, basic matrix:
+  `zig build external-interop -- runner --role client --runner-dir ../quic-interop-runner --servers quic-go,ngtcp2,quiche --tests H,D`
+  is passing with `quic-go`, `ngtcp2`, and `quiche` all green for
+  handshake and transfer: `✓(H,DC)`.
+- Official QUIC interop-runner QNS client gate, quic-go feature matrix:
+  `zig build external-interop -- runner --role client --runner-dir ../quic-interop-runner --servers quic-go --tests H,D,C,S,R,Z,M`
+  is passing for `H,D,S,R,Z,M`: `✓(H,DC,S,R,Z,M)`. `C20` remains red
+  because BoringSSL's QUIC client currently offers/selects AES-128 on
+  AES-capable hosts and does not expose a C-callable TLS 1.3
+  cipher-suite override through `boringssl-zig`.
 
 ## Production work landed
 
@@ -107,16 +117,17 @@ Current as of 2026-05-04.
   offered.
 - Client-side Retry now validates the RFC 9001 integrity tag, enforces
   the Retry CID constraints, stores the token for the replacement
-  Initial, resets Initial packet number/recovery state, and validates
-  the peer's original/retry source CID transport parameters.
+  Initial, clears stale Initial recovery while preserving packet-number
+  continuity, and validates the peer's original/retry source CID
+  transport parameters.
 - Server embedders can write a standards-compliant QUIC v1 Retry packet
   with `Connection.writeRetry`; token contents and acceptance policy
   intentionally remain application-owned.
 - A first official QUIC interop-runner gate has landed. `qns-endpoint`
-  adapts nullq to the runner's HTTP/0.9 server contract, while
-  `zig build external-interop -- ...` builds a local Docker endpoint,
-  overlays a `nullq` server entry into a throwaway runner copy, and
-  runs nullq-as-server against selected external clients without
+  adapts nullq to the runner's HTTP/0.9 server and client contracts,
+  while `zig build external-interop -- ...` builds a local Docker
+  endpoint, overlays a role-specific `nullq` entry into a throwaway
+  runner copy, and runs nullq against selected external peers without
   mutating the external checkout. The `qns-endpoint` build step now
   installs the endpoint directly, so Docker images can build the
   selective target instead of the full install step.

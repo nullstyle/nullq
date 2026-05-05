@@ -20,6 +20,9 @@ QUIC interop runner.
   `resumption` and `zerortt`: it downloads the first request, captures
   a session ticket, reconnects for the remaining requests, and sends
   those second-flight requests as early data for `zerortt`.
+- Client downloads are scheduled as peer stream credit becomes
+  available, so high-fanout `multiplexing` tests do not fail just
+  because the server starts with a smaller bidirectional stream limit.
 - Honors the runner's `SSLKEYLOGFILE` and `QLOGDIR` environment
   variables. `SSLKEYLOGFILE` receives Wireshark-compatible TLS secrets;
   `QLOGDIR` receives nullq qlog-style key lifecycle JSONL traces.
@@ -57,9 +60,13 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   handshake and transfer: `✓(H,DC)`.
 - `quic-go` passes the feature matrix:
   `✓(H,DC,C20,S,R,Z,M)`.
-- Client-role wrapper support is wired for local-only private gates;
-  run it with `--role client` to validate nullq downloads from external
-  QNS servers.
+- `quic-go`, `ngtcp2`, and `quiche` all pass nullq-as-client
+  handshake and transfer: `✓(H,DC)`.
+- `quic-go` passes nullq-as-client `H,D,S,R,Z,M`:
+  `✓(H,DC,S,R,Z,M)`. `C20` remains red because the current
+  `boringssl-zig` surface does not expose a C-callable TLS 1.3 client
+  cipher-suite preference/override, so the client selects AES-128 on
+  AES-capable hosts.
 - The runner may print `At least one QUIC packet could not be
   decrypted` during trace processing even when the QNS result is green;
   keep an eye on that warning while expanding the gate.
