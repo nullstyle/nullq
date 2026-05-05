@@ -67,6 +67,9 @@ pub fn mint(dst: []u8, opts: MintOptions) Error!usize {
     std.mem.writeInt(u32, dst[1..5], opts.quic_version, .big);
     std.mem.writeInt(u64, dst[5..13], opts.now_us, .big);
     std.mem.writeInt(u64, dst[13..21], addSat(opts.now_us, opts.lifetime_us), .big);
+    // invariant: validateBoundInputs above already rejected oversized
+    // inputs, so authTag's only error path (ContextTooLong from
+    // updateBound) cannot fire here. Not peer-reachable.
     const tag = authTag(opts.key, dst[0..header_len], opts.client_address, opts.original_dcid, opts.retry_scid) catch unreachable;
     @memcpy(dst[header_len..token_len], &tag);
     return token_len;

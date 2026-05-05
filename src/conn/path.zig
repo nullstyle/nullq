@@ -422,10 +422,14 @@ pub const PathSet = struct {
     }
 
     pub fn primary(self: *PathSet) *PathState {
+        // invariant: primary_id is set in init() before any caller
+        // can observe a PathSet, and openPath/abandon never remove
+        // the primary entry. Not peer-reachable.
         return self.get(self.primary_id) orelse unreachable;
     }
 
     pub fn primaryConst(self: *const PathSet) *const PathState {
+        // invariant: see primary(). Not peer-reachable.
         return self.getConst(self.primary_id) orelse unreachable;
     }
 
@@ -491,6 +495,10 @@ pub const PathSet = struct {
     }
 
     fn selectRoundRobin(self: *PathSet) *PathState {
+        // invariant: callers only invoke this from selectForSending,
+        // which is reachable only after openPath has been called at
+        // least once (i.e. after a Connection is initialized). Not
+        // peer-reachable.
         if (self.paths.items.len == 0) unreachable;
         var attempts: usize = 0;
         while (attempts < self.paths.items.len) : (attempts += 1) {
