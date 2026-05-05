@@ -48,6 +48,72 @@ mise install
 just test
 ```
 
+## Embed nullq as a server
+
+`nullq.Server` is the thinnest convenience wrapper that keeps the
+embedder in charge of the UDP socket and the wall clock while
+nullq owns the TLS context, the per-connection state, and the
+demultiplexing of incoming datagrams. The full lower-level
+`Connection` API is fully supported — `Server` just spares you the
+boilerplate of writing it yourself for the common case.
+
+```zig
+const std = @import("std");
+const nullq = @import("nullq");
+
+pub fn run(
+    allocator: std.mem.Allocator,
+    sock: anytype, // your UDP socket
+    cert_pem: []const u8,
+    key_pem: []const u8,
+) !void {
+    const protos = [_][]const u8{"hq-interop"};
+
+    var server = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = cert_pem,
+        .tls_key_pem = key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = .{
+            .max_idle_timeout_ms = 30_000,
+            .initial_max_data = 16 * 1024 * 1024,
+            .initial_max_stream_data_bidi_local = 1 << 20,
+            .initial_max_stream_data_bidi_remote = 1 << 20,
+            .initial_max_stream_data_uni = 1 << 20,
+            .initial_max_streams_bidi = 1000,
+            .initial_max_streams_uni = 64,
+            .active_connection_id_limit = 4,
+        },
+    });
+    defer server.deinit();
+
+    var rx: [64 * 1024]u8 = undefined;
+    var tx: [1350]u8 = undefined;
+
+    while (true) {
+        const now_us = monotonicNowUs();
+        if (try sock.recv(&rx)) |msg| {
+            _ = try server.feed(msg.bytes, msg.from, now_us);
+        }
+        for (server.iterator()) |slot| {
+            // App work goes here: open streams, read data, send
+            // datagrams. `slot.conn` is the full `*nullq.Connection`.
+            // `pollDatagram` returns the destination address with
+            // each outgoing packet so multipath / migration work.
+            while (try slot.conn.pollDatagram(&tx, now_us)) |out| {
+                try sock.send(out.to.?, tx[0..out.len]);
+            }
+        }
+        try server.tick(now_us);
+        _ = server.reap();
+    }
+}
+```
+
+For interop-specific behavior (Retry, version negotiation,
+deterministic CIDs), see `interop/qns_endpoint.zig` for the
+fully-customised pattern.
+
 ## 0-RTT Tickets
 
 Session tickets are owned by `boringssl-zig` and re-exported as

@@ -33,6 +33,11 @@ pub const retry_token = conn.retry_token;
 /// I/O and path-tracking helpers later.
 pub const transport = @import("transport/root.zig");
 
+/// High-level convenience wrapper for embedding nullq as a QUIC
+/// server. Owns the TLS context and a connection table; the
+/// embedder still owns the UDP socket and the clock.
+pub const Server = @import("server.zig").Server;
+
 pub const Connection = conn.Connection;
 pub const OutgoingDatagram = conn.OutgoingDatagram;
 pub const IncomingDatagram = conn.IncomingDatagram;
@@ -69,6 +74,7 @@ test {
     _ = tls;
     _ = conn;
     _ = transport;
+    _ = @import("server.zig");
 }
 
 test "phase 0: builds and links against boringssl-zig" {
