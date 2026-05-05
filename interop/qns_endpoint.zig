@@ -19,6 +19,7 @@ const endpoint_connection_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
 const max_qns_server_connections = 128;
+const qns_time_base_us: u64 = 1_000_000;
 
 const ServerOptions = struct {
     listen: []const u8 = "0.0.0.0:443",
@@ -459,11 +460,12 @@ fn runServer(
         conns.deinit(allocator);
     }
 
-    var now_us: u64 = 1_000_000;
+    const start = std.Io.Timestamp.now(io, .awake);
     var rx: [64 * 1024]u8 = undefined;
     var tx: [endpoint_udp_payload_size]u8 = undefined;
 
     while (true) {
+        var now_us = qnsNowUs(io, start);
         const maybe_msg = sock.receiveTimeout(io, &rx, .{
             .duration = .{
                 .raw = std.Io.Duration.fromMilliseconds(5),
@@ -473,27 +475,24 @@ fn runServer(
             error.Timeout => null,
             else => return err,
         };
+        now_us = qnsNowUs(io, start);
 
         if (maybe_msg) |msg| {
             var server_conn = findServerConn(conns.items, msg.data, msg.from);
             if (server_conn == null) {
                 const ids = peekLongHeaderIds(msg.data) orelse {
-                    now_us += 1_000;
                     continue;
                 };
                 if (ids.version != nullq.QUIC_VERSION_1) {
                     const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
                     try sock.send(io, &msg.from, tx[0..n]);
-                    now_us += 1_000;
                     continue;
                 }
                 if (!isInitialLongHeader(msg.data)) {
-                    now_us += 1_000;
                     continue;
                 }
                 if (conns.items.len >= max_qns_server_connections) {
                     std.debug.print("dropping new QNS server connection from {f}: active limit reached\n", .{msg.from});
-                    now_us += 1_000;
                     continue;
                 }
                 const new_conn = try ServerConn.init(
@@ -514,13 +513,11 @@ fn runServer(
             sc.last_activity_us = now_us;
             if (!sc.transport_params_set) {
                 const ids = peekLongHeaderIds(msg.data) orelse {
-                    now_us += 1_000;
                     continue;
                 };
                 if (ids.version != nullq.QUIC_VERSION_1) {
                     const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
                     try sock.send(io, &msg.from, tx[0..n]);
-                    now_us += 1_000;
                     continue;
                 }
 
@@ -530,7 +527,6 @@ fn runServer(
                     const n = try sc.conn.writeRetry(&tx, msg.data, &sc.retry_source_cid, &token);
                     try sock.send(io, &msg.from, tx[0..n]);
                     sc.retry_sent = true;
-                    now_us += 1_000;
                     continue;
                 }
 
@@ -541,11 +537,9 @@ fn runServer(
                     null;
                 if (sc.retry_sent) {
                     const token = peekInitialToken(msg.data) orelse {
-                        now_us += 1_000;
                         continue;
                     };
                     if (!validRetryToken(msg.from, now_us, original_dcid.slice(), &sc.retry_source_cid, token)) {
-                        now_us += 1_000;
                         continue;
                     }
                 }
@@ -587,7 +581,6 @@ fn runServer(
             }
             i += 1;
         }
-        now_us += 1_000;
     }
 }
 
@@ -698,6 +691,14 @@ fn clientMode(testcase: []const u8) ClientMode {
     return .normal;
 }
 
+fn qnsNowUs(io: std.Io, start: std.Io.Timestamp) u64 {
+    const now = std.Io.Timestamp.now(io, .awake);
+    const delta = start.durationTo(now).toMicroseconds();
+    if (delta <= 0) return qns_time_base_us;
+    const delta_us: u64 = @intCast(delta);
+    return qns_time_base_us +| delta_us;
+}
+
 fn runClientConnection(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -754,12 +755,13 @@ fn runClientConnection(
     }
     try conn.advance();
 
-    var now_us: u64 = 1_000_000;
-    var idle_us: u64 = 0;
+    const start = std.Io.Timestamp.now(io, .awake);
+    var last_progress_us = qnsNowUs(io, start);
     var rx: [64 * 1024]u8 = undefined;
     var tx: [endpoint_udp_payload_size]u8 = undefined;
 
     while ((!allDownloadsComplete(downloads) or !ticketRequirementMet(conn_opts.wait_for_ticket)) and !conn.isClosed()) {
+        var now_us = qnsNowUs(io, start);
         var progressed = false;
         const had_ticket = ticketRequirementMet(conn_opts.wait_for_ticket);
 
@@ -772,6 +774,7 @@ fn runClientConnection(
             error.Timeout => null,
             else => return err,
         };
+        now_us = qnsNowUs(io, start);
         if (maybe_msg) |msg| {
             try conn.handle(msg.data, null, now_us);
             progressed = true;
@@ -798,12 +801,10 @@ fn runClientConnection(
         try conn.tick(now_us);
 
         if (progressed) {
-            idle_us = 0;
+            last_progress_us = now_us;
         } else {
-            idle_us += 1_000;
-            if (idle_us > 120_000_000) return error.ClientTimeout;
+            if (now_us -| last_progress_us > 120_000_000) return error.ClientTimeout;
         }
-        now_us += 1_000;
     }
 
     if (!allDownloadsComplete(downloads)) {
@@ -827,9 +828,9 @@ fn runClientConnection(
     conn.close(false, 0, "qns downloads complete");
     var flushes: u8 = 0;
     while (flushes < 8) : (flushes += 1) {
+        const now_us = qnsNowUs(io, start);
         while (try conn.poll(&tx, now_us)) |n| try sock.send(io, &server_addr, tx[0..n]);
         try conn.tick(now_us);
-        now_us += 1_000;
     }
 }
 
