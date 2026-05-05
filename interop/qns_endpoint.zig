@@ -23,6 +23,7 @@ const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 2;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
 const max_qns_server_connections = 128;
+const max_qns_server_rx_burst = 64;
 const qns_time_base_us: u64 = 1_000_000;
 
 const ServerOptions = struct {
@@ -470,103 +471,33 @@ fn runServer(
 
     while (true) {
         var now_us = qnsNowUs(io, start);
-        const maybe_msg = sock.receiveTimeout(io, &rx, .{
-            .duration = .{
-                .raw = std.Io.Duration.fromMilliseconds(5),
-                .clock = .awake,
-            },
-        }) catch |err| switch (err) {
-            error.Timeout => null,
-            else => return err,
-        };
-        now_us = qnsNowUs(io, start);
-
-        if (maybe_msg) |msg| {
-            var server_conn = findServerConn(conns.items, msg.data, msg.from);
-            if (server_conn == null) {
-                const ids = peekLongHeaderIds(msg.data) orelse {
-                    continue;
-                };
-                if (ids.version != nullq.QUIC_VERSION_1) {
-                    const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
-                    try sock.send(io, &msg.from, tx[0..n]);
-                    continue;
-                }
-                if (!isInitialLongHeader(msg.data)) {
-                    continue;
-                }
-                if (conns.items.len >= max_qns_server_connections) {
-                    std.debug.print("dropping new QNS server connection from {f}: active limit reached\n", .{msg.from});
-                    continue;
-                }
-                const new_conn = try ServerConn.init(
-                    allocator,
-                    io,
-                    server_tls,
-                    opts.www,
-                    if (qlog_sink) |*sink| sink else null,
-                    msg.from,
-                    now_us,
-                );
-                try conns.append(allocator, new_conn);
-                server_conn = new_conn;
-            }
-
-            const sc = server_conn.?;
-            sc.peer = msg.from;
-            sc.last_activity_us = now_us;
-            if (!sc.transport_params_set) {
-                const ids = peekLongHeaderIds(msg.data) orelse {
-                    continue;
-                };
-                if (ids.version != nullq.QUIC_VERSION_1) {
-                    const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
-                    try sock.send(io, &msg.from, tx[0..n]);
-                    continue;
-                }
-
-                if (opts.retry and !sc.retry_sent) {
-                    sc.retry_original_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
-                    const token = try retryToken(msg.from, now_us, ids.dcid, &sc.retry_source_cid);
-                    const n = try sc.conn.writeRetry(&tx, msg.data, &sc.retry_source_cid, &token);
-                    try sock.send(io, &msg.from, tx[0..n]);
-                    sc.retry_sent = true;
-                    continue;
-                }
-
-                const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
-                const retry_source: ?nullq.conn.path.ConnectionId = if (sc.retry_sent)
-                    nullq.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
-                else
-                    null;
-                if (sc.retry_sent) {
-                    const token = peekInitialToken(msg.data) orelse {
-                        continue;
-                    };
-                    if (!validRetryToken(msg.from, now_us, original_dcid.slice(), &sc.retry_source_cid, token)) {
-                        continue;
-                    }
-                }
-
-                const params: nullq.tls.TransportParams = .{
-                    .original_destination_connection_id = original_dcid,
-                    .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
-                    .retry_source_connection_id = retry_source,
-                    .max_idle_timeout_ms = 30_000,
-                    .initial_max_data = endpoint_connection_receive_window,
-                    .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
-                    .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
-                    .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
-                    .initial_max_streams_bidi = endpoint_bidi_stream_limit,
-                    .initial_max_streams_uni = endpoint_uni_stream_limit,
-                    .max_udp_payload_size = endpoint_udp_payload_size,
-                    .active_connection_id_limit = endpoint_active_connection_id_limit,
-                };
-                try sc.conn.acceptInitial(msg.data, params);
-                _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "nullq qns endpoint v1");
-                sc.transport_params_set = true;
-            }
-            try sc.conn.handle(msg.data, netAddressToPathAddress(msg.from), now_us);
+        var received: usize = 0;
+        while (received < max_qns_server_rx_burst) {
+            const wait_ms: i64 = if (received == 0) 5 else 0;
+            const maybe_msg = sock.receiveTimeout(io, &rx, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(wait_ms),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => null,
+                else => return err,
+            };
+            now_us = qnsNowUs(io, start);
+            const msg = maybe_msg orelse break;
+            try handleServerDatagram(
+                allocator,
+                io,
+                opts,
+                server_tls,
+                if (qlog_sink) |*sink| sink else null,
+                &conns,
+                msg,
+                &tx,
+                now_us,
+                sock,
+            );
+            received += 1;
         }
 
         var i: usize = 0;
@@ -586,6 +517,95 @@ fn runServer(
             i += 1;
         }
     }
+}
+
+fn handleServerDatagram(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    opts: ServerOptions,
+    server_tls: boringssl.tls.Context,
+    qlog_sink: ?*QlogSink,
+    conns: *std.ArrayList(*ServerConn),
+    msg: anytype,
+    tx: []u8,
+    now_us: u64,
+    sock: anytype,
+) !void {
+    var server_conn = findServerConn(conns.items, msg.data, msg.from);
+    if (server_conn == null) {
+        const ids = peekLongHeaderIds(msg.data) orelse return;
+        if (ids.version != nullq.QUIC_VERSION_1) {
+            const n = try writeVersionNegotiation(tx, msg.data, &.{nullq.QUIC_VERSION_1});
+            try sock.send(io, &msg.from, tx[0..n]);
+            return;
+        }
+        if (!isInitialLongHeader(msg.data)) return;
+        if (conns.items.len >= max_qns_server_connections) {
+            std.debug.print("dropping new QNS server connection from {f}: active limit reached\n", .{msg.from});
+            return;
+        }
+        const new_conn = try ServerConn.init(
+            allocator,
+            io,
+            server_tls,
+            opts.www,
+            qlog_sink,
+            msg.from,
+            now_us,
+        );
+        try conns.append(allocator, new_conn);
+        server_conn = new_conn;
+    }
+
+    const sc = server_conn.?;
+    sc.peer = msg.from;
+    sc.last_activity_us = now_us;
+    if (!sc.transport_params_set) {
+        const ids = peekLongHeaderIds(msg.data) orelse return;
+        if (ids.version != nullq.QUIC_VERSION_1) {
+            const n = try writeVersionNegotiation(tx, msg.data, &.{nullq.QUIC_VERSION_1});
+            try sock.send(io, &msg.from, tx[0..n]);
+            return;
+        }
+
+        if (opts.retry and !sc.retry_sent) {
+            sc.retry_original_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
+            const token = try retryToken(msg.from, now_us, ids.dcid, &sc.retry_source_cid);
+            const n = try sc.conn.writeRetry(tx, msg.data, &sc.retry_source_cid, &token);
+            try sock.send(io, &msg.from, tx[0..n]);
+            sc.retry_sent = true;
+            return;
+        }
+
+        const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
+        const retry_source: ?nullq.conn.path.ConnectionId = if (sc.retry_sent)
+            nullq.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
+        else
+            null;
+        if (sc.retry_sent) {
+            const token = peekInitialToken(msg.data) orelse return;
+            if (!validRetryToken(msg.from, now_us, original_dcid.slice(), &sc.retry_source_cid, token)) return;
+        }
+
+        const params: nullq.tls.TransportParams = .{
+            .original_destination_connection_id = original_dcid,
+            .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
+            .retry_source_connection_id = retry_source,
+            .max_idle_timeout_ms = 30_000,
+            .initial_max_data = endpoint_connection_receive_window,
+            .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
+            .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
+            .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
+            .initial_max_streams_bidi = endpoint_bidi_stream_limit,
+            .initial_max_streams_uni = endpoint_uni_stream_limit,
+            .max_udp_payload_size = endpoint_udp_payload_size,
+            .active_connection_id_limit = endpoint_active_connection_id_limit,
+        };
+        try sc.conn.acceptInitial(msg.data, params);
+        _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "nullq qns endpoint v1");
+        sc.transport_params_set = true;
+    }
+    try sc.conn.handle(msg.data, netAddressToPathAddress(msg.from), now_us);
 }
 
 fn runClient(
