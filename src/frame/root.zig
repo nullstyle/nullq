@@ -14,10 +14,15 @@
 
 const std = @import("std");
 
+/// Frame type definitions (`Frame`, `Padding`, `Ack`, etc).
 pub const types = @import("types.zig");
+/// ACK frame range-list helpers (`Iterator`, `writeRanges`, `rangesEncodedLen`).
 pub const ack_range = @import("ack_range.zig");
+/// Parse a single frame from a byte slice. See `decode.zig`.
 pub const decode = @import("decode.zig").decode;
+/// Write a single frame to a byte slice. See `encode.zig`.
 pub const encode = @import("encode.zig").encode;
+/// Predicted byte length of `encode(dst, frame)` without writing.
 pub const encodedLen = @import("encode.zig").encodedLen;
 
 /// Walk every frame in a packet payload. Frames borrow slices from
@@ -26,9 +31,13 @@ pub fn iter(src: []const u8) Iterator {
     return .{ .rest = src };
 }
 
+/// Walks frames in a packet payload one at a time. Each yielded
+/// `Frame` borrows from the original input slice — keep it alive.
 pub const Iterator = struct {
     rest: []const u8,
 
+    /// Yields the next frame in the payload, or `null` once exhausted.
+    /// Forwards any `DecodeError` from the underlying frame parser.
     pub fn next(self: *Iterator) DecodeError!?Frame {
         if (self.rest.len == 0) return null;
         const d = try decode(self.rest);
@@ -37,8 +46,11 @@ pub const Iterator = struct {
     }
 };
 
+/// Re-export of `types.Frame` — the tagged union of every frame.
 pub const Frame = types.Frame;
+/// Errors returned by `decode` and `Iterator.next`.
 pub const DecodeError = @import("decode.zig").Error;
+/// Errors returned by `encode`.
 pub const EncodeError = @import("encode.zig").Error;
 
 test {

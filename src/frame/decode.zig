@@ -27,16 +27,26 @@ const frame_type_max_path_id: u64 = 0x3e7a;
 const frame_type_paths_blocked: u64 = 0x3e7b;
 const frame_type_path_cids_blocked: u64 = 0x3e7c;
 
+/// Errors `decode` can return. Wire-level varint/CID errors plus:
+/// - `UnknownFrameType` — frame type byte/varint is not a recognized v1
+///   or supported draft-21 multipath type.
+/// - `PathIdTooLarge` — multipath frame's path_id exceeds `u32` range.
 pub const Error = varint.Error || wire_header.Error || error{
     UnknownFrameType,
     PathIdTooLarge,
 };
 
+/// Result of `decode`: the parsed frame and how many input bytes it
+/// consumed. Slice fields inside `frame` borrow from the input.
 pub const Decoded = struct {
     frame: Frame,
     bytes_consumed: usize,
 };
 
+/// Reads one frame from the start of `src`. Slice fields in the
+/// returned `Frame` borrow from `src`, so `src` must outlive the
+/// returned value. Returns `error.InsufficientBytes` on truncation,
+/// `error.UnknownFrameType` on unknown type bytes.
 pub fn decode(src: []const u8) Error!Decoded {
     if (src.len == 0) return Error.InsufficientBytes;
 
