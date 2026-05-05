@@ -4136,7 +4136,13 @@ pub const Connection = struct {
             const short_overhead: usize = 1 + dcid_len + 4 + 16;
             const overhead: usize = if (lvl == .application) short_overhead else long_overhead;
             var packet_capacity = @min(self.mtu, dst.len);
-            if ((lvl == .application or lvl == .early_data) and !app_path.path.isValidated()) {
+            // RFC 9000 §8.1: anti-amplification applies to ALL bytes the
+            // endpoint sends on an unvalidated path, not just 1-RTT.
+            // Initial and Handshake bytes count too — otherwise an off-path
+            // attacker can spoof a small Initial and force us to emit a
+            // full-MTU Initial+Handshake response (a >10x amplification
+            // factor when the spoofed Initial is unpadded).
+            if (!app_path.path.isValidated()) {
                 const allowance = u64ToUsizeClamped(app_path.path.antiAmpAllowance());
                 packet_capacity = @min(packet_capacity, allowance);
                 if (packet_capacity <= overhead) return null;
@@ -10370,6 +10376,81 @@ test "unvalidated rebound path obeys anti-amplification before polling" {
     try std.testing.expect(conn.pending_path_challenge != null);
     try std.testing.expectEqual(@as(u32, 0), path.sent.count);
     try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
+}
+
+test "unvalidated path enforces anti-amplification on Initial sends" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Force the primary path to be unvalidated and simulate the peer
+    // having sent us only a small Initial. RFC 9000 §8.1 caps the
+    // server's send budget at 3x bytes_received until validation
+    // succeeds — and that applies to Initial and Handshake bytes too,
+    // not just 1-RTT.
+    const path = conn.primaryPath();
+    path.path.validated = false;
+    path.path.validator = .{};
+    path.path.bytes_received = 100;
+    path.path.bytes_sent = 0;
+
+    // Plant retransmittable Initial CRYPTO bytes so pollLevel actually
+    // wants to emit a packet. Without anti-amp, sealInitial would
+    // happily fill an MTU-sized datagram.
+    const odcid: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setLocalScid(&.{0xc1});
+    try conn.setPeerDcid(&odcid);
+
+    const crypto_bytes = try allocator.dupe(u8, &([_]u8{0xab} ** 800));
+    try conn.crypto_retx[EncryptionLevel.initial.idx()].append(allocator, .{
+        .offset = 0,
+        .data = crypto_bytes,
+    });
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const result = try conn.pollLevel(.initial, &packet_buf, 1_000_000);
+
+    if (result) |n| {
+        // Anti-amp says we must not send more than 3 * 100 = 300 bytes.
+        try std.testing.expect(n <= 300);
+    }
+    try std.testing.expect(path.path.antiAmpAllowance() <= 300);
+}
+
+test "validated path is not constrained by anti-amplification" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Default primary path is born validated, so even a tiny
+    // bytes_received does not gate Initial sends — keep the existing
+    // behavior intact for the validated case.
+    const path = conn.primaryPath();
+    try std.testing.expect(path.path.isValidated());
+    path.path.bytes_received = 50;
+    path.path.bytes_sent = 0;
+
+    const odcid: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try conn.setInitialDcid(&odcid);
+    try conn.setLocalScid(&.{0xc1});
+    try conn.setPeerDcid(&odcid);
+
+    const crypto_bytes = try allocator.dupe(u8, &([_]u8{0xab} ** 800));
+    try conn.crypto_retx[EncryptionLevel.initial.idx()].append(allocator, .{
+        .offset = 0,
+        .data = crypto_bytes,
+    });
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevel(.initial, &packet_buf, 1_000_000)).?;
+    // Allowance is unbounded for a validated path, so we should be
+    // able to send well over 3 * 50 = 150 bytes.
+    try std.testing.expect(n > 150);
 }
 
 test "failed NAT rebinding validation rolls back to the previous address" {
