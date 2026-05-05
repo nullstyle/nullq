@@ -167,7 +167,7 @@ pub const max_pending_datagram_bytes: usize = 64 * 1024;
 /// Bounded reassembly budgets for peer-controlled CRYPTO gaps.
 pub const max_pending_crypto_bytes_per_level: usize = 64 * 1024;
 pub const max_crypto_reassembly_gap: u64 = 64 * 1024;
-pub const application_ack_eliciting_threshold: u8 = 2;
+pub const application_ack_eliciting_threshold: u8 = 1;
 pub const max_application_ack_ranges_bytes: usize = 128;
 pub const max_application_ack_lower_ranges: u64 = 48;
 
@@ -8017,7 +8017,7 @@ test "timer deadline reports ACK delay" {
     try std.testing.expectEqual(@as(u64, 1_010_000), deadline.at_us);
 }
 
-test "application delayed ACK waits for threshold or timer" {
+test "application delayed ACK waits for configured threshold or timer" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
     defer ctx.deinit();
@@ -8026,7 +8026,8 @@ test "application delayed ACK waits for threshold or timer" {
 
     try conn.setTransportParams(.{ .max_ack_delay_ms = 10 });
     const tracker = &conn.primaryPath().app_pn_space.received;
-    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(7, 1000, true, application_ack_eliciting_threshold);
+    const delayed_ack_threshold = 2;
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(7, 1000, true, delayed_ack_threshold);
 
     try std.testing.expect(!tracker.pending_ack);
     try std.testing.expect(tracker.delayed_ack_armed);
@@ -8040,8 +8041,8 @@ test "application delayed ACK waits for threshold or timer" {
     try std.testing.expect(tracker.pending_ack);
 
     tracker.markAckSent();
-    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(8, 1011, true, application_ack_eliciting_threshold);
-    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(9, 1012, true, application_ack_eliciting_threshold);
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(8, 1011, true, delayed_ack_threshold);
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(9, 1012, true, delayed_ack_threshold);
     try std.testing.expect(tracker.pending_ack);
 }
 
@@ -9900,7 +9901,7 @@ test "server handles accepted 0-RTT STREAM frames" {
 
     const consumed = try conn.handleOnePacket(packet[0..packet_len], 1_000);
     try std.testing.expectEqual(packet_len, consumed);
-    try std.testing.expect(!conn.pnSpaceForLevel(.early_data).received.pending_ack);
+    try std.testing.expect(conn.pnSpaceForLevel(.early_data).received.pending_ack);
     try std.testing.expect(conn.pnSpaceForLevel(.early_data).received.delayed_ack_armed);
 
     var buf: [8]u8 = undefined;
