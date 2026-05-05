@@ -25,8 +25,12 @@ const std = @import("std");
 const types = @import("types.zig");
 const varint = @import("../wire/varint.zig");
 
+/// Re-export of `types.AckRange` — one (gap, length) varint pair.
 pub const AckRange = types.AckRange;
 
+/// Errors `Iterator.next`, `writeRanges`, and `rangesEncodedLen` can
+/// produce. Wire-level varint errors plus `error.InvalidLength` when
+/// the range arithmetic underflows (a malformed peer ACK).
 pub const Error = varint.Error;
 
 /// Inclusive interval of acknowledged packet numbers.
@@ -53,6 +57,9 @@ pub const Iterator = struct {
     /// Has the First ACK Range been emitted yet?
     first_emitted: bool = false,
 
+    /// Yields the next acked interval (or `null` when exhausted).
+    /// Returns `error.InvalidLength` if the wire bytes describe a
+    /// range that would underflow `u64`.
     pub fn next(self: *Iterator) Error!?Interval {
         if (!self.first_emitted) {
             self.first_emitted = true;
@@ -83,6 +90,8 @@ pub const Iterator = struct {
     }
 };
 
+/// Builds an `Iterator` over the acked intervals of an ACK frame.
+/// Borrows `ack.ranges_bytes`, so the iterator must not outlive it.
 pub fn iter(ack: types.Ack) Iterator {
     return .{
         .largest_acked = ack.largest_acked,

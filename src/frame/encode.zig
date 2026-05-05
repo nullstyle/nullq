@@ -12,19 +12,34 @@ const wire_header = @import("../wire/header.zig");
 
 const Frame = types.Frame;
 
+/// Errors that `encode` can return — `BufferTooSmall` if `dst` doesn't
+/// fit the frame, plus any wire-level varint/CID errors.
 pub const Error = varint.Error || wire_header.Error;
 
+/// Frame type for PATH_ACK without ECN (draft-ietf-quic-multipath-21).
 pub const frame_type_path_ack: u64 = 0x3e;
+/// Frame type for PATH_ACK with ECN counts.
 pub const frame_type_path_ack_ecn: u64 = 0x3f;
+/// Frame type for PATH_ABANDON.
 pub const frame_type_path_abandon: u64 = 0x3e75;
+/// Frame type for PATH_STATUS_BACKUP.
 pub const frame_type_path_status_backup: u64 = 0x3e76;
+/// Frame type for PATH_STATUS_AVAILABLE.
 pub const frame_type_path_status_available: u64 = 0x3e77;
+/// Frame type for PATH_NEW_CONNECTION_ID.
 pub const frame_type_path_new_connection_id: u64 = 0x3e78;
+/// Frame type for PATH_RETIRE_CONNECTION_ID.
 pub const frame_type_path_retire_connection_id: u64 = 0x3e79;
+/// Frame type for MAX_PATH_ID.
 pub const frame_type_max_path_id: u64 = 0x3e7a;
+/// Frame type for PATHS_BLOCKED.
 pub const frame_type_paths_blocked: u64 = 0x3e7b;
+/// Frame type for PATH_CIDS_BLOCKED.
 pub const frame_type_path_cids_blocked: u64 = 0x3e7c;
 
+/// Writes `frame` to the start of `dst` and returns the number of
+/// bytes written. Returns `error.BufferTooSmall` if `dst` doesn't have
+/// room for the full frame.
 pub fn encode(dst: []u8, frame: Frame) Error!usize {
     return switch (frame) {
         .padding => |f| encodePadding(dst, f),
@@ -60,6 +75,8 @@ pub fn encode(dst: []u8, frame: Frame) Error!usize {
     };
 }
 
+/// Number of bytes `encode(dst, frame)` would write, without touching
+/// any buffer. Useful for the packet builder's PMTU budget.
 pub fn encodedLen(frame: Frame) usize {
     return switch (frame) {
         .padding => |f| @intCast(f.count),
