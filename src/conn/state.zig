@@ -5006,6 +5006,22 @@ pub const Connection = struct {
         self.queuePathChallengeOnPath(path_id, token);
     }
 
+    /// Queue an application-level PING on the primary path. This is
+    /// useful for embedders that need an explicit liveness probe even
+    /// when they have no stream or datagram bytes to send.
+    pub fn requestPing(self: *Connection) void {
+        if (self.closeState() != .open) return;
+        self.primaryPath().pending_ping = true;
+    }
+
+    /// Queue an application-level PING on a specific path.
+    pub fn requestPathPing(self: *Connection, path_id: u32) Error!void {
+        if (self.closeState() != .open) return;
+        const path = self.paths.get(path_id) orelse return Error.PathNotFound;
+        if (path.path.state == .failed or path.path.state == .retiring) return Error.PathNotFound;
+        path.pending_ping = true;
+    }
+
     /// True iff the active path has been validated (either via the
     /// validator's PATH_RESPONSE flow or by `markPathValidated`).
     pub fn isPathValidated(self: *const Connection) bool {
@@ -8242,6 +8258,52 @@ test "PTO arms PING when no retransmittable data can be requeued" {
 
     try std.testing.expect(conn.pendingPingForLevel(.application).*);
     try std.testing.expectEqual(@as(u32, 1), conn.ptoCountForLevel(.application).*);
+}
+
+test "requestPing queues application PING on primary path" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+
+    conn.requestPing();
+    try std.testing.expect(conn.primaryPath().pending_ping);
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevel(.application, &packet_buf, 1_000_000)).?;
+
+    try std.testing.expect(!conn.primaryPath().pending_ping);
+    try std.testing.expectEqual(@as(u32, 1), conn.primaryPath().sent.count);
+    try std.testing.expect(conn.primaryPath().sent.packets[0].ack_eliciting);
+}
+
+test "requestPathPing queues application PING on non-primary path" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    markTestMultipathNegotiated(&conn, 1);
+    try conn.setPeerDcid(&.{0xaa});
+    const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    try std.testing.expect(conn.markPathValidated(path_id));
+
+    try conn.requestPathPing(path_id);
+    const path = conn.paths.get(path_id).?;
+    try std.testing.expect(path.pending_ping);
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevelOnPath(.application, path_id, &packet_buf, 1_000_000)).?;
+
+    try std.testing.expect(!path.pending_ping);
+    try std.testing.expectEqual(@as(u32, 1), path.sent.count);
+    try std.testing.expect(path.sent.packets[0].ack_eliciting);
 }
 
 test "PTO requeues CRYPTO bytes at original offsets" {
