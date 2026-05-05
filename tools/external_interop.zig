@@ -28,13 +28,20 @@ const Config = struct {
     zig_version: []const u8 = default_zig_version,
     dry_run: bool = false,
     runner_dir: ?[]const u8 = null,
+    role: RunnerRole = .server,
     clients: []const u8 = "quic-go,ngtcp2,quiche",
+    servers: []const u8 = "quic-go,ngtcp2,quiche",
     tests: []const u8 = "core+retry",
     runner_python: []const u8 = default_runner_python,
     wireshark_image: []const u8 = default_wireshark_image,
     log_dir: ?[]const u8 = null,
     json_path: ?[]const u8 = null,
     build_image: bool = false,
+};
+
+const RunnerRole = enum {
+    server,
+    client,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -93,7 +100,7 @@ fn usage() void {
         \\usage:
         \\  zig build external-interop -- preflight [--image nullq-interop:local] [--dry-run]
         \\  zig build external-interop -- build-image [--image nullq-interop:local] [--zig-version 0.16.0] [--dry-run]
-        \\  zig build external-interop -- runner [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--tests core+retry] [--python 3.12] [--wireshark-image nullq-interop-wireshark:local] [--dry-run]
+        \\  zig build external-interop -- runner [--role server|client] [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--servers quic-go,ngtcp2,quiche] [--tests core+retry] [--python 3.12] [--wireshark-image nullq-interop-wireshark:local] [--dry-run]
         \\
     , .{});
 }
@@ -134,10 +141,20 @@ fn parseRunner(allocator: std.mem.Allocator, args: []const []const u8, cfg: *Con
             if (i >= args.len) return error.MissingRunnerDir;
             cfg.runner_dir = args[i];
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--role")) {
+            i += 1;
+            if (i >= args.len) return error.MissingRole;
+            cfg.role = parseRole(args[i]) orelse return error.InvalidRole;
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--clients")) {
             i += 1;
             if (i >= args.len) return error.MissingClients;
             cfg.clients = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--servers")) {
+            i += 1;
+            if (i >= args.len) return error.MissingServers;
+            cfg.servers = args[i];
             i += 1;
         } else if (std.mem.eql(u8, arg, "--tests")) {
             i += 1;
@@ -179,11 +196,24 @@ fn parseRunner(allocator: std.mem.Allocator, args: []const []const u8, cfg: *Con
         cfg.log_dir = try std.fs.path.join(allocator, &.{ cfg.repo, "interop", "logs" });
     }
     if (cfg.json_path == null) {
-        cfg.json_path = try std.fs.path.join(allocator, &.{ cfg.repo, "interop", "results", "nullq-server.json" });
+        cfg.json_path = try std.fs.path.join(allocator, &.{ cfg.repo, "interop", "results", defaultRunnerJsonName(cfg.role) });
     }
     cfg.runner_dir = try absolutePath(allocator, cfg.repo, cfg.runner_dir.?);
     cfg.log_dir = try absolutePath(allocator, cfg.repo, cfg.log_dir.?);
     cfg.json_path = try absolutePath(allocator, cfg.repo, cfg.json_path.?);
+}
+
+fn parseRole(role: []const u8) ?RunnerRole {
+    if (std.ascii.eqlIgnoreCase(role, "server")) return .server;
+    if (std.ascii.eqlIgnoreCase(role, "client")) return .client;
+    return null;
+}
+
+fn defaultRunnerJsonName(role: RunnerRole) []const u8 {
+    return switch (role) {
+        .server => "nullq-server.json",
+        .client => "nullq-client.json",
+    };
 }
 
 fn absolutePath(allocator: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
@@ -253,7 +283,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     const overlay = try std.fs.path.join(allocator, &.{ cfg.repo, ".zig-cache", "interop-runner-overlay" });
     try recreateDir(io, overlay);
     try copyTree(allocator, io, runner_dir, overlay);
-    try injectNullqImplementation(allocator, io, overlay, cfg.image);
+    try injectNullqImplementation(allocator, io, overlay, cfg.image, @tagName(cfg.role));
     const trace_tools_dir = try prepareTraceTools(allocator, io, cfg, overlay);
 
     const tests = try expandCases(allocator, cfg.tests);
@@ -277,10 +307,22 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     try cmd.appendSlice(allocator, &.{
         "python",
         "run.py",
-        "-s",
-        "nullq",
-        "-c",
-        cfg.clients,
+    });
+    switch (cfg.role) {
+        .server => try cmd.appendSlice(allocator, &.{
+            "-s",
+            "nullq",
+            "-c",
+            cfg.clients,
+        }),
+        .client => try cmd.appendSlice(allocator, &.{
+            "-s",
+            cfg.servers,
+            "-c",
+            "nullq",
+        }),
+    }
+    try cmd.appendSlice(allocator, &.{
         "-t",
         tests,
         "-l",
@@ -427,7 +469,13 @@ fn ignoreCopyPath(path: []const u8) bool {
     return false;
 }
 
-fn injectNullqImplementation(allocator: std.mem.Allocator, io: std.Io, overlay: []const u8, image: []const u8) !void {
+fn injectNullqImplementation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    overlay: []const u8,
+    image: []const u8,
+    role: []const u8,
+) !void {
     const impl_path = try std.fs.path.join(allocator, &.{ overlay, "implementations_quic.json" });
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, impl_path, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(bytes);
@@ -439,7 +487,7 @@ fn injectNullqImplementation(allocator: std.mem.Allocator, io: std.Io, overlay: 
     var nullq = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     try nullq.put(allocator, "image", .{ .string = image });
     try nullq.put(allocator, "url", .{ .string = "https://github.com/nullstyle/nullq" });
-    try nullq.put(allocator, "role", .{ .string = "server" });
+    try nullq.put(allocator, "role", .{ .string = role });
     try parsed.value.object.put(allocator, "nullq", .{ .object = nullq });
 
     const rendered = try std.fmt.allocPrint(allocator, "{f}\n", .{std.json.fmt(parsed.value, .{ .whitespace = .indent_2 })});
@@ -571,6 +619,28 @@ test "runner paths are normalized to absolute paths" {
     try std.testing.expect(std.mem.endsWith(u8, cfg.runner_dir.?, "quic-interop-runner"));
     try std.testing.expect(std.mem.endsWith(u8, cfg.log_dir.?, "interop/logs"));
     try std.testing.expect(std.mem.endsWith(u8, cfg.json_path.?, "interop/results/out.json"));
+}
+
+test "runner client role defaults to client result path" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .repo = "/tmp/nullq",
+        .workspace = "/tmp",
+    };
+    const args = [_][]const u8{
+        "--role",
+        "client",
+        "--servers",
+        "quic-go",
+    };
+    try parseRunner(allocator, &args, &cfg);
+    defer allocator.free(cfg.runner_dir.?);
+    defer allocator.free(cfg.log_dir.?);
+    defer allocator.free(cfg.json_path.?);
+
+    try std.testing.expectEqual(RunnerRole.client, cfg.role);
+    try std.testing.expectEqualStrings("quic-go", cfg.servers);
+    try std.testing.expect(std.mem.endsWith(u8, cfg.json_path.?, "interop/results/nullq-client.json"));
 }
 
 test "copy ignore filters generated trees" {

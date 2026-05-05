@@ -102,6 +102,8 @@ test "client + server handshake via real datagram exchange" {
 
     try std.testing.expect(client.handshakeDone());
     try std.testing.expect(server.handshakeDone());
+    try std.testing.expectEqualSlices(u8, &ServerScid, client.peer_dcid.slice());
+    try std.testing.expectEqualSlices(u8, &ServerScid, client.paths.get(0).?.path.peer_cid.slice());
 
     // Application-level keys derived on both sides.
     try std.testing.expect(client.haveSecret(.application, .read));

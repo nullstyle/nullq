@@ -30,8 +30,8 @@ const ServerOptions = struct {
 };
 
 const ClientOptions = struct {
-    server: []const u8 = "server:443",
-    server_name: []const u8 = "server",
+    server: []const u8 = "server4:443",
+    server_name: []const u8 = "server4",
     downloads: []const u8 = "/downloads",
     requests: []const u8 = "",
     testcase: []const u8 = "",

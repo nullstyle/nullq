@@ -31,7 +31,20 @@ case "${ROLE:-server}" in
     exec "$@"
     ;;
   client)
-    set -- /qns-endpoint client -server "${SERVER:-server:443}" -server-name "${SERVER_NAME:-server}" -downloads /downloads -requests "${REQUESTS:-}" -testcase "${TESTCASE:-}"
+    server_arg="${SERVER:-}"
+    if [ -z "${server_arg}" ] && [ -n "${REQUESTS:-}" ]; then
+      first_request=${REQUESTS%% *}
+      server_arg=${first_request#*://}
+      server_arg=${server_arg%%/*}
+    fi
+    if [ -z "${server_arg}" ]; then
+      server_arg="server4:443"
+    fi
+    server_name_arg="${SERVER_NAME:-}"
+    if [ -z "${server_name_arg}" ]; then
+      server_name_arg=${server_arg%%:*}
+    fi
+    set -- /qns-endpoint client -server "${server_arg}" -server-name "${server_name_arg}" -downloads /downloads -requests "${REQUESTS:-}" -testcase "${TESTCASE:-}"
     if [ -n "${SSLKEYLOGFILE:-}" ]; then
       set -- "$@" -keylog-file "${SSLKEYLOGFILE}"
     fi

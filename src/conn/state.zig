@@ -5352,6 +5352,12 @@ pub const Connection = struct {
                 try self.ensureInitialKeys();
             }
         }
+        if (self.role == .client) {
+            const server_scid = ConnectionId.fromSlice(opened.scid.slice());
+            if (!ConnectionId.eql(self.primaryPath().path.peer_cid, server_scid)) {
+                try self.setPeerDcid(server_scid.slice());
+            }
+        }
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
         self.pnSpaceForLevel(.initial).recordReceived(opened.pn, now_us / 1000);

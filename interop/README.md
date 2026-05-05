@@ -31,6 +31,14 @@ current official clients `quic-go`, `ngtcp2`, and `quiche`, using:
 zig build external-interop -- runner --build-image
 ```
 
+Client-side nullq can be exercised by selecting `--role client`, which
+injects the local image as a runner client and pairs it with external
+servers:
+
+```sh
+zig build external-interop -- runner --role client --servers quic-go,ngtcp2,quiche --tests H,D
+```
+
 By default that expands to:
 
 ```text
@@ -49,6 +57,9 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   handshake and transfer: `✓(H,DC)`.
 - `quic-go` passes the feature matrix:
   `✓(H,DC,C20,S,R,Z,M)`.
+- Client-role wrapper support is wired for local-only private gates;
+  run it with `--role client` to validate nullq downloads from external
+  QNS servers.
 - The runner may print `At least one QUIC packet could not be
   decrypted` during trace processing even when the QNS result is green;
   keep an eye on that warning while expanding the gate.
@@ -77,11 +88,13 @@ mise run interop-preflight
 mise run interop-build-image
 mise exec -- zig build qns-endpoint -Doptimize=ReleaseSafe
 mise exec -- zig build external-interop -- runner --dry-run
+mise exec -- zig build external-interop -- runner --role client --servers quic-go --tests H,D
 mise exec -- zig build external-interop -- runner --clients quic-go --tests H,D,C
 mise exec -- zig build external-interop -- runner --clients quic-go --tests H,D --python 3.12
 mise exec -- zig build external-interop -- runner --clients quic-go,ngtcp2,quiche --tests core+retry
 ```
 
 Runner logs land in `interop/logs/`; matrix JSON lands in
-`interop/results/nullq-server.json`. Both are generated artifacts and
-are ignored by git.
+`interop/results/nullq-server.json` or
+`interop/results/nullq-client.json`, depending on the selected role.
+Both are generated artifacts and are ignored by git.
