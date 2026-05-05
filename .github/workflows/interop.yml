@@ -35,13 +35,6 @@ jobs:
         with:
           path: nullq
 
-      - name: Checkout boringssl-zig (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: nullstyle/boringssl-zig
-          ref: main
-          path: boringssl-zig
-
       - name: Checkout nullq-qns
         uses: actions/checkout@v4
         with:
@@ -77,11 +70,12 @@ jobs:
         working-directory: nullq-qns
         env:
           NULLQ_DIR: ${{ github.workspace }}/nullq
-          BORINGSSL_ZIG_DIR: ${{ github.workspace }}/boringssl-zig
         run: |
-          # `make build-local` archives both repos and feeds them in
-          # as Docker build contexts (see nullq-qns/Makefile and
-          # Dockerfile.local). LOCALTAG=local matches NULLQ_IMAGE.
+          # `make build-local` archives nullq and feeds it in as a
+          # Docker build context (see nullq-qns/Makefile and
+          # Dockerfile.local). Zig fetches boringssl-zig from the
+          # URL+hash pin in nullq's build.zig.zon during the
+          # in-Docker build. LOCALTAG=local matches NULLQ_IMAGE.
           make build-local LOCALTAG=local
 
       - name: Run QNS interop (server role)

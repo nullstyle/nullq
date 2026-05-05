@@ -17,19 +17,47 @@ breaking changes; see notes per release.
   against quic-go, quiche, ngtcp2). Marked `continue-on-error` since
   interop is environment-sensitive and not a hard merge gate.
 - This `CHANGELOG.md`.
+- `nullq.Server` convenience wrapper for embedding nullq as a UDP
+  server (Config / Slot / feed / poll / tick / reap / iterator).
+  See `src/server.zig` and the `README.md` "Embed nullq as a server"
+  section.
+- Public-API doc comments across `src/root.zig`, `src/conn/root.zig`,
+  `src/wire/root.zig`, `src/frame/root.zig`, `src/tls/root.zig`, and
+  ~25 of the embedder-facing methods on `Connection`.
+- 14 new qlog event variants (`packet_sent` / `packet_received` /
+  `packet_dropped` / `packet_lost`, `loss_detected`,
+  `congestion_state_updated`, `metrics_updated`, `parameters_set`,
+  `migration_path_validated` / `migration_path_failed`,
+  `connection_started` / `connection_state_updated`,
+  `stream_state_updated`, `key_updated`). Per-packet events are
+  opt-in via `Connection.setQlogPacketEvents(true)` to keep the
+  default cost off the hot path.
+- `PathStats` now surfaces `total_bytes_sent`, `total_bytes_received`,
+  `packets_sent`, `packets_received`, `packets_lost`, `srtt_us`,
+  `rttvar_us`, `min_rtt_us`, `ssthresh`, and `congestion_window_state`.
+- `zig build bench` step with 9 ReleaseFast wire/frame microbenchmarks
+  (varint enc/dec, STREAM enc/dec, ACK enc/dec, short-header enc/dec,
+  CID generation). See `bench/main.zig` and `bench/README.md`.
+
+### Changed
+- `boringssl-zig` is now a URL+hash dep pinned to a specific upstream
+  commit (currently `8c47b6e`, post-v0.5.0). External consumers can
+  build nullq without a sibling boringssl-zig checkout. Bumping the
+  pin is a `zig fetch <url>` + commit.
+- Stateless reset token comparison uses
+  `std.crypto.timing_safe.eql` instead of `std.mem.eql`, closing
+  the timing side-channel called out in RFC 9000 §10.3.
+- The 9 internal `unreachable` arms in `src/wire`, `src/conn/path`,
+  and `src/conn/retry_token` are now annotated with `// invariant:`
+  comments documenting why each is unreachable from peer input.
+  All 15 `unreachable`/`@panic` sites in `src/` were audited; none
+  are peer-reachable.
 
 ### Notes
 - nullq remains pre-1.0 (`0.0.0` in `build.zig.zon`). The transport is
   feature-rich and passes a substantial QNS interop matrix, but the
   public Zig API is still expected to churn before the first tagged
-  release. See the "decisions" section of the agent CI/release report
-  for why no version bump was applied.
-- The `boringssl-zig` dependency is currently a path dep
-  (`../boringssl-zig`). The upstream repo is published at
-  `github.com/nullstyle/boringssl-zig` with tagged releases, so a
-  follow-up will migrate this to a URL+hash dep once we settle on a
-  release tag (`v0.5.0` is the current candidate). Until then, CI
-  checks out the dependency repo as a sibling.
+  release.
 
 ## [0.0.0] - pre-release development
 

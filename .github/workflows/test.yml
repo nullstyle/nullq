@@ -6,10 +6,9 @@ on:
   pull_request:
     branches: [main]
 
-# nullq depends on boringssl-zig via a sibling path dependency
-# (`.path = "../boringssl-zig"` in build.zig.zon). CI checks out
-# both repos side by side under the runner's workspace so the
-# resolver finds the dep without any URL/hash plumbing.
+# nullq pins boringssl-zig as a URL+hash dep in build.zig.zon, so
+# Zig fetches the package itself during build. CI just needs Zig
+# and network access — no sibling checkout required.
 jobs:
   build-test:
     strategy:
@@ -20,18 +19,6 @@ jobs:
     steps:
       - name: Checkout nullq
         uses: actions/checkout@v4
-        with:
-          path: nullq
-
-      - name: Checkout boringssl-zig (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: nullstyle/boringssl-zig
-          ref: main
-          path: boringssl-zig
-          # If this checkout ever fails because the dependency repo
-          # isn't accessible, switch the dep in build.zig.zon to a
-          # URL+hash form and remove this step.
 
       - name: Set up Zig 0.16.0
         uses: mlugg/setup-zig@v1
@@ -39,15 +26,12 @@ jobs:
           version: 0.16.0
 
       - name: Print toolchain
-        working-directory: nullq
         run: |
           zig version
           uname -a
 
       - name: zig build
-        working-directory: nullq
         run: zig build --summary all
 
       - name: zig build test
-        working-directory: nullq
         run: zig build test --summary all
