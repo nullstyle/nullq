@@ -103,6 +103,21 @@ pub const QlogEvent = conn.QlogEvent;
 /// The set of qlog event names nullq currently emits.
 pub const QlogEventName = conn.QlogEventName;
 
+/// Packet number space for qlog events.
+pub const QlogPnSpace = conn.QlogPnSpace;
+/// Packet kind classification (long-header type or short-header) for qlog.
+pub const QlogPacketKind = conn.QlogPacketKind;
+/// Reason a packet was dropped before processing.
+pub const QlogPacketDropReason = conn.QlogPacketDropReason;
+/// Stream lifecycle state for `stream_state_updated` qlog events.
+pub const QlogStreamState = conn.QlogStreamState;
+/// Congestion controller state for `congestion_state_updated` qlog events.
+pub const QlogCongestionState = conn.QlogCongestionState;
+/// Loss-detection reason classification for qlog `loss_detected` events.
+pub const QlogLossReason = conn.QlogLossReason;
+/// Per-path congestion controller state, exposed via `PathStats`.
+pub const CongestionState = conn.CongestionState;
+
 /// TLS keylog callback re-exported from boringssl-zig for SSLKEYLOGFILE
 /// debugging.
 pub const KeylogCallback = boringssl.tls.KeylogCallback;

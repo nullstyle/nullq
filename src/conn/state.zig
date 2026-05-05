@@ -483,8 +483,112 @@ pub const QlogEventName = enum {
     application_write_update_acked,
     aead_confidentiality_limit_reached,
     aead_integrity_limit_reached,
+    // -- new richer events (modeled after qlog draft-ietf-quic-qlog-quic-events) --
+    /// One-shot event when the connection begins exchanging packets — emitted from
+    /// the first call to `bind` for clients (or first authenticated packet for the
+    /// server). Carries our role plus the SCID/DCID known at the time.
+    connection_started,
+    /// Emitted whenever `closeState()` transitions (open → closing → draining → closed).
+    connection_state_updated,
+    /// Emitted once when peer transport parameters are first decoded and
+    /// validation passes.
+    parameters_set,
+    /// Opt-in (gated by `qlog_packet_events`): every outgoing packet.
+    packet_sent,
+    /// Opt-in (gated by `qlog_packet_events`): every incoming packet that
+    /// we successfully authenticate.
+    packet_received,
+    /// A datagram or packet rejected before frame dispatch (header decode
+    /// failure, AEAD failure, version mismatch, retired DCID, etc).
+    packet_dropped,
+    /// One or more packets declared lost via RFC 9002 logic.
+    loss_detected,
+    /// Opt-in (gated by `qlog_packet_events`): each individual lost packet.
+    packet_lost,
+    /// Congestion-controller phase transition (slow-start | recovery |
+    /// application-limited). Emitted on transitions only, not periodically.
+    congestion_state_updated,
+    /// Snapshot of cwnd / RTT / bytes-in-flight after a meaningful update
+    /// (currently emitted once per ack-eliciting ACK on the application
+    /// path, which keeps volume bounded without per-packet overhead).
+    metrics_updated,
+    /// Path validation succeeded — PATH_RESPONSE matched a pending PATH_CHALLENGE.
+    migration_path_validated,
+    /// Path validation failed (timeout) or the peer abandoned the path.
+    migration_path_failed,
+    /// Stream lifecycle change (open / half-closed / closed).
+    stream_state_updated,
+    /// Generic key update notification — covers Initial, Handshake, 1-RTT
+    /// installs and rotations beyond the more specific application_*
+    /// variants above. Currently emitted from `installApplicationSecret`
+    /// and `promoteApplicationReadKeys` callers as a duplicate of those
+    /// finer-grained events to give a uniform "any key changed" stream.
+    key_updated,
 };
 
+pub const QlogPacketKind = enum {
+    initial,
+    handshake,
+    zero_rtt,
+    one_rtt,
+    retry,
+    version_negotiation,
+};
+
+pub const QlogPacketDropReason = enum {
+    /// Packet was too short or had a malformed header.
+    header_decode_failure,
+    /// AEAD authentication failed (key or content mismatch).
+    decryption_failure,
+    /// Long-header packet for an unsupported QUIC version.
+    unsupported_version,
+    /// Short-header DCID didn't map to any active local CID.
+    unknown_connection_id,
+    /// Packet payload exceeded the local `max_udp_payload_size`.
+    payload_too_large,
+    /// Stateless reset detected (the rest of the datagram is dropped).
+    stateless_reset,
+    /// Packet arrived after the keys for its level were dropped.
+    keys_unavailable,
+    /// Other / unspecified.
+    other,
+};
+
+pub const QlogPnSpace = enum {
+    initial,
+    handshake,
+    application,
+};
+
+pub const QlogStreamState = enum {
+    open,
+    half_closed_local,
+    half_closed_remote,
+    closed,
+    reset,
+};
+
+pub const QlogCongestionState = enum {
+    slow_start,
+    recovery,
+    application_limited,
+    congestion_avoidance,
+};
+
+pub const QlogLossReason = enum {
+    /// RFC 9002 §6.1.1 packet-threshold loss detection.
+    packet_threshold,
+    /// RFC 9002 §6.1.2 time-threshold loss detection.
+    time_threshold,
+    /// PTO probe — RFC 9002 §6.2 declared the leading ack-eliciting
+    /// packet lost so a probe could go out.
+    pto_probe,
+};
+
+/// Optional qlog event payload. Existing variants only populate the
+/// previous fields; new variants additionally fill the per-event
+/// fields below. Callers should branch on `name` and read only the
+/// fields documented for that variant.
 pub const QlogEvent = struct {
     name: QlogEventName,
     at_us: u64 = 0,
@@ -494,6 +598,49 @@ pub const QlogEvent = struct {
     packet_number: ?u64 = null,
     discard_deadline_us: ?u64 = null,
     details: []const u8 = &.{},
+
+    // -- fields populated by new event variants ----------------------------
+    /// Role and connection-id triple — populated by `connection_started`.
+    role: ?Role = null,
+    local_scid: ?ConnectionId = null,
+    peer_scid: ?ConnectionId = null,
+    /// Old/new state for `connection_state_updated`.
+    old_state: ?CloseState = null,
+    new_state: ?CloseState = null,
+    /// Per-packet metadata used by packet_sent/packet_received/packet_lost.
+    pn_space: ?QlogPnSpace = null,
+    packet_kind: ?QlogPacketKind = null,
+    packet_size: ?u32 = null,
+    frames_summary: u32 = 0,
+    drop_reason: ?QlogPacketDropReason = null,
+    /// Loss-detection counts (loss_detected).
+    lost_count: ?u32 = null,
+    bytes_lost: ?u64 = null,
+    loss_reason: ?QlogLossReason = null,
+    /// Path-validation outcome (migration_path_*) and stream lifecycle.
+    path_id: ?u32 = null,
+    stream_id: ?u64 = null,
+    stream_state: ?QlogStreamState = null,
+    /// Congestion / RTT snapshot — congestion_state_updated + metrics_updated.
+    cwnd: ?u64 = null,
+    bytes_in_flight: ?u64 = null,
+    ssthresh: ?u64 = null,
+    smoothed_rtt_us: ?u64 = null,
+    rtt_var_us: ?u64 = null,
+    min_rtt_us: ?u64 = null,
+    latest_rtt_us: ?u64 = null,
+    pacing_rate: ?u64 = null,
+    congestion_state: ?QlogCongestionState = null,
+    /// Top-level numeric copy of the most relevant peer transport parameters.
+    /// Filled only by `parameters_set`.
+    peer_idle_timeout_ms: ?u64 = null,
+    peer_max_udp_payload_size: ?u64 = null,
+    peer_initial_max_data: ?u64 = null,
+    peer_initial_max_streams_bidi: ?u64 = null,
+    peer_initial_max_streams_uni: ?u64 = null,
+    peer_active_connection_id_limit: ?u64 = null,
+    peer_max_ack_delay_ms: ?u64 = null,
+    peer_max_datagram_frame_size: ?u64 = null,
 };
 
 pub const QlogCallback = *const fn (user_data: ?*anyopaque, event: QlogEvent) void;
@@ -701,6 +848,32 @@ pub const Connection = struct {
     app_key_update_limits: ApplicationKeyUpdateLimits = .{},
     qlog_callback: ?QlogCallback = null,
     qlog_user_data: ?*anyopaque = null,
+    /// Opt-in for high-volume per-packet qlog events
+    /// (`packet_sent`, `packet_received`, `packet_lost`). Disabled by
+    /// default so production callers don't pay for every packet
+    /// crossing the boundary.
+    qlog_packet_events: bool = false,
+    /// Whether `connection_started` has fired yet. Single-shot.
+    qlog_started: bool = false,
+    /// Last close-state we emitted for `connection_state_updated`.
+    qlog_last_state: CloseState = .open,
+    /// Whether `parameters_set` fired.
+    qlog_params_emitted: bool = false,
+    /// Last congestion controller phase emitted (so we don't spam
+    /// transitions). `null` means no snapshot has been taken yet.
+    qlog_last_congestion_state: ?QlogCongestionState = null,
+
+    // -- cheap aggregate counters used by PathStats --
+    /// Total packets we've sent (across all paths/levels).
+    qlog_packets_sent: u64 = 0,
+    /// Total packets we've successfully received (post-AEAD).
+    qlog_packets_received: u64 = 0,
+    /// Total packets declared lost.
+    qlog_packets_lost: u64 = 0,
+    /// Total UDP payload bytes we've sent.
+    qlog_bytes_sent: u64 = 0,
+    /// Total UDP payload bytes the peer has sent us.
+    qlog_bytes_received: u64 = 0,
 
     /// Local datagram budget for outgoing packets.
     mtu: usize = default_mtu,
@@ -882,6 +1055,10 @@ pub const Connection = struct {
             try self.inner.setHostname(h);
             self.pending_hostname = null;
         }
+        // For clients, `bind` is the moment we kick off the handshake;
+        // emit `connection_started` here. Servers fire it from
+        // `handleInitial` once they have a peer SCID.
+        if (self.role == .client) self.emitConnectionStartedOnce();
     }
 
     /// Free all per-connection allocations, including stream
@@ -1123,8 +1300,216 @@ pub const Connection = struct {
         self.qlog_user_data = user_data;
     }
 
+    /// Enable or disable per-packet qlog events
+    /// (`packet_sent`, `packet_received`, `packet_lost`). High-volume —
+    /// keep off in production unless actively debugging.
+    pub fn setQlogPacketEvents(self: *Connection, enabled: bool) void {
+        self.qlog_packet_events = enabled;
+    }
+
     fn emitQlog(self: *Connection, event: QlogEvent) void {
         if (self.qlog_callback) |callback| callback(self.qlog_user_data, event);
+    }
+
+    fn qlogPnSpaceFromLevel(lvl: EncryptionLevel) QlogPnSpace {
+        return switch (lvl) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .early_data, .application => .application,
+        };
+    }
+
+    fn qlogPacketKindFromLevel(lvl: EncryptionLevel) QlogPacketKind {
+        return switch (lvl) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .early_data => .zero_rtt,
+            .application => .one_rtt,
+        };
+    }
+
+    /// One-shot `connection_started` emitter. Called from `bind` for
+    /// clients and from the handshake-progress callback for servers.
+    fn emitConnectionStartedOnce(self: *Connection) void {
+        if (self.qlog_callback == null or self.qlog_started) return;
+        self.qlog_started = true;
+        self.emitQlog(.{
+            .name = .connection_started,
+            .role = self.role,
+            .local_scid = if (self.local_scid_set) self.local_scid else null,
+            .peer_scid = if (self.peer_dcid_set) self.peer_dcid else null,
+        });
+    }
+
+    /// Re-evaluate close state and emit a `connection_state_updated`
+    /// if it changed since the last emit.
+    fn emitConnectionStateIfChanged(self: *Connection) void {
+        if (self.qlog_callback == null) return;
+        const new_state = self.closeState();
+        if (new_state == self.qlog_last_state) return;
+        const old = self.qlog_last_state;
+        self.qlog_last_state = new_state;
+        self.emitQlog(.{
+            .name = .connection_state_updated,
+            .old_state = old,
+            .new_state = new_state,
+        });
+    }
+
+    /// Emit `parameters_set` when the peer's transport parameters are
+    /// first decoded and accepted.
+    fn emitPeerParametersSet(self: *Connection) void {
+        if (self.qlog_callback == null or self.qlog_params_emitted) return;
+        const params = self.cached_peer_transport_params orelse return;
+        self.qlog_params_emitted = true;
+        self.emitQlog(.{
+            .name = .parameters_set,
+            .peer_idle_timeout_ms = params.max_idle_timeout_ms,
+            .peer_max_udp_payload_size = params.max_udp_payload_size,
+            .peer_initial_max_data = params.initial_max_data,
+            .peer_initial_max_streams_bidi = params.initial_max_streams_bidi,
+            .peer_initial_max_streams_uni = params.initial_max_streams_uni,
+            .peer_active_connection_id_limit = params.active_connection_id_limit,
+            .peer_max_ack_delay_ms = params.max_ack_delay_ms,
+            .peer_max_datagram_frame_size = params.max_datagram_frame_size,
+        });
+    }
+
+    fn emitPacketSent(
+        self: *Connection,
+        lvl: EncryptionLevel,
+        pn: u64,
+        size: u32,
+        frames_count: u32,
+    ) void {
+        if (!self.qlog_packet_events or self.qlog_callback == null) return;
+        self.emitQlog(.{
+            .name = .packet_sent,
+            .level = lvl,
+            .pn_space = qlogPnSpaceFromLevel(lvl),
+            .packet_kind = qlogPacketKindFromLevel(lvl),
+            .packet_number = pn,
+            .packet_size = size,
+            .frames_summary = frames_count,
+        });
+    }
+
+    fn emitPacketReceived(
+        self: *Connection,
+        lvl: EncryptionLevel,
+        pn: u64,
+        size: u32,
+        frames_count: u32,
+    ) void {
+        if (!self.qlog_packet_events or self.qlog_callback == null) return;
+        self.emitQlog(.{
+            .name = .packet_received,
+            .level = lvl,
+            .pn_space = qlogPnSpaceFromLevel(lvl),
+            .packet_kind = qlogPacketKindFromLevel(lvl),
+            .packet_number = pn,
+            .packet_size = size,
+            .frames_summary = frames_count,
+        });
+    }
+
+    fn emitPacketDropped(
+        self: *Connection,
+        lvl: ?EncryptionLevel,
+        size: u32,
+        reason: QlogPacketDropReason,
+    ) void {
+        if (self.qlog_callback == null) return;
+        self.emitQlog(.{
+            .name = .packet_dropped,
+            .level = lvl orelse .application,
+            .pn_space = if (lvl) |l| qlogPnSpaceFromLevel(l) else null,
+            .packet_kind = if (lvl) |l| qlogPacketKindFromLevel(l) else null,
+            .packet_size = size,
+            .drop_reason = reason,
+        });
+    }
+
+    fn emitLossDetected(
+        self: *Connection,
+        lvl: EncryptionLevel,
+        stats: LossStats,
+        reason: QlogLossReason,
+    ) void {
+        if (self.qlog_callback == null or stats.count == 0) return;
+        self.emitQlog(.{
+            .name = .loss_detected,
+            .level = lvl,
+            .pn_space = qlogPnSpaceFromLevel(lvl),
+            .lost_count = stats.count,
+            .bytes_lost = stats.bytes_lost,
+            .loss_reason = reason,
+        });
+    }
+
+    fn emitPacketLost(
+        self: *Connection,
+        lvl: EncryptionLevel,
+        pn: u64,
+        bytes: u32,
+        reason: QlogLossReason,
+    ) void {
+        if (!self.qlog_packet_events or self.qlog_callback == null) return;
+        self.emitQlog(.{
+            .name = .packet_lost,
+            .level = lvl,
+            .pn_space = qlogPnSpaceFromLevel(lvl),
+            .packet_number = pn,
+            .packet_size = bytes,
+            .loss_reason = reason,
+        });
+    }
+
+    /// Compute the current congestion phase for the primary application
+    /// path and emit `congestion_state_updated` if it changed.
+    fn emitCongestionStateIfChanged(self: *Connection, now_us: u64) void {
+        if (self.qlog_callback == null) return;
+        const path = self.primaryPath();
+        const cc = &path.path.cc;
+        const new_state: QlogCongestionState = blk: {
+            if (cc.recovery_start_time_us != null and now_us <= cc.recovery_start_time_us.?) {
+                break :blk .recovery;
+            }
+            if (cc.isSlowStart()) break :blk .slow_start;
+            break :blk .congestion_avoidance;
+        };
+        if (self.qlog_last_congestion_state) |prev| {
+            if (prev == new_state) return;
+        }
+        self.qlog_last_congestion_state = new_state;
+        self.emitQlog(.{
+            .name = .congestion_state_updated,
+            .at_us = now_us,
+            .congestion_state = new_state,
+            .cwnd = cc.cwnd,
+            .ssthresh = cc.ssthresh,
+            .bytes_in_flight = path.sent.bytes_in_flight,
+        });
+    }
+
+    /// Emit `metrics_updated` with a snapshot of the primary path's
+    /// congestion / RTT counters.
+    fn emitMetricsSnapshot(self: *Connection, now_us: u64) void {
+        if (self.qlog_callback == null) return;
+        const path = self.primaryPath();
+        const cc = &path.path.cc;
+        const rtt = &path.path.rtt;
+        self.emitQlog(.{
+            .name = .metrics_updated,
+            .at_us = now_us,
+            .cwnd = cc.cwnd,
+            .ssthresh = cc.ssthresh,
+            .bytes_in_flight = path.sent.bytes_in_flight,
+            .smoothed_rtt_us = rtt.smoothed_rtt_us,
+            .rtt_var_us = rtt.rtt_var_us,
+            .min_rtt_us = rtt.min_rtt_us,
+            .latest_rtt_us = rtt.latest_rtt_us,
+        });
     }
 
     /// Are read/write secrets installed at the given encryption level?
@@ -1251,6 +1636,12 @@ pub const Connection = struct {
                     .key_epoch = epoch.epoch,
                     .key_phase = epoch.key_phase,
                 });
+                self.emitQlog(.{
+                    .name = .key_updated,
+                    .level = .application,
+                    .key_epoch = epoch.epoch,
+                    .key_phase = epoch.key_phase,
+                });
             },
             .write => {
                 self.levels[app_idx].write = material;
@@ -1259,6 +1650,12 @@ pub const Connection = struct {
                 self.app_next_local_update_after_us = null;
                 self.emitQlog(.{
                     .name = .application_write_key_installed,
+                    .key_epoch = epoch.epoch,
+                    .key_phase = epoch.key_phase,
+                });
+                self.emitQlog(.{
+                    .name = .key_updated,
+                    .level = .application,
                     .key_epoch = epoch.epoch,
                     .key_phase = epoch.key_phase,
                 });
@@ -1297,6 +1694,13 @@ pub const Connection = struct {
             .key_epoch = self.app_read_current.?.epoch,
             .key_phase = self.app_read_current.?.key_phase,
         });
+        self.emitQlog(.{
+            .name = .key_updated,
+            .at_us = now_us,
+            .level = .application,
+            .key_epoch = self.app_read_current.?.epoch,
+            .key_phase = self.app_read_current.?.key_phase,
+        });
     }
 
     fn installNextApplicationWriteKeys(
@@ -1312,6 +1716,13 @@ pub const Connection = struct {
         self.emitQlog(.{
             .name = .application_write_key_updated,
             .at_us = now_us,
+            .key_epoch = self.app_write_current.?.epoch,
+            .key_phase = self.app_write_current.?.key_phase,
+        });
+        self.emitQlog(.{
+            .name = .key_updated,
+            .at_us = now_us,
+            .level = .application,
             .key_epoch = self.app_write_current.?.epoch,
             .key_phase = self.app_write_current.?.key_phase,
         });
@@ -1949,6 +2360,11 @@ pub const Connection = struct {
             .send_max_data = self.initialSendStreamLimit(id),
         };
         try self.streams.put(self.allocator, id, ptr);
+        self.emitQlog(.{
+            .name = .stream_state_updated,
+            .stream_id = id,
+            .stream_state = .open,
+        });
         return ptr;
     }
 
@@ -2945,7 +3361,15 @@ pub const Connection = struct {
     /// Read-only snapshot of `path_id`'s RTT, congestion, and loss
     /// counters. Returns null for unknown `path_id`.
     pub fn pathStats(self: *const Connection, path_id: u32) ?PathStats {
-        return self.paths.stats(path_id);
+        var st = self.paths.stats(path_id) orelse return null;
+        // Connection-level counters live on Connection, not on PathState,
+        // because they aggregate across all paths/levels (and across migrations).
+        st.total_bytes_sent = self.qlog_bytes_sent;
+        st.total_bytes_received = self.qlog_bytes_received;
+        st.packets_sent = self.qlog_packets_sent;
+        st.packets_received = self.qlog_packets_received;
+        st.packets_lost = self.qlog_packets_lost;
+        return st;
     }
 
     pub fn queuePathAbandon(
@@ -3185,11 +3609,19 @@ pub const Connection = struct {
             self.multipath_enabled = true;
         }
         self.validatePeerTransportLimits();
-        if (self.pending_close != null or self.closed) return;
+        if (self.pending_close != null or self.closed) {
+            self.emitConnectionStateIfChanged();
+            return;
+        }
         self.validatePeerTransportRole();
-        if (self.pending_close != null or self.closed) return;
+        if (self.pending_close != null or self.closed) {
+            self.emitConnectionStateIfChanged();
+            return;
+        }
         try self.installPeerTransportStatelessResetToken();
         self.validatePeerTransportConnectionIds();
+        // Successfully accepted — fire `parameters_set` once.
+        self.emitPeerParametersSet();
     }
 
     fn validatePeerTransportLimits(self: *Connection) void {
@@ -3408,14 +3840,17 @@ pub const Connection = struct {
         self: *Connection,
         path: *PathState,
     ) void {
+        const path_id = path.id;
         if (path.pending_migration_reset and path.rollbackFailedMigration()) {
-            self.clearQueuedPathChallengeForPath(path.id);
+            self.clearQueuedPathChallengeForPath(path_id);
+            self.emitQlog(.{ .name = .migration_path_failed, .path_id = path_id });
             return;
         }
         path.path.fail();
         path.pending_migration_reset = false;
         path.migration_rollback = null;
-        self.clearQueuedPathChallengeForPath(path.id);
+        self.clearQueuedPathChallengeForPath(path_id);
+        self.emitQlog(.{ .name = .migration_path_failed, .path_id = path_id });
     }
 
     fn recordPathResponse(
@@ -3431,6 +3866,7 @@ pub const Connection = struct {
         if (path.pending_migration_reset) {
             self.resetPathRecoveryAfterMigration(path);
         }
+        self.emitQlog(.{ .name = .migration_path_validated, .path_id = path_id });
     }
 
     fn shouldRequeuePathChallenge(
@@ -4346,6 +4782,10 @@ pub const Connection = struct {
             const draining_deadline = now_us + self.drainingDurationUs();
             self.draining_deadline_us = draining_deadline;
             self.updateCloseEventDrainingDeadline(draining_deadline);
+            self.qlog_packets_sent +|= 1;
+            self.qlog_bytes_sent +|= n_close;
+            self.emitPacketSent(lvl, pn, @intCast(n_close), 1);
+            self.emitConnectionStateIfChanged();
             return n_close;
         }
 
@@ -4914,6 +5354,11 @@ pub const Connection = struct {
             app_path.pto_probe_count -= 1;
         }
 
+        // qlog hooks for the outgoing packet.
+        self.qlog_packets_sent +|= 1;
+        self.qlog_bytes_sent +|= n;
+        self.emitPacketSent(lvl, pn, @intCast(n), countFrames(pl_buf[0..pl_pos]));
+
         return n;
     }
 
@@ -5038,10 +5483,15 @@ pub const Connection = struct {
     ) Error!void {
         if (self.pending_close != null or self.closed) return;
         if (bytes.len > self.localUdpPayloadLimit()) {
+            self.emitPacketDropped(null, @intCast(bytes.len), .payload_too_large);
             self.close(true, transport_error_protocol_violation, "udp payload exceeds local limit");
+            self.emitConnectionStateIfChanged();
             return;
         }
-        if (bytes.len > 0) self.last_activity_us = now_us;
+        if (bytes.len > 0) {
+            self.last_activity_us = now_us;
+            self.qlog_bytes_received +|= bytes.len;
+        }
         const incoming_path_id = self.incomingPathId(from);
         self.current_incoming_path_id = incoming_path_id;
         self.current_incoming_addr = from;
@@ -5232,6 +5682,7 @@ pub const Connection = struct {
         self.closed = true;
         self.draining_deadline_us = draining_deadline;
         self.clearPendingPings();
+        self.emitConnectionStateIfChanged();
     }
 
     fn finishDraining(self: *Connection) void {
@@ -5239,6 +5690,7 @@ pub const Connection = struct {
         self.draining_deadline_us = null;
         self.closed = true;
         self.clearRecoveryState();
+        self.emitConnectionStateIfChanged();
     }
 
     fn enterClosed(
@@ -5263,6 +5715,7 @@ pub const Connection = struct {
         self.draining_deadline_us = null;
         self.closed = true;
         self.clearRecoveryState();
+        self.emitConnectionStateIfChanged();
     }
 
     fn enterStatelessReset(self: *Connection, now_us: u64) void {
@@ -5371,6 +5824,7 @@ pub const Connection = struct {
             .error_code = error_code,
             .reason = reason,
         };
+        self.emitConnectionStateIfChanged();
     }
 
     /// Queue a STOP_SENDING for `stream_id` with the given app
@@ -5537,7 +5991,12 @@ pub const Connection = struct {
         const largest_received = if (app_pn_space.received.largest) |l| l else 0;
         const multipath_path_id: ?u32 = if (self.multipathNegotiated()) app_path.id else null;
         if (self.app_read_current == null) {
-            if (self.isKnownStatelessReset(bytes)) self.enterStatelessReset(now_us);
+            if (self.isKnownStatelessReset(bytes)) {
+                self.emitPacketDropped(.application, @intCast(bytes.len), .stateless_reset);
+                self.enterStatelessReset(now_us);
+            } else {
+                self.emitPacketDropped(.application, @intCast(bytes.len), .keys_unavailable);
+            }
             return bytes.len;
         }
 
@@ -5550,9 +6009,11 @@ pub const Connection = struct {
             multipath_path_id,
         )) orelse {
             if (self.isKnownStatelessReset(bytes)) {
+                self.emitPacketDropped(.application, @intCast(bytes.len), .stateless_reset);
                 self.enterStatelessReset(now_us);
                 return bytes.len;
             }
+            self.emitPacketDropped(.application, @intCast(bytes.len), .decryption_failure);
             self.noteApplicationAuthFailure();
             return bytes.len;
         };
@@ -5564,8 +6025,19 @@ pub const Connection = struct {
 
         self.last_authenticated_path_id = app_path.id;
         recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
+        self.qlog_packets_received +|= 1;
+        self.emitPacketReceived(.application, opened.pn, @intCast(bytes.len), countFrames(opened.payload));
         try self.dispatchFrames(.application, opened.payload, now_us);
         return bytes.len;
+    }
+
+    fn countFrames(payload: []const u8) u32 {
+        var count: u32 = 0;
+        var it = frame_mod.iter(payload);
+        while (it.next() catch return count) |_| {
+            count += 1;
+        }
+        return count;
     }
 
     fn openApplicationPacket(
@@ -5642,22 +6114,37 @@ pub const Connection = struct {
         // happen. RFC 9001 §5.2 derives Initial keys from the DCID
         // the client put on its first Initial.
         if (self.role == .server and !self.initial_dcid_set) {
-            if (bytes.len < 6) return bytes.len;
+            if (bytes.len < 6) {
+                self.emitPacketDropped(.initial, @intCast(bytes.len), .header_decode_failure);
+                return bytes.len;
+            }
             const dcid_len = bytes[5];
-            if (dcid_len > path_mod.max_cid_len) return bytes.len;
-            if (bytes.len < @as(usize, 6) + dcid_len) return bytes.len;
+            if (dcid_len > path_mod.max_cid_len) {
+                self.emitPacketDropped(.initial, @intCast(bytes.len), .header_decode_failure);
+                return bytes.len;
+            }
+            if (bytes.len < @as(usize, 6) + dcid_len) {
+                self.emitPacketDropped(.initial, @intCast(bytes.len), .header_decode_failure);
+                return bytes.len;
+            }
             try self.setInitialDcid(bytes[6 .. 6 + dcid_len]);
         }
         try self.ensureInitialKeys();
         const r_keys_opt = self.initial_keys_read;
-        const r_keys = r_keys_opt orelse return bytes.len;
+        const r_keys = r_keys_opt orelse {
+            self.emitPacketDropped(.initial, @intCast(bytes.len), .keys_unavailable);
+            return bytes.len;
+        };
 
         var pt_buf: [max_recv_plaintext]u8 = undefined;
         const opened = long_packet_mod.openInitial(&pt_buf, bytes, .{
             .keys = &r_keys,
             .largest_received = if (self.pnSpaceForLevel(.initial).received.largest) |l| l else 0,
         }) catch |e| switch (e) {
-            boringssl.crypto.aead.Error.Auth => return bytes.len,
+            boringssl.crypto.aead.Error.Auth => {
+                self.emitPacketDropped(.initial, @intCast(bytes.len), .decryption_failure);
+                return bytes.len;
+            },
             else => return e,
         };
 
@@ -5672,6 +6159,7 @@ pub const Connection = struct {
                 self.initial_dcid_set = true;
                 try self.ensureInitialKeys();
             }
+            self.emitConnectionStartedOnce();
         }
         if (self.role == .client) {
             const server_scid = ConnectionId.fromSlice(opened.scid.slice());
@@ -5682,6 +6170,8 @@ pub const Connection = struct {
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
         self.pnSpaceForLevel(.initial).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
+        self.qlog_packets_received +|= 1;
+        self.emitPacketReceived(.initial, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
         try self.dispatchFrames(.initial, opened.payload, now_us);
         return opened.bytes_consumed;
     }
@@ -5731,11 +6221,20 @@ pub const Connection = struct {
         bytes: []u8,
         now_us: u64,
     ) Error!usize {
-        if (self.role != .server) return bytes.len;
-        if (self.inner.earlyDataStatus() == .rejected) return bytes.len;
+        if (self.role != .server) {
+            self.emitPacketDropped(.early_data, @intCast(bytes.len), .other);
+            return bytes.len;
+        }
+        if (self.inner.earlyDataStatus() == .rejected) {
+            self.emitPacketDropped(.early_data, @intCast(bytes.len), .keys_unavailable);
+            return bytes.len;
+        }
 
         const r_keys_opt = try self.packetKeys(.early_data, .read);
-        const r_keys = r_keys_opt orelse return bytes.len;
+        const r_keys = r_keys_opt orelse {
+            self.emitPacketDropped(.early_data, @intCast(bytes.len), .keys_unavailable);
+            return bytes.len;
+        };
         const app_path = self.pathForId(self.current_incoming_path_id);
         const app_pn_space = &app_path.app_pn_space;
         const largest_received = if (app_pn_space.received.largest) |l| l else 0;
@@ -5745,12 +6244,17 @@ pub const Connection = struct {
             .keys = &r_keys,
             .largest_received = largest_received,
         }) catch |e| switch (e) {
-            boringssl.crypto.aead.Error.Auth => return bytes.len,
+            boringssl.crypto.aead.Error.Auth => {
+                self.emitPacketDropped(.early_data, @intCast(bytes.len), .decryption_failure);
+                return bytes.len;
+            },
             else => return e,
         };
 
         self.last_authenticated_path_id = app_path.id;
         recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
+        self.qlog_packets_received +|= 1;
+        self.emitPacketReceived(.early_data, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
         try self.dispatchFrames(.early_data, opened.payload, now_us);
         return opened.bytes_consumed;
     }
@@ -5761,19 +6265,27 @@ pub const Connection = struct {
         now_us: u64,
     ) Error!usize {
         const r_keys_opt = try self.packetKeys(.handshake, .read);
-        const r_keys = r_keys_opt orelse return bytes.len;
+        const r_keys = r_keys_opt orelse {
+            self.emitPacketDropped(.handshake, @intCast(bytes.len), .keys_unavailable);
+            return bytes.len;
+        };
 
         var pt_buf: [max_recv_plaintext]u8 = undefined;
         const opened = long_packet_mod.openHandshake(&pt_buf, bytes, .{
             .keys = &r_keys,
             .largest_received = if (self.pnSpaceForLevel(.handshake).received.largest) |l| l else 0,
         }) catch |e| switch (e) {
-            boringssl.crypto.aead.Error.Auth => return bytes.len,
+            boringssl.crypto.aead.Error.Auth => {
+                self.emitPacketDropped(.handshake, @intCast(bytes.len), .decryption_failure);
+                return bytes.len;
+            },
             else => return e,
         };
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
         self.pnSpaceForLevel(.handshake).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
+        self.qlog_packets_received +|= 1;
+        self.emitPacketReceived(.handshake, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
         try self.dispatchFrames(.handshake, opened.payload, now_us);
         return opened.bytes_consumed;
     }
@@ -6643,6 +7155,12 @@ pub const Connection = struct {
         // Loss detection at the same level — packet-threshold only
         // (time-threshold lives in `tick`).
         try self.detectLossesByPacketThresholdAtLevel(lvl);
+
+        // Snapshot metrics + congestion phase after a meaningful ACK.
+        if (any_ack_eliciting_newly_acked or in_flight_bytes_acked > 0) {
+            self.emitCongestionStateIfChanged(now_us);
+            self.emitMetricsSnapshot(now_us);
+        }
     }
 
     fn handleApplicationAckOnPath(
@@ -6709,6 +7227,12 @@ pub const Connection = struct {
         }
 
         try self.detectLossesByPacketThresholdOnApplicationPath(path);
+
+        // Snapshot metrics + congestion phase after a meaningful ACK.
+        if (any_ack_eliciting_newly_acked or in_flight_bytes_acked > 0) {
+            self.emitCongestionStateIfChanged(now_us);
+            self.emitMetricsSnapshot(now_us);
+        }
     }
 
     fn dispatchAckedToStreams(self: *Connection, pn: u64) Error!void {
@@ -7060,12 +7584,16 @@ pub const Connection = struct {
                 var lost = sent.removeAt(i);
                 defer lost.deinit(self.allocator);
                 stats.add(lost);
+                self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .packet_threshold);
                 _ = try self.requeueLostPacket(lvl, &lost);
                 continue;
             }
             i += 1;
         }
+        self.qlog_packets_lost +|= stats.count;
+        self.emitLossDetected(lvl, stats, .packet_threshold);
         self.onPacketsLostAtLevel(lvl, stats);
+        self.emitCongestionStateIfChanged(0);
     }
 
     fn detectLossesByPacketThresholdOnApplicationPath(
@@ -7085,12 +7613,16 @@ pub const Connection = struct {
                 var lost = path.sent.removeAt(i);
                 defer lost.deinit(self.allocator);
                 stats.add(lost);
+                self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .packet_threshold);
                 _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
                 continue;
             }
             i += 1;
         }
+        self.qlog_packets_lost +|= stats.count;
+        self.emitLossDetected(.application, stats, .packet_threshold);
         self.onApplicationPathPacketsLost(path, stats);
+        self.emitCongestionStateIfChanged(0);
     }
 
     fn detectLossesByTimeThresholdAtLevel(
@@ -7120,12 +7652,16 @@ pub const Connection = struct {
                 var lost = sent.removeAt(i);
                 defer lost.deinit(self.allocator);
                 stats.add(lost);
+                self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .time_threshold);
                 _ = try self.requeueLostPacket(lvl, &lost);
                 continue;
             }
             i += 1;
         }
+        self.qlog_packets_lost +|= stats.count;
+        self.emitLossDetected(lvl, stats, .time_threshold);
         self.onPacketsLostAtLevel(lvl, stats);
+        self.emitCongestionStateIfChanged(now_us);
     }
 
     fn detectLossesByTimeThresholdOnApplicationPath(
@@ -7153,12 +7689,16 @@ pub const Connection = struct {
                 var lost = path.sent.removeAt(i);
                 defer lost.deinit(self.allocator);
                 stats.add(lost);
+                self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .time_threshold);
                 _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
                 continue;
             }
             i += 1;
         }
+        self.qlog_packets_lost +|= stats.count;
+        self.emitLossDetected(.application, stats, .time_threshold);
         self.onApplicationPathPacketsLost(path, stats);
+        self.emitCongestionStateIfChanged(now_us);
     }
 
     fn firePtoAtLevel(
@@ -7175,7 +7715,10 @@ pub const Connection = struct {
             defer lost.deinit(self.allocator);
             var stats: LossStats = .{};
             stats.add(lost);
+            self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .pto_probe);
             const requeued = try self.requeueLostPacket(lvl, &lost);
+            self.qlog_packets_lost +|= stats.count;
+            self.emitLossDetected(lvl, stats, .pto_probe);
             self.onPacketsLostAtLevel(lvl, stats);
 
             self.pendingPingForLevel(lvl).* = !requeued;
@@ -7198,7 +7741,10 @@ pub const Connection = struct {
             defer lost.deinit(self.allocator);
             var stats: LossStats = .{};
             stats.add(lost);
+            self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .pto_probe);
             const requeued = try self.requeueLostPacketOnPath(.application, &lost, path.id);
+            self.qlog_packets_lost +|= stats.count;
+            self.emitLossDetected(.application, stats, .pto_probe);
             self.onApplicationPathPacketsLost(path, stats);
 
             path.pending_ping = !requeued;
@@ -7400,6 +7946,9 @@ fn setSecret(
     } else switch (dir) {
         .read => conn.levels[lvl.idx()].read = material,
         .write => conn.levels[lvl.idx()].write = material,
+    }
+    if (lvl != .application) {
+        conn.emitQlog(.{ .name = .key_updated, .level = lvl });
     }
     return 1;
 }
@@ -9372,7 +9921,7 @@ fn testEarlyDataPacketKeys() !PacketKeys {
 }
 
 const TestQlogRecorder = struct {
-    events: [16]QlogEvent = undefined,
+    events: [128]QlogEvent = undefined,
     count: usize = 0,
 
     fn callback(user_data: ?*anyopaque, event: QlogEvent) void {
@@ -9387,6 +9936,21 @@ const TestQlogRecorder = struct {
             if (event.name == name) return true;
         }
         return false;
+    }
+
+    fn first(self: *const TestQlogRecorder, name: QlogEventName) ?QlogEvent {
+        for (self.events[0..self.count]) |event| {
+            if (event.name == name) return event;
+        }
+        return null;
+    }
+
+    fn countOf(self: *const TestQlogRecorder, name: QlogEventName) usize {
+        var n: usize = 0;
+        for (self.events[0..self.count]) |event| {
+            if (event.name == name) n += 1;
+        }
+        return n;
     }
 };
 
@@ -11614,4 +12178,217 @@ test "idle timer closes and enters draining" {
     try conn.tick(conn.draining_deadline_us.?);
     try std.testing.expectEqual(CloseState.closed, conn.closeState());
     try std.testing.expect(conn.nextTimerDeadline(10_000) == null);
+}
+
+test "qlog: connection_started and connection_state_updated fire on bind+close" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    try conn.bind();
+    // Client `bind` should have fired exactly one `connection_started`.
+    try std.testing.expectEqual(@as(usize, 1), recorder.countOf(.connection_started));
+    const started = recorder.first(.connection_started).?;
+    try std.testing.expectEqual(@as(?Role, .client), started.role);
+
+    // Re-bind shouldn't double-fire.
+    try conn.bind();
+    try std.testing.expectEqual(@as(usize, 1), recorder.countOf(.connection_started));
+
+    // Closing transitions open → closing → draining → closed across the close pipeline.
+    conn.close(true, transport_error_protocol_violation, "test close");
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
+    try std.testing.expect(recorder.countOf(.connection_state_updated) >= 1);
+    const closing_event = blk: {
+        var i: usize = 0;
+        while (i < recorder.count) : (i += 1) {
+            const e = recorder.events[i];
+            if (e.name == .connection_state_updated and e.new_state == .closing) break :blk e;
+        }
+        return error.TestExpectedClosingTransition;
+    };
+    try std.testing.expectEqual(@as(?CloseState, .open), closing_event.old_state);
+}
+
+test "qlog: parameters_set carries top-level peer transport-parameter fields" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    // Pretend the peer's params arrived and the connection accepted them.
+    conn.cached_peer_transport_params = .{
+        .max_idle_timeout_ms = 30_000,
+        .max_udp_payload_size = 1452,
+        .initial_max_data = 65536,
+        .initial_max_streams_bidi = 100,
+        .initial_max_streams_uni = 50,
+        .active_connection_id_limit = 4,
+        .max_ack_delay_ms = 25,
+        .max_datagram_frame_size = 1200,
+    };
+    conn.emitPeerParametersSet();
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.countOf(.parameters_set));
+    const e = recorder.first(.parameters_set).?;
+    try std.testing.expectEqual(@as(?u64, 30_000), e.peer_idle_timeout_ms);
+    try std.testing.expectEqual(@as(?u64, 1452), e.peer_max_udp_payload_size);
+    try std.testing.expectEqual(@as(?u64, 65536), e.peer_initial_max_data);
+    try std.testing.expectEqual(@as(?u64, 100), e.peer_initial_max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, 50), e.peer_initial_max_streams_uni);
+    try std.testing.expectEqual(@as(?u64, 4), e.peer_active_connection_id_limit);
+    try std.testing.expectEqual(@as(?u64, 25), e.peer_max_ack_delay_ms);
+    try std.testing.expectEqual(@as(?u64, 1200), e.peer_max_datagram_frame_size);
+
+    // Idempotent — second call is a no-op.
+    conn.emitPeerParametersSet();
+    try std.testing.expectEqual(@as(usize, 1), recorder.countOf(.parameters_set));
+}
+
+test "qlog: packet_sent / packet_received are gated by setQlogPacketEvents" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationReadSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{});
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    // With per-packet events disabled (the default), nothing should fire.
+    var buf: [default_mtu]u8 = undefined;
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &buf, 1_000_000)).?;
+    try std.testing.expectEqual(@as(usize, 0), recorder.countOf(.packet_sent));
+    // But the cheap counter should have advanced.
+    try std.testing.expect(conn.qlog_packets_sent >= 1);
+
+    // Enable the opt-in flag and try again — now we should see the event.
+    conn.setQlogPacketEvents(true);
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &buf, 1_001_000)).?;
+    try std.testing.expect(recorder.countOf(.packet_sent) >= 1);
+    const sent_event = recorder.first(.packet_sent).?;
+    try std.testing.expectEqual(@as(?QlogPnSpace, .application), sent_event.pn_space);
+    try std.testing.expectEqual(@as(?QlogPacketKind, .one_rtt), sent_event.packet_kind);
+    try std.testing.expect(sent_event.packet_size != null);
+    try std.testing.expect(sent_event.packet_size.? > 0);
+}
+
+test "qlog: packet_dropped fires on AEAD authentication failure" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationReadSecret(&conn);
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    // Build a valid 1-RTT, then corrupt the tag so AEAD fails.
+    const keys = conn.app_read_current.?.keys;
+    var payload: [16]u8 = undefined;
+    const payload_len = try frame_mod.encode(&payload, .{ .ping = .{} });
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = &.{},
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+    });
+    packet_buf[n - 1] ^= 0x01;
+
+    _ = try conn.handleShort(packet_buf[0..n], 1_000_000);
+    try std.testing.expect(recorder.contains(.packet_dropped));
+    const dropped = recorder.first(.packet_dropped).?;
+    try std.testing.expectEqual(@as(?QlogPacketDropReason, .decryption_failure), dropped.drop_reason);
+}
+
+test "qlog: loss_detected fires from packet-threshold loss detection" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+    conn.setQlogPacketEvents(true);
+
+    // Inject a few sent packets at Initial level, then ack a later PN to
+    // force packet-threshold loss detection on the early ones.
+    const initial_sent = self_blk: {
+        break :self_blk &conn.sent[EncryptionLevel.initial.idx()];
+    };
+    for ([_]u64{ 0, 1, 2 }) |pn| {
+        try initial_sent.record(.{
+            .pn = pn,
+            .sent_time_us = pn * 1000,
+            .bytes = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+    }
+    // Set largest_acked > packet_threshold so the early ones look lost.
+    conn.pnSpaceForLevel(.initial).next_pn = 10;
+    try conn.handleAckAtLevel(.initial, .{
+        .largest_acked = 9,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    }, 5_000);
+
+    try std.testing.expect(recorder.countOf(.loss_detected) >= 1);
+    const loss = recorder.first(.loss_detected).?;
+    try std.testing.expectEqual(@as(?QlogLossReason, .packet_threshold), loss.loss_reason);
+    try std.testing.expect(loss.lost_count != null);
+    try std.testing.expect(loss.lost_count.? > 0);
+    // packet_lost should fire too because we enabled per-packet events.
+    try std.testing.expect(recorder.countOf(.packet_lost) >= 1);
+    // The connection-level counter should also have moved.
+    try std.testing.expect(conn.qlog_packets_lost >= 1);
+}
+
+test "qlog: pathStats exposes the new connection-level counters" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationReadSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{});
+
+    // Drive a single send to bump counters.
+    var buf: [default_mtu]u8 = undefined;
+    conn.primaryPath().pending_ping = true;
+    _ = (try conn.pollLevel(.application, &buf, 1_000_000)).?;
+
+    const stats = conn.pathStats(0).?;
+    try std.testing.expect(stats.packets_sent >= 1);
+    try std.testing.expect(stats.total_bytes_sent >= 1);
+    // RTT estimator hasn't run yet — values are at their initial defaults.
+    try std.testing.expect(stats.srtt_us > 0); // default kInitialRtt
+    try std.testing.expectEqual(stats.srtt_us, stats.smoothed_rtt_us);
+    try std.testing.expectEqual(stats.rttvar_us, stats.srtt_us / 2);
+    // Slow start phase before any loss.
+    try std.testing.expectEqual(path_mod.CongestionState.slow_start, stats.congestion_window_state);
 }
