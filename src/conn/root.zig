@@ -1,4 +1,24 @@
 //! nullq.conn — per-connection state machine.
+//!
+//! The bulk of nullq lives here: the `Connection` type itself
+//! (handshake driving, packet protection, streams, datagrams,
+//! migration, multipath, key updates) and its supporting subsystems
+//! split across submodules.
+//!
+//! Submodules:
+//!  - `state` — the `Connection` state machine; ~106 public methods
+//!    spanning bind/handshake, send/receive, stream open/close,
+//!    multipath, close + draining, and event polling.
+//!  - `ack_tracker` / `pn_space` / `sent_packets` — packet-number
+//!    bookkeeping that drives ACK emission and loss detection.
+//!  - `rtt` / `congestion` / `loss_recovery` — RFC 9002 recovery
+//!    and NewReno congestion control.
+//!  - `flow_control` — stream and connection MAX_DATA accounting.
+//!  - `path` / `path_validator` — multipath, migration, and
+//!    PATH_CHALLENGE/PATH_RESPONSE validation.
+//!  - `send_stream` / `recv_stream` — half-stream send/receive
+//!    state and reassembly.
+//!  - `retry_token` — stateless Retry token HMAC helpers.
 
 pub const state = @import("state.zig");
 pub const ack_tracker = @import("ack_tracker.zig");

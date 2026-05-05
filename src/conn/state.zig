@@ -828,6 +828,12 @@ pub const Connection = struct {
     pending_paths_blocked: ?u32 = null,
     pending_path_cids_blocked: ?frame_types.PathCidsBlocked = null,
 
+    /// Build a client-side `Connection`. `tls_ctx` must be a
+    /// client-mode `boringssl.tls.Context` and stays caller-owned;
+    /// `server_name` becomes the SNI hostname. The returned
+    /// `Connection` must be `bind()`ed once it lives at its final
+    /// memory address (`bind` stashes `&self` in SSL ex-data, so
+    /// it has to happen post-move).
     pub fn initClient(
         allocator: std.mem.Allocator,
         tls_ctx: boringssl.tls.Context,
@@ -844,6 +850,10 @@ pub const Connection = struct {
         return conn;
     }
 
+    /// Build a server-side `Connection`. `tls_ctx` must be a
+    /// server-mode `boringssl.tls.Context` and stays caller-owned.
+    /// Like `initClient`, `bind()` must be called once the
+    /// `Connection` lives at its final memory address.
     pub fn initServer(
         allocator: std.mem.Allocator,
         tls_ctx: boringssl.tls.Context,
@@ -874,6 +884,10 @@ pub const Connection = struct {
         }
     }
 
+    /// Free all per-connection allocations, including stream
+    /// buffers, queued frames, packet-number space state, and the
+    /// underlying `boringssl.tls.Conn`. After this call the
+    /// `Connection` is `undefined` and must not be reused.
     pub fn deinit(self: *Connection) void {
         var it = self.streams.iterator();
         while (it.next()) |entry| {
@@ -1033,10 +1047,16 @@ pub const Connection = struct {
         self.inner.setEarlyDataEnabled(enabled);
     }
 
+    /// Snapshot of BoringSSL's 0-RTT state machine: whether early
+    /// data was attempted, accepted, or rejected, plus the rejection
+    /// reason if any. Useful after the handshake finishes for
+    /// metrics and assertions.
     pub fn earlyDataStatus(self: *Connection) EarlyDataStatus {
         return self.inner.earlyDataStatus();
     }
 
+    /// Free-form reason string from BoringSSL describing why 0-RTT
+    /// was rejected. Empty when 0-RTT was accepted or not attempted.
     pub fn earlyDataReason(self: *Connection) []const u8 {
         return self.inner.earlyDataReason();
     }
@@ -1068,6 +1088,10 @@ pub const Connection = struct {
         return digest;
     }
 
+    /// True once the TLS-1.3 handshake has emitted Finished and
+    /// the server has issued HANDSHAKE_DONE. Streams and DATAGRAMs
+    /// queued before this can still flow at 0-RTT level if early
+    /// data was negotiated; everything else waits.
     pub fn handshakeDone(self: *Connection) bool {
         return self.inner.handshakeDone();
     }
@@ -1080,6 +1104,9 @@ pub const Connection = struct {
         self.handshake_done_queued_once = true;
     }
 
+    /// True if BoringSSL is in QUIC mode (i.e. `tls.quic.Method`
+    /// callbacks are wired up). Should always be true after `init*`.
+    /// Useful as a sanity check during embedder bring-up.
     pub fn isQuic(self: *Connection) bool {
         return self.inner.isQuic();
     }
@@ -1297,6 +1324,9 @@ pub const Connection = struct {
         try self.installNextApplicationWriteKeys(now_us, true);
     }
 
+    /// True if the embedder may call `requestKeyUpdate` right now
+    /// (RFC 9001 §6). Returns false while a previous update is still
+    /// awaiting an ACK or while the cooldown deadline is in the future.
     pub fn canInitiateKeyUpdateAt(self: *const Connection, now_us: u64) bool {
         if (self.app_write_current == null) return false;
         if (self.app_write_update_pending_ack) return false;
@@ -1306,11 +1336,17 @@ pub const Connection = struct {
         return true;
     }
 
+    /// Initiate an application key update (RFC 9001 §6). Returns
+    /// `error.KeyUpdateBlocked` if `canInitiateKeyUpdateAt` would
+    /// have returned false.
     pub fn requestKeyUpdate(self: *Connection, now_us: u64) Error!void {
         if (!self.canInitiateKeyUpdateAt(now_us)) return Error.KeyUpdateBlocked;
         try self.installNextApplicationWriteKeys(now_us, true);
     }
 
+    /// Snapshot of the current application key-update lifecycle —
+    /// read/write epoch, key phase, packets protected with the
+    /// current write key, and whether a discard deadline is set.
     pub fn keyUpdateStatus(self: *const Connection) ApplicationKeyUpdateStatus {
         var status: ApplicationKeyUpdateStatus = .{
             .write_update_pending_ack = self.app_write_update_pending_ack,
@@ -1605,6 +1641,9 @@ pub const Connection = struct {
         return next;
     }
 
+    /// Sequence number to use for the next NEW_CONNECTION_ID
+    /// the embedder issues on `path_id`. Useful when minting CIDs
+    /// outside of `replenishConnectionIds`.
     pub fn nextLocalConnectionIdSequence(self: *const Connection, path_id: u32) u64 {
         return self.nextLocalCidSequence(path_id);
     }
@@ -1685,6 +1724,9 @@ pub const Connection = struct {
         return @intCast(limit);
     }
 
+    /// Number of fresh NEW_CONNECTION_ID frames the embedder may
+    /// queue on `path_id` without exceeding the peer's
+    /// `active_connection_id_limit`.
     pub fn localConnectionIdIssueBudget(self: *const Connection, path_id: u32) usize {
         return self.localConnectionIdIssueBudgetAfterRetirePriorTo(path_id, 0);
     }
@@ -2164,28 +2206,42 @@ pub const Connection = struct {
         return s.arrived_in_early_data;
     }
 
+    /// If the *local* sender ran out of connection-level send credit
+    /// (RFC 9000 §4.1) and we therefore plan to emit a DATA_BLOCKED
+    /// frame, this returns the limit we hit. Diagnostic only.
     pub fn localDataBlockedAt(self: *const Connection) ?u64 {
         return self.local_data_blocked_at;
     }
 
+    /// As `localDataBlockedAt` but for one specific stream's
+    /// stream-level send credit (would emit STREAM_DATA_BLOCKED).
     pub fn localStreamDataBlockedAt(self: *const Connection, stream_id: u64) ?u64 {
         const idx = findStreamBlocked(self.local_stream_data_blocked.items, stream_id) orelse return null;
         return self.local_stream_data_blocked.items[idx].maximum_stream_data;
     }
 
+    /// As `localDataBlockedAt` but for stream-count limits (would
+    /// emit STREAMS_BLOCKED). `bidi=true` checks bidi limits.
     pub fn localStreamsBlockedAt(self: *const Connection, bidi: bool) ?u64 {
         return if (bidi) self.local_streams_blocked_bidi else self.local_streams_blocked_uni;
     }
 
+    /// If the *peer* told us they're stuck on connection-level send
+    /// credit (received a DATA_BLOCKED frame), this is the limit
+    /// they advertised. Useful for diagnosing flow-control deadlocks.
     pub fn peerDataBlockedAt(self: *const Connection) ?u64 {
         return self.peer_data_blocked_at;
     }
 
+    /// As `peerDataBlockedAt` but for a single stream
+    /// (received STREAM_DATA_BLOCKED).
     pub fn peerStreamDataBlockedAt(self: *const Connection, stream_id: u64) ?u64 {
         const idx = findStreamBlocked(self.peer_stream_data_blocked.items, stream_id) orelse return null;
         return self.peer_stream_data_blocked.items[idx].maximum_stream_data;
     }
 
+    /// As `peerDataBlockedAt` but for stream-count limits
+    /// (received STREAMS_BLOCKED).
     pub fn peerStreamsBlockedAt(self: *const Connection, bidi: bool) ?u64 {
         return if (bidi) self.peer_streams_blocked_bidi else self.peer_streams_blocked_uni;
     }
@@ -2716,6 +2772,8 @@ pub const Connection = struct {
         self.refreshConnectionIdEventsForPath(0);
     }
 
+    /// Queue a RETIRE_CONNECTION_ID frame asking the peer to drop a
+    /// previously-issued CID at `sequence_number`. Idempotent.
     pub fn queueRetireConnectionId(
         self: *Connection,
         sequence_number: u64,
@@ -2763,10 +2821,15 @@ pub const Connection = struct {
         self.multipath_enabled = enabled;
     }
 
+    /// True if `enableMultipath(true)` has been called locally.
+    /// Doesn't imply the peer agreed — see `multipathNegotiated`.
     pub fn multipathEnabled(self: *const Connection) bool {
         return self.multipath_enabled;
     }
 
+    /// True only when *both* sides advertised
+    /// `initial_max_path_id` in transport parameters. Until this
+    /// returns true, `openPath` for non-zero path ids will fail.
     pub fn multipathNegotiated(self: *const Connection) bool {
         if (!self.multipath_enabled) return false;
         if (self.local_transport_params.initial_max_path_id == null) return false;
@@ -2807,14 +2870,22 @@ pub const Connection = struct {
         return opened_path_id;
     }
 
+    /// Make `path_id` the primary path for new application data.
+    /// Returns false if no such path exists.
     pub fn setActivePath(self: *Connection, path_id: u32) bool {
         return self.paths.setActive(path_id);
     }
 
+    /// Mark `path_id` for retirement at the current activity time
+    /// with error code 0. New traffic stops scheduling here; in-flight
+    /// frames may still be acked.
     pub fn abandonPath(self: *Connection, path_id: u32) bool {
         return self.abandonPathAt(path_id, 0, self.last_activity_us);
     }
 
+    /// As `abandonPath` but with an explicit timestamp and PATH_ABANDON
+    /// error code (draft-21 §6.2). Useful when the embedder has a
+    /// tighter clock than `last_activity_us`.
     pub fn abandonPathAt(
         self: *Connection,
         path_id: u32,
@@ -2824,12 +2895,18 @@ pub const Connection = struct {
         return self.retirePath(path_id, error_code, now_us, true);
     }
 
+    /// Override the lifecycle state of `path_id` directly. Mainly
+    /// useful for tests; production code should drive paths via
+    /// `openPath`, `markPathValidated`, `abandonPath`.
     pub fn setPathStatus(self: *Connection, path_id: u32, state: path_mod.State) bool {
         const p = self.paths.get(path_id) orelse return false;
         p.path.state = state;
         return true;
     }
 
+    /// Mark `path_id` available (`backup=false`) or backup
+    /// (`backup=true`) and queue a PATH_STATUS_AVAILABLE /
+    /// PATH_STATUS_BACKUP frame to inform the peer (draft-21 §6.4).
     pub fn setPathBackup(self: *Connection, path_id: u32, backup: bool) bool {
         const p = self.paths.get(path_id) orelse return false;
         p.local_status_sequence_number +|= 1;
@@ -2841,6 +2918,10 @@ pub const Connection = struct {
         return true;
     }
 
+    /// Treat `path_id` as validated without running PATH_CHALLENGE.
+    /// Useful when validation is provided out-of-band (e.g. tests
+    /// that drive multipath through a mock transport). Returns false
+    /// for unknown `path_id`.
     pub fn markPathValidated(self: *Connection, path_id: u32) bool {
         const p = self.paths.get(path_id) orelse return false;
         p.path.markValidated();
@@ -2848,14 +2929,21 @@ pub const Connection = struct {
         return true;
     }
 
+    /// Choose how `poll` distributes application bytes across
+    /// validated paths: `primary`, `round_robin`, or
+    /// `lowest_rtt_cwnd`.
     pub fn setScheduler(self: *Connection, scheduler: Scheduler) void {
         self.paths.setScheduler(scheduler);
     }
 
+    /// Path id currently used as the primary (active) path. Always 0
+    /// for single-path connections.
     pub fn activePathId(self: *const Connection) u32 {
         return self.paths.activeConst().id;
     }
 
+    /// Read-only snapshot of `path_id`'s RTT, congestion, and loss
+    /// counters. Returns null for unknown `path_id`.
     pub fn pathStats(self: *const Connection, path_id: u32) ?PathStats {
         return self.paths.stats(path_id);
     }
@@ -3840,10 +3928,14 @@ pub const Connection = struct {
         return total;
     }
 
+    /// Current NewReno congestion window in bytes for the active
+    /// application-data path. Diagnostic only; there is no setter.
     pub fn congestionWindow(self: *const Connection) u64 {
         return self.ccForApplicationConst().cwnd;
     }
 
+    /// Total bytes currently in flight across all packet-number
+    /// spaces and paths. Useful for back-pressure decisions.
     pub fn congestionBytesInFlight(self: *const Connection) u64 {
         return self.bytesInFlight();
     }
@@ -3868,6 +3960,10 @@ pub const Connection = struct {
         return app_path.path.cc.sendAllowance(app_path.sent.bytes_in_flight) == 0;
     }
 
+    /// Soonest timer deadline among ack-delay, loss detection, PTO,
+    /// idle, draining, path retirement, and key-discard. Embedders
+    /// can park their event loop on this until `tick` should fire.
+    /// Returns null when no timer is currently armed.
     pub fn nextTimerDeadline(self: *const Connection, now_us: u64) ?TimerDeadline {
         _ = now_us;
         var best: ?TimerDeadline = null;
@@ -5025,6 +5121,8 @@ pub const Connection = struct {
         try self.probePathId(0, token, now_us, timeout_us);
     }
 
+    /// As `probePath` but for an explicit `path_id`. Returns
+    /// `error.PathNotFound` if the id is unknown.
     pub fn probePathId(
         self: *Connection,
         path_id: u32,
