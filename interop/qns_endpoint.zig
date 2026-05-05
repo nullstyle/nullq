@@ -20,6 +20,8 @@ const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
 const endpoint_bidi_stream_limit = nullq.conn.state.max_streams_per_connection;
 const endpoint_uni_stream_limit: u64 = 64;
+const endpoint_active_connection_id_limit: u64 = 2;
+const endpoint_server_cid_desired_last_seq: u8 = 1;
 const max_qns_server_connections = 128;
 const max_qns_server_receive_batch = 256;
 const qns_time_base_us: u64 = 1_000_000;
@@ -282,7 +284,7 @@ const ServerConn = struct {
         if (qlog_sink) |sink| self.conn.setQlogCallback(QlogSink.callback, sink);
         try self.conn.bind();
         try self.conn.setLocalScid(&self.initial_server_cid);
-        try queueServerConnectionIds(&self.conn, &self.next_cid_seq, 4, &self.initial_server_cid);
+        try queueServerConnectionIds(&self.conn, &self.next_cid_seq, endpoint_server_cid_desired_last_seq, &self.initial_server_cid);
         return self;
     }
 
@@ -563,7 +565,7 @@ fn runServer(
                     .initial_max_streams_bidi = endpoint_bidi_stream_limit,
                     .initial_max_streams_uni = endpoint_uni_stream_limit,
                     .max_udp_payload_size = endpoint_udp_payload_size,
-                    .active_connection_id_limit = 8,
+                    .active_connection_id_limit = endpoint_active_connection_id_limit,
                 };
                 try sc.conn.acceptInitial(msg.data, params);
                 _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "nullq qns endpoint v1");
@@ -576,7 +578,7 @@ fn runServer(
         var i: usize = 0;
         while (i < conns.items.len) {
             const sc = conns.items[i];
-            if (sc.conn.handshakeDone()) try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, 8, &sc.initial_server_cid);
+            if (sc.conn.handshakeDone()) try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, endpoint_server_cid_desired_last_seq, &sc.initial_server_cid);
             try sc.app.process(&sc.conn);
             while (try sc.conn.poll(&tx, now_us)) |n| {
                 try sock.send(io, &sc.peer, tx[0..n]);
@@ -752,7 +754,7 @@ fn runClientConnection(
         .initial_max_streams_bidi = endpoint_bidi_stream_limit,
         .initial_max_streams_uni = endpoint_uni_stream_limit,
         .max_udp_payload_size = endpoint_udp_payload_size,
-        .active_connection_id_limit = 8,
+        .active_connection_id_limit = endpoint_active_connection_id_limit,
     };
     try conn.setTransportParams(params);
 
