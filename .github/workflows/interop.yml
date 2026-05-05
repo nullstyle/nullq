@@ -49,15 +49,12 @@ jobs:
           ref: master
           path: quic-interop-runner
 
-      - name: Set up Zig 0.16.0
-        uses: mlugg/setup-zig@v1
+      - name: Set up mise (zig 0.16.0, python 3.12, uv, just)
+        uses: jdx/mise-action@v2
         with:
-          version: 0.16.0
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+          install: true
+          cache: true
+          working_directory: nullq
 
       - name: Install runner deps
         working-directory: quic-interop-runner

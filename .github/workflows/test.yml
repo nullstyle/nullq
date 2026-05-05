@@ -6,9 +6,11 @@ on:
   pull_request:
     branches: [main]
 
-# nullq pins boringssl-zig as a URL+hash dep in build.zig.zon, so
-# Zig fetches the package itself during build. CI just needs Zig
-# and network access — no sibling checkout required.
+# nullq pins Zig 0.16.0 via mise (mise.toml). The official Zig
+# downloads index doesn't list 0.16.0 — it's installed from mise's
+# registry — so we use jdx/mise-action to install the same toolchain
+# CI as local. boringssl-zig is a URL+hash dep, so Zig fetches it
+# itself during build.
 jobs:
   build-test:
     strategy:
@@ -20,10 +22,11 @@ jobs:
       - name: Checkout nullq
         uses: actions/checkout@v4
 
-      - name: Set up Zig 0.16.0
-        uses: mlugg/setup-zig@v1
+      - name: Set up mise (zig 0.16.0 + project tools)
+        uses: jdx/mise-action@v2
         with:
-          version: 0.16.0
+          install: true
+          cache: true
 
       - name: Print toolchain
         run: |
