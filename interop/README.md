@@ -62,11 +62,10 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   `✓(H,DC,C20,S,R,Z,M)`.
 - `quic-go`, `ngtcp2`, and `quiche` all pass nullq-as-client
   handshake and transfer: `✓(H,DC)`.
-- `quic-go` passes nullq-as-client `H,D,S,R,Z,M`:
-  `✓(H,DC,S,R,Z,M)`. `C20` remains red because the current
-  `boringssl-zig` surface does not expose a C-callable TLS 1.3 client
-  cipher-suite preference/override, so the client selects AES-128 on
-  AES-capable hosts.
+- `quic-go` passes nullq-as-client feature coverage:
+  `✓(H,DC,C20,S,R,Z,M)`. The `chacha20` client testcase uses the
+  `boringssl-zig` AES-hardware testing override so BoringSSL prefers
+  ChaCha on AES-capable hosts.
 - The runner may print `At least one QUIC packet could not be
   decrypted` during trace processing even when the QNS result is green;
   keep an eye on that warning while expanding the gate.

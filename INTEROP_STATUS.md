@@ -84,10 +84,10 @@ Current as of 2026-05-04.
   handshake and transfer: `✓(H,DC)`.
 - Official QUIC interop-runner QNS client gate, quic-go feature matrix:
   `zig build external-interop -- runner --role client --runner-dir ../quic-interop-runner --servers quic-go --tests H,D,C,S,R,Z,M`
-  is passing for `H,D,S,R,Z,M`: `✓(H,DC,S,R,Z,M)`. `C20` remains red
-  because BoringSSL's QUIC client currently offers/selects AES-128 on
-  AES-capable hosts and does not expose a C-callable TLS 1.3
-  cipher-suite override through `boringssl-zig`.
+  is passing: `✓(H,DC,C20,S,R,Z,M)`. The QNS C20 client path uses the
+  `boringssl-zig` AES-hardware testing override so BoringSSL emits a
+  deterministic ChaCha-preferred TLS 1.3 ClientHello on AES-capable
+  hosts.
 
 ## Production work landed
 
@@ -386,14 +386,15 @@ Current as of 2026-05-04.
    data. The endpoint installs through the selective `qns-endpoint`
    build step and emits keylog/qlog-style trace files when the runner
    provides `SSLKEYLOGFILE` and `QLOGDIR`. Real runner execution now
-   passes nullq-as-server handshake/transfer against quic-go, ngtcp2,
-   and quiche, and passes the quic-go feature matrix for chacha20,
-   retry, resumption, 0-RTT, and multiplexing. Remaining gate work is
-   client-role execution against external servers, automated CI
-   packaging, lossy/reordered runner scenarios, trace-warning cleanup,
-   and any available external draft-21 multipath runner peer. The
-   runner wrapper invokes upstream Python through `uv run`; repo-local
-   tools are declared in `mise.toml`.
+   passes nullq-as-server and nullq-as-client handshake/transfer
+   against quic-go, ngtcp2, and quiche, and passes the quic-go feature
+   matrix for chacha20, retry, resumption, 0-RTT, and multiplexing in
+   both roles. Remaining gate work is automated CI packaging,
+   lossy/reordered runner scenarios, trace-warning cleanup, broader
+   client-role feature matrices against non-quic-go servers where
+   applicable, and any available external draft-21 multipath runner
+   peer. The runner wrapper invokes upstream Python through `uv run`;
+   repo-local tools are declared in `mise.toml`.
 
 Note: the passing mock multipath test validates simultaneous two-path
 transfer inside nullq. The passing `go-quic-peer multipath` gate now
