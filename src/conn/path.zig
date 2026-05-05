@@ -231,6 +231,14 @@ pub const PathState = struct {
     peer_prefers_backup: bool = false,
     peer_status_sequence_number: ?u64 = null,
     local_status_sequence_number: u64 = 0,
+    /// Highest sequence number we have ever assigned to a locally-issued
+    /// connection ID on this path, plus one. Used to enforce
+    /// RFC 9000 §19.16: a peer that sends RETIRE_CONNECTION_ID with a
+    /// sequence number we never issued is committing a PROTOCOL_VIOLATION.
+    /// Path 0 starts at 1 because sequence 0 is implicitly assigned to
+    /// the long-header SCID; non-primary paths grow this when CIDs are
+    /// issued via PATH_NEW_CONNECTION_ID.
+    next_local_cid_seq: u64 = 0,
 
     pub fn init(
         id: u32,

@@ -1483,6 +1483,12 @@ pub const Connection = struct {
                 path.path.local_cid = cid;
                 if (path_id == 0) self.local_scid = cid;
             }
+            // Keep the per-path high watermark of issued CID sequences.
+            // RFC 9000 §19.16 requires us to reject RETIRE_CONNECTION_ID
+            // whose sequence is greater than any we ever assigned.
+            if (sequence_number >= path.next_local_cid_seq) {
+                path.next_local_cid_seq = sequence_number + 1;
+            }
         }
     }
 
@@ -5960,6 +5966,16 @@ pub const Connection = struct {
         self: *Connection,
         rc: frame_types.RetireConnectionId,
     ) void {
+        // RFC 9000 §19.16: a sequence number greater than any we ever
+        // sent is a PROTOCOL_VIOLATION. Without this gate, an off-path
+        // attacker (or a misbehaving peer) could spam RETIRE_CONNECTION_ID
+        // for fabricated sequences and waste server processing per packet.
+        if (self.paths.getConst(0)) |path| {
+            if (rc.sequence_number >= path.next_local_cid_seq) {
+                self.close(true, transport_error_protocol_violation, "retire_connection_id sequence not yet issued");
+                return;
+            }
+        }
         self.retireLocalCidFromPeer(0, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(0, rc.sequence_number);
     }
@@ -6016,6 +6032,15 @@ pub const Connection = struct {
         self: *Connection,
         rc: frame_types.PathRetireConnectionId,
     ) void {
+        // Multipath analogue of RFC 9000 §19.16. Same DoS surface — a
+        // peer that walks ahead of the issued sequence forces us to do
+        // a lookup-and-discard per frame.
+        if (self.paths.getConst(rc.path_id)) |path| {
+            if (rc.sequence_number >= path.next_local_cid_seq) {
+                self.close(true, transport_error_protocol_violation, "path_retire_connection_id sequence not yet issued");
+                return;
+            }
+        }
         self.retireLocalCidFromPeer(rc.path_id, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(rc.path_id, rc.sequence_number);
     }
@@ -10612,6 +10637,50 @@ test "RETIRE_CONNECTION_ID surfaces replacement CID budget to embedders" {
     try std.testing.expectEqual(@as(usize, 1), queued);
     try std.testing.expectEqual(@as(usize, 0), conn.localConnectionIdIssueBudget(0));
     try std.testing.expect(conn.pollEvent() == null);
+}
+
+test "RETIRE_CONNECTION_ID with sequence we never issued is a PROTOCOL_VIOLATION" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 4 };
+    // We've issued sequences 0, 1, and 2 to the peer.
+    try conn.setLocalScid(&.{0xa0});
+    try conn.queueNewConnectionId(1, 0, &.{0xa1}, @splat(0xa1));
+    try conn.queueNewConnectionId(2, 0, &.{0xa2}, @splat(0xa2));
+
+    // A peer that retires a sequence we never assigned (RFC 9000 §19.16)
+    // is committing a PROTOCOL_VIOLATION. Without this gate an attacker
+    // could spam fabricated retire frames to force expensive list walks.
+    conn.handleRetireConnectionId(.{ .sequence_number = 99 });
+    try std.testing.expect(conn.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+}
+
+test "RETIRE_CONNECTION_ID for an already-retired sequence is allowed" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 4 };
+    try conn.setLocalScid(&.{0xa0});
+    try conn.queueNewConnectionId(1, 0, &.{0xa1}, @splat(0xa1));
+    try conn.queueNewConnectionId(2, 0, &.{0xa2}, @splat(0xa2));
+
+    // First retire of seq 1: legitimate.
+    conn.handleRetireConnectionId(.{ .sequence_number = 1 });
+    try std.testing.expect(conn.pending_close == null);
+    // Second retire of seq 1 (could happen if we received a duplicate or
+    // a delayed retransmission): still legitimate because seq 1 was issued
+    // at some point. Only sequences strictly above the high watermark are
+    // rejected.
+    conn.handleRetireConnectionId(.{ .sequence_number = 1 });
+    try std.testing.expect(conn.pending_close == null);
 }
 
 test "retiring CID sequence 0 does not change long-header source CID" {
