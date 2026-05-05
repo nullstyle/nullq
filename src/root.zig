@@ -29,6 +29,10 @@ pub const tls = @import("tls/root.zig");
 pub const conn = @import("conn/root.zig");
 pub const retry_token = conn.retry_token;
 
+/// UDP transport plumbing — socket-option tuning today, batch
+/// I/O and path-tracking helpers later.
+pub const transport = @import("transport/root.zig");
+
 pub const Connection = conn.Connection;
 pub const OutgoingDatagram = conn.OutgoingDatagram;
 pub const IncomingDatagram = conn.IncomingDatagram;
@@ -64,6 +68,7 @@ test {
     _ = frame;
     _ = tls;
     _ = conn;
+    _ = transport;
 }
 
 test "phase 0: builds and links against boringssl-zig" {
