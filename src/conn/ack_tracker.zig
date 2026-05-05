@@ -39,14 +39,22 @@ pub const AckTracker = struct {
     pending_ack: bool = false,
 
     /// Add a successfully-decrypted PN. Idempotent (re-adding a PN
-    /// that's already in the set is a no-op).
-    pub fn add(self: *AckTracker, pn: u64, now_ms: u64) void {
+    /// that's already in the set is a no-op). `ack_eliciting`
+    /// controls only the ACK scheduling signal; all processed packet
+    /// numbers remain ACKable once a later ACK-eliciting packet or
+    /// timer causes an ACK frame to be emitted.
+    pub fn addPacket(self: *AckTracker, pn: u64, now_ms: u64, ack_eliciting: bool) void {
         if (self.largest == null or pn > self.largest.?) {
             self.largest = pn;
             self.largest_at_ms = now_ms;
         }
-        self.pending_ack = true;
+        if (ack_eliciting) self.pending_ack = true;
         self.insert(pn);
+    }
+
+    /// Add an ACK-eliciting packet number.
+    pub fn add(self: *AckTracker, pn: u64, now_ms: u64) void {
+        self.addPacket(pn, now_ms, true);
     }
 
     /// True if `pn` has previously been added.

@@ -5248,6 +5248,25 @@ pub const Connection = struct {
         };
     }
 
+    fn frameAckEliciting(f: frame_types.Frame) bool {
+        return switch (f) {
+            .padding,
+            .ack,
+            .path_ack,
+            .connection_close,
+            => false,
+            else => true,
+        };
+    }
+
+    fn packetPayloadAckEliciting(payload: []const u8) bool {
+        var it = frame_mod.iter(payload);
+        while (it.next() catch return true) |f| {
+            if (frameAckEliciting(f)) return true;
+        }
+        return false;
+    }
+
     fn versionListContains(vn: wire_header.VersionNegotiation, version: u32) bool {
         var i: usize = 0;
         while (i < vn.versionCount()) : (i += 1) {
@@ -5323,7 +5342,7 @@ pub const Connection = struct {
         const opened = open_result.opened;
 
         self.last_authenticated_path_id = app_path.id;
-        app_pn_space.recordReceived(opened.pn, now_us / 1000);
+        app_pn_space.recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
         try self.dispatchFrames(.application, opened.payload, now_us);
         return bytes.len;
     }
@@ -5441,7 +5460,7 @@ pub const Connection = struct {
         }
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
-        self.pnSpaceForLevel(.initial).recordReceived(opened.pn, now_us / 1000);
+        self.pnSpaceForLevel(.initial).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
         try self.dispatchFrames(.initial, opened.payload, now_us);
         return opened.bytes_consumed;
     }
@@ -5510,7 +5529,7 @@ pub const Connection = struct {
         };
 
         self.last_authenticated_path_id = app_path.id;
-        app_pn_space.recordReceived(opened.pn, now_us / 1000);
+        app_pn_space.recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
         try self.dispatchFrames(.early_data, opened.payload, now_us);
         return opened.bytes_consumed;
     }
@@ -5533,7 +5552,7 @@ pub const Connection = struct {
         };
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
-        self.pnSpaceForLevel(.handshake).recordReceived(opened.pn, now_us / 1000);
+        self.pnSpaceForLevel(.handshake).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
         try self.dispatchFrames(.handshake, opened.payload, now_us);
         return opened.bytes_consumed;
     }
@@ -7739,6 +7758,24 @@ test "EncryptionLevel idx round-trip" {
     inline for (level_mod.all) |lvl| {
         try std.testing.expectEqual(lvl.idx(), @intFromEnum(lvl));
     }
+}
+
+test "packetPayloadAckEliciting ignores ACK-only payloads" {
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+
+    pos += try frame_mod.encode(buf[pos..], .{ .padding = .{ .count = 2 } });
+    pos += try frame_mod.encode(buf[pos..], .{ .ack = .{
+        .largest_acked = 9,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+    } });
+    try std.testing.expect(!Connection.packetPayloadAckEliciting(buf[0..pos]));
+
+    pos += try frame_mod.encode(buf[pos..], .{ .ping = .{} });
+    try std.testing.expect(Connection.packetPayloadAckEliciting(buf[0..pos]));
 }
 
 test "CRYPTO reassembly: out-of-order fragments delivered in order" {

@@ -37,6 +37,10 @@ pub const PnSpace = struct {
         self.received.add(pn, now_ms);
     }
 
+    pub fn recordReceivedPacket(self: *PnSpace, pn: u64, now_ms: u64, ack_eliciting: bool) void {
+        self.received.addPacket(pn, now_ms, ack_eliciting);
+    }
+
     pub fn onAckReceived(self: *PnSpace, ack_largest_acked: u64) void {
         if (self.largest_acked_sent == null or ack_largest_acked > self.largest_acked_sent.?) {
             self.largest_acked_sent = ack_largest_acked;
@@ -66,6 +70,19 @@ test "recordReceived updates ack tracker" {
     try std.testing.expectEqual(@as(u8, 2), s.received.range_count);
     try std.testing.expectEqual(@as(?u64, 3), s.received.largest);
     try std.testing.expectEqual(@as(u64, 110), s.received.largest_at_ms);
+}
+
+test "recordReceivedPacket can avoid arming an ACK" {
+    var s: PnSpace = .{};
+    s.recordReceivedPacket(0, 100, false);
+    try std.testing.expectEqual(@as(u8, 1), s.received.range_count);
+    try std.testing.expectEqual(@as(?u64, 0), s.received.largest);
+    try std.testing.expect(!s.received.pending_ack);
+
+    s.recordReceivedPacket(1, 101, true);
+    try std.testing.expectEqual(@as(u8, 1), s.received.range_count);
+    try std.testing.expectEqual(@as(?u64, 1), s.received.largest);
+    try std.testing.expect(s.received.pending_ack);
 }
 
 test "onAckReceived tracks the largest ack sent" {
