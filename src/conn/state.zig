@@ -2235,8 +2235,10 @@ pub const Connection = struct {
         }
         s.stream_count_credit_returned = true;
         if (streamIsBidi(s.id)) {
+            if (self.local_max_streams_bidi >= max_streams_per_connection) return;
             self.queueMaxStreams(true, self.local_max_streams_bidi + 1);
         } else {
+            if (self.local_max_streams_uni >= max_streams_per_connection) return;
             self.queueMaxStreams(false, self.local_max_streams_uni + 1);
         }
     }
@@ -9455,6 +9457,32 @@ test "draining a peer-initiated stream returns MAX_STREAMS credit" {
     try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(0, &buf));
     try std.testing.expectEqual(@as(?u64, 2), conn.pending_max_streams_bidi);
     try std.testing.expectEqual(@as(u64, 2), conn.local_max_streams_bidi);
+}
+
+test "draining at stream cap does not queue duplicate MAX_STREAMS" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try conn.setTransportParams(.{
+        .initial_max_data = 16,
+        .initial_max_stream_data_bidi_remote = 16,
+        .initial_max_streams_bidi = max_streams_per_connection,
+    });
+    try conn.handleStream(.application, .{
+        .stream_id = 0,
+        .offset = 0,
+        .data = "x",
+        .has_length = true,
+        .fin = true,
+    });
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(0, &buf));
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_max_streams_bidi);
+    try std.testing.expectEqual(max_streams_per_connection, conn.local_max_streams_bidi);
 }
 
 test "0-RTT send path requires explicit per-connection opt-in" {
