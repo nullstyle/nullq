@@ -18,6 +18,7 @@ const endpoint_udp_payload_size = 1350;
 const endpoint_connection_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
+const max_qns_server_connections = 128;
 
 const ServerOptions = struct {
     listen: []const u8 = "0.0.0.0:443",
@@ -234,6 +235,73 @@ const Http09App = struct {
     }
 };
 
+const ServerConn = struct {
+    conn: nullq.Connection,
+    app: Http09App,
+    peer: Net.IpAddress,
+    transport_params_set: bool = false,
+    retry_sent: bool = false,
+    retry_original_dcid: nullq.conn.path.ConnectionId = .{},
+    retry_source_cid: [server_cid_len]u8,
+    initial_server_cid: [server_cid_len]u8,
+    next_cid_seq: u8 = 1,
+    last_activity_us: u64,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        server_tls: boringssl.tls.Context,
+        www: []const u8,
+        qlog_sink: ?*QlogSink,
+        peer: Net.IpAddress,
+        now_us: u64,
+    ) !*ServerConn {
+        const self = try allocator.create(ServerConn);
+        errdefer allocator.destroy(self);
+        self.* = undefined;
+
+        self.conn = try nullq.Connection.initServer(allocator, server_tls);
+        errdefer self.conn.deinit();
+
+        self.app = Http09App.init(allocator, io, try openDir(io, www));
+        errdefer self.app.deinit();
+
+        self.peer = peer;
+        self.transport_params_set = false;
+        self.retry_sent = false;
+        self.retry_original_dcid = .{};
+        self.initial_server_cid = randomServerCid(io);
+        self.retry_source_cid = retrySourceCid(&self.initial_server_cid);
+        self.next_cid_seq = 1;
+        self.last_activity_us = now_us;
+
+        if (qlog_sink) |sink| self.conn.setQlogCallback(QlogSink.callback, sink);
+        try self.conn.bind();
+        try self.conn.setLocalScid(&self.initial_server_cid);
+        try queueServerConnectionIds(&self.conn, &self.next_cid_seq, 4, &self.initial_server_cid);
+        return self;
+    }
+
+    fn destroy(self: *ServerConn, allocator: std.mem.Allocator) void {
+        self.app.deinit();
+        self.conn.deinit();
+        allocator.destroy(self);
+    }
+
+    fn ownsServerCid(self: *const ServerConn, cid: []const u8) bool {
+        if (std.mem.eql(u8, cid, &self.initial_server_cid)) return true;
+        if (self.retry_sent and std.mem.eql(u8, cid, &self.retry_source_cid)) return true;
+
+        var seq: u8 = 1;
+        while (seq < self.next_cid_seq) : (seq += 1) {
+            var issued = self.initial_server_cid;
+            issued[7] +%= seq;
+            if (std.mem.eql(u8, cid, &issued)) return true;
+        }
+        return false;
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -385,98 +453,141 @@ fn runServer(
 
     std.debug.print("nullq qns endpoint listening on {f} www={s} retry={}\n", .{ bind_addr, opts.www, opts.retry });
 
+    var conns: std.ArrayList(*ServerConn) = .empty;
+    defer {
+        for (conns.items) |server_conn| server_conn.destroy(allocator);
+        conns.deinit(allocator);
+    }
+
+    var now_us: u64 = 1_000_000;
+    var rx: [64 * 1024]u8 = undefined;
+    var tx: [endpoint_udp_payload_size]u8 = undefined;
+
     while (true) {
-        var conn = try nullq.Connection.initServer(allocator, server_tls);
-        defer conn.deinit();
-        if (qlog_sink) |*sink| conn.setQlogCallback(QlogSink.callback, sink);
-        try conn.bind();
-        const initial_server_cid = randomServerCid(io);
-        try conn.setLocalScid(&initial_server_cid);
+        const maybe_msg = sock.receiveTimeout(io, &rx, .{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(5),
+                .clock = .awake,
+            },
+        }) catch |err| switch (err) {
+            error.Timeout => null,
+            else => return err,
+        };
 
-        var next_cid_seq: u8 = 1;
-        try queueServerConnectionIds(&conn, &next_cid_seq, 4, &initial_server_cid);
-
-        var app = Http09App.init(allocator, io, try openDir(io, opts.www));
-        defer app.deinit();
-
-        var peer: ?Net.IpAddress = null;
-        var transport_params_set = false;
-        var retry_sent = false;
-        var retry_original_dcid: nullq.conn.path.ConnectionId = .{};
-        var retry_source_cid = retrySourceCid(&initial_server_cid);
-        var now_us: u64 = 1_000_000;
-        var rx: [64 * 1024]u8 = undefined;
-        var tx: [endpoint_udp_payload_size]u8 = undefined;
-
-        while (!conn.isClosed()) {
-            const maybe_msg = sock.receiveTimeout(io, &rx, .{
-                .duration = .{
-                    .raw = std.Io.Duration.fromMilliseconds(5),
-                    .clock = .awake,
-                },
-            }) catch |err| switch (err) {
-                error.Timeout => null,
-                else => return err,
-            };
-
-            if (maybe_msg) |msg| {
-                peer = msg.from;
-                if (!transport_params_set) {
-                    const ids = peekLongHeaderIds(msg.data) orelse continue;
-                    if (ids.version != nullq.QUIC_VERSION_1) {
-                        const n = try conn.writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
-                        try sock.send(io, &msg.from, tx[0..n]);
-                        continue;
-                    }
-
-                    if (opts.retry and !retry_sent) {
-                        retry_original_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
-                        const token = try retryToken(msg.from, now_us, ids.dcid, &retry_source_cid);
-                        const n = try conn.writeRetry(&tx, msg.data, &retry_source_cid, &token);
-                        try sock.send(io, &msg.from, tx[0..n]);
-                        retry_sent = true;
-                        continue;
-                    }
-
-                    const original_dcid = if (retry_sent) retry_original_dcid else nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
-                    const retry_source: ?nullq.conn.path.ConnectionId = if (retry_sent)
-                        nullq.conn.path.ConnectionId.fromSlice(&retry_source_cid)
-                    else
-                        null;
-                    if (retry_sent) {
-                        const token = peekInitialToken(msg.data) orelse continue;
-                        if (!validRetryToken(msg.from, now_us, original_dcid.slice(), &retry_source_cid, token)) continue;
-                    }
-
-                    const params: nullq.tls.TransportParams = .{
-                        .original_destination_connection_id = original_dcid,
-                        .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&initial_server_cid),
-                        .retry_source_connection_id = retry_source,
-                        .max_idle_timeout_ms = 30_000,
-                        .initial_max_data = endpoint_connection_receive_window,
-                        .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
-                        .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
-                        .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
-                        .initial_max_streams_bidi = 128,
-                        .initial_max_streams_uni = 16,
-                        .max_udp_payload_size = endpoint_udp_payload_size,
-                        .active_connection_id_limit = 8,
-                    };
-                    try conn.acceptInitial(msg.data, params);
-                    _ = try conn.setEarlyDataContextForParams(params, hq_alpn, "nullq qns endpoint v1");
-                    transport_params_set = true;
+        if (maybe_msg) |msg| {
+            var server_conn = findServerConn(conns.items, msg.data, msg.from);
+            if (server_conn == null) {
+                const ids = peekLongHeaderIds(msg.data) orelse {
+                    now_us += 1_000;
+                    continue;
+                };
+                if (ids.version != nullq.QUIC_VERSION_1) {
+                    const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
+                    try sock.send(io, &msg.from, tx[0..n]);
+                    now_us += 1_000;
+                    continue;
                 }
-                try conn.handle(msg.data, null, now_us);
+                if (!isInitialLongHeader(msg.data)) {
+                    now_us += 1_000;
+                    continue;
+                }
+                if (conns.items.len >= max_qns_server_connections) {
+                    std.debug.print("dropping new QNS server connection from {f}: active limit reached\n", .{msg.from});
+                    now_us += 1_000;
+                    continue;
+                }
+                const new_conn = try ServerConn.init(
+                    allocator,
+                    io,
+                    server_tls,
+                    opts.www,
+                    if (qlog_sink) |*sink| sink else null,
+                    msg.from,
+                    now_us,
+                );
+                try conns.append(allocator, new_conn);
+                server_conn = new_conn;
             }
 
-            if (conn.handshakeDone()) try queueServerConnectionIds(&conn, &next_cid_seq, 8, &initial_server_cid);
-            try app.process(&conn);
-            while (try conn.poll(&tx, now_us)) |n| {
-                if (peer) |p| try sock.send(io, &p, tx[0..n]) else break;
+            const sc = server_conn.?;
+            sc.peer = msg.from;
+            sc.last_activity_us = now_us;
+            if (!sc.transport_params_set) {
+                const ids = peekLongHeaderIds(msg.data) orelse {
+                    now_us += 1_000;
+                    continue;
+                };
+                if (ids.version != nullq.QUIC_VERSION_1) {
+                    const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
+                    try sock.send(io, &msg.from, tx[0..n]);
+                    now_us += 1_000;
+                    continue;
+                }
+
+                if (opts.retry and !sc.retry_sent) {
+                    sc.retry_original_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
+                    const token = try retryToken(msg.from, now_us, ids.dcid, &sc.retry_source_cid);
+                    const n = try sc.conn.writeRetry(&tx, msg.data, &sc.retry_source_cid, &token);
+                    try sock.send(io, &msg.from, tx[0..n]);
+                    sc.retry_sent = true;
+                    now_us += 1_000;
+                    continue;
+                }
+
+                const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
+                const retry_source: ?nullq.conn.path.ConnectionId = if (sc.retry_sent)
+                    nullq.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
+                else
+                    null;
+                if (sc.retry_sent) {
+                    const token = peekInitialToken(msg.data) orelse {
+                        now_us += 1_000;
+                        continue;
+                    };
+                    if (!validRetryToken(msg.from, now_us, original_dcid.slice(), &sc.retry_source_cid, token)) {
+                        now_us += 1_000;
+                        continue;
+                    }
+                }
+
+                const params: nullq.tls.TransportParams = .{
+                    .original_destination_connection_id = original_dcid,
+                    .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
+                    .retry_source_connection_id = retry_source,
+                    .max_idle_timeout_ms = 30_000,
+                    .initial_max_data = endpoint_connection_receive_window,
+                    .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
+                    .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
+                    .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
+                    .initial_max_streams_bidi = 128,
+                    .initial_max_streams_uni = 16,
+                    .max_udp_payload_size = endpoint_udp_payload_size,
+                    .active_connection_id_limit = 8,
+                };
+                try sc.conn.acceptInitial(msg.data, params);
+                _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "nullq qns endpoint v1");
+                sc.transport_params_set = true;
             }
-            try conn.tick(now_us);
-            now_us += 1_000;
+            try sc.conn.handle(msg.data, netAddressToPathAddress(msg.from), now_us);
         }
+
+        var i: usize = 0;
+        while (i < conns.items.len) {
+            const sc = conns.items[i];
+            if (sc.conn.handshakeDone()) try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, 8, &sc.initial_server_cid);
+            try sc.app.process(&sc.conn);
+            while (try sc.conn.poll(&tx, now_us)) |n| {
+                try sock.send(io, &sc.peer, tx[0..n]);
+            }
+            try sc.conn.tick(now_us);
+            if (sc.conn.isClosed()) {
+                sc.destroy(allocator);
+                _ = conns.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        now_us += 1_000;
     }
 }
 
@@ -925,6 +1036,91 @@ fn openDir(io: std.Io, path: []const u8) !std.Io.Dir {
 
 fn readWholeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
+}
+
+fn findServerConn(conns: []const *ServerConn, bytes: []const u8, from: Net.IpAddress) ?*ServerConn {
+    if (peekPacketDcid(bytes)) |dcid| {
+        for (conns) |server_conn| {
+            if (server_conn.ownsServerCid(dcid)) return server_conn;
+        }
+    }
+
+    const initial = isInitialLongHeader(bytes);
+    for (conns) |server_conn| {
+        if (!netAddressEql(server_conn.peer, from)) continue;
+        if (!initial) return server_conn;
+        if (!server_conn.transport_params_set or !server_conn.conn.handshakeDone()) return server_conn;
+    }
+    return null;
+}
+
+fn peekPacketDcid(bytes: []const u8) ?[]const u8 {
+    if (bytes.len == 0) return null;
+    if ((bytes[0] & 0x80) != 0) {
+        const ids = peekLongHeaderIds(bytes) orelse return null;
+        return ids.dcid;
+    }
+    if (bytes.len < 1 + server_cid_len) return null;
+    return bytes[1 .. 1 + server_cid_len];
+}
+
+fn isInitialLongHeader(bytes: []const u8) bool {
+    if (bytes.len == 0 or (bytes[0] & 0x80) == 0) return false;
+    const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
+    return long_type_bits == 0;
+}
+
+fn netAddressEql(a: Net.IpAddress, b: Net.IpAddress) bool {
+    return switch (a) {
+        .ip4 => |a4| switch (b) {
+            .ip4 => |b4| a4.port == b4.port and std.mem.eql(u8, &a4.bytes, &b4.bytes),
+            else => false,
+        },
+        .ip6 => |a6| switch (b) {
+            .ip6 => |b6| a6.port == b6.port and a6.flow == b6.flow and std.mem.eql(u8, &a6.bytes, &b6.bytes),
+            else => false,
+        },
+    };
+}
+
+fn netAddressToPathAddress(addr: Net.IpAddress) nullq.conn.path.Address {
+    var out: nullq.conn.path.Address = .{};
+    switch (addr) {
+        .ip4 => |ip4| {
+            out.bytes[0] = 4;
+            @memcpy(out.bytes[1..5], &ip4.bytes);
+            std.mem.writeInt(u16, out.bytes[5..7], ip4.port, .big);
+        },
+        .ip6 => |ip6| {
+            out.bytes[0] = 6;
+            @memcpy(out.bytes[1..17], &ip6.bytes);
+            std.mem.writeInt(u16, out.bytes[17..19], ip6.port, .big);
+            out.bytes[19] = @truncate(ip6.flow >> 16);
+            out.bytes[20] = @truncate(ip6.flow >> 8);
+            out.bytes[21] = @truncate(ip6.flow);
+        },
+    }
+    return out;
+}
+
+fn writeVersionNegotiation(
+    dst: []u8,
+    client_packet: []const u8,
+    supported_versions: []const u32,
+) !usize {
+    if (supported_versions.len == 0 or supported_versions.len > 16) return error.InvalidVersionNegotiation;
+    const ids = peekLongHeaderIds(client_packet) orelse return error.InvalidVersionNegotiation;
+
+    var versions_bytes: [16 * 4]u8 = undefined;
+    for (supported_versions, 0..) |version, i| {
+        std.mem.writeInt(u32, versions_bytes[i * 4 ..][0..4], version, .big);
+    }
+
+    return try nullq.wire.header.encode(dst, .{ .version_negotiation = .{
+        .dcid = try nullq.wire.header.ConnId.fromSlice(ids.scid),
+        .scid = try nullq.wire.header.ConnId.fromSlice(ids.dcid),
+        .versions_bytes = versions_bytes[0 .. supported_versions.len * 4],
+    } });
 }
 
 fn randomServerCid(io: std.Io) [server_cid_len]u8 {
