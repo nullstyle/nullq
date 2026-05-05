@@ -562,6 +562,8 @@ fn pnLengthFromInt(pn_len: u8) header.PnLength {
         2 => .two,
         3 => .three,
         4 => .four,
+        // invariant: this helper is only fed by chooseLongPnLength,
+        // which returns 1..=4 by construction. Not peer-reachable.
         else => unreachable,
     };
 }

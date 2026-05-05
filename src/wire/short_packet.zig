@@ -346,6 +346,8 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
         2 => .two,
         3 => .three,
         4 => .four,
+        // invariant: line 331 returns InvalidPnLength for any pn_len
+        // outside [1, 4]. Not peer-reachable.
         else => unreachable,
     };
     const truncated = packetNumberTruncated(opts.pn, pn_len);
