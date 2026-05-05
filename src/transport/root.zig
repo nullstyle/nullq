@@ -10,15 +10,27 @@
 //! `IP_PKTINFO` / `IPV6_RECVPKTINFO` for path tracking, ECN
 //! marking helpers.
 
+/// Submodule of UDP socket-option helpers (`SO_RCVBUF`, `SO_SNDBUF`).
 pub const socket_opts = @import("socket_opts.zig");
 
+/// Re-export of `socket_opts.ServerTuning`, the buffer-size knob struct.
 pub const ServerTuning = socket_opts.ServerTuning;
+/// Re-export of `socket_opts.setRecvBufferSize` — sets `SO_RCVBUF`
+/// (with Linux `SO_RCVBUFFORCE` fallback).
 pub const setRecvBufferSize = socket_opts.setRecvBufferSize;
+/// Re-export of `socket_opts.setSendBufferSize` — sets `SO_SNDBUF`
+/// (with Linux `SO_SNDBUFFORCE` fallback).
 pub const setSendBufferSize = socket_opts.setSendBufferSize;
+/// Re-export of `socket_opts.getRecvBufferSize`.
 pub const getRecvBufferSize = socket_opts.getRecvBufferSize;
+/// Re-export of `socket_opts.getSendBufferSize`.
 pub const getSendBufferSize = socket_opts.getSendBufferSize;
+/// Re-export of `socket_opts.applyServerTuning` — applies a
+/// `ServerTuning` to a freshly bound UDP socket.
 pub const applyServerTuning = socket_opts.applyServerTuning;
+/// Re-export of `socket_opts.default_server_recv_buffer_bytes` (4 MiB).
 pub const default_server_recv_buffer_bytes = socket_opts.default_server_recv_buffer_bytes;
+/// Re-export of `socket_opts.default_server_send_buffer_bytes` (4 MiB).
 pub const default_server_send_buffer_bytes = socket_opts.default_server_send_buffer_bytes;
 
 test {
