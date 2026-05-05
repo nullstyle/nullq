@@ -18,6 +18,8 @@ const endpoint_udp_payload_size = 1350;
 const endpoint_connection_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
+const endpoint_bidi_stream_limit = nullq.conn.state.max_streams_per_connection;
+const endpoint_uni_stream_limit: u64 = 64;
 const max_qns_server_connections = 128;
 const qns_time_base_us: u64 = 1_000_000;
 
@@ -553,8 +555,8 @@ fn runServer(
                     .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
                     .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
                     .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
-                    .initial_max_streams_bidi = 128,
-                    .initial_max_streams_uni = 16,
+                    .initial_max_streams_bidi = endpoint_bidi_stream_limit,
+                    .initial_max_streams_uni = endpoint_uni_stream_limit,
                     .max_udp_payload_size = endpoint_udp_payload_size,
                     .active_connection_id_limit = 8,
                 };
@@ -741,8 +743,8 @@ fn runClientConnection(
         .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
         .initial_max_stream_data_bidi_remote = endpoint_uni_stream_receive_window,
         .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
-        .initial_max_streams_bidi = 256,
-        .initial_max_streams_uni = 16,
+        .initial_max_streams_bidi = endpoint_bidi_stream_limit,
+        .initial_max_streams_uni = endpoint_uni_stream_limit,
         .max_udp_payload_size = endpoint_udp_payload_size,
         .active_connection_id_limit = 8,
     };
