@@ -154,6 +154,14 @@ pub fn run(
         if (try sock.recv(&rx)) |msg| {
             _ = try server.feed(msg.bytes, msg.from, now_us);
         }
+        // Drain any stateless responses (Version Negotiation, Retry)
+        // the server queued from the most recent feed. These don't
+        // belong to any slot — `feed` returns one of
+        // `.version_negotiated` / `.retry_sent` to signal the queue
+        // grew, but it's safe to drain unconditionally.
+        while (server.drainStatelessResponse()) |resp| {
+            try sock.send(resp.dst, resp.slice());
+        }
         for (server.iterator()) |slot| {
             // App work goes here: open streams, read data, send
             // datagrams. `slot.conn` is the full `*nullq.Connection`.
@@ -169,9 +177,13 @@ pub fn run(
 }
 ```
 
-For interop-specific behavior (Retry, version negotiation,
-deterministic CIDs), see `interop/qns_endpoint.zig` for the
-fully-customised pattern.
+Set `Config.retry_token_key` to a stable 32-byte HMAC key to
+enable stateless Retry-based source validation
+(RFC 9000 §8.1.2); first Initials from each peer earn a Retry
+challenge instead of a half-allocated `Connection`. Version
+Negotiation (RFC 9000 §6) is unconditional. For interop-specific
+behavior (deterministic CID prefix, per-testcase wiring), see
+`interop/qns_endpoint.zig`.
 
 ## Embed nullq as a client
 

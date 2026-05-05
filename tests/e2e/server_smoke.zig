@@ -135,3 +135,183 @@ test "Server source rate limiter trips after the configured cap" {
         try srv.feed(&initial, addr, 1_500_000),
     );
 }
+
+test "Server.feed with unsupported version queues a Version Negotiation packet" {
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    // Long-header packet declaring version 0xdeadbeef, with 4-byte
+    // DCID and 4-byte SCID. Anything past the SCID is unparsed
+    // junk and irrelevant to VN — the server only needs the
+    // version + CIDs to assemble the response.
+    var bytes = [_]u8{
+        0xc0, // long-header bit set, type=Initial-ish
+        0xde, 0xad, 0xbe, 0xef, // unsupported version
+        0x04, // DCID len
+        0xa0, 0xa1, 0xa2, 0xa3, // DCID
+        0x04, // SCID len
+        0xb0, 0xb1, 0xb2, 0xb3, // SCID
+        0x00, 0x00, 0x00, // padding
+    };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+
+    const outcome = try srv.feed(&bytes, addr, 1000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.version_negotiated, outcome);
+    try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+
+    const drained = srv.drainStatelessResponse() orelse return error.NoStatelessResponse;
+    try std.testing.expect(addr.eql(drained.dst));
+
+    // Parse the queued bytes back as a VN packet and verify the
+    // CIDs are swapped (RFC 8999 §6) and the supported_versions
+    // list contains exactly QUIC_VERSION_1.
+    const parsed = try nullq.wire.header.parse(drained.slice(), 0);
+    try std.testing.expect(parsed.header == .version_negotiation);
+    const vn = parsed.header.version_negotiation;
+    // The VN response sets DCID=client SCID and SCID=client DCID.
+    try std.testing.expectEqualSlices(u8, &.{ 0xb0, 0xb1, 0xb2, 0xb3 }, vn.dcid.slice());
+    try std.testing.expectEqualSlices(u8, &.{ 0xa0, 0xa1, 0xa2, 0xa3 }, vn.scid.slice());
+    try std.testing.expectEqual(@as(usize, 1), vn.versionCount());
+    try std.testing.expectEqual(nullq.QUIC_VERSION_1, vn.version(0));
+
+    // Drain returns null once the queue is empty.
+    try std.testing.expectEqual(@as(?nullq.Server.StatelessResponse, null), srv.drainStatelessResponse());
+}
+
+test "Server.feed without `from` drops unsupported-version packets" {
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    var bytes = [_]u8{
+        0xc0,
+        0xde, 0xad, 0xbe, 0xef,
+        0x04,
+        0xa0, 0xa1, 0xa2, 0xa3,
+        0x04,
+        0xb0, 0xb1, 0xb2, 0xb3,
+        0x00,
+    };
+
+    // Without a destination, the server can't queue a VN — drop
+    // per the documented pass-through behavior.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.dropped,
+        try srv.feed(&bytes, null, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
+}
+
+test "Server.feed with retry_token_key issues a Retry then drops a malformed echo" {
+    const protos = [_][]const u8{"hq-test"};
+
+    const retry_key: nullq.RetryTokenKey = .{
+        0x86, 0x71, 0x15, 0x0d, 0x9a, 0x2c, 0x5e, 0x04,
+        0x31, 0xa8, 0x6a, 0xf9, 0x18, 0x44, 0xbd, 0x2b,
+        0x4d, 0xee, 0x90, 0x3f, 0xa7, 0x61, 0x0c, 0x55,
+        0xf2, 0x83, 0x1d, 0xb6, 0x95, 0x77, 0x40, 0x29,
+    };
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .retry_token_key = retry_key,
+    });
+    defer srv.deinit();
+
+    // First Initial: no token. Build an Initial that parses
+    // cleanly — the wire-format is Initial-shape with an explicit
+    // token-length=0 varint, payload-length=0 varint, and PN
+    // truncated 1-byte. That's enough for `peekInitialToken` to
+    // surface "no token" and trigger Retry.
+    const odcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+    const client_scid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3 };
+
+    // Hand-roll an Initial header (token-len=0, payload-len=1,
+    // pn-bits=00 i.e. 1-byte PN). The cell after the PN doesn't
+    // matter — Retry never inspects the payload.
+    var initial: [256]u8 = @splat(0);
+    initial[0] = 0xc0; // long header, type=Initial, PN-len bits=00
+    std.mem.writeInt(u32, initial[1..5], nullq.QUIC_VERSION_1, .big);
+    initial[5] = odcid.len;
+    @memcpy(initial[6..][0..odcid.len], &odcid);
+    var pos: usize = 6 + odcid.len;
+    initial[pos] = client_scid.len;
+    pos += 1;
+    @memcpy(initial[pos..][0..client_scid.len], &client_scid);
+    pos += client_scid.len;
+    initial[pos] = 0x00; // token length: 0
+    pos += 1;
+    initial[pos] = 0x01; // payload length: 1
+    pos += 1;
+    initial[pos] = 0x00; // PN
+    pos += 1;
+    initial[pos] = 0xff; // payload byte (irrelevant)
+    const initial_len = pos + 1;
+
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const outcome1 = try srv.feed(initial[0..initial_len], addr, 1_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.retry_sent, outcome1);
+    try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+
+    const retry_resp = srv.drainStatelessResponse() orelse return error.NoRetryQueued;
+    try std.testing.expect(addr.eql(retry_resp.dst));
+    const retry_parsed = try nullq.wire.header.parse(retry_resp.slice(), 0);
+    try std.testing.expect(retry_parsed.header == .retry);
+    try std.testing.expectEqualSlices(u8, &client_scid, retry_parsed.header.retry.dcid.slice());
+    try std.testing.expectEqual(@as(usize, 53), retry_parsed.header.retry.retry_token.len);
+
+    // Second Initial: malformed token (4 bytes of garbage instead
+    // of the canonical 53-byte token). The peer is addressing the
+    // retry SCID we just minted, but the token won't validate, so
+    // the datagram drops and no Connection is created.
+    const retry_scid_bytes = retry_parsed.header.retry.scid.slice();
+    var bad_initial: [256]u8 = @splat(0);
+    bad_initial[0] = 0xc0;
+    std.mem.writeInt(u32, bad_initial[1..5], nullq.QUIC_VERSION_1, .big);
+    bad_initial[5] = @intCast(retry_scid_bytes.len);
+    @memcpy(bad_initial[6..][0..retry_scid_bytes.len], retry_scid_bytes);
+    var bp: usize = 6 + retry_scid_bytes.len;
+    bad_initial[bp] = client_scid.len;
+    bp += 1;
+    @memcpy(bad_initial[bp..][0..client_scid.len], &client_scid);
+    bp += client_scid.len;
+    bad_initial[bp] = 0x04; // token length: 4
+    bp += 1;
+    const garbage_token = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    @memcpy(bad_initial[bp..][0..4], &garbage_token);
+    bp += 4;
+    bad_initial[bp] = 0x01;
+    bp += 1;
+    bad_initial[bp] = 0x00;
+    bp += 1;
+    bad_initial[bp] = 0xff;
+    const bad_len = bp + 1;
+
+    const outcome2 = try srv.feed(bad_initial[0..bad_len], addr, 2_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome2);
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+    // Crucially: a malformed echo does NOT mint a fresh Retry
+    // (per the documented behavior — would amplify probing).
+    try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
+}
