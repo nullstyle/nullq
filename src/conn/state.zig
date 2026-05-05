@@ -169,6 +169,7 @@ pub const max_pending_crypto_bytes_per_level: usize = 64 * 1024;
 pub const max_crypto_reassembly_gap: u64 = 64 * 1024;
 pub const application_ack_eliciting_threshold: u8 = 2;
 pub const max_application_ack_ranges_bytes: usize = 128;
+pub const max_application_ack_lower_ranges: u64 = 48;
 
 pub const default_stream_receive_window: u64 = 1024 * 1024;
 pub const default_connection_receive_window: u64 = 16 * 1024 * 1024;
@@ -4231,10 +4232,15 @@ pub const Connection = struct {
                 ranges_budget = @min(ranges_budget, max_application_ack_ranges_bytes);
             }
             while (true) {
-                const ack_frame = try recv_tracker.toAckFrameLimited(
+                const max_lower_ranges = if (lvl == .application)
+                    max_application_ack_lower_ranges
+                else
+                    std.math.maxInt(u64);
+                const ack_frame = try recv_tracker.toAckFrameLimitedRanges(
                     self.ackDelayScaled(recv_tracker, now_us),
                     &ranges_buf,
                     ranges_budget,
+                    max_lower_ranges,
                 );
                 const frame: frame_types.Frame = if (lvl == .application and app_path.id != 0)
                     .{ .path_ack = .{

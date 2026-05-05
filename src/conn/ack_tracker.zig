@@ -192,6 +192,24 @@ pub const AckTracker = struct {
         ranges_bytes_buf: []u8,
         max_ranges_bytes: usize,
     ) Error!frame_types.Ack {
+        return self.toAckFrameLimitedRanges(
+            ack_delay_scaled,
+            ranges_bytes_buf,
+            max_ranges_bytes,
+            std.math.maxInt(u64),
+        );
+    }
+
+    /// Like `toAckFrameLimited`, but also caps the number of encoded lower
+    /// ranges. The tracker still remembers all ranges for duplicate detection;
+    /// this only bounds how much stale ACK history we spend packet budget on.
+    pub fn toAckFrameLimitedRanges(
+        self: *const AckTracker,
+        ack_delay_scaled: u64,
+        ranges_bytes_buf: []u8,
+        max_ranges_bytes: usize,
+        max_lower_ranges: u64,
+    ) Error!frame_types.Ack {
         if (self.range_count == 0) return Error.Empty;
 
         const top = self.ranges[self.range_count - 1];
@@ -202,7 +220,7 @@ pub const AckTracker = struct {
         var included_ranges: u64 = 0;
         var prev = top;
         var i: u8 = self.range_count - 1;
-        while (i > 0) {
+        while (i > 0 and included_ranges < max_lower_ranges) {
             i -= 1;
             const this = self.ranges[i];
             const gap = prev.smallest - this.largest - 2;
@@ -408,6 +426,33 @@ test "toAckFrameLimited truncates older ranges to fit budget" {
     try std.testing.expectEqual(@as(u64, 8), top.largest);
     try std.testing.expectEqual(@as(u64, 6), next.smallest);
     try std.testing.expectEqual(@as(u64, 6), next.largest);
+}
+
+test "toAckFrameLimitedRanges truncates older ranges by count" {
+    var t: AckTracker = .{};
+    var pn: u64 = 0;
+    while (pn <= 10) : (pn += 2) t.add(pn, 0);
+
+    var buf: [64]u8 = undefined;
+    const ack = try t.toAckFrameLimitedRanges(0, &buf, buf.len, 2);
+    try std.testing.expectEqual(@as(u64, 10), ack.largest_acked);
+    try std.testing.expectEqual(@as(u64, 0), ack.first_range);
+    try std.testing.expectEqual(@as(u64, 2), ack.range_count);
+    try std.testing.expectEqual(@as(usize, 4), ack.ranges_bytes.len);
+
+    const ack_range = @import("../frame/ack_range.zig");
+    var it = ack_range.iter(ack);
+    const top = (try it.next()).?;
+    const next = (try it.next()).?;
+    const last = (try it.next()).?;
+    try std.testing.expectEqual(@as(?ack_range.Interval, null), try it.next());
+    try std.testing.expectEqual(@as(u64, 10), top.smallest);
+    try std.testing.expectEqual(@as(u64, 10), top.largest);
+    try std.testing.expectEqual(@as(u64, 8), next.smallest);
+    try std.testing.expectEqual(@as(u64, 8), next.largest);
+    try std.testing.expectEqual(@as(u64, 6), last.smallest);
+    try std.testing.expectEqual(@as(u64, 6), last.largest);
+    try std.testing.expectEqual(@as(u8, 6), t.range_count);
 }
 
 test "markAckSent clears pending_ack but preserves intervals" {
