@@ -23,7 +23,6 @@ const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 2;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
 const max_qns_server_connections = 128;
-const max_qns_server_responses_per_tick = 64;
 const qns_time_base_us: u64 = 1_000_000;
 
 const ServerOptions = struct {
@@ -188,10 +187,9 @@ const Http09App = struct {
     }
 
     fn process(self: *Http09App, conn: *nullq.Connection) !void {
-        var responses_left: usize = max_qns_server_responses_per_tick;
         var it = conn.streamIterator();
         while (it.next()) |entry| {
-            try self.processStream(conn, entry.key_ptr.*, &responses_left);
+            try self.processStream(conn, entry.key_ptr.*);
         }
     }
 
@@ -201,12 +199,7 @@ const Http09App = struct {
         return gop.value_ptr;
     }
 
-    fn processStream(
-        self: *Http09App,
-        conn: *nullq.Connection,
-        stream_id: u64,
-        responses_left: *usize,
-    ) !void {
+    fn processStream(self: *Http09App, conn: *nullq.Connection, stream_id: u64) !void {
         const state = try self.stateFor(stream_id);
         if (state.responded) return;
 
@@ -219,12 +212,10 @@ const Http09App = struct {
 
         const stream = conn.stream(stream_id) orelse return;
         if (!(stream.recv.state == .data_recvd or stream.recv.state == .data_read)) return;
-        if (responses_left.* == 0) return;
 
         const rel = parseGetPath(state.buf.items) orelse {
             _ = try conn.streamWrite(stream_id, "400");
             try conn.streamFinish(stream_id);
-            responses_left.* -= 1;
             state.responded = true;
             return;
         };
@@ -241,7 +232,6 @@ const Http09App = struct {
             _ = try conn.streamWrite(stream_id, bytes);
         }
         try conn.streamFinish(stream_id);
-        responses_left.* -= 1;
         state.responded = true;
     }
 
