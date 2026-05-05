@@ -6,16 +6,29 @@
 
 const boringssl = @import("boringssl");
 
+/// QUIC encryption level (RFC 9001 §2). Determines which keys
+/// protect a packet and which CRYPTO buffer the TLS engine reads
+/// from / writes to.
+///
+/// - `initial` — RFC 9001 §5.2 initial keys (well-known salt).
+/// - `early_data` — 0-RTT keys derived from the resumption secret.
+/// - `handshake` — derived after ServerHello.
+/// - `application` — 1-RTT keys, used for the rest of the connection.
 pub const EncryptionLevel = enum(u8) {
     initial = 0,
     early_data = 1,
     handshake = 2,
     application = 3,
 
+    /// Convert from the BoringSSL enum without going through an
+    /// explicit `switch`. The numeric values are kept in sync with
+    /// `boringssl.tls.quic.EncryptionLevel` so a bitcast is valid.
     pub fn fromBoringssl(lvl: boringssl.tls.quic.EncryptionLevel) EncryptionLevel {
         return @enumFromInt(@intFromEnum(lvl));
     }
 
+    /// Inverse of `fromBoringssl`. Used when handing a level back
+    /// down to the BoringSSL QUIC method callbacks.
     pub fn toBoringssl(self: EncryptionLevel) boringssl.tls.quic.EncryptionLevel {
         return @enumFromInt(@intFromEnum(self));
     }

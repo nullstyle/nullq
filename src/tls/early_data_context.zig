@@ -11,9 +11,17 @@ const std = @import("std");
 const boringssl = @import("boringssl");
 const Params = @import("transport_params.zig").Params;
 
+/// Length of the SHA-256 digest stored in the BoringSSL early-data
+/// context per RFC 9001 §4.6.1.
 pub const digest_len: usize = 32;
+/// Fixed-size SHA-256 digest used as `quic_early_data_context`.
 pub const Digest = [digest_len]u8;
 
+/// Inputs to the 0-RTT context digest builder. Every setting that
+/// could change how 0-RTT bytes are interpreted across resumption
+/// must feed into the digest (RFC 9001 §4.6.1) — otherwise a server
+/// might accept early data under different limits than the client
+/// assumed when it encrypted the bytes.
 pub const Options = struct {
     /// QUIC wire version whose transport rules the ticket is bound to.
     quic_version: u32 = 0x00000001,
@@ -27,6 +35,11 @@ pub const Options = struct {
     application_context: []const u8 = &.{},
 };
 
+/// Build the SHA-256 0-RTT context digest for `opts`. The output is
+/// what nullq passes to `SSL_set_quic_early_data_context` so
+/// resumption only accepts early data when the same QUIC version,
+/// ALPN, replay-relevant transport params, and application context
+/// (e.g. HTTP/3 SETTINGS) are all in effect.
 pub fn build(opts: Options) Digest {
     var h = boringssl.crypto.hash.Sha256.init();
     h.update("nullq quic 0-rtt context v1");
@@ -37,6 +50,9 @@ pub fn build(opts: Options) Digest {
     return h.finalDigest();
 }
 
+/// Convenience wrapper around `build` for the common call shape:
+/// transport params + ALPN + opaque application context, leaving
+/// `quic_version` at its default (QUIC v1 = 0x00000001).
 pub fn buildForTransportParams(
     transport_params: Params,
     alpn: []const u8,

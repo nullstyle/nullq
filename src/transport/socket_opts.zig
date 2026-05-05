@@ -59,6 +59,9 @@ pub const default_server_recv_buffer_bytes: usize = 4 * 1024 * 1024;
 /// matches what other production stacks use.
 pub const default_server_send_buffer_bytes: usize = 4 * 1024 * 1024;
 
+/// Errors returned by `setRecvBufferSize` / `setSendBufferSize` /
+/// `applyServerTuning`. See each variant for the corresponding
+/// `setsockopt` failure mode.
 pub const SetBufferError = error{
     /// The platform does not expose a way to set this option.
     Unsupported,
@@ -172,6 +175,8 @@ pub const ServerTuning = struct {
     send_buffer_bytes: ?usize = default_server_send_buffer_bytes,
 };
 
+/// Alias for `SetBufferError` — every error from `applyServerTuning`
+/// flows through one of the underlying `setsockopt` calls.
 pub const TuneError = SetBufferError;
 
 /// Apply `ServerTuning` to a socket handle. Errors from the
@@ -191,6 +196,9 @@ pub fn getRecvBufferSize(handle: Handle) !usize {
     return getBufferImpl(handle, .recv);
 }
 
+/// Read back the kernel's actual send buffer size via
+/// `getsockopt(SO_SNDBUF, ...)`. Mirrors `getRecvBufferSize` and is
+/// useful for the same operator-visible "asked vs. got" logging.
 pub fn getSendBufferSize(handle: Handle) !usize {
     return getBufferImpl(handle, .send);
 }

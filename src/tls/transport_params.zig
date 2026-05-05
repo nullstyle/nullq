@@ -15,6 +15,9 @@ const std = @import("std");
 const varint = @import("../wire/varint.zig");
 const path_mod = @import("../conn/path.zig");
 
+/// QUIC connection ID type — re-exported from `conn/path` so
+/// transport-parameter callers don't have to import the path module
+/// just to construct a CID.
 pub const ConnectionId = path_mod.ConnectionId;
 
 /// Multipath QUIC draft version targeted by nullq's public API.
@@ -22,22 +25,39 @@ pub const multipath_draft_version: u32 = 21;
 
 /// IANA Transport Parameter Registry — RFC 9000 §18.2 + RFC 9221.
 pub const Id = struct {
+    /// Per RFC 9000 §18.2 — `original_destination_connection_id` (server-only echo of client's first DCID).
     pub const original_destination_connection_id: u64 = 0x00;
+    /// Per RFC 9000 §18.2 — `max_idle_timeout` (ms; 0 disables).
     pub const max_idle_timeout: u64 = 0x01;
+    /// Per RFC 9000 §18.2 — `stateless_reset_token` (server-only, 16 bytes).
     pub const stateless_reset_token: u64 = 0x02;
+    /// Per RFC 9000 §18.2 — `max_udp_payload_size`.
     pub const max_udp_payload_size: u64 = 0x03;
+    /// Per RFC 9000 §18.2 — `initial_max_data` (connection-level flow control).
     pub const initial_max_data: u64 = 0x04;
+    /// Per RFC 9000 §18.2 — `initial_max_stream_data_bidi_local`.
     pub const initial_max_stream_data_bidi_local: u64 = 0x05;
+    /// Per RFC 9000 §18.2 — `initial_max_stream_data_bidi_remote`.
     pub const initial_max_stream_data_bidi_remote: u64 = 0x06;
+    /// Per RFC 9000 §18.2 — `initial_max_stream_data_uni`.
     pub const initial_max_stream_data_uni: u64 = 0x07;
+    /// Per RFC 9000 §18.2 — `initial_max_streams_bidi`.
     pub const initial_max_streams_bidi: u64 = 0x08;
+    /// Per RFC 9000 §18.2 — `initial_max_streams_uni`.
     pub const initial_max_streams_uni: u64 = 0x09;
+    /// Per RFC 9000 §18.2 — `ack_delay_exponent`.
     pub const ack_delay_exponent: u64 = 0x0a;
+    /// Per RFC 9000 §18.2 — `max_ack_delay` (ms).
     pub const max_ack_delay: u64 = 0x0b;
+    /// Per RFC 9000 §18.2 — `disable_active_migration` (zero-length flag).
     pub const disable_active_migration: u64 = 0x0c;
+    /// Per RFC 9000 §18.2 — `preferred_address` (server-only).
     pub const preferred_address: u64 = 0x0d;
+    /// Per RFC 9000 §18.2 — `active_connection_id_limit`.
     pub const active_connection_id_limit: u64 = 0x0e;
+    /// Per RFC 9000 §18.2 — `initial_source_connection_id`.
     pub const initial_source_connection_id: u64 = 0x0f;
+    /// Per RFC 9000 §18.2 — `retry_source_connection_id` (server-only).
     pub const retry_source_connection_id: u64 = 0x10;
     /// RFC 9221 §3
     pub const max_datagram_frame_size: u64 = 0x20;
@@ -45,6 +65,14 @@ pub const Id = struct {
     pub const initial_max_path_id: u64 = 0x3e;
 };
 
+/// Errors returned by `Params.encode` and `Params.decode`.
+///
+/// `BufferTooSmall` — encode buffer too short for the emitted blob.
+/// `DuplicateParameter` — RFC 9000 §18 forbids repeating an id.
+/// `UnknownLength` / `ValueTooLarge` — value field outside the
+/// representable varint range.
+/// `InvalidValue` — RFC-mandated bounds violated (e.g. `ack_delay_exponent > 20`,
+/// `active_connection_id_limit < 2`, malformed `preferred_address`).
 pub const Error = error{
     BufferTooSmall,
     DuplicateParameter,
@@ -53,6 +81,11 @@ pub const Error = error{
     InvalidValue,
 } || varint.Error;
 
+/// Typed view of the QUIC transport parameters blob exchanged
+/// during the handshake (RFC 9000 §18, RFC 9221, draft-ietf-quic-multipath-21).
+/// Each field corresponds to one IANA-registered parameter id;
+/// `encode` emits only non-default values and `decode` accepts an
+/// arbitrary ordering with unknown ids skipped.
 pub const Params = struct {
     /// 0x00 — server-only echo of the client's first-Initial DCID.
     /// Required on server transport params (RFC 9000 §7.3); the client
@@ -207,6 +240,10 @@ pub const Params = struct {
     }
 };
 
+/// Decoded `preferred_address` transport parameter (RFC 9000 §18.2).
+/// All six wire fields are preserved so embedders can advertise or
+/// inspect server-side migration hints without treating the value
+/// as opaque.
 pub const PreferredAddress = struct {
     ipv4_address: [4]u8 = @splat(0),
     ipv4_port: u16 = 0,
