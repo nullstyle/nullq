@@ -10,6 +10,17 @@ breaking changes; see notes per release.
 ## [Unreleased]
 
 ### Added
+- `nullq.transport.runUdpServer` — opinionated `std.Io`-based UDP
+  server loop that binds the socket, applies `SO_RCVBUF` / `SO_SNDBUF`
+  tuning, drives the `feed` / `pollDatagram` / `tick` / `reap`
+  cadence on a 5 ms heartbeat, and shuts down cleanly when a
+  caller-supplied `std.atomic.Value(bool)` flag flips. Intended as
+  the fastest path from `nullq.Server.init` to a working QUIC
+  endpoint. The QNS endpoint and other embedders that need full
+  control (Retry, version negotiation, deterministic CIDs) keep
+  driving the I/O-agnostic Server interface directly. See
+  `src/transport/udp_server.zig` and the README "Embed nullq as a
+  server" section.
 - `.github/workflows/test.yml`: matrix build/test on ubuntu-latest and
   macos-latest with Zig 0.16.0.
 - `.github/workflows/interop.yml`: weekly QNS interop run against the

@@ -12,6 +12,8 @@
 
 /// Submodule of UDP socket-option helpers (`SO_RCVBUF`, `SO_SNDBUF`).
 pub const socket_opts = @import("socket_opts.zig");
+/// Submodule of the opinionated `std.Io`-based UDP server loop.
+pub const udp_server = @import("udp_server.zig");
 
 /// Re-export of `socket_opts.ServerTuning`, the buffer-size knob struct.
 pub const ServerTuning = socket_opts.ServerTuning;
@@ -33,6 +35,16 @@ pub const default_server_recv_buffer_bytes = socket_opts.default_server_recv_buf
 /// Re-export of `socket_opts.default_server_send_buffer_bytes` (4 MiB).
 pub const default_server_send_buffer_bytes = socket_opts.default_server_send_buffer_bytes;
 
+/// Re-export of `udp_server.runUdpServer` — the opinionated
+/// `std.Io`-based UDP server loop. See `udp_server.zig` for the full
+/// option surface.
+pub const runUdpServer = udp_server.runUdpServer;
+/// Re-export of `udp_server.RunUdpOptions`.
+pub const RunUdpOptions = udp_server.RunUdpOptions;
+/// Re-export of `udp_server.RunError`.
+pub const RunError = udp_server.RunError;
+
 test {
     _ = socket_opts;
+    _ = udp_server;
 }
