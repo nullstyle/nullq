@@ -175,7 +175,7 @@ pub const default_stream_receive_window: u64 = 1024 * 1024;
 pub const default_connection_receive_window: u64 = 16 * 1024 * 1024;
 pub const max_stream_count_limit: u64 = @as(u64, 1) << 60;
 pub const min_stream_credit_return_batch: u64 = 16;
-pub const stream_credit_return_divisor: u64 = 8;
+pub const stream_credit_return_divisor: u64 = 1;
 
 /// Implementation allocation policy. QUIC's wire limits are intentionally
 /// enormous; nullq caps the resources it advertises and tracks so peer input
