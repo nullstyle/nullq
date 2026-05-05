@@ -36,15 +36,17 @@
 //! the TLS context. Set it for any deployment exposed to the open
 //! internet.
 //!
-//! For an example loop, see the README. The QNS endpoint at
-//! `interop/qns_endpoint.zig` keeps its own bespoke loop because it
-//! has interop-specific quirks (Retry, version negotiation,
-//! deterministic CID prefix); embedders without those constraints
-//! should reach for `Server` first.
+//! For a hand-rolled loop, see the README. Embedders that just want
+//! "bind a socket and serve QUIC" should reach for
+//! `nullq.transport.runUdpServer` instead — it owns the
+//! `std.Io`-based bind / tune / receive / feed / poll / tick / reap
+//! cadence. The QNS endpoint at `interop/qns_endpoint.zig` keeps its
+//! own bespoke loop because it has interop-specific quirks (Retry,
+//! version negotiation, deterministic CID prefix); embedders without
+//! those constraints should reach for `Server` first.
 //!
 //! TODO(api): client-side `Client.connect` helper, optional built-in
-//! Retry token issuance & validation, optional version negotiation,
-//! optional `std.Io` socket loop helper.
+//! Retry token issuance & validation, optional version negotiation.
 
 const std = @import("std");
 const boringssl = @import("boringssl");

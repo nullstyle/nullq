@@ -57,6 +57,65 @@ demultiplexing of incoming datagrams. The full lower-level
 `Connection` API is fully supported — `Server` just spares you the
 boilerplate of writing it yourself for the common case.
 
+### One-liner: `transport.runUdpServer`
+
+The fastest path to a working QUIC server is the opinionated
+`std.Io`-based loop bundled with nullq. It binds the UDP socket,
+applies `SO_RCVBUF` / `SO_SNDBUF` tuning, drives a 5 ms
+receive/feed/poll/tick cadence, and exits cleanly when the supplied
+shutdown flag flips. Use this when you want nullq to "just run" and
+you don't need Retry, version negotiation, or deterministic CIDs.
+
+```zig
+const std = @import("std");
+const nullq = @import("nullq");
+
+pub fn run(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cert_pem: []const u8,
+    key_pem: []const u8,
+    shutdown: *const std.atomic.Value(bool),
+) !void {
+    const protos = [_][]const u8{"hq-interop"};
+
+    var server = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = cert_pem,
+        .tls_key_pem = key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = .{
+            .max_idle_timeout_ms = 30_000,
+            .initial_max_data = 16 * 1024 * 1024,
+            .initial_max_stream_data_bidi_local = 1 << 20,
+            .initial_max_stream_data_bidi_remote = 1 << 20,
+            .initial_max_stream_data_uni = 1 << 20,
+            .initial_max_streams_bidi = 1000,
+            .initial_max_streams_uni = 64,
+            .active_connection_id_limit = 4,
+        },
+    });
+    defer server.deinit();
+
+    try nullq.transport.runUdpServer(&server, .{
+        .listen = "0.0.0.0:443",
+        .io = io,
+        .shutdown_flag = shutdown,
+    });
+}
+```
+
+The loop ends when `shutdown.load(.acquire)` returns `true`; it
+queues `CONNECTION_CLOSE` on every live slot, drains for up to
+`shutdown_grace_us` microseconds (default 5 s), and returns. Wire the
+flag to a `SIGINT` handler for graceful Ctrl-C.
+
+### Roll your own loop
+
+When you need full control — Retry, version negotiation, deterministic
+CIDs, batched I/O via `recvmmsg`, qlog file rotation — drive
+`Server.feed` / `slot.conn.pollDatagram` / `slot.conn.tick` yourself:
+
 ```zig
 const std = @import("std");
 const nullq = @import("nullq");
@@ -103,8 +162,8 @@ pub fn run(
             while (try slot.conn.pollDatagram(&tx, now_us)) |out| {
                 try sock.send(out.to.?, tx[0..out.len]);
             }
+            try slot.conn.tick(now_us);
         }
-        try server.tick(now_us);
         _ = server.reap();
     }
 }
