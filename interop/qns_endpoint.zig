@@ -494,12 +494,15 @@ fn runClient(
 
     const server_addr = try resolveEndpoint(io, opts.server);
     const protos = [_][]const u8{hq_alpn};
+    const aes_hw_override_for_testing: ?bool =
+        if (std.mem.eql(u8, opts.testcase, "chacha20")) false else null;
     var client_tls = try boringssl.tls.Context.initClient(.{
         .verify = .none,
         .min_version = boringssl.raw.TLS1_3_VERSION,
         .max_version = boringssl.raw.TLS1_3_VERSION,
         .alpn = &protos,
         .early_data_enabled = true,
+        .aes_hw_override_for_testing = aes_hw_override_for_testing,
     });
     defer client_tls.deinit();
     if (opts.keylog_file) |path| try enableKeylog(io, &client_tls, path);
