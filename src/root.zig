@@ -49,6 +49,12 @@ pub const transport = @import("transport/root.zig");
 /// embedder still owns the UDP socket and the clock.
 pub const Server = @import("server.zig").Server;
 
+/// High-level convenience wrapper for embedding nullq as a QUIC
+/// client. Mirror to `Server` — owns the TLS context and per-Initial
+/// random DCID/SCID generation; the embedder still owns the UDP
+/// socket, the clock, and the returned `Connection` lifecycle.
+pub const Client = @import("client.zig").Client;
+
 /// The per-connection state machine. See `conn.Connection` for the
 /// full method surface (~106 public methods).
 pub const Connection = conn.Connection;
@@ -176,6 +182,7 @@ test {
     _ = conn;
     _ = transport;
     _ = @import("server.zig");
+    _ = @import("client.zig");
 }
 
 test "phase 0: builds and links against boringssl-zig" {

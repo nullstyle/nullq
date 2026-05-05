@@ -39,6 +39,15 @@ breaking changes; see notes per release.
   `Config.max_initials_per_source_per_window` and surfaces a
   distinct `FeedOutcome.rate_limited` variant. See `src/server.zig`
   and the `README.md` "Embed nullq as a server" section.
+- `nullq.Client` convenience wrapper for embedding nullq as a QUIC
+  client. Mirror to `nullq.Server`: builds a client-mode TLS
+  context, generates the per-connection random initial DCID and
+  SCID (RFC 9000 §7.2), and runs `bind` / `setLocalScid` /
+  `setInitialDcid` / `setPeerDcid` / `setTransportParams` in the
+  right order, returning a heap-allocated `*Connection` ready for
+  the first `advance` / `poll`. Optional `Config.session_ticket`
+  wires up resumption + 0-RTT in one step. See `src/client.zig` and
+  the `README.md` "Embed nullq as a client" section.
 - `Connection.localScidCount`, `Connection.localScids`, and
   `Connection.ownsLocalCid` for embedders that maintain a
   CID-to-connection routing table outside the connection

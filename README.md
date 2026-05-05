@@ -173,6 +173,79 @@ For interop-specific behavior (Retry, version negotiation,
 deterministic CIDs), see `interop/qns_endpoint.zig` for the
 fully-customised pattern.
 
+## Embed nullq as a client
+
+`nullq.Client` is the mirror of `nullq.Server` for the dialing side.
+It builds a client-mode TLS context, generates the random initial
+DCID and SCID per RFC 9000 §7.2, calls
+`bind`/`setLocalScid`/`setInitialDcid`/`setPeerDcid`/`setTransportParams`
+in the right order, and hands back a heap-allocated `*Connection`
+that's ready for the first scheduler step. The caller still owns
+the UDP socket, the wall clock, and the `Connection` lifecycle.
+
+```zig
+const std = @import("std");
+const nullq = @import("nullq");
+
+pub fn dial(
+    allocator: std.mem.Allocator,
+    sock: anytype, // your UDP socket, already bound
+    server_addr: anytype,
+    server_name: []const u8,
+) !void {
+    const protos = [_][]const u8{"hq-interop"};
+
+    const conn = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = server_name,
+        .alpn_protocols = &protos,
+        .transport_params = .{
+            .max_idle_timeout_ms = 30_000,
+            .initial_max_data = 16 * 1024 * 1024,
+            .initial_max_stream_data_bidi_local = 1 << 20,
+            .initial_max_stream_data_bidi_remote = 1 << 20,
+            .initial_max_stream_data_uni = 1 << 20,
+            .initial_max_streams_bidi = 100,
+            .initial_max_streams_uni = 64,
+            .active_connection_id_limit = 4,
+        },
+    });
+    defer {
+        conn.deinit();
+        allocator.destroy(conn);
+    }
+
+    // Kick the handshake: emit the first Initial.
+    try conn.advance();
+
+    var rx: [64 * 1024]u8 = undefined;
+    var tx: [1350]u8 = undefined;
+
+    while (!conn.isClosed()) {
+        const now_us = monotonicNowUs();
+        if (try sock.recv(&rx)) |msg| {
+            try conn.handle(msg.bytes, null, now_us);
+        }
+        while (try conn.poll(&tx, now_us)) |n| {
+            try sock.send(server_addr, tx[0..n]);
+        }
+        try conn.tick(now_us);
+
+        // Once the handshake completes, open streams, send
+        // datagrams, etc. on `conn` directly.
+        if (conn.handshakeDone()) {
+            // ... application logic ...
+        }
+    }
+}
+```
+
+For 0-RTT, pass a previously captured ticket via
+`Config.session_ticket` (raw bytes from `Session.toBytes`).
+`Client.connect` parses it via `Session.fromBytes`, installs it via
+`Connection.setSession`, and enables early data on this connection
+so the scheduler can emit application data on the first flight.
+
 ## 0-RTT Tickets
 
 Session tickets are owned by `boringssl-zig` and re-exported as

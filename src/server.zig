@@ -45,8 +45,10 @@
 //! version negotiation, deterministic CID prefix); embedders without
 //! those constraints should reach for `Server` first.
 //!
-//! TODO(api): client-side `Client.connect` helper, optional built-in
-//! Retry token issuance & validation, optional version negotiation.
+//! TODO(api): optional built-in Retry token issuance & validation,
+//! optional version negotiation. (`nullq.Client` covers the
+//! client-side connect helper; `nullq.transport.runUdpServer`
+//! covers the std.Io socket loop.)
 
 const std = @import("std");
 const boringssl = @import("boringssl");
