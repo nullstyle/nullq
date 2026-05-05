@@ -4646,8 +4646,13 @@ pub const Connection = struct {
         if (lvl == .application) self.recordApplicationPacketProtected(&sent_packet);
         const sent_stream_key = if (sent_chunk != null) self.nextStreamPacketKey() else null;
         sent_packet.stream_key = sent_stream_key;
-        try sent_tracker.record(sent_packet);
-        sent_packet_recorded = true;
+        if (sent_packet.ack_eliciting) {
+            try sent_tracker.record(sent_packet);
+            sent_packet_recorded = true;
+        } else {
+            sent_packet.deinit(self.allocator);
+            sent_packet_recorded = true;
+        }
         if (sent_chunk) |sc| {
             try sc.stream.send.recordSent(sent_stream_key.?, sc.chunk);
             self.recordStreamFlowSent(sc.stream, sc.chunk);
@@ -7751,6 +7756,28 @@ test "timer deadline reports ACK delay" {
     try std.testing.expectEqual(@as(u64, 1_010_000), deadline.at_us);
 }
 
+test "ACK-only application packets do not consume sent tracker slots" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    try std.testing.expect(conn.markPathValidated(0));
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    var pn: u64 = 0;
+    while (pn < 32) : (pn += 1) {
+        conn.pnSpaceForLevel(.application).recordReceived(pn, @intCast(1_000 + pn));
+        _ = (try conn.pollLevelOnPath(.application, 0, &packet_buf, 1_000_000 + pn)).?;
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.application).count);
+    try std.testing.expectEqual(@as(u64, 0), conn.sentForLevel(.application).bytes_in_flight);
+}
+
 test "PTO requeues application stream data and arms a probe" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -9650,7 +9677,7 @@ test "pollLevel emits PATH_ACK for non-zero application path ACKs" {
     var packet_buf: [default_mtu]u8 = undefined;
     const n = (try conn.pollLevelOnPath(.application, path_id, &packet_buf, 1_001_000)).?;
     try std.testing.expect(!path.app_pn_space.received.pending_ack);
-    try std.testing.expectEqual(@as(u32, 1), path.sent.count);
+    try std.testing.expectEqual(@as(u32, 0), path.sent.count);
 
     var plaintext: [max_recv_plaintext]u8 = undefined;
     const keys = (try conn.packetKeys(.application, .write)).?;
