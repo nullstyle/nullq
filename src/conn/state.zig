@@ -632,6 +632,13 @@ pub const Connection = struct {
     /// issued) as DCID on every incoming packet. Zero-length is valid.
     local_scid: ConnectionId = .{},
     local_scid_set: bool = false,
+    /// Stable Source CID used on Initial, Handshake, and 0-RTT long
+    /// headers. Peers can retire CID sequence 0 before the Initial or
+    /// Handshake packet spaces are fully quiet, but the long-header SCID
+    /// still has to remain the one advertised by the handshake transport
+    /// parameter.
+    initial_source_cid: ConnectionId = .{},
+    initial_source_cid_set: bool = false,
     /// Original DCID used for Initial-key derivation (RFC 9001 §5.2).
     /// Client side: the random DCID it sent on the very first Initial.
     /// Server side: same value, recovered from that incoming Initial.
@@ -1404,6 +1411,10 @@ pub const Connection = struct {
     pub fn setLocalScid(self: *Connection, cid: []const u8) Error!void {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
         self.local_scid = ConnectionId.fromSlice(cid);
+        if (!self.initial_source_cid_set) {
+            self.initial_source_cid = self.local_scid;
+            self.initial_source_cid_set = true;
+        }
         self.primaryPath().path.local_cid = self.local_scid;
         self.local_scid_set = true;
         try self.rememberLocalCid(0, 0, 0, self.local_scid, @splat(0));
@@ -1413,6 +1424,10 @@ pub const Connection = struct {
     /// peer puts on incoming short-header packets.
     pub fn localDcidLen(self: *const Connection) u8 {
         return self.local_scid.len;
+    }
+
+    fn longHeaderScid(self: *const Connection) ConnectionId {
+        return if (self.initial_source_cid_set) self.initial_source_cid else self.local_scid;
     }
 
     fn rememberLocalCid(
@@ -4036,9 +4051,10 @@ pub const Connection = struct {
             &app_path.path.peer_cid
         else
             &self.peer_dcid;
+        const packet_scid = self.longHeaderScid();
         const max_payload: usize = blk: {
             const dcid_len: usize = packet_dcid.len;
-            const scid_len: usize = self.local_scid.len;
+            const scid_len: usize = packet_scid.len;
             const long_overhead: usize = 1 + 4 + 1 + dcid_len + 1 + scid_len + 8 + 4 + 16 + 8; // ample
             const short_overhead: usize = 1 + dcid_len + 4 + 16;
             const overhead: usize = if (lvl == .application) short_overhead else long_overhead;
@@ -4087,7 +4103,7 @@ pub const Connection = struct {
             const n_close = switch (lvl) {
                 .initial => try long_packet_mod.sealInitial(dst, .{
                     .dcid = packet_dcid.slice(),
-                    .scid = self.local_scid.slice(),
+                    .scid = packet_scid.slice(),
                     .pn = pn,
                     .largest_acked = largest_acked_close,
                     .payload = pl_buf[0..pl_pos],
@@ -4095,7 +4111,7 @@ pub const Connection = struct {
                 }),
                 .handshake => try long_packet_mod.sealHandshake(dst, .{
                     .dcid = packet_dcid.slice(),
-                    .scid = self.local_scid.slice(),
+                    .scid = packet_scid.slice(),
                     .pn = pn,
                     .largest_acked = largest_acked_close,
                     .payload = pl_buf[0..pl_pos],
@@ -4112,7 +4128,7 @@ pub const Connection = struct {
                 }),
                 .early_data => try long_packet_mod.sealZeroRtt(dst, .{
                     .dcid = packet_dcid.slice(),
-                    .scid = self.local_scid.slice(),
+                    .scid = packet_scid.slice(),
                     .pn = pn,
                     .largest_acked = largest_acked_close,
                     .payload = pl_buf[0..pl_pos],
@@ -4138,14 +4154,16 @@ pub const Connection = struct {
         // 1) ACK frame (if pending in this level's space).
         const recv_tracker = &pn_space.received;
         if (lvl != .early_data and recv_tracker.pending_ack) {
-            var ranges_buf: [128]u8 = undefined;
-            const ack_frame = try recv_tracker.toAckFrame(
-                self.ackDelayScaled(recv_tracker, now_us),
-                &ranges_buf,
-            );
-            const ack_len = if (lvl == .application and app_path.id != 0)
-                try frame_mod.encode(
-                    pl_buf[pl_pos..max_payload],
+            var ranges_buf: [default_mtu]u8 = undefined;
+            const available = max_payload - pl_pos;
+            var ranges_budget: usize = @min(ranges_buf.len, available);
+            while (true) {
+                const ack_frame = try recv_tracker.toAckFrameLimited(
+                    self.ackDelayScaled(recv_tracker, now_us),
+                    &ranges_buf,
+                    ranges_budget,
+                );
+                const frame: frame_types.Frame = if (lvl == .application and app_path.id != 0)
                     .{ .path_ack = .{
                         .path_id = app_path.id,
                         .largest_acked = ack_frame.largest_acked,
@@ -4154,15 +4172,27 @@ pub const Connection = struct {
                         .range_count = ack_frame.range_count,
                         .ranges_bytes = ack_frame.ranges_bytes,
                         .ecn_counts = ack_frame.ecn_counts,
-                    } },
-                )
-            else
-                try frame_mod.encode(
-                    pl_buf[pl_pos..max_payload],
-                    .{ .ack = ack_frame },
-                );
-            pl_pos += ack_len;
-            recv_tracker.markAckSent();
+                    } }
+                else
+                    .{ .ack = ack_frame };
+                const needed = frame_mod.encodedLen(frame);
+                if (needed <= available) {
+                    const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], frame);
+                    pl_pos += wrote;
+                    recv_tracker.markAckSent();
+                    break;
+                }
+                if (ranges_budget == 0 or ack_frame.ranges_bytes.len == 0) break;
+                const overflow = needed - available;
+                const reduced_budget = if (overflow >= ack_frame.ranges_bytes.len)
+                    @as(usize, 0)
+                else
+                    ack_frame.ranges_bytes.len - overflow;
+                ranges_budget = if (reduced_budget >= ack_frame.ranges_bytes.len)
+                    ack_frame.ranges_bytes.len - 1
+                else
+                    reduced_budget;
+            }
         }
 
         // 1a) PTO probe PING. A lost PING is not retransmitted as a
@@ -4567,7 +4597,7 @@ pub const Connection = struct {
         const n = switch (lvl) {
             .initial => try long_packet_mod.sealInitial(dst, .{
                 .dcid = packet_dcid.slice(),
-                .scid = self.local_scid.slice(),
+                .scid = packet_scid.slice(),
                 .token = if (self.role == .client) self.retry_token.items else &.{},
                 .pn = pn,
                 .largest_acked = largest_acked,
@@ -4581,7 +4611,7 @@ pub const Connection = struct {
             }),
             .handshake => try long_packet_mod.sealHandshake(dst, .{
                 .dcid = packet_dcid.slice(),
-                .scid = self.local_scid.slice(),
+                .scid = packet_scid.slice(),
                 .pn = pn,
                 .largest_acked = largest_acked,
                 .payload = pl_buf[0..pl_pos],
@@ -4598,7 +4628,7 @@ pub const Connection = struct {
             }),
             .early_data => try long_packet_mod.sealZeroRtt(dst, .{
                 .dcid = packet_dcid.slice(),
-                .scid = self.local_scid.slice(),
+                .scid = packet_scid.slice(),
                 .pn = pn,
                 .largest_acked = largest_acked,
                 .payload = pl_buf[0..pl_pos],
@@ -9629,6 +9659,39 @@ test "pollLevel emits PATH_ACK for non-zero application path ACKs" {
     try std.testing.expectEqual(@as(u64, 9), decoded.frame.path_ack.largest_acked);
 }
 
+test "pollLevel caps ACK ranges to packet budget" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    try std.testing.expect(conn.markPathValidated(0));
+
+    const tracker = &conn.primaryPath().app_pn_space.received;
+    var pn: u64 = 0;
+    while (pn < 200) : (pn += 2) tracker.add(pn, 1_000);
+    const tracked_lower_ranges = @as(u64, tracker.range_count - 1);
+
+    var packet_buf: [128]u8 = undefined;
+    const n = (try conn.pollLevel(.application, &packet_buf, 1_001_000)).?;
+    try std.testing.expect(!tracker.pending_ack);
+
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..n], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+    });
+    const decoded = try frame_mod.decode(opened.payload);
+    try std.testing.expect(decoded.frame == .ack);
+    try std.testing.expectEqual(@as(u64, 198), decoded.frame.ack.largest_acked);
+    try std.testing.expect(decoded.frame.ack.range_count < tracked_lower_ranges);
+}
+
 test "pollDatagram can select a non-zero application path" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -10065,6 +10128,38 @@ test "RETIRE_CONNECTION_ID surfaces replacement CID budget to embedders" {
     try std.testing.expectEqual(@as(usize, 1), queued);
     try std.testing.expectEqual(@as(usize, 0), conn.localConnectionIdIssueBudget(0));
     try std.testing.expect(conn.pollEvent() == null);
+}
+
+test "retiring CID sequence 0 does not change long-header source CID" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const initial_dcid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 };
+    const initial_scid = [_]u8{0xa0};
+    const replacement_scid = [_]u8{0xa1};
+    try conn.setInitialDcid(&initial_dcid);
+    try conn.setPeerDcid(&.{});
+    try conn.setLocalScid(&initial_scid);
+    try conn.queueNewConnectionId(1, 0, &replacement_scid, @splat(0xa1));
+
+    conn.handleRetireConnectionId(.{ .sequence_number = 0 });
+    try std.testing.expectEqualSlices(u8, &replacement_scid, conn.local_scid.slice());
+    try std.testing.expectEqualSlices(u8, &initial_scid, conn.longHeaderScid().slice());
+
+    const bytes = try allocator.dupe(u8, "late-initial-ack");
+    try conn.crypto_retx[EncryptionLevel.initial.idx()].append(allocator, .{
+        .offset = 0,
+        .data = bytes,
+    });
+
+    var out: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevel(.initial, &out, 1_000_000)).?;
+    const parsed = try wire_header.parse(out[0..n], 0);
+    try std.testing.expect(parsed.header == .initial);
+    try std.testing.expectEqualSlices(u8, &initial_scid, parsed.header.initial.scid.slice());
 }
 
 test "PATH_NEW_CONNECTION_ID rejects sequence reuse with different cid" {

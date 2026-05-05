@@ -5,7 +5,8 @@ const boringssl = @import("boringssl");
 const Net = std.Io.net;
 
 const hq_alpn = "hq-interop";
-const server_cid = [_]u8{ 0x51, 0x4e, 0x53, 0x2d, 0x6e, 0x75, 0x6c, 0x6c };
+const server_cid_len = 8;
+const server_cid_prefix = [_]u8{ 0x51, 0x4e, 0x53, 0x2d }; // "QNS-"
 const retry_token_key = [_]u8{
     0x4e, 0x55, 0x4c, 0x4c, 0x51, 0x2d, 0x51, 0x4e,
     0x53, 0x2d, 0x52, 0x45, 0x54, 0x52, 0x59, 0x21,
@@ -389,10 +390,11 @@ fn runServer(
         defer conn.deinit();
         if (qlog_sink) |*sink| conn.setQlogCallback(QlogSink.callback, sink);
         try conn.bind();
-        try conn.setLocalScid(&server_cid);
+        const initial_server_cid = randomServerCid(io);
+        try conn.setLocalScid(&initial_server_cid);
 
         var next_cid_seq: u8 = 1;
-        try queueServerConnectionIds(&conn, &next_cid_seq, 4);
+        try queueServerConnectionIds(&conn, &next_cid_seq, 4, &initial_server_cid);
 
         var app = Http09App.init(allocator, io, try openDir(io, opts.www));
         defer app.deinit();
@@ -401,7 +403,7 @@ fn runServer(
         var transport_params_set = false;
         var retry_sent = false;
         var retry_original_dcid: nullq.conn.path.ConnectionId = .{};
-        var retry_source_cid = retrySourceCid();
+        var retry_source_cid = retrySourceCid(&initial_server_cid);
         var now_us: u64 = 1_000_000;
         var rx: [64 * 1024]u8 = undefined;
         var tx: [endpoint_udp_payload_size]u8 = undefined;
@@ -448,7 +450,7 @@ fn runServer(
 
                     const params: nullq.tls.TransportParams = .{
                         .original_destination_connection_id = original_dcid,
-                        .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&server_cid),
+                        .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&initial_server_cid),
                         .retry_source_connection_id = retry_source,
                         .max_idle_timeout_ms = 30_000,
                         .initial_max_data = endpoint_connection_receive_window,
@@ -467,7 +469,7 @@ fn runServer(
                 try conn.handle(msg.data, null, now_us);
             }
 
-            if (conn.handshakeDone()) try queueServerConnectionIds(&conn, &next_cid_seq, 8);
+            if (conn.handshakeDone()) try queueServerConnectionIds(&conn, &next_cid_seq, 8, &initial_server_cid);
             try app.process(&conn);
             while (try conn.poll(&tx, now_us)) |n| {
                 if (peer) |p| try sock.send(io, &p, tx[0..n]) else break;
@@ -917,20 +919,32 @@ fn readWholeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
 }
 
-fn queueServerConnectionIds(conn: *nullq.Connection, next_seq: *u8, desired_last_seq: u8) !void {
+fn randomServerCid(io: std.Io) [server_cid_len]u8 {
+    var cid: [server_cid_len]u8 = undefined;
+    @memcpy(cid[0..server_cid_prefix.len], &server_cid_prefix);
+    io.random(cid[server_cid_prefix.len..]);
+    return cid;
+}
+
+fn queueServerConnectionIds(
+    conn: *nullq.Connection,
+    next_seq: *u8,
+    desired_last_seq: u8,
+    base_cid: *const [server_cid_len]u8,
+) !void {
     const budget = conn.localConnectionIdIssueBudget(0);
     if (budget == 0 or next_seq.* > desired_last_seq) return;
 
-    var cid_storage: [8][server_cid.len]u8 = undefined;
+    var cid_storage: [8][server_cid_len]u8 = undefined;
     var provisions: [8]nullq.ConnectionIdProvision = undefined;
     var count: usize = 0;
     var seq = next_seq.*;
     while (seq <= desired_last_seq and count < provisions.len and count < budget) {
-        cid_storage[count] = server_cid;
+        cid_storage[count] = base_cid.*;
         cid_storage[count][7] +%= seq;
         provisions[count] = .{
             .connection_id = cid_storage[count][0..],
-            .stateless_reset_token = statelessResetToken(seq),
+            .stateless_reset_token = statelessResetToken(&cid_storage[count], seq),
         };
         count += 1;
         seq += 1;
@@ -941,14 +955,14 @@ fn queueServerConnectionIds(conn: *nullq.Connection, next_seq: *u8, desired_last
     next_seq.* += @as(u8, @intCast(queued));
 }
 
-fn statelessResetToken(seq: u8) [16]u8 {
+fn statelessResetToken(cid: []const u8, seq: u8) [16]u8 {
     var token: [16]u8 = undefined;
-    for (&token, 0..) |*b, i| b.* = seq ^ @as(u8, @truncate(i * 17));
+    for (&token, 0..) |*b, i| b.* = seq ^ @as(u8, @truncate(i * 17)) ^ cid[i % cid.len];
     return token;
 }
 
-fn retrySourceCid() [server_cid.len]u8 {
-    var cid = server_cid;
+fn retrySourceCid(base_cid: *const [server_cid_len]u8) [server_cid_len]u8 {
+    var cid = base_cid.*;
     cid[7] +%= 0x80;
     return cid;
 }

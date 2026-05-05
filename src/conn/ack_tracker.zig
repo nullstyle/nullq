@@ -106,6 +106,50 @@ pub const AckTracker = struct {
         };
     }
 
+    /// Build an ACK frame that includes the largest contiguous range and
+    /// then as many lower ranges as fit in `max_ranges_bytes`. This is the
+    /// packet builder's bounded-emission path: under heavy loss/reordering,
+    /// an ACK frame may legally omit older ranges instead of failing packet
+    /// construction.
+    pub fn toAckFrameLimited(
+        self: *const AckTracker,
+        ack_delay_scaled: u64,
+        ranges_bytes_buf: []u8,
+        max_ranges_bytes: usize,
+    ) Error!frame_types.Ack {
+        if (self.range_count == 0) return Error.Empty;
+
+        const top = self.ranges[self.range_count - 1];
+        const first_range = top.largest - top.smallest;
+        const ranges_capacity = @min(ranges_bytes_buf.len, max_ranges_bytes);
+
+        var pos: usize = 0;
+        var included_ranges: u64 = 0;
+        var prev = top;
+        var i: u8 = self.range_count - 1;
+        while (i > 0) {
+            i -= 1;
+            const this = self.ranges[i];
+            const gap = prev.smallest - this.largest - 2;
+            const length = this.largest - this.smallest;
+            const needed = varint.encodedLen(gap) + varint.encodedLen(length);
+            if (needed > ranges_capacity - pos) break;
+            pos += try varint.encode(ranges_bytes_buf[pos..], gap);
+            pos += try varint.encode(ranges_bytes_buf[pos..], length);
+            prev = this;
+            included_ranges += 1;
+        }
+
+        return .{
+            .largest_acked = top.largest,
+            .ack_delay = ack_delay_scaled,
+            .first_range = first_range,
+            .range_count = included_ranges,
+            .ranges_bytes = ranges_bytes_buf[0..pos],
+            .ecn_counts = null,
+        };
+    }
+
     fn insert(self: *AckTracker, pn: u64) void {
         // Find the lowest index `i` such that ranges[i].largest >= pn,
         // or `range_count` if no such index exists.
@@ -265,6 +309,29 @@ test "toAckFrame: round-trip via ack_range Iterator" {
     try std.testing.expectEqual(@as(u64, 92), mid.largest);
     try std.testing.expectEqual(@as(u64, 80), bot.smallest);
     try std.testing.expectEqual(@as(u64, 82), bot.largest);
+}
+
+test "toAckFrameLimited truncates older ranges to fit budget" {
+    var t: AckTracker = .{};
+    var pn: u64 = 0;
+    while (pn <= 8) : (pn += 2) t.add(pn, 0);
+
+    var buf: [3]u8 = undefined;
+    const ack = try t.toAckFrameLimited(0, &buf, buf.len);
+    try std.testing.expectEqual(@as(u64, 8), ack.largest_acked);
+    try std.testing.expectEqual(@as(u64, 0), ack.first_range);
+    try std.testing.expectEqual(@as(u64, 1), ack.range_count);
+    try std.testing.expectEqual(@as(usize, 2), ack.ranges_bytes.len);
+
+    const ack_range = @import("../frame/ack_range.zig");
+    var it = ack_range.iter(ack);
+    const top = (try it.next()).?;
+    const next = (try it.next()).?;
+    try std.testing.expectEqual(@as(?ack_range.Interval, null), try it.next());
+    try std.testing.expectEqual(@as(u64, 8), top.smallest);
+    try std.testing.expectEqual(@as(u64, 8), top.largest);
+    try std.testing.expectEqual(@as(u64, 6), next.smallest);
+    try std.testing.expectEqual(@as(u64, 6), next.largest);
 }
 
 test "markAckSent clears pending_ack but preserves intervals" {

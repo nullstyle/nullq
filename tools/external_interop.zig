@@ -2,6 +2,8 @@ const std = @import("std");
 
 const default_image = "nullq-interop:local";
 const default_zig_version = "0.16.0";
+const default_runner_python = "3.12";
+const default_wireshark_image = "nullq-interop-wireshark:local";
 
 const case_aliases = [_]CaseAlias{
     .{ .short = "H", .long = "handshake" },
@@ -21,12 +23,15 @@ const CaseAlias = struct {
 const Config = struct {
     repo: []const u8,
     workspace: []const u8,
+    path_env: []const u8 = "",
     image: []const u8 = default_image,
     zig_version: []const u8 = default_zig_version,
     dry_run: bool = false,
     runner_dir: ?[]const u8 = null,
     clients: []const u8 = "quic-go,ngtcp2,quiche",
     tests: []const u8 = "core+retry",
+    runner_python: []const u8 = default_runner_python,
+    wireshark_image: []const u8 = default_wireshark_image,
     log_dir: ?[]const u8 = null,
     json_path: ?[]const u8 = null,
     build_image: bool = false,
@@ -46,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var cfg = Config{
         .repo = repo,
         .workspace = workspace,
+        .path_env = init.environ_map.get("PATH") orelse "",
     };
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -87,7 +93,7 @@ fn usage() void {
         \\usage:
         \\  zig build external-interop -- preflight [--image nullq-interop:local] [--dry-run]
         \\  zig build external-interop -- build-image [--image nullq-interop:local] [--zig-version 0.16.0] [--dry-run]
-        \\  zig build external-interop -- runner [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--tests core+retry] [--dry-run]
+        \\  zig build external-interop -- runner [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--tests core+retry] [--python 3.12] [--wireshark-image nullq-interop-wireshark:local] [--dry-run]
         \\
     , .{});
 }
@@ -138,6 +144,16 @@ fn parseRunner(allocator: std.mem.Allocator, args: []const []const u8, cfg: *Con
             if (i >= args.len) return error.MissingTests;
             cfg.tests = args[i];
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--python")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPython;
+            cfg.runner_python = args[i];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--wireshark-image")) {
+            i += 1;
+            if (i >= args.len) return error.MissingWiresharkImage;
+            cfg.wireshark_image = args[i];
+            i += 1;
         } else if (std.mem.eql(u8, arg, "--log-dir")) {
             i += 1;
             if (i >= args.len) return error.MissingLogDir;
@@ -165,6 +181,14 @@ fn parseRunner(allocator: std.mem.Allocator, args: []const []const u8, cfg: *Con
     if (cfg.json_path == null) {
         cfg.json_path = try std.fs.path.join(allocator, &.{ cfg.repo, "interop", "results", "nullq-server.json" });
     }
+    cfg.runner_dir = try absolutePath(allocator, cfg.repo, cfg.runner_dir.?);
+    cfg.log_dir = try absolutePath(allocator, cfg.repo, cfg.log_dir.?);
+    cfg.json_path = try absolutePath(allocator, cfg.repo, cfg.json_path.?);
+}
+
+fn absolutePath(allocator: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return path;
+    return try std.fs.path.resolve(allocator, &.{ base, path });
 }
 
 fn parseCommonAt(args: []const []const u8, i: *usize, cfg: *Config) !bool {
@@ -230,15 +254,22 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     try recreateDir(io, overlay);
     try copyTree(allocator, io, runner_dir, overlay);
     try injectNullqImplementation(allocator, io, overlay, cfg.image);
+    const trace_tools_dir = try prepareTraceTools(allocator, io, cfg, overlay);
 
     const tests = try expandCases(allocator, cfg.tests);
     defer allocator.free(tests);
-    try ensureParentDir(io, cfg.log_dir.?);
-    try ensureParentDir(io, cfg.json_path.?);
+    try prepareRunnerOutputs(io, cfg);
 
     var cmd: std.ArrayList([]const u8) = .empty;
     defer cmd.deinit(allocator);
-    try cmd.appendSlice(allocator, &.{ "uv", "run" });
+    if (trace_tools_dir) |dir| {
+        const env_path = if (cfg.path_env.len > 0)
+            try std.fmt.allocPrint(allocator, "PATH={s}:{s}", .{ dir, cfg.path_env })
+        else
+            try std.fmt.allocPrint(allocator, "PATH={s}", .{dir});
+        try cmd.appendSlice(allocator, &.{ "/usr/bin/env", env_path });
+    }
+    try cmd.appendSlice(allocator, &.{ "uv", "run", "--python", cfg.runner_python });
     const requirements = try std.fs.path.join(allocator, &.{ overlay, "requirements.txt" });
     if (pathExists(io, requirements)) {
         try cmd.appendSlice(allocator, &.{ "--with-requirements", "requirements.txt" });
@@ -263,9 +294,86 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     try runCommand(io, cmd.items, overlay, cfg.dry_run);
 }
 
+fn prepareTraceTools(allocator: std.mem.Allocator, io: std.Io, cfg: Config, overlay: []const u8) !?[]const u8 {
+    if (commandAvailable(allocator, io, cfg.path_env, "tshark") and commandAvailable(allocator, io, cfg.path_env, "editcap")) {
+        return null;
+    }
+
+    std.debug.print("host tshark/editcap not found; using Docker Wireshark tools image {s}\n", .{cfg.wireshark_image});
+    try ensureWiresharkImage(allocator, io, cfg);
+
+    const bin_dir = try std.fs.path.join(allocator, &.{ overlay, ".nullq-tools-bin" });
+    if (cfg.dry_run) return bin_dir;
+
+    try std.Io.Dir.cwd().createDirPath(io, bin_dir);
+    try writeDockerToolShim(allocator, io, bin_dir, "tshark", cfg);
+    try writeDockerToolShim(allocator, io, bin_dir, "editcap", cfg);
+    return bin_dir;
+}
+
+fn ensureWiresharkImage(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
+    if (!cfg.dry_run and dockerImageExists(allocator, io, cfg.wireshark_image)) return;
+
+    const dockerfile = try std.fs.path.join(allocator, &.{ cfg.repo, "interop", "qns-tools", "Dockerfile" });
+    const context = try std.fs.path.join(allocator, &.{ cfg.repo, "interop", "qns-tools" });
+    const cmd = [_][]const u8{
+        "docker",
+        "build",
+        "-f",
+        dockerfile,
+        "-t",
+        cfg.wireshark_image,
+        ".",
+    };
+    try runCommand(io, &cmd, context, cfg.dry_run);
+}
+
+fn dockerImageExists(allocator: std.mem.Allocator, io: std.Io, image: []const u8) bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "docker", "image", "inspect", image },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn writeDockerToolShim(allocator: std.mem.Allocator, io: std.Io, bin_dir: []const u8, tool: []const u8, cfg: Config) !void {
+    const path = try std.fs.path.join(allocator, &.{ bin_dir, tool });
+    const script = try std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\exec docker run --rm -i -v '{s}:{s}:rw' -v /tmp:/tmp:rw -v /private:/private:rw --entrypoint {s} {s} "$@"
+        \\
+    , .{ cfg.workspace, cfg.workspace, tool, cfg.wireshark_image });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
+    try runAndRequireZero(allocator, io, &.{ "chmod", "+x", path }, null);
+}
+
+fn commandAvailable(allocator: std.mem.Allocator, io: std.Io, path_env: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, path_env, std.fs.path.delimiter);
+    while (it.next()) |dir| {
+        const candidate = std.fs.path.join(allocator, &.{ dir, name }) catch continue;
+        defer allocator.free(candidate);
+        std.Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
+        return true;
+    }
+    return false;
+}
+
 fn recreateDir(io: std.Io, path: []const u8) !void {
     try std.Io.Dir.cwd().deleteTree(io, path);
     try std.Io.Dir.cwd().createDirPath(io, path);
+}
+
+fn prepareRunnerOutputs(io: std.Io, cfg: Config) !void {
+    try ensureParentDir(io, cfg.log_dir.?);
+    try ensureParentDir(io, cfg.json_path.?);
+    if (cfg.dry_run) return;
+    try std.Io.Dir.cwd().deleteTree(io, cfg.log_dir.?);
 }
 
 fn copyTree(allocator: std.mem.Allocator, io: std.Io, source_path: []const u8, dest_path: []const u8) !void {
@@ -436,6 +544,33 @@ test "case expansion supports presets and aliases" {
     const preset = try expandCases(allocator, "core+retry");
     defer allocator.free(preset);
     try std.testing.expect(std.mem.indexOf(u8, preset, "retry") != null);
+}
+
+test "runner paths are normalized to absolute paths" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .repo = "/tmp/nullq",
+        .workspace = "/tmp",
+    };
+    const args = [_][]const u8{
+        "--runner-dir",
+        "../quic-interop-runner",
+        "--log-dir",
+        "interop/logs",
+        "--json",
+        "interop/results/out.json",
+    };
+    try parseRunner(allocator, &args, &cfg);
+    defer allocator.free(cfg.runner_dir.?);
+    defer allocator.free(cfg.log_dir.?);
+    defer allocator.free(cfg.json_path.?);
+
+    try std.testing.expect(std.fs.path.isAbsolute(cfg.runner_dir.?));
+    try std.testing.expect(std.fs.path.isAbsolute(cfg.log_dir.?));
+    try std.testing.expect(std.fs.path.isAbsolute(cfg.json_path.?));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.runner_dir.?, "quic-interop-runner"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.log_dir.?, "interop/logs"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.json_path.?, "interop/results/out.json"));
 }
 
 test "copy ignore filters generated trees" {

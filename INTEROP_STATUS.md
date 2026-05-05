@@ -63,10 +63,21 @@ Current as of 2026-05-04.
   server/client HTTP/0.9 transfer with `SSLKEYLOGFILE` and `QLOGDIR`
   enabled. The smoke verified the downloaded file, Wireshark-compatible
   TLS key log lines, and nullq qlog-style key lifecycle JSONL output.
-- `zig build external-interop -- preflight` and
-  `zig build external-interop -- build-image --dry-run` in `nullq`:
-  passing. The helper stages a throwaway Docker context under
-  `.zig-cache/` and prints the expected Docker build invocation.
+- `zig build external-interop -- preflight`,
+  `zig build external-interop -- build-image --dry-run`, and
+  `zig build external-interop -- build-image` in `nullq`: passing.
+  The helper stages a throwaway Docker context under `.zig-cache/`,
+  prints the expected Docker build invocation in dry-run mode, and
+  builds the local `nullq-interop:local` QNS Docker image.
+- Official QUIC interop-runner QNS server gate, basic matrix:
+  `zig build external-interop -- runner --runner-dir ../quic-interop-runner --clients quic-go,ngtcp2,quiche --tests H,D`
+  is passing with `quic-go`, `ngtcp2`, and `quiche` all green for
+  handshake and transfer: `✓(H,DC)`.
+- Official QUIC interop-runner QNS server gate, quic-go feature matrix:
+  `zig build external-interop -- runner --runner-dir ../quic-interop-runner --clients quic-go --tests H,D,C,S,R,Z,M`
+  is passing: `✓(H,DC,C20,S,R,Z,M)`. The current runner still emits an
+  occasional trace-analysis warning that one packet could not be
+  decrypted, but the QNS result is green.
 
 ## Production work landed
 
@@ -264,6 +275,11 @@ Current as of 2026-05-04.
 - QNS trace plumbing now honors `SSLKEYLOGFILE` and `QLOGDIR` in both
   endpoint roles. The key log file uses standard SSLKEYLOGFILE lines;
   the qlog directory receives nullq key-lifecycle JSONL traces.
+- ACK emission is now bounded under heavy loss/reordering. The receive
+  ACK tracker retains broad range history, but poll-side packet
+  construction emits the newest ACK ranges that fit the current packet
+  budget instead of surfacing `BufferTooSmall`; this unblocked quiche's
+  QNS transfer case.
 
 ## Still not production-grade
 
@@ -350,20 +366,23 @@ Current as of 2026-05-04.
    reason truncation plus stateless-reset false-positive filtering.
    Remaining hardening work: broader shutdown-path interop with external
    peers.
-7. **The official interop runner gate is scaffolded, not complete.**
+7. **The official interop runner gate is active but not complete.**
    nullq now has QNS server and client endpoint roles plus a Zig-native
    wrapper for nullq matrices against quic-go, ngtcp2, and quiche. The
    client role covers full-handshake HTTP/0.9 downloads, multiplexed
    requests, QNS resumption, and QNS 0-RTT by capturing a session
    ticket, reconnecting, and sending second-flight requests as early
-   data. The endpoint now also installs through the selective
-   `qns-endpoint` build step and emits keylog/qlog-style trace files
-   when the runner provides `SSLKEYLOGFILE` and `QLOGDIR`. It still
-   needs actual runner execution in a
-   Docker/Wireshark-equipped environment and fixes from the first real
-   external traces before it can be called a release gate. The runner
-   wrapper invokes upstream Python through `uv run`; repo-local tools
-   are declared in `mise.toml`.
+   data. The endpoint installs through the selective `qns-endpoint`
+   build step and emits keylog/qlog-style trace files when the runner
+   provides `SSLKEYLOGFILE` and `QLOGDIR`. Real runner execution now
+   passes nullq-as-server handshake/transfer against quic-go, ngtcp2,
+   and quiche, and passes the quic-go feature matrix for chacha20,
+   retry, resumption, 0-RTT, and multiplexing. Remaining gate work is
+   client-role execution against external servers, automated CI
+   packaging, lossy/reordered runner scenarios, trace-warning cleanup,
+   and any available external draft-21 multipath runner peer. The
+   runner wrapper invokes upstream Python through `uv run`; repo-local
+   tools are declared in `mise.toml`.
 
 Note: the passing mock multipath test validates simultaneous two-path
 transfer inside nullq. The passing `go-quic-peer multipath` gate now

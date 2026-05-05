@@ -43,15 +43,28 @@ The official runner's current abbreviations map as follows:
 H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multiplexing
 ```
 
+## Latest local results
+
+- `quic-go`, `ngtcp2`, and `quiche` all pass nullq-as-server
+  handshake and transfer: `✓(H,DC)`.
+- `quic-go` passes the feature matrix:
+  `✓(H,DC,C20,S,R,Z,M)`.
+- The runner may print `At least one QUIC packet could not be
+  decrypted` during trace processing even when the QNS result is green;
+  keep an eye on that warning while expanding the gate.
+
 ## Requirements
 
 - Docker with the quic-network-simulator base image reachable.
 - A checkout of `quic-interop-runner` next to this repo, or
   `--runner-dir /path/to/quic-interop-runner`.
-- `mise install` from the repo root to provision Zig, Python, and `uv`.
+- `mise install` from the repo root to provision Zig, Python 3.12, and
+  `uv`.
 - Runner Python dependencies are managed by `uv run` inside the
   official runner overlay. nullq's wrapper is Zig-native, but the
-  upstream runner itself still executes `run.py`.
+  upstream runner itself still executes `run.py`. The wrapper defaults
+  to `uv run --python 3.12` because the current pyshark stack is not yet
+  clean under Python 3.14.
 - Wireshark/tshark new enough for the runner's trace checks.
 
 The wrapper creates local throwaway state under `.zig-cache/` and does
@@ -65,8 +78,10 @@ mise run interop-build-image
 mise exec -- zig build qns-endpoint -Doptimize=ReleaseSafe
 mise exec -- zig build external-interop -- runner --dry-run
 mise exec -- zig build external-interop -- runner --clients quic-go --tests H,D,C
+mise exec -- zig build external-interop -- runner --clients quic-go --tests H,D --python 3.12
 mise exec -- zig build external-interop -- runner --clients quic-go,ngtcp2,quiche --tests core+retry
 ```
 
 Runner logs land in `interop/logs/`; matrix JSON lands in
-`interop/results/nullq-server.json`.
+`interop/results/nullq-server.json`. Both are generated artifacts and
+are ignored by git.

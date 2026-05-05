@@ -6,3 +6,5 @@ zig-out/
 zig-pkg/
 __pycache__/
 *.pyc
+interop/logs/
+interop/results/
