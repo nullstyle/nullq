@@ -21,6 +21,7 @@ const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
 const endpoint_bidi_stream_limit = nullq.conn.state.max_streams_per_connection;
 const endpoint_uni_stream_limit: u64 = 64;
 const max_qns_server_connections = 128;
+const max_qns_server_receive_batch = 256;
 const qns_time_base_us: u64 = 1_000_000;
 
 const ServerOptions = struct {
@@ -468,18 +469,22 @@ fn runServer(
 
     while (true) {
         var now_us = qnsNowUs(io, start);
-        const maybe_msg = sock.receiveTimeout(io, &rx, .{
-            .duration = .{
-                .raw = std.Io.Duration.fromMilliseconds(5),
-                .clock = .awake,
-            },
-        }) catch |err| switch (err) {
-            error.Timeout => null,
-            else => return err,
-        };
-        now_us = qnsNowUs(io, start);
+        var receive_count: usize = 0;
+        while (receive_count < max_qns_server_receive_batch) {
+            const receive_timeout_ms: i64 = if (receive_count == 0) 5 else 0;
+            const maybe_msg = sock.receiveTimeout(io, &rx, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(receive_timeout_ms),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => null,
+                else => return err,
+            };
+            now_us = qnsNowUs(io, start);
+            const msg = maybe_msg orelse break;
+            receive_count += 1;
 
-        if (maybe_msg) |msg| {
             var server_conn = findServerConn(conns.items, msg.data, msg.from);
             if (server_conn == null) {
                 const ids = peekLongHeaderIds(msg.data) orelse {
@@ -566,6 +571,7 @@ fn runServer(
             }
             try sc.conn.handle(msg.data, netAddressToPathAddress(msg.from), now_us);
         }
+        now_us = qnsNowUs(io, start);
 
         var i: usize = 0;
         while (i < conns.items.len) {
