@@ -83,6 +83,7 @@ const wire = @import("wire/root.zig");
 const retry_token_mod = conn_mod.retry_token;
 
 const Connection = conn_mod.Connection;
+const ConnectionError = conn_mod.state.Error;
 const TransportParams = tls_mod.TransportParams;
 const ConnectionId = conn_mod.path.ConnectionId;
 const Address = conn_mod.path.Address;
@@ -660,7 +661,7 @@ pub const Server = struct {
         slot: *Slot,
         dst: []u8,
         now_us: u64,
-    ) Connection.Error!?usize {
+    ) ConnectionError!?usize {
         _ = self;
         return try slot.conn.poll(dst, now_us);
     }
@@ -668,7 +669,7 @@ pub const Server = struct {
     /// Drive time-based recovery on every live slot. Idempotent and
     /// cheap — call it on every loop iteration. Closed slots are
     /// skipped; call `reap` periodically to reclaim them.
-    pub fn tick(self: *Server, now_us: u64) Connection.Error!void {
+    pub fn tick(self: *Server, now_us: u64) ConnectionError!void {
         for (self.slots.items) |slot| {
             if (slot.conn.isClosed()) continue;
             try slot.conn.tick(now_us);
