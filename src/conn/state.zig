@@ -2001,6 +2001,15 @@ pub const Connection = struct {
         s: *const Stream,
         chunk: send_stream_mod.Chunk,
     ) Error!?send_stream_mod.Chunk {
+        return self.limitChunkToSendFlowAfterPlanned(s, chunk, 0);
+    }
+
+    fn limitChunkToSendFlowAfterPlanned(
+        self: *Connection,
+        s: *const Stream,
+        chunk: send_stream_mod.Chunk,
+        planned_conn_new_bytes: u64,
+    ) Error!?send_stream_mod.Chunk {
         if (!self.localMaySendOnStream(s.id)) return null;
         if (chunk.length == 0) return chunk;
 
@@ -2010,10 +2019,11 @@ pub const Connection = struct {
             0
         else
             s.send_max_data - s.send_flow_highest;
-        const conn_new_allowance = if (self.we_sent_stream_data >= self.peer_max_data)
+        const planned_conn_sent = self.we_sent_stream_data +| planned_conn_new_bytes;
+        const conn_new_allowance = if (planned_conn_sent >= self.peer_max_data)
             0
         else
-            self.peer_max_data - self.we_sent_stream_data;
+            self.peer_max_data - planned_conn_sent;
         if (wants_new_data and stream_new_allowance == 0) {
             try self.noteStreamDataBlocked(s.id, s.send_max_data);
         }
@@ -2034,6 +2044,12 @@ pub const Connection = struct {
         limited.length = send_end - chunk.offset;
         limited.fin = chunk.fin and send_end == chunk_end;
         return limited;
+    }
+
+    fn streamFlowNewBytes(s: *const Stream, chunk: send_stream_mod.Chunk) u64 {
+        const end = std.math.add(u64, chunk.offset, chunk.length) catch return 0;
+        if (end <= s.send_flow_highest) return 0;
+        return end - s.send_flow_highest;
     }
 
     fn recordStreamFlowSent(self: *Connection, s: *Stream, chunk: send_stream_mod.Chunk) void {
@@ -3574,9 +3590,7 @@ pub const Connection = struct {
                 var removed = path.sent.removeAt(i);
                 defer removed.deinit(self.allocator);
                 self.recordDatagramLost(&removed);
-                if (removed.stream_key) |stream_key| {
-                    _ = try self.dispatchLostToStreams(stream_key);
-                }
+                _ = try self.dispatchLostPacketToStreams(&removed);
                 _ = try self.dispatchLostControlFramesOnPath(&removed, path.id);
                 self.discardSentCryptoForPacket(.early_data, removed.pn);
             }
@@ -4587,17 +4601,31 @@ pub const Connection = struct {
             }
         }
 
-        // 3b) STREAM frame (Application PN space).
-        var sent_chunk: ?struct { stream: *Stream, chunk: send_stream_mod.Chunk } = null;
+        // 3b) STREAM frames (Application PN space). Pack as many
+        // independent streams as fit; each chunk gets its own
+        // connection-local key so ACK/loss can still route precisely.
+        const SentStreamChunk = struct {
+            stream: *Stream,
+            chunk: send_stream_mod.Chunk,
+            stream_key: u64,
+        };
+        var sent_chunks: [sent_packets_mod.max_stream_keys_per_packet]SentStreamChunk = undefined;
+        var sent_chunk_count: usize = 0;
+        var planned_conn_new_bytes: u64 = 0;
         if (!path_response_used_addr_override and !congestion_blocked and (lvl == .application or lvl == .early_data)) {
             var s_it = self.streams.iterator();
             while (s_it.next()) |entry| {
+                if (sent_chunk_count >= sent_chunks.len) break;
                 const s = entry.value_ptr.*;
                 const stream_overhead: usize = 25;
                 if (max_payload <= pl_pos + stream_overhead) break;
                 const budget = max_payload - pl_pos - stream_overhead;
                 const raw_chunk = s.send.peekChunk(budget) orelse continue;
-                const chunk = (try self.limitChunkToSendFlow(s, raw_chunk)) orelse continue;
+                const chunk = (try self.limitChunkToSendFlowAfterPlanned(
+                    s,
+                    raw_chunk,
+                    planned_conn_new_bytes,
+                )) orelse continue;
                 const data_slice = s.send.chunkBytes(chunk);
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                     .stream = .{
@@ -4610,9 +4638,14 @@ pub const Connection = struct {
                     },
                 });
                 pl_pos += wrote;
-                sent_chunk = .{ .stream = s, .chunk = chunk };
+                sent_chunks[sent_chunk_count] = .{
+                    .stream = s,
+                    .chunk = chunk,
+                    .stream_key = self.nextStreamPacketKey(),
+                };
+                sent_chunk_count += 1;
+                planned_conn_new_bytes +|= streamFlowNewBytes(s, chunk);
                 ack_eliciting = true;
-                break;
             }
         }
 
@@ -4671,8 +4704,9 @@ pub const Connection = struct {
         sent_packet.is_early_data = lvl == .early_data;
         sent_packet.datagram = sent_datagram;
         if (lvl == .application) self.recordApplicationPacketProtected(&sent_packet);
-        const sent_stream_key = if (sent_chunk != null) self.nextStreamPacketKey() else null;
-        sent_packet.stream_key = sent_stream_key;
+        for (sent_chunks[0..sent_chunk_count]) |sc| {
+            try sent_packet.addStreamKey(self.allocator, sc.stream_key);
+        }
         if (sent_packet.ack_eliciting) {
             try sent_tracker.record(sent_packet);
             sent_packet_recorded = true;
@@ -4680,8 +4714,8 @@ pub const Connection = struct {
             sent_packet.deinit(self.allocator);
             sent_packet_recorded = true;
         }
-        if (sent_chunk) |sc| {
-            try sc.stream.send.recordSent(sent_stream_key.?, sc.chunk);
+        for (sent_chunks[0..sent_chunk_count]) |sc| {
+            try sc.stream.send.recordSent(sc.stream_key, sc.chunk);
             self.recordStreamFlowSent(sc.stream, sc.chunk);
         }
         if (sent_crypto_chunk) |sc| {
@@ -6293,9 +6327,7 @@ pub const Connection = struct {
                     }
                     if (lvl == .application) {
                         self.onApplicationPacketAckedForKeys(&acked, now_us);
-                        if (acked.stream_key) |stream_key| {
-                            self.dispatchAckedToStreams(stream_key) catch |e| return e;
-                        }
+                        self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
                     }
                     self.discardSentCryptoForPacket(lvl, acked.pn);
                     self.dispatchAckedControlFrames(&acked);
@@ -6359,9 +6391,7 @@ pub const Connection = struct {
                             newest_acked_sent_time_us = acked.sent_time_us;
                         }
                     }
-                    if (acked.stream_key) |stream_key| {
-                        self.dispatchAckedToStreams(stream_key) catch |e| return e;
-                    }
+                    self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
                     self.onApplicationPacketAckedForKeys(&acked, now_us);
                     self.discardSentCryptoForPacket(.application, acked.pn);
                     self.dispatchAckedControlFrames(&acked);
@@ -6400,6 +6430,16 @@ pub const Connection = struct {
         }
     }
 
+    fn dispatchAckedPacketToStreams(
+        self: *Connection,
+        packet: *const sent_packets_mod.SentPacket,
+    ) Error!void {
+        var keys = packet.streamKeys();
+        while (keys.next()) |stream_key| {
+            try self.dispatchAckedToStreams(stream_key);
+        }
+    }
+
     fn dispatchLostToStreams(self: *Connection, pn: u64) Error!bool {
         var any = false;
         var s_it = self.streams.iterator();
@@ -6409,6 +6449,18 @@ pub const Connection = struct {
                 else => return e,
             };
             any = true;
+        }
+        return any;
+    }
+
+    fn dispatchLostPacketToStreams(
+        self: *Connection,
+        packet: *const sent_packets_mod.SentPacket,
+    ) Error!bool {
+        var any = false;
+        var keys = packet.streamKeys();
+        while (keys.next()) |stream_key| {
+            any = (try self.dispatchLostToStreams(stream_key)) or any;
         }
         return any;
     }
@@ -6625,9 +6677,7 @@ pub const Connection = struct {
         var any = false;
         self.recordDatagramLost(packet);
         if (lvl == .application or lvl == .early_data or packet.is_early_data) {
-            if (packet.stream_key) |stream_key| {
-                any = (try self.dispatchLostToStreams(stream_key)) or any;
-            }
+            any = (try self.dispatchLostPacketToStreams(packet)) or any;
         }
         any = (try self.requeueSentCryptoForPacket(lvl, packet.pn)) or any;
         any = (try self.dispatchLostControlFramesOnPath(packet, path_id)) or any;
@@ -9765,6 +9815,38 @@ test "pollLevel caps ACK ranges to packet budget" {
     try std.testing.expect(decoded.frame == .ack);
     try std.testing.expectEqual(@as(u64, 198), decoded.frame.ack.largest_acked);
     try std.testing.expect(decoded.frame.ack.range_count < tracked_lower_ranges);
+}
+
+test "pollLevel coalesces multiple STREAM frames with distinct loss keys" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    try std.testing.expect(conn.markPathValidated(0));
+
+    const s0 = try conn.openBidi(0);
+    const s1 = try conn.openBidi(4);
+    const s2 = try conn.openBidi(8);
+    _ = try s0.send.write("alpha");
+    _ = try s1.send.write("bravo");
+    _ = try s2.send.write("charlie");
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    _ = (try conn.pollLevelOnPath(.application, 0, &packet_buf, 1_000_000)).?;
+
+    const sent = conn.sentForLevel(.application);
+    try std.testing.expectEqual(@as(u32, 1), sent.count);
+    var keys = sent.packets[0].streamKeys();
+    var key_count: usize = 0;
+    while (keys.next()) |_| key_count += 1;
+    try std.testing.expectEqual(@as(usize, 3), key_count);
+    try std.testing.expectEqual(@as(u32, 1), s0.send.in_flight.count());
+    try std.testing.expectEqual(@as(u32, 1), s1.send.in_flight.count());
+    try std.testing.expectEqual(@as(u32, 1), s2.send.in_flight.count());
 }
 
 test "pollDatagram can select a non-zero application path" {

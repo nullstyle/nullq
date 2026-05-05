@@ -9,6 +9,7 @@ const std = @import("std");
 const frame_types = @import("../frame/types.zig");
 
 pub const max_retransmit_frames: usize = 16;
+pub const max_stream_keys_per_packet: usize = 32;
 
 pub const RetransmitFrame = union(enum) {
     max_data: frame_types.MaxData,
@@ -64,6 +65,11 @@ pub const SentPacket = struct {
     /// notifications. Application packet numbers are per-path when
     /// multipath is enabled, so a wire PN alone is not globally unique.
     stream_key: ?u64 = null,
+    /// Additional STREAM keys when multiple STREAM frames are packed
+    /// into one QUIC packet. Allocated only for coalesced STREAM
+    /// packets; `stream_key` remains the first entry so the common
+    /// single-frame case stays compact.
+    extra_stream_keys: std.ArrayList(u64) = .empty,
     /// True when this Application-space packet was sent under 0-RTT
     /// keys. If TLS rejects early data, callers can requeue STREAM
     /// bytes without treating the packet as congestion loss.
@@ -85,8 +91,40 @@ pub const SentPacket = struct {
         try self.retransmit_frames.append(allocator, frame);
     }
 
+    pub fn addStreamKey(self: *SentPacket, allocator: std.mem.Allocator, key: u64) Error!void {
+        if (self.stream_key == null) {
+            self.stream_key = key;
+            return;
+        }
+        if (self.extra_stream_keys.items.len >= max_stream_keys_per_packet - 1) {
+            return Error.TooManyStreamFrames;
+        }
+        try self.extra_stream_keys.append(allocator, key);
+    }
+
+    pub const StreamKeyIterator = struct {
+        packet: *const SentPacket,
+        index: usize = 0,
+
+        pub fn next(self: *StreamKeyIterator) ?u64 {
+            if (self.index == 0) {
+                self.index = 1;
+                if (self.packet.stream_key) |key| return key;
+            }
+            const extra_index = self.index - 1;
+            if (extra_index >= self.packet.extra_stream_keys.items.len) return null;
+            self.index += 1;
+            return self.packet.extra_stream_keys.items[extra_index];
+        }
+    };
+
+    pub fn streamKeys(self: *const SentPacket) StreamKeyIterator {
+        return .{ .packet = self };
+    }
+
     pub fn deinit(self: *SentPacket, allocator: std.mem.Allocator) void {
         self.retransmit_frames.deinit(allocator);
+        self.extra_stream_keys.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -101,6 +139,7 @@ pub const max_tracked: usize = 4096;
 pub const Error = error{
     TooManyInFlight,
     TooManyRetransmittableFrames,
+    TooManyStreamFrames,
 } || std.mem.Allocator.Error;
 
 pub const SentPacketTracker = struct {
@@ -246,4 +285,25 @@ test "SentPacket stores retransmittable control frames" {
     try std.testing.expect(p.retransmit_frames.items[0] == .max_data);
     try std.testing.expectEqual(@as(u64, 4096), p.retransmit_frames.items[0].max_data.maximum_data);
     try std.testing.expect(p.retransmit_frames.items[1] == .path_challenge);
+}
+
+test "SentPacket stores multiple STREAM keys" {
+    var p: SentPacket = .{
+        .pn = 1,
+        .sent_time_us = 10,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    defer p.deinit(std.testing.allocator);
+
+    try p.addStreamKey(std.testing.allocator, 11);
+    try p.addStreamKey(std.testing.allocator, 12);
+    try p.addStreamKey(std.testing.allocator, 13);
+
+    var it = p.streamKeys();
+    try std.testing.expectEqual(@as(?u64, 11), it.next());
+    try std.testing.expectEqual(@as(?u64, 12), it.next());
+    try std.testing.expectEqual(@as(?u64, 13), it.next());
+    try std.testing.expectEqual(@as(?u64, null), it.next());
 }
