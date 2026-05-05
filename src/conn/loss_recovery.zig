@@ -17,8 +17,9 @@ const granularity_us = @import("rtt.zig").granularity_us;
 
 /// kPacketThreshold from RFC 9002 §6.1.1: 3.
 pub const packet_threshold: u64 = 3;
-/// kTimeThreshold from RFC 9002 §6.1.2: 9/8.
+/// kTimeThreshold numerator from RFC 9002 §6.1.2.
 pub const time_threshold_num: u64 = 9;
+/// kTimeThreshold denominator from RFC 9002 §6.1.2 (threshold = 9/8 of the RTT).
 pub const time_threshold_den: u64 = 8;
 
 /// Outcome of `processAck`. The connection feeds the contained

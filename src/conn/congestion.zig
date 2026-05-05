@@ -11,8 +11,9 @@ const std = @import("std");
 /// kPersistentCongestionThreshold from RFC 9002 §7.6.1: 3.
 pub const persistent_congestion_threshold: u8 = 3;
 
-/// kLossReductionFactor from RFC 9002 §B.1: 0.5 (multiplied integer-style).
+/// kLossReductionFactor numerator from RFC 9002 §B.1.
 pub const loss_reduction_factor_num: u64 = 1;
+/// kLossReductionFactor denominator from RFC 9002 §B.1 (factor = 1/2).
 pub const loss_reduction_factor_den: u64 = 2;
 
 /// Tunables for the NewReno controller. Held by-value inside the
