@@ -1,0 +1,46 @@
+name: fuzz
+
+on:
+  schedule:
+    # Sunday 09:00 UTC, just after the interop run.
+    - cron: "0 9 * * 0"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Per-target iteration budget (e.g. 100K, 1M)"
+        required: false
+        default: "100K"
+
+# Coverage-guided fuzzing of the wire / frame / server header-peek
+# parsers. The harness lives next to the unit tests in src/wire/,
+# src/frame/, and src/server.zig (every `std.testing.fuzz` site).
+# Crashes save to .zig-cache/v/; the artifact upload preserves them
+# so we can replay locally.
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    env:
+      ITERS: ${{ github.event.inputs.iterations || '100K' }}
+    steps:
+      - name: Checkout nullq
+        uses: actions/checkout@v4
+
+      - name: Set up mise (zig master + project tools)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: zig build test --fuzz
+        run: zig build test --fuzz=$ITERS
+
+      - name: Upload corpus + crashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-cache-${{ github.run_id }}
+          path: .zig-cache/v
+          if-no-files-found: ignore
+          retention-days: 30

@@ -10,7 +10,7 @@ breaking changes; see notes per release.
 ## [Unreleased]
 
 ### Added
-- `std.testing.fuzz` harness coverage for the four highest-yield
+- `std.testing.fuzz` harness coverage for the seven highest-yield
   parser surfaces: `wire/varint.zig` (decode/encode round-trip
   property), `wire/header.zig` (parse-never-panics + structural
   invariants per long-header variant), `frame/decode.zig` (single
@@ -19,11 +19,11 @@ breaking changes; see notes per release.
   with bounds-checks asserting returned slices lie inside the
   input). Each callback runs once per `zig build test` against an
   empty input, exercising the property-check code path on every CI
-  run. Coverage-guided fuzzing (`-ffuzz`) is wired up but commented
-  out in `build.zig` pending an upstream fix for a Zig 0.16.0
-  `test_runner.zig` type mismatch (`builtin.StackTrace` vs
-  `debug.StackTrace`) on the fuzz failure-reporting path; once Zig
-  ships the fix the `fuzz` step is a one-block uncomment.
+  run. Coverage-guided fuzzing is invoked via the build-system
+  flag: `zig build test --fuzz=100K` for a bounded run, or
+  `zig build test --fuzz` to run forever with a web UI. Validated
+  on Zig 0.17-dev master with ~1.8M iterations against
+  `peekLongHeaderIds` finding zero crashes.
 - `Connection.setMigrationCallback` and the `MigrationCallback` /
   `MigrationDecision` types — an embedder policy hook gating peer
   migrations to a new 4-tuple (RFC 9000 §9). The callback fires
