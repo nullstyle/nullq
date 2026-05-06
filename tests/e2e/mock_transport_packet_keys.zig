@@ -6,9 +6,10 @@
 const std = @import("std");
 const nullq = @import("nullq");
 const boringssl = @import("boringssl");
+const common = @import("common.zig");
 
-const test_cert_pem = @embedFile("../data/test_cert.pem");
-const test_key_pem = @embedFile("../data/test_key.pem");
+const test_cert_pem = common.test_cert_pem;
+const test_key_pem = common.test_key_pem;
 
 test "1-RTT keys derive cross-consistently and round-trip a packet" {
     const allocator = std.testing.allocator;

@@ -11,9 +11,10 @@
 const std = @import("std");
 const nullq = @import("nullq");
 const boringssl = @import("boringssl");
+const common = @import("common.zig");
 
-const test_cert_pem = @embedFile("../data/test_cert.pem");
-const test_key_pem = @embedFile("../data/test_key.pem");
+const test_cert_pem = common.test_cert_pem;
+const test_key_pem = common.test_key_pem;
 
 const InitialDcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
 const ClientScid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7 };
