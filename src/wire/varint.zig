@@ -247,3 +247,36 @@ test "round-trip: deterministic random" {
         try std.testing.expectEqual(v, d.value);
     }
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// `zig build fuzz` invokes the test binary with libFuzzer-equivalent
+// coverage feedback. The property: any byte slice fed to `decode`
+// either errors cleanly or returns a `Decoded` whose `bytes_read` does
+// not exceed the input, whose `value` fits in `max_value`, and whose
+// payload re-encodes to a byte-equal prefix when run through
+// `encodeFixed` at the same length. Crashes / panics / unreachable
+// reaches abort the harness. Invariant violations from `expectEqual`
+// are minimized + saved to the corpus.
+
+test "fuzz: varint decode/encode round-trip" {
+    try std.testing.fuzz({}, fuzzVarintRoundTrip, .{});
+}
+
+fn fuzzVarintRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [256]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+
+    const d = decode(input) catch return;
+
+    // The decoder must never report consuming bytes beyond the input.
+    try std.testing.expect(d.bytes_read <= input.len);
+    // Decoded value must always fit in the QUIC v1 varint range.
+    try std.testing.expect(d.value <= max_value);
+    // Re-encode at the original length: the bytes must match.
+    var rt_buf: [max_len]u8 = undefined;
+    const w = try encodeFixed(&rt_buf, d.value, d.bytes_read);
+    try std.testing.expectEqual(@as(usize, d.bytes_read), w);
+    try std.testing.expectEqualSlices(u8, input[0..d.bytes_read], rt_buf[0..w]);
+}

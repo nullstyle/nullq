@@ -825,3 +825,58 @@ test "Header.dcid accessor returns the right CID for each variant" {
     } };
     try std.testing.expectEqualSlices(u8, cid3.slice(), o.dcid().slice());
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `parse` with arbitrary bytes and a fuzzer-chosen short-header
+// DCID length, then assert structural invariants on whatever it
+// returned. Aborts on panic / unreachable. Invariant violations
+// minimize and save to the corpus.
+
+test "fuzz: header parse never panics and reports consistent offsets" {
+    try std.testing.fuzz({}, fuzzHeaderParse, .{});
+}
+
+fn fuzzHeaderParse(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [2048]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+    const dcid_len_for_short = smith.valueRangeAtMost(u8, 0, 20);
+
+    const parsed = parse(input, dcid_len_for_short) catch return;
+
+    // pn_offset is meaningful only for protected packets (Initial,
+    // Handshake, ZeroRtt, OneRtt). For Retry / VersionNegotiation it
+    // is documented as zero. Either way it must lie inside the input.
+    try std.testing.expect(parsed.pn_offset <= input.len);
+
+    // The parsed header's CIDs all came from inside `input`, so
+    // accessing them must not access random memory.
+    switch (parsed.header) {
+        .initial => |h| {
+            try std.testing.expect(h.dcid.len <= 20);
+            try std.testing.expect(h.scid.len <= 20);
+        },
+        .zero_rtt => |h| {
+            try std.testing.expect(h.dcid.len <= 20);
+            try std.testing.expect(h.scid.len <= 20);
+        },
+        .handshake => |h| {
+            try std.testing.expect(h.dcid.len <= 20);
+            try std.testing.expect(h.scid.len <= 20);
+        },
+        .retry => |h| {
+            try std.testing.expect(h.dcid.len <= 20);
+            try std.testing.expect(h.scid.len <= 20);
+        },
+        .version_negotiation => |h| {
+            try std.testing.expect(h.dcid.len <= 20);
+            try std.testing.expect(h.scid.len <= 20);
+            // VN versions list must be a multiple of 4 bytes.
+            try std.testing.expectEqual(@as(usize, 0), h.versions_bytes.len % 4);
+        },
+        .one_rtt => |h| {
+            try std.testing.expectEqual(dcid_len_for_short, h.dcid.len);
+        },
+    }
+}

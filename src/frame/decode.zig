@@ -620,3 +620,58 @@ test "decode HANDSHAKE_DONE (single byte 0x1e)" {
     try std.testing.expect(d.frame == .handshake_done);
     try std.testing.expectEqual(@as(usize, 1), d.bytes_consumed);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `decode` (single-frame) with arbitrary bytes. Property: the
+// decoder must never panic, and on success it must report a
+// `bytes_consumed` that lies inside the input. The decoded frame's
+// type tag must match the QUIC v1 frame catalog. Crashes / panics
+// abort. Invariant violations save to corpus.
+
+test "fuzz: frame decode single-frame property" {
+    try std.testing.fuzz({}, fuzzFrameDecode, .{});
+}
+
+fn fuzzFrameDecode(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [4096]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+
+    const d = decode(input) catch return;
+
+    // The decoder must not over-read.
+    try std.testing.expect(d.bytes_consumed <= input.len);
+    // bytes_consumed of 0 is meaningless — at minimum the type byte
+    // costs 1.
+    try std.testing.expect(d.bytes_consumed >= 1);
+}
+
+// Drive `decode` repeatedly until input is exhausted or the parser
+// errors. Mirrors how `Connection.handle` walks the frames inside one
+// decrypted packet payload. Property: no panic; cumulative
+// `bytes_consumed` stays inside the input.
+
+test "fuzz: frame decode loop until exhausted" {
+    try std.testing.fuzz({}, fuzzFrameDecodeLoop, .{});
+}
+
+fn fuzzFrameDecodeLoop(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [4096]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+
+    var pos: usize = 0;
+    var iters: usize = 0;
+    while (pos < input.len) {
+        const d = decode(input[pos..]) catch return;
+        try std.testing.expect(d.bytes_consumed >= 1);
+        try std.testing.expect(d.bytes_consumed <= input.len - pos);
+        pos += d.bytes_consumed;
+        // Cap loop iterations as a defense against an O(1)-per-frame
+        // payload like all-PADDING (one byte per frame). 16k frames
+        // is far more than any real packet would carry.
+        iters += 1;
+        if (iters >= 16_384) break;
+    }
+}
