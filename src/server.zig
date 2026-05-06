@@ -81,6 +81,7 @@ const conn_mod = @import("conn/root.zig");
 const tls_mod = @import("tls/root.zig");
 const wire = @import("wire/root.zig");
 const retry_token_mod = conn_mod.retry_token;
+const lifecycle = conn_mod.lifecycle;
 
 const Connection = conn_mod.Connection;
 const ConnectionError = conn_mod.state.Error;
@@ -112,6 +113,164 @@ const stateless_response_queue_capacity: usize = 64;
 pub const StatelessResponseKind = enum {
     version_negotiation,
     retry,
+};
+
+/// Structured observability events emitted by the `Server` at
+/// well-defined choice points. Embedders install a `LogCallback` via
+/// `Config.log_callback` to forward these to their logger of choice;
+/// the server emits them synchronously and never holds any internal
+/// lock while the callback runs. Re-exported as `Server.LogEvent`.
+///
+/// The variants are intentionally narrow — one struct per choice
+/// point — so the embedder can pattern-match on the discriminator and
+/// pick out only the fields they care about. Adding a new variant is
+/// a non-breaking change at the source level (existing callers'
+/// `else =>` arms still type-check) but is a wire/behavior change for
+/// any embedder logging the variants verbatim, so each addition
+/// should land in a CHANGELOG entry.
+const LogEventImpl = union(enum) {
+    /// A new connection slot was opened from an Initial datagram. The
+    /// `slot_count` field is the live-slot count *after* this accept,
+    /// which embedders can use to alert on saturation.
+    connection_accepted: struct { peer: Address, slot_count: usize },
+    /// A previously-live slot was reaped. `peer` is the last source
+    /// address observed for that slot (or null if the embedder never
+    /// passed `from` on `feed`); `source` is the close reason from
+    /// the connection's sticky `closeEvent` (or null for slots torn
+    /// down before they ever transitioned through the close pipeline).
+    connection_closed: struct { peer: ?Address, source: ?lifecycle.CloseSource },
+    /// The per-source rate limiter rejected an Initial. `recent_count`
+    /// is the source's tally inside the current window at the moment
+    /// of rejection, surfaced so embedders can tune
+    /// `max_initials_per_source_per_window`.
+    feed_rate_limited: struct { peer: Address, recent_count: u32 },
+    /// A Retry packet was successfully minted and queued for `peer`.
+    /// `scid_len` is the length of the server-issued SCID embedded in
+    /// the Retry — currently always equal to `Config.local_cid_len`.
+    retry_minted: struct { peer: Address, scid_len: u8 },
+    /// A long-header packet declared an unsupported version and a
+    /// Version Negotiation response was queued. `requested_version` is
+    /// the version field the peer asked for; embedders can correlate
+    /// this with their version-deployment posture.
+    version_negotiated: struct { peer: Address, requested_version: u32 },
+    /// The bounded stateless-response queue was full when a fresh
+    /// response (VN or Retry) arrived; the indicated entry was
+    /// evicted to make room. `kind` is the kind of the *evicted*
+    /// entry, not the new one.
+    stateless_queue_evicted: struct { kind: StatelessResponseKind },
+    /// `feed` rejected an Initial because the slot table was at
+    /// `max_concurrent_connections`. `peer` is the source address (or
+    /// null when the embedder didn't pass `from`).
+    table_full: struct { peer: ?Address },
+};
+
+/// Embedder-supplied logging hook. The `user_data` pointer is the
+/// `Config.log_user_data` the server stashed at init time and is
+/// passed back verbatim. Re-exported as `Server.LogCallback`.
+///
+/// The callback is invoked synchronously from inside `feed` / `reap` /
+/// `queueStatelessResponse` and must not call back into the server it
+/// was registered with (no `feed`, no `drainStatelessResponse`,
+/// nothing else that mutates server state). Returning an error is not
+/// supported — the callback's job is to push the event into a buffer,
+/// log line, or counter and return.
+const LogCallbackImpl = *const fn (user_data: ?*anyopaque, ev: LogEventImpl) void;
+
+/// By-value snapshot of the server's instrumentation counters and
+/// gauges. Returned from `Server.metricsSnapshot`; the snapshot is
+/// taken atomically (no mutation between fields) because all reads
+/// run on the embedder's thread. Re-exported as
+/// `Server.MetricsSnapshot`.
+///
+/// Fields divide into two groups:
+///   * Gauges describe *current* state — table sizes, queue depth,
+///     the post-init high-water mark for the stateless queue.
+///   * Counters monotonically increase from `init` to `deinit` and
+///     cover every lifecycle event the embedder might want to chart.
+///
+/// Counters wrap at `u64` overflow, which is decades of traffic on
+/// any realistic deployment. The embedder is responsible for
+/// computing per-second rates if they want a flow chart.
+const MetricsSnapshotImpl = struct {
+    // Gauges (current state).
+    /// Current number of live connection slots. Mirrors
+    /// `Server.connectionCount`.
+    live_connections: u64,
+    /// Current number of routing CIDs across all live slots. Mirrors
+    /// `Server.routingTableSize`.
+    routing_table_size: u64,
+    /// Number of distinct sources the rate limiter currently tracks.
+    /// Zero when the limiter is disabled.
+    source_rate_table_size: u64,
+    /// Number of distinct peers with Retry-pending state. Zero when
+    /// Retry is disabled.
+    retry_state_table_size: u64,
+    /// Current depth of the stateless-response (VN/Retry) queue.
+    /// Mirrors `Server.statelessResponseCount`.
+    stateless_queue_depth: u64,
+    /// All-time maximum value of `stateless_queue_depth` since
+    /// `init`. Sticky — it does not decrease when the queue drains.
+    /// Useful for sizing the queue capacity for production load.
+    stateless_queue_high_water: u64,
+
+    // Counters (monotonic since init).
+    /// Datagrams routed to an existing slot.
+    feeds_routed: u64,
+    /// Initials that opened a new slot (`.accepted`).
+    feeds_accepted: u64,
+    /// Datagrams rejected with `.dropped` for any reason — empty,
+    /// malformed, slot creation failed, expired token, etc.
+    feeds_dropped: u64,
+    /// Initials rejected by the per-source rate limiter
+    /// (`.rate_limited`).
+    feeds_rate_limited: u64,
+    /// Initials rejected because `max_concurrent_connections` was
+    /// reached (`.table_full`).
+    feeds_table_full: u64,
+    /// Long-header packets that triggered a Version Negotiation
+    /// response (`.version_negotiated`).
+    feeds_version_negotiated: u64,
+    /// Initials that triggered a Retry packet (`.retry_sent`).
+    feeds_retry_sent: u64,
+    /// Echoed Retry tokens that successfully validated and led to a
+    /// post-Retry `.accepted`. Always less than or equal to
+    /// `feeds_retry_sent`.
+    retries_validated: u64,
+    /// Stateless responses dropped on queue overflow.
+    stateless_responses_evicted: u64,
+    /// Slots reclaimed by `reap()` (one per closed connection).
+    slots_reaped: u64,
+};
+
+/// By-value snapshot of the per-source rate limiter, ranked by
+/// recent activity. Returned from `Server.rateLimitSnapshot`; the
+/// top-N list is sorted in descending order by `recent_count`. When
+/// the rate limiter is disabled, the snapshot is all-zero.
+/// Re-exported as `Server.RateLimitSnapshot`.
+const RateLimitSnapshotImpl = struct {
+    /// One row in the top-N table.
+    pub const SourceRow = struct {
+        addr: Address,
+        recent_count: u32,
+        window_start_us: u64,
+    };
+
+    /// Maximum number of top-offender rows the snapshot returns.
+    pub const top_n: usize = 16;
+
+    /// Total number of distinct sources currently tracked. May be
+    /// larger than `top_offender_count` when the table holds more
+    /// than `top_n` sources.
+    table_size: usize,
+    /// Cumulative count of `.rate_limited` returns since `init`.
+    /// Mirrors `MetricsSnapshot.feeds_rate_limited`.
+    cumulative_rejections: u64,
+    /// Top offenders, sorted descending by `recent_count`. Slots
+    /// past `top_offender_count` are zero-initialized and should be
+    /// ignored.
+    top_offenders: [top_n]SourceRow,
+    /// Number of valid rows in `top_offenders`.
+    top_offender_count: usize,
 };
 
 /// One queued stateless server response (VN or Retry), held by
@@ -235,6 +394,16 @@ const ConfigImpl = struct {
     /// qlog callback for application-key-update telemetry.
     qlog_callback: ?QlogCallback = null,
     qlog_user_data: ?*anyopaque = null,
+
+    /// Optional structured-logging hook. When set, the server emits
+    /// a `LogEvent` at every observable choice point (connection
+    /// open / close / reaped, rate-limited Initial, Retry minted,
+    /// VN response, queue eviction, table-full rejection). The
+    /// callback runs synchronously on the embedder's thread inside
+    /// `feed` / `reap` and must not call back into the server.
+    log_callback: ?LogCallbackImpl = null,
+    /// Opaque pointer passed back to `log_callback` on every event.
+    log_user_data: ?*anyopaque = null,
 
     /// Optional override of the underlying `boringssl.tls.Context`.
     /// When null, `Server.init` constructs a TLS-1.3-only server
@@ -468,15 +637,19 @@ const ErrorImpl = error{
 pub const Server = struct {
     /// Re-exports of the helper types so `Server.Config`,
     /// `Server.Slot`, `Server.FeedOutcome`, `Server.StatelessResponse`,
-    /// `Server.TlsReload`, and `Server.Error` all resolve from the
-    /// public API surface. The top-level definitions remain
-    /// authoritative.
+    /// `Server.TlsReload`, `Server.Error`, and the observability
+    /// types all resolve from the public API surface. The top-level
+    /// definitions remain authoritative.
     pub const Config = ConfigImpl;
     pub const Slot = SlotImpl;
     pub const FeedOutcome = FeedOutcomeImpl;
     pub const StatelessResponse = StatelessResponseImpl;
     pub const TlsReload = TlsReloadImpl;
     pub const Error = ErrorImpl;
+    pub const LogEvent = LogEventImpl;
+    pub const LogCallback = LogCallbackImpl;
+    pub const MetricsSnapshot = MetricsSnapshotImpl;
+    pub const RateLimitSnapshot = RateLimitSnapshotImpl;
 
     allocator: std.mem.Allocator,
     tls_ctx: boringssl.tls.Context,
@@ -502,6 +675,8 @@ pub const Server = struct {
     local_cid_len: u8,
     qlog_callback: ?QlogCallback,
     qlog_user_data: ?*anyopaque,
+    log_callback: ?LogCallbackImpl,
+    log_user_data: ?*anyopaque,
 
     /// Live connection slots. Embedders may iterate this between
     /// `feed` / `poll` calls to inspect or mutate connections.
@@ -557,6 +732,29 @@ pub const Server = struct {
     /// `tls_context_override` are NOT inserted here — the embedder
     /// retains ownership of those.
     draining_tls_contexts: std.ArrayListUnmanaged(DrainingTlsEntry) = .empty,
+
+    // -- observability counters ---------------------------------------
+    //
+    // All counters are monotonic since `init` and never reset; the
+    // embedder takes deltas if they want a rate. They're plain `u64`
+    // (not atomic) because `Server` is single-threaded — the embedder
+    // serializes their loop on a single thread, so an atomic load is
+    // strictly more expensive without buying anything.
+    feeds_routed: u64 = 0,
+    feeds_accepted: u64 = 0,
+    feeds_dropped: u64 = 0,
+    feeds_rate_limited: u64 = 0,
+    feeds_table_full: u64 = 0,
+    feeds_version_negotiated: u64 = 0,
+    feeds_retry_sent: u64 = 0,
+    retries_validated: u64 = 0,
+    stateless_responses_evicted: u64 = 0,
+    slots_reaped: u64 = 0,
+    /// Sticky high-water mark of `stateless_responses.items.len`. Set
+    /// in `queueStatelessResponse` *before* the new entry lands in
+    /// the queue so it reflects the maximum depth ever observed,
+    /// regardless of subsequent drains.
+    stateless_queue_high_water: u64 = 0,
 
     pub fn init(config: Config) Error!Server {
         if (config.alpn_protocols.len == 0) return Error.InvalidConfig;
@@ -629,6 +827,8 @@ pub const Server = struct {
             .local_cid_len = config.local_cid_len,
             .qlog_callback = config.qlog_callback,
             .qlog_user_data = config.qlog_user_data,
+            .log_callback = config.log_callback,
+            .log_user_data = config.log_user_data,
             .slots = slots,
             .cid_table = cid_table,
             .source_rate_table = .empty,
@@ -699,7 +899,10 @@ pub const Server = struct {
         from: ?Address,
         now_us: u64,
     ) Error!FeedOutcome {
-        if (bytes.len == 0) return .dropped;
+        if (bytes.len == 0) {
+            self.feeds_dropped += 1;
+            return .dropped;
+        }
 
         // Existing connection? Hash table lookup, O(1).
         if (self.findSlotForDatagram(bytes)) |slot| {
@@ -707,6 +910,7 @@ pub const Server = struct {
             if (from) |addr| slot.peer_addr = addr;
             try self.dispatchToSlot(slot, bytes, from, now_us);
             try self.resyncSlotCids(slot);
+            self.feeds_routed += 1;
             return .routed;
         }
 
@@ -718,26 +922,53 @@ pub const Server = struct {
         if (peekLongHeaderIds(bytes)) |ids| {
             if (ids.version != QUIC_VERSION_1) {
                 if (from) |addr| {
-                    self.queueVersionNegotiation(addr, bytes) catch return .dropped;
+                    self.queueVersionNegotiation(addr, bytes) catch {
+                        self.feeds_dropped += 1;
+                        return .dropped;
+                    };
+                    self.feeds_version_negotiated += 1;
+                    self.emitLog(.{ .version_negotiated = .{
+                        .peer = addr,
+                        .requested_version = ids.version,
+                    } });
                     return .version_negotiated;
                 }
                 // No destination address — we can't send a VN, so
                 // the datagram is dropped per the documented
                 // pass-through behavior.
+                self.feeds_dropped += 1;
                 return .dropped;
             }
         }
 
         // New connection candidate: must be a long-header Initial.
-        if (!isInitialLongHeader(bytes)) return .dropped;
-        if (self.slots.items.len >= self.max_concurrent_connections) return .table_full;
+        if (!isInitialLongHeader(bytes)) {
+            self.feeds_dropped += 1;
+            return .dropped;
+        }
+        if (self.slots.items.len >= self.max_concurrent_connections) {
+            self.feeds_table_full += 1;
+            self.emitLog(.{ .table_full = .{ .peer = from } });
+            return .table_full;
+        }
 
         // Source-rate gate runs *before* Retry / TLS / Connection
         // setup so an attacker spraying Initials from one address
         // can't burn server CPU minting state we'll throw away.
         if (self.max_initials_per_source) |cap| {
             if (from) |addr| {
-                if (!self.acceptSourceRate(addr, cap, now_us)) return .rate_limited;
+                if (!self.acceptSourceRate(addr, cap, now_us)) {
+                    self.feeds_rate_limited += 1;
+                    // Surface the bucket count *after* the rejection
+                    // so the embedder sees the value the gate just
+                    // tripped against.
+                    const recent_count = if (self.source_rate_table.get(addr)) |e| e.count else cap;
+                    self.emitLog(.{ .feed_rate_limited = .{
+                        .peer = addr,
+                        .recent_count = recent_count,
+                    } });
+                    return .rate_limited;
+                }
             }
         }
 
@@ -749,8 +980,21 @@ pub const Server = struct {
         if (self.retry_token_key) |_| {
             if (from) |addr| {
                 switch (try self.applyRetryGate(addr, bytes, now_us)) {
-                    .sent => return .retry_sent,
-                    .drop => return .dropped,
+                    .sent => {
+                        self.feeds_retry_sent += 1;
+                        // The Retry state table now holds the per-source
+                        // entry just minted. Surface its SCID length.
+                        const scid_len = if (self.retry_state_table.get(addr)) |e| e.retry_scid_len else self.local_cid_len;
+                        self.emitLog(.{ .retry_minted = .{
+                            .peer = addr,
+                            .scid_len = scid_len,
+                        } });
+                        return .retry_sent;
+                    },
+                    .drop => {
+                        self.feeds_dropped += 1;
+                        return .dropped;
+                    },
                     .none => {},
                     .echo => |echo| retry_ctx = echo,
                 }
@@ -767,16 +1011,29 @@ pub const Server = struct {
             // setup) is a per-peer hiccup — drop the datagram and
             // keep the server alive. The slot was never registered,
             // so cid_table stays clean.
-            else => return .dropped,
+            else => {
+                self.feeds_dropped += 1;
+                return .dropped;
+            },
         };
         // Successful Retry round-trip: clear the per-source bucket
         // so the next Initial from this address (e.g. a new
         // connection) starts fresh.
         if (retry_ctx != null) {
             if (from) |addr| _ = self.retry_state_table.remove(addr);
+            self.retries_validated += 1;
         }
         try self.dispatchToSlot(slot, bytes, from, now_us);
         try self.resyncSlotCids(slot);
+        self.feeds_accepted += 1;
+        // Emit *after* slot is fully visible in the routing table so
+        // the callback can index into `slots` if it wants to.
+        if (from) |addr| {
+            self.emitLog(.{ .connection_accepted = .{
+                .peer = addr,
+                .slot_count = self.slots.items.len,
+            } });
+        }
         return .accepted;
     }
 
@@ -836,6 +1093,12 @@ pub const Server = struct {
             i -= 1;
             const slot = self.slots.items[i];
             if (!slot.conn.isClosed()) continue;
+            // Capture the close-event source and peer address before
+            // we tear the connection down — once `slot.conn.deinit`
+            // has run, both pointers are dead.
+            const close_source: ?lifecycle.CloseSource =
+                if (slot.conn.closeEvent()) |ev| ev.source else null;
+            const close_peer: ?Address = slot.peer_addr;
             self.dropAllCidsFromTable(slot);
             const generation = slot.tls_generation;
             slot.conn.deinit();
@@ -844,7 +1107,12 @@ pub const Server = struct {
             _ = self.slots.swapRemove(i);
             reaped += 1;
             self.releaseGeneration(generation);
+            self.emitLog(.{ .connection_closed = .{
+                .peer = close_peer,
+                .source = close_source,
+            } });
         }
+        self.slots_reaped += reaped;
         return reaped;
     }
 
@@ -1478,9 +1746,114 @@ pub const Server = struct {
                 }
                 break :blk 0;
             };
+            const evicted_kind = self.stateless_responses.items[evict_idx].kind;
             _ = self.stateless_responses.orderedRemove(evict_idx);
+            self.stateless_responses_evicted += 1;
+            self.emitLog(.{ .stateless_queue_evicted = .{ .kind = evicted_kind } });
         }
         try self.stateless_responses.append(self.allocator, entry);
+        // Update the sticky high-water mark *after* append — it
+        // captures the post-insert depth, which is the value the
+        // queue actually held at this instant. The mark only ever
+        // grows.
+        const depth: u64 = @intCast(self.stateless_responses.items.len);
+        if (depth > self.stateless_queue_high_water) {
+            self.stateless_queue_high_water = depth;
+        }
+    }
+
+    // -- observability -------------------------------------------------
+
+    /// Internal helper: invoke `log_callback` if installed. Inlined
+    /// at call sites so the no-callback path stays a single
+    /// optional-null check.
+    fn emitLog(self: *const Server, ev: LogEvent) void {
+        if (self.log_callback) |cb| cb(self.log_user_data, ev);
+    }
+
+    /// Snapshot the server's instrumentation gauges and counters.
+    /// The returned `MetricsSnapshot` is a flat by-value struct;
+    /// reading it does not allocate, mutate the server, or invoke
+    /// any user callback. Embedders typically call this on a fixed
+    /// schedule and forward to their metrics pipeline (Prometheus,
+    /// statsd, OpenTelemetry).
+    pub fn metricsSnapshot(self: *const Server) MetricsSnapshot {
+        return .{
+            .live_connections = @intCast(self.slots.items.len),
+            .routing_table_size = @intCast(self.cid_table.count()),
+            .source_rate_table_size = @intCast(self.source_rate_table.count()),
+            .retry_state_table_size = @intCast(self.retry_state_table.count()),
+            .stateless_queue_depth = @intCast(self.stateless_responses.items.len),
+            .stateless_queue_high_water = self.stateless_queue_high_water,
+            .feeds_routed = self.feeds_routed,
+            .feeds_accepted = self.feeds_accepted,
+            .feeds_dropped = self.feeds_dropped,
+            .feeds_rate_limited = self.feeds_rate_limited,
+            .feeds_table_full = self.feeds_table_full,
+            .feeds_version_negotiated = self.feeds_version_negotiated,
+            .feeds_retry_sent = self.feeds_retry_sent,
+            .retries_validated = self.retries_validated,
+            .stateless_responses_evicted = self.stateless_responses_evicted,
+            .slots_reaped = self.slots_reaped,
+        };
+    }
+
+    /// Snapshot the rate-limiter table, returning the top
+    /// `RateLimitSnapshot.top_n` (16) sources by `recent_count` in
+    /// descending order. The unused tail of `top_offenders` is
+    /// zero-initialized; embedders should iterate up to
+    /// `top_offender_count`.
+    ///
+    /// The implementation is an O(N * top_n) insertion sort across
+    /// the table (N = `source_rate_table` size, bounded by
+    /// `Config.source_rate_table_capacity`). With the default
+    /// capacity of 4096 entries and top_n=16 this is well under a
+    /// millisecond on commodity hardware; the snapshot is meant for
+    /// occasional polling (every few seconds), not the per-packet
+    /// hot path.
+    pub fn rateLimitSnapshot(self: *const Server) RateLimitSnapshot {
+        var snap: RateLimitSnapshot = .{
+            .table_size = self.source_rate_table.count(),
+            .cumulative_rejections = self.feeds_rate_limited,
+            .top_offenders = @splat(.{ .addr = .{}, .recent_count = 0, .window_start_us = 0 }),
+            .top_offender_count = 0,
+        };
+
+        // Insertion-sort across the live table. For each entry, find
+        // the first position whose count is below ours and shift
+        // everything after it down by one. Bounded scan because the
+        // top-N array is fixed at 16.
+        var it = self.source_rate_table.iterator();
+        while (it.next()) |entry| {
+            const row: RateLimitSnapshot.SourceRow = .{
+                .addr = entry.key_ptr.*,
+                .recent_count = entry.value_ptr.count,
+                .window_start_us = entry.value_ptr.window_start_us,
+            };
+
+            // Find insertion point in the descending-by-count list.
+            var insert_idx: usize = snap.top_offender_count;
+            for (0..snap.top_offender_count) |i| {
+                if (row.recent_count > snap.top_offenders[i].recent_count) {
+                    insert_idx = i;
+                    break;
+                }
+            }
+            if (insert_idx >= RateLimitSnapshot.top_n) continue;
+
+            // Shift down to make room. If the array is already at
+            // capacity, the last entry falls off the bottom.
+            const last = @min(snap.top_offender_count, RateLimitSnapshot.top_n - 1);
+            var j: usize = last;
+            while (j > insert_idx) : (j -= 1) {
+                snap.top_offenders[j] = snap.top_offenders[j - 1];
+            }
+            snap.top_offenders[insert_idx] = row;
+            if (snap.top_offender_count < RateLimitSnapshot.top_n) {
+                snap.top_offender_count += 1;
+            }
+        }
+        return snap;
     }
 };
 

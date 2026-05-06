@@ -51,6 +51,23 @@ breaking changes; see notes per release.
   keys themselves and pass the rebuilt context via the `.override`
   variant. See `src/server.zig` and the tests in
   `tests/e2e/server_smoke.zig`.
+- `nullq.Server` operability surface: a structured logging hook
+  (`Config.log_callback` / `Config.log_user_data` plus `Server.LogEvent`
+  / `Server.LogCallback`) emits one event per observable choice point
+  (`connection_accepted`, `connection_closed`, `feed_rate_limited`,
+  `retry_minted`, `version_negotiated`, `stateless_queue_evicted`,
+  `table_full`); `Server.metricsSnapshot()` returns a flat by-value
+  `MetricsSnapshot` covering live-connection / routing-table /
+  source-rate-table / retry-state-table / stateless-queue gauges, the
+  sticky `stateless_queue_high_water` mark, and ten cumulative
+  counters since `init` (`feeds_routed`, `feeds_accepted`,
+  `feeds_dropped`, `feeds_rate_limited`, `feeds_table_full`,
+  `feeds_version_negotiated`, `feeds_retry_sent`, `retries_validated`,
+  `stateless_responses_evicted`, `slots_reaped`); and
+  `Server.rateLimitSnapshot()` returns the top 16 most-active sources
+  by recent count (`RateLimitSnapshot.SourceRow`). The log callback
+  runs synchronously and never holds an internal lock; counters are
+  plain `u64` fields with no allocator-using state. See `src/server.zig`.
 
 ## [0.1.0-pre.1] - 2026-05-05
 
