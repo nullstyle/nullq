@@ -160,10 +160,22 @@ test "Server.feed with unsupported version queues a Version Negotiation packet" 
     const drained = srv.drainStatelessResponse() orelse return error.NoStatelessResponse;
     try std.testing.expect(addr.eql(drained.dst));
 
+    const wire_bytes = drained.slice();
+
+    // Wire-level invariants (RFC 8999 §6 / RFC 9000 §6):
+    //   - byte 0 has the long-header bit set;
+    //   - version field (bytes 1..5) is zero — that's the VN sentinel.
+    try std.testing.expect(wire_bytes.len >= 7);
+    try std.testing.expect((wire_bytes[0] & 0x80) != 0);
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        std.mem.readInt(u32, wire_bytes[1..5], .big),
+    );
+
     // Parse the queued bytes back as a VN packet and verify the
     // CIDs are swapped (RFC 8999 §6) and the supported_versions
     // list contains exactly QUIC_VERSION_1.
-    const parsed = try nullq.wire.header.parse(drained.slice(), 0);
+    const parsed = try nullq.wire.header.parse(wire_bytes, 0);
     try std.testing.expect(parsed.header == .version_negotiation);
     const vn = parsed.header.version_negotiation;
     // The VN response sets DCID=client SCID and SCID=client DCID.
@@ -171,6 +183,19 @@ test "Server.feed with unsupported version queues a Version Negotiation packet" 
     try std.testing.expectEqualSlices(u8, &.{ 0xa0, 0xa1, 0xa2, 0xa3 }, vn.scid.slice());
     try std.testing.expectEqual(@as(usize, 1), vn.versionCount());
     try std.testing.expectEqual(nullq.QUIC_VERSION_1, vn.version(0));
+
+    // Layout sanity: 1 (first byte) + 4 (version=0) + 1 (dcid_len) +
+    // 4 (dcid) + 1 (scid_len) + 4 (scid) + 4 (one supported version)
+    // = 19 bytes. No trailing junk: pn_offset is 0 for VN, and the
+    // versions slice borrows from wire_bytes[end..].
+    try std.testing.expectEqual(@as(usize, 19), wire_bytes.len);
+    // The supported_versions slice the parser handed back must be
+    // contained in (and end exactly at) the drained bytes — no extra
+    // trailing data.
+    const versions_end = @intFromPtr(vn.versions_bytes.ptr) +
+        vn.versions_bytes.len;
+    const wire_end = @intFromPtr(wire_bytes.ptr) + wire_bytes.len;
+    try std.testing.expectEqual(wire_end, versions_end);
 
     // Drain returns null once the queue is empty.
     try std.testing.expectEqual(@as(?nullq.Server.StatelessResponse, null), srv.drainStatelessResponse());
@@ -302,5 +327,188 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     // Crucially: a malformed echo does NOT mint a fresh Retry
     // (per the documented behavior — would amplify probing).
+    try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
+}
+
+test "Server.feed Retry happy-path: client echoes a valid token and a slot opens" {
+    // Drive a real `nullq.Client` through the Retry round trip:
+    //   1. Client emits Initial #1 (no token).
+    //   2. Server queues Retry, returns `.retry_sent`.
+    //   3. We hand the Retry to the Client; it captures the token,
+    //      switches its peer DCID to the Retry SCID, and re-arms the
+    //      Initial PN space.
+    //   4. Client emits Initial #2 with the captured token.
+    //   5. Server validates the token and opens a slot — `.accepted`.
+    //
+    // Hand-rolling Initial #2 would mean reproducing the AEAD seal,
+    // header protection, and the post-Retry CID/keys swap; the
+    // canonical client already does that. The Client's TLS/QUIC
+    // wiring is the load-bearing path we want to cover here anyway.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    const retry_key: nullq.RetryTokenKey = .{
+        0x86, 0x71, 0x15, 0x0d, 0x9a, 0x2c, 0x5e, 0x04,
+        0x31, 0xa8, 0x6a, 0xf9, 0x18, 0x44, 0xbd, 0x2b,
+        0x4d, 0xee, 0x90, 0x3f, 0xa7, 0x61, 0x0c, 0x55,
+        0xf2, 0x83, 0x1d, 0xb6, 0x95, 0x77, 0x40, 0x29,
+    };
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .retry_token_key = retry_key,
+    });
+    defer srv.deinit();
+
+    var client = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client.deinit();
+
+    // Step 1: drive the client's TLS state forward until the first
+    // Initial is in its outbox, then poll it out.
+    try client.conn.advance();
+
+    var initial1: [2048]u8 = undefined;
+    const n1 = (try client.conn.poll(&initial1, 1_000)) orelse
+        return error.NoInitialEmitted;
+
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+
+    // Step 2: feed Initial #1 to the server. Should trigger Retry.
+    const outcome1 = try srv.feed(initial1[0..n1], addr, 1_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.retry_sent, outcome1);
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+    try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
+
+    // Step 3: drain the Retry, parse it, sanity-check it.
+    var retry_resp = srv.drainStatelessResponse() orelse
+        return error.NoRetryQueued;
+    try std.testing.expect(addr.eql(retry_resp.dst));
+
+    const retry_parsed = try nullq.wire.header.parse(retry_resp.slice(), 0);
+    try std.testing.expect(retry_parsed.header == .retry);
+    const retry = retry_parsed.header.retry;
+    try std.testing.expectEqual(nullq.QUIC_VERSION_1, retry.version);
+    // RFC 9000 §17.2.5: token is 53 bytes (header 21 + HMAC tag 32).
+    try std.testing.expectEqual(@as(usize, 53), retry.retry_token.len);
+
+    // Step 4: hand the Retry to the client. `Connection.handle`
+    // accepts the Retry, swaps its peer/initial DCID to the server's
+    // retry SCID, and re-arms the Initial PN space with the token.
+    // `handle` wants a mutable slice — copy out of the response.
+    var retry_buf: [256]u8 = undefined;
+    const retry_len = retry_resp.slice().len;
+    @memcpy(retry_buf[0..retry_len], retry_resp.slice());
+    try client.conn.handle(retry_buf[0..retry_len], null, 1_500);
+
+    // Step 5: poll the next Initial. It carries the captured token
+    // and addresses the server's retry SCID.
+    var initial2: [2048]u8 = undefined;
+    const n2 = (try client.conn.poll(&initial2, 2_000)) orelse
+        return error.NoEchoedInitialEmitted;
+
+    // Sanity-check the echoed Initial before feeding it: parse it as
+    // a long header and confirm the token is present and matches.
+    const echo_parsed = try nullq.wire.header.parse(initial2[0..n2], 0);
+    try std.testing.expect(echo_parsed.header == .initial);
+    try std.testing.expectEqualSlices(
+        u8,
+        retry.retry_token,
+        echo_parsed.header.initial.token,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        retry.scid.slice(),
+        echo_parsed.header.initial.dcid.slice(),
+    );
+
+    // Step 6: feed the echoed Initial to the server. The token
+    // validates, a slot is allocated, and the per-source Retry state
+    // is cleared.
+    const outcome2 = try srv.feed(initial2[0..n2], addr, 2_500);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.accepted, outcome2);
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+    // No new stateless response: a successful echo proceeds to slot
+    // creation, it does not mint another Retry.
+    try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
+
+    // Closing the slot is the embedder's responsibility on shutdown;
+    // `srv.deinit` cleans up regardless.
+}
+
+test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
+    // Variant of the happy-path test: configure a 1µs Retry token
+    // lifetime so the second feed lands beyond `expires_at` and the
+    // gate returns `.drop`. Confirms the expiry branch of
+    // `applyRetryGate.validate`.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    const retry_key: nullq.RetryTokenKey = .{
+        0x86, 0x71, 0x15, 0x0d, 0x9a, 0x2c, 0x5e, 0x04,
+        0x31, 0xa8, 0x6a, 0xf9, 0x18, 0x44, 0xbd, 0x2b,
+        0x4d, 0xee, 0x90, 0x3f, 0xa7, 0x61, 0x0c, 0x55,
+        0xf2, 0x83, 0x1d, 0xb6, 0x95, 0x77, 0x40, 0x29,
+    };
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .retry_token_key = retry_key,
+        .retry_token_lifetime_us = 1,
+    });
+    defer srv.deinit();
+
+    var client = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client.deinit();
+
+    try client.conn.advance();
+
+    var initial1: [2048]u8 = undefined;
+    const n1 = (try client.conn.poll(&initial1, 1_000)) orelse
+        return error.NoInitialEmitted;
+
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.retry_sent,
+        try srv.feed(initial1[0..n1], addr, 1_000),
+    );
+
+    var retry_resp = srv.drainStatelessResponse() orelse
+        return error.NoRetryQueued;
+
+    var retry_buf: [256]u8 = undefined;
+    const retry_len = retry_resp.slice().len;
+    @memcpy(retry_buf[0..retry_len], retry_resp.slice());
+    try client.conn.handle(retry_buf[0..retry_len], null, 1_500);
+
+    var initial2: [2048]u8 = undefined;
+    const n2 = (try client.conn.poll(&initial2, 2_000)) orelse
+        return error.NoEchoedInitialEmitted;
+
+    // Feed the echoed Initial well after the 1µs expiry window. The
+    // token is structurally well-formed and HMAC-correct, but its
+    // `expires_at_us` (= mint_now + 1) is far in the past relative
+    // to this `now_us`, so `validate` returns `.expired` and the
+    // gate drops the datagram without minting a fresh Retry.
+    const outcome = try srv.feed(initial2[0..n2], addr, 1_000_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
 }
