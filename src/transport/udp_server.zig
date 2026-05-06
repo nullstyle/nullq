@@ -47,6 +47,17 @@ const Address = path_mod.Address;
 /// the QNS endpoint's `rx` buffer.
 pub const default_rx_buffer_bytes: usize = 64 * 1024;
 
+/// Hardening guide §8 `max_datagrams_per_event_loop_tick`: the loop
+/// processes exactly one inbound datagram per iteration. After ingest
+/// it drains every slot's outbox before looping back to `recv`. The
+/// 1-per-tick cap is a structural property of `runUdpServer`, not a
+/// configurable knob — it exists primarily so PTO / loss-detection
+/// tick-driven work can't be starved by a hot ingress queue. Embedders
+/// that need batched ingress (e.g. via `recvmmsg`) bypass this loop
+/// and call `Server.feed` directly, taking responsibility for their
+/// own per-tick budget.
+pub const max_datagrams_per_loop_iteration: u32 = 1;
+
 /// Default size of the send buffer scratch space used by the loop.
 /// 1500 bytes covers the default QUIC `max_udp_payload_size` plus a
 /// small margin; embedders that raise the transport parameter cap
@@ -201,7 +212,9 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
 
         // Receive (or timeout). Timeout is the loop's heartbeat —
         // it bounds the latency between datagram arrival and the
-        // next `tick` call, which is what drives QUIC PTO.
+        // next `tick` call, which is what drives QUIC PTO. Exactly
+        // one datagram per iteration per
+        // `max_datagrams_per_loop_iteration` (hardening §8).
         const maybe_msg = sock.receiveTimeout(options.io, rx, .{
             .duration = .{
                 .raw = options.receive_timeout,
