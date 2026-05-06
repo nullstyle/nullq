@@ -89,6 +89,17 @@ pub const ResetInfo = struct {
     acked: bool = false,
 };
 
+/// Default ceiling on `SendStream.bytes` length — i.e. how many
+/// app-written bytes can sit in the per-stream send queue before
+/// `write` short-writes (returning < data.len) to apply local
+/// back-pressure. Hardening guide §8 calls for `max_send_queue_bytes`;
+/// the previous behavior (no cap) let an embedder calling
+/// `streamWrite` faster than the peer could ACK push the buffer to
+/// arbitrary size. 1 MiB matches the default per-stream receive
+/// window, so the steady-state queue fills by one round-trip's worth
+/// of data before back-pressure kicks in.
+pub const default_max_buffered_send: usize = 1 * 1024 * 1024;
+
 /// One stream's send half: app-side write queue, in-flight tracking,
 /// FIN/RESET state machine.
 pub const SendStream = struct {
@@ -97,6 +108,13 @@ pub const SendStream = struct {
     /// Bytes the app has written but not yet had fully-prefix-acked.
     /// `bytes.items[0]` is at absolute offset `base_offset`.
     bytes: std.ArrayList(u8) = .empty,
+    /// Soft cap on `bytes.items.len`. `write` short-writes when
+    /// `bytes.items.len + data.len` would exceed this. Set by
+    /// `Connection` from `default_max_buffered_send` (or an embedder
+    /// override at construction time). Tests using bare
+    /// `SendStream.init` get the default. Set to `maxInt(usize)` to
+    /// disable.
+    max_buffered: usize = default_max_buffered_send,
     /// Absolute offset of the first byte still in `bytes`.
     base_offset: u64 = 0,
     /// One past the highest absolute offset the app has written.
@@ -141,18 +159,30 @@ pub const SendStream = struct {
     }
 
     /// Append `data` to the stream. Returns the number of bytes
-    /// accepted (always `data.len` for now; future flow-control
-    /// gates may shorten it).
+    /// accepted, which may be less than `data.len` if the per-stream
+    /// send-queue cap (`max_buffered`) would be exceeded — embedders
+    /// must check the return value and either retry (after polling
+    /// the connection so ACK'd bytes can shrink the buffer) or
+    /// surface the back-pressure to their application layer. Returns
+    /// 0 when the cap is full but the stream is still open.
     pub fn write(self: *SendStream, data: []const u8) Error!usize {
         if (self.fin_marked or self.reset != null) return Error.StreamClosed;
         if (data.len == 0) return 0;
 
-        try self.bytes.appendSlice(self.allocator, data);
+        // Hardening guide §8 (`max_send_queue_bytes`): cap how many
+        // app-written bytes can sit in `bytes` waiting to be sent.
+        // Without this an embedder calling `streamWrite` faster than
+        // the peer ACKs grows the buffer unboundedly.
+        const headroom = self.max_buffered -| self.bytes.items.len;
+        const accept = @min(data.len, headroom);
+        if (accept == 0) return 0;
+
+        try self.bytes.appendSlice(self.allocator, data[0..accept]);
         const start = self.write_offset;
-        self.write_offset += data.len;
+        self.write_offset += accept;
         try self.addPending(.{ .offset = start, .end = self.write_offset });
         if (self.state == .ready) self.state = .send;
-        return data.len;
+        return accept;
     }
 
     /// Mark the send side closed. The current `write_offset` becomes
@@ -724,4 +754,43 @@ test "stress with simulated 10% loss until convergence" {
 
     try testing.expect(s.isTerminal());
     try testing.expectEqual(@as(u64, total), s.ackedFloor());
+}
+
+test "write short-writes when max_buffered cap would overflow (hardening §8)" {
+    // Cap at 8 bytes; first write of 6 bytes accepts all 6; second
+    // write of 10 bytes only accepts the remaining 2 bytes of
+    // headroom (8 - 6 = 2). A third write returns 0 — the queue is
+    // full but the stream is still open. After ACK + base_offset
+    // advance, headroom returns and writes can resume.
+    var s = SendStream.init(test_alloc);
+    defer s.deinit();
+    s.max_buffered = 8;
+
+    try testing.expectEqual(@as(usize, 6), try s.write("aaaaaa"));
+    try testing.expectEqual(@as(usize, 2), try s.write("bbbbbbbbbb"));
+    try testing.expectEqual(@as(usize, 0), try s.write("ccc"));
+
+    // Drain by ACK: peek the chunk, record it as sent, then ack the
+    // covering packet. The base_offset advances and headroom returns.
+    const c = s.peekChunk(8).?;
+    try testing.expectEqual(@as(u64, 8), c.length);
+    try s.recordSent(0, c);
+    try s.onPacketAcked(0);
+    try testing.expectEqual(@as(u64, 8), s.ackedFloor());
+
+    // Now bytes is empty (ACK trimmed it), so the full 4-byte write
+    // succeeds.
+    try testing.expectEqual(@as(usize, 4), try s.write("dddd"));
+}
+
+test "write fully accepts when max_buffered exceeds payload (default 1 MiB)" {
+    // The default cap (1 MiB) is large enough that typical-sized
+    // writes never trip it — preserves existing test/embedder
+    // semantics where a small write returns its full length.
+    var s = SendStream.init(test_alloc);
+    defer s.deinit();
+    try testing.expectEqual(default_max_buffered_send, s.max_buffered);
+
+    try testing.expectEqual(@as(usize, 5), try s.write("hello"));
+    try testing.expectEqual(@as(u64, 5), s.writtenBytes());
 }
