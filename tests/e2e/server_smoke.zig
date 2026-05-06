@@ -512,3 +512,244 @@ test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
 }
+
+// -- observability ------------------------------------------------------
+
+/// Test sink for `LogEvent`s. Pushes each event onto a heap-allocated
+/// `ArrayList` so tests can drive a few `feed` calls and then
+/// pattern-match the captured stream.
+const LogSink = struct {
+    events: std.ArrayList(nullq.Server.LogEvent) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn cb(user_data: ?*anyopaque, ev: nullq.Server.LogEvent) void {
+        const self: *LogSink = @ptrCast(@alignCast(user_data.?));
+        self.events.append(self.allocator, ev) catch {};
+    }
+
+    fn deinit(self: *LogSink) void {
+        self.events.deinit(self.allocator);
+    }
+};
+
+test "Server log_callback fires for table_full" {
+    const protos = [_][]const u8{"hq-test"};
+    var sink: LogSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_concurrent_connections = 0,
+        .log_callback = LogSink.cb,
+        .log_user_data = &sink,
+    });
+    defer srv.deinit();
+
+    var bytes = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
+    const peer = nullq.conn.path.Address{ .bytes = @splat(0x55) };
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.table_full,
+        try srv.feed(&bytes, peer, 0),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), sink.events.items.len);
+    try std.testing.expect(sink.events.items[0] == .table_full);
+    const got = sink.events.items[0].table_full;
+    try std.testing.expect(got.peer != null);
+    try std.testing.expect(peer.eql(got.peer.?));
+}
+
+test "Server log_callback fires for rate_limited and version_negotiated" {
+    const protos = [_][]const u8{"hq-test"};
+    var sink: LogSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_initials_per_source_per_window = 2,
+        .source_rate_window_us = 1_000_000,
+        .log_callback = LogSink.cb,
+        .log_user_data = &sink,
+    });
+    defer srv.deinit();
+
+    // VN-triggering: long-header, version=0xdeadbeef.
+    var vn_bytes = [_]u8{
+        0xc0, 0xde, 0xad, 0xbe, 0xef,
+        0x04, 0xa0, 0xa1, 0xa2, 0xa3,
+        0x04, 0xb0, 0xb1, 0xb2, 0xb3,
+        0x00,
+    };
+    const vn_peer = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+    _ = try srv.feed(&vn_bytes, vn_peer, 1000);
+
+    // Rate-limit: long-header v1 Initial that fails openSlot but
+    // ticks the rate limiter. The DCID length 21 makes openSlotFromInitial
+    // return InvalidConfig (DCID > 20). The first two attempts get .dropped
+    // (each consuming a token); the third is rate-limited.
+    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    const rl_peer = nullq.conn.path.Address{ .bytes = @splat(0xab) };
+    _ = try srv.feed(&initial, rl_peer, 0);
+    _ = try srv.feed(&initial, rl_peer, 1);
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.rate_limited,
+        try srv.feed(&initial, rl_peer, 2),
+    );
+
+    // We expect at least one VN event and one rate-limited event.
+    var saw_vn = false;
+    var saw_rl = false;
+    for (sink.events.items) |ev| {
+        switch (ev) {
+            .version_negotiated => |v| {
+                try std.testing.expect(vn_peer.eql(v.peer));
+                try std.testing.expectEqual(@as(u32, 0xdeadbeef), v.requested_version);
+                saw_vn = true;
+            },
+            .feed_rate_limited => |r| {
+                try std.testing.expect(rl_peer.eql(r.peer));
+                try std.testing.expect(r.recent_count >= 2);
+                saw_rl = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_vn);
+    try std.testing.expect(saw_rl);
+}
+
+test "Server metricsSnapshot tracks counters across feed outcomes" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_initials_per_source_per_window = 2,
+        .source_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    const baseline = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), baseline.feeds_dropped);
+    try std.testing.expectEqual(@as(u64, 0), baseline.feeds_routed);
+    try std.testing.expectEqual(@as(u64, 0), baseline.feeds_accepted);
+    try std.testing.expectEqual(@as(u64, 0), baseline.live_connections);
+
+    // Empty datagram -> dropped.
+    var empty: [0]u8 = .{};
+    _ = try srv.feed(&empty, null, 0);
+
+    // VN -> version_negotiated counter increments and queue depth
+    // ticks up to 1.
+    var vn_bytes = [_]u8{
+        0xc0, 0xde, 0xad, 0xbe, 0xef,
+        0x04, 0xa0, 0xa1, 0xa2, 0xa3,
+        0x04, 0xb0, 0xb1, 0xb2, 0xb3,
+        0x00,
+    };
+    const vn_peer = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+    _ = try srv.feed(&vn_bytes, vn_peer, 100);
+
+    // Rate-limit hit. Two attempts at the cap, then over.
+    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    const rl_peer = nullq.conn.path.Address{ .bytes = @splat(0xab) };
+    _ = try srv.feed(&initial, rl_peer, 0);
+    _ = try srv.feed(&initial, rl_peer, 1);
+    _ = try srv.feed(&initial, rl_peer, 2);
+
+    const m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_version_negotiated);
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_rate_limited);
+    // 3 dropped: empty + 2 attempts that consumed tokens then failed openSlot.
+    try std.testing.expect(m.feeds_dropped >= 3);
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_accepted);
+    try std.testing.expect(m.stateless_queue_depth >= 1);
+    try std.testing.expect(m.stateless_queue_high_water >= 1);
+}
+
+test "Server rateLimitSnapshot reports top offender after cap is hit" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_initials_per_source_per_window = 3,
+        .source_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    const heavy_peer = nullq.conn.path.Address{ .bytes = @splat(0xaa) };
+    const light_peer = nullq.conn.path.Address{ .bytes = @splat(0x11) };
+
+    // Heavy peer: 3 attempts then 1 rate-limited (count stays at cap=3).
+    for (0..3) |i| _ = try srv.feed(&initial, heavy_peer, @intCast(i));
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.rate_limited,
+        try srv.feed(&initial, heavy_peer, 4),
+    );
+    // Light peer: 1 attempt only.
+    _ = try srv.feed(&initial, light_peer, 5);
+
+    const snap = srv.rateLimitSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), snap.cumulative_rejections);
+    try std.testing.expectEqual(@as(usize, 2), snap.table_size);
+    try std.testing.expectEqual(@as(usize, 2), snap.top_offender_count);
+    // Top offender is heavy_peer (count 3 vs 1).
+    const top = snap.top_offenders[0];
+    try std.testing.expect(heavy_peer.eql(top.addr));
+    try std.testing.expectEqual(@as(u32, 3), top.recent_count);
+    // Second is light_peer.
+    try std.testing.expect(light_peer.eql(snap.top_offenders[1].addr));
+    try std.testing.expectEqual(@as(u32, 1), snap.top_offenders[1].recent_count);
+}
+
+test "Server metricsSnapshot stateless_queue_high_water is sticky across drains" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    // Queue 3 VN responses from three different peers.
+    var vn_bytes = [_]u8{
+        0xc0, 0xde, 0xad, 0xbe, 0xef,
+        0x04, 0xa0, 0xa1, 0xa2, 0xa3,
+        0x04, 0xb0, 0xb1, 0xb2, 0xb3,
+        0x00,
+    };
+    const peers = [_]nullq.conn.path.Address{
+        .{ .bytes = @splat(0x01) },
+        .{ .bytes = @splat(0x02) },
+        .{ .bytes = @splat(0x03) },
+    };
+    for (peers) |p| _ = try srv.feed(&vn_bytes, p, 0);
+
+    const before = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 3), before.stateless_queue_depth);
+    try std.testing.expectEqual(@as(u64, 3), before.stateless_queue_high_water);
+
+    // Drain all three.
+    while (srv.drainStatelessResponse()) |_| {}
+
+    const after = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), after.stateless_queue_depth);
+    // High-water mark is sticky.
+    try std.testing.expectEqual(@as(u64, 3), after.stateless_queue_high_water);
+}
