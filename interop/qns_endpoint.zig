@@ -1342,13 +1342,31 @@ test "Retry-token endpoint validation rejects malformed and replayed probes" {
         &token,
     ));
 
-    std.mem.writeInt(u32, token[1..5], 0x6b3343cf, .big);
+    // §4.3 hardening (B2): Retry tokens are now AES-GCM-256-sealed,
+    // so the v1 trick of corrupting bytes[1..5] (the cleartext version
+    // field) doesn't hit the `.wrong_version` path under v2 — those
+    // bytes are AEAD nonce now, and corrupting them yields
+    // `.malformed` (auth fail). To drive `.wrong_version` properly
+    // under v2 we mint with one version and validate against another:
+    // the AEAD opens cleanly, the recovered plaintext version doesn't
+    // match `opts.quic_version`, so the validator returns
+    // `.wrong_version` exactly as the §4.3 path is documented to.
+    var addr_buf2: [32]u8 = undefined;
+    const wrong_version_token = try nullq.retry_token.minted(.{
+        .key = &retry_token_key,
+        .now_us = 1_000_000,
+        .lifetime_us = retry_token_lifetime_us,
+        .client_address = retryAddressContext(&addr_buf2, peer),
+        .original_dcid = &original_dcid,
+        .retry_scid = &retry_scid,
+        .quic_version = 0x6b3343cf,
+    });
     try std.testing.expectEqual(nullq.RetryTokenValidationResult.wrong_version, retryTokenValidationResult(
         peer,
         2_000_000,
         &original_dcid,
         &retry_scid,
-        &token,
+        &wrong_version_token,
     ));
 }
 
