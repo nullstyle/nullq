@@ -1,5 +1,12 @@
 # nullq — a Zig-first QUIC implementation, built from the RFCs
 
+> **Historical document.** This is the original Codex-ready brief that
+> seeded the project. Phases 0–10 have all landed (see annotations
+> below). For a current-state overview, read `README.md`; for what's
+> shipped, `CHANGELOG.md`; for interop matrix, `INTEROP_STATUS.md`.
+> This file is preserved as the architectural rationale and the
+> historical phase plan.
+
 A from-the-RFC-up implementation of IETF QUIC v1 in Zig 0.16, using
 [`boringssl-zig`](../boringssl-zig) for crypto and TLS 1.3. nullq is the
 QUIC *transport*: it carries reliable streams, unreliable datagrams,
@@ -704,7 +711,7 @@ no keys are installed yet). The `boringssl-zig` v0.3.0
 this Phase 4 test is the higher-level "nullq drives the bridge
 correctly through its own state machine" check.
 
-### Phase 5 — Connection state machine
+### Phase 5 — Connection state machine ✓ (complete)
 
 - Implement packet number spaces (`conn/pn_space.zig`).
 - Implement ACK tracking and ACK frame generation
@@ -740,7 +747,7 @@ correctly through its own state machine" check.
   unvalidated → validated by exchanging matched challenge/response;
   mismatched response leaves it unvalidated; timeout marks failure.
 
-### Phase 6 — POSIX UDP transport
+### Phase 6 — POSIX UDP transport ✓ (complete)
 
 - `transport/udp.zig` blocking adapter on top of `std.posix` socket
   syscalls. Non-blocking is a Phase-7 nicety; blocking is enough for
@@ -751,7 +758,7 @@ correctly through its own state machine" check.
 **Acceptance:** `just qclient https://cloudflare-quic.com/` returns a
 non-empty response body. TLS verification on; certificate validates.
 
-### Phase 7 — Server mode + interop
+### Phase 7 — Server mode + interop ✓ (complete)
 
 - Implement server-side: address validation token, Retry packet,
   version negotiation packet (RFC 9000 §17.2.5).
@@ -763,7 +770,7 @@ non-empty response body. TLS verification on; certificate validates.
 **Acceptance:** Pass `H` (handshake), `D` (transfer), `C` (close),
 `R` (retry) against ngtcp2 *and* quiche.
 
-### Phase 8 — 0-RTT (RFC 9001 §4.5/4.6)
+### Phase 8 — 0-RTT (RFC 9001 §4.5/4.6) ✓ (complete; rejection hardening continues)
 
 Phase 4 already reserved the `early_data` encryption level. Phase 8
 turns it on and wires the resumption flow.
@@ -816,7 +823,7 @@ turns it on and wires the resumption flow.
      1-RTT, semantics preserved, no data loss, no duplicate delivery.
 - Interop runner `Z` (zero-RTT) test passes against ngtcp2 and quiche.
 
-### Phase 9 — Connection migration (RFC 9000 §9)
+### Phase 9 — Connection migration (RFC 9000 §9) ✓ (complete)
 
 The `Path` type and validator from Phase 5 are real. Phase 9 turns
 on path *switching*.
@@ -856,7 +863,7 @@ on path *switching*.
      state remains on old path; idle timeout cleans up.
 - Interop runner `M` (migration) passes against ngtcp2 and quiche.
 
-### Phase 10 — Multipath QUIC (draft-ietf-quic-multipath)
+### Phase 10 — Multipath QUIC (draft-ietf-quic-multipath) ✓ (draft-21 surface complete; tracks the in-flight draft)
 
 Major architectural step. The single-path code from Phases 5–9 was
 written with `Path` already first-class; Phase 10 widens the active
