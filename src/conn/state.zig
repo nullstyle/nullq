@@ -1188,6 +1188,28 @@ pub const Connection = struct {
             for (list.items) |chunk| self.allocator.free(chunk.data);
             list.deinit(self.allocator);
         }
+
+        // Hardening guide §3.5 / §9.4: zero sensitive packet
+        // protection material before the buffers go back to the
+        // allocator. `secureZero` is volatile-backed so the optimizer
+        // can't elide it on the dead-store path where the struct is
+        // about to be `undefined`-poisoned. We zero in place — the
+        // surrounding ArrayLists and structs will be deinit-ed below.
+        for (&self.levels) |*level| {
+            if (level.read) |*material| std.crypto.secureZero(u8, &material.secret);
+            if (level.write) |*material| std.crypto.secureZero(u8, &material.secret);
+        }
+        zeroAppKeyEpoch(&self.app_read_previous);
+        zeroAppKeyEpoch(&self.app_read_current);
+        zeroAppKeyEpoch(&self.app_read_next);
+        zeroAppKeyEpoch(&self.app_write_current);
+        // Stateless-reset tokens — both directions. Peer-supplied
+        // ones are the ones we'd compare incoming traffic against;
+        // local ones are the ones we minted and may have shipped over
+        // the wire. Either way they shouldn't linger in freed memory.
+        for (self.peer_cids.items) |*item| std.crypto.secureZero(u8, &item.stateless_reset_token);
+        for (self.local_cids.items) |*item| std.crypto.secureZero(u8, &item.stateless_reset_token);
+
         self.peer_cids.deinit(self.allocator);
         self.local_cids.deinit(self.allocator);
         self.retry_token.deinit(self.allocator);
@@ -1195,6 +1217,17 @@ pub const Connection = struct {
         self.peer_stream_data_blocked.deinit(self.allocator);
         self.inner.deinit();
         self.* = undefined;
+    }
+
+    /// Helper used by `deinit` to zero the secret + derived packet
+    /// keys held inside an `ApplicationKeyEpoch` slot.
+    fn zeroAppKeyEpoch(slot: *?ApplicationKeyEpoch) void {
+        if (slot.*) |*epoch| {
+            std.crypto.secureZero(u8, &epoch.material.secret);
+            std.crypto.secureZero(u8, &epoch.keys.key);
+            std.crypto.secureZero(u8, &epoch.keys.iv);
+            std.crypto.secureZero(u8, &epoch.keys.hp);
+        }
     }
 
     /// Encode `params` (RFC 9000 §18 + RFC 9221) and hand the blob

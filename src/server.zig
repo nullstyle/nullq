@@ -948,6 +948,15 @@ pub const Server = struct {
         self.source_rate_table.deinit(self.allocator);
         self.retry_state_table.deinit(self.allocator);
         self.stateless_responses.deinit(self.allocator);
+        // Hardening guide §3.5 / §9.4: zero the Retry-token HMAC key
+        // before the `Server` struct is released. Even though the
+        // memory is about to leave scope, the optimizer can't elide
+        // a volatile-backed `secureZero`, so the key bytes don't
+        // linger in a freed allocation that the host allocator might
+        // reuse for unrelated data (or surface in a core dump).
+        if (self.retry_token_key) |*key| {
+            std.crypto.secureZero(u8, key[0..]);
+        }
         // Draining contexts always represent ownership the Server
         // took on at swap-time, so they're unconditionally deinit-ed
         // here regardless of `owns_tls` (which only describes the
