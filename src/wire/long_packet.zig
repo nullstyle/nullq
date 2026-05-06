@@ -881,7 +881,7 @@ test "openInitial rejects bytes whose first bit indicates short header" {
     const secret = fromHex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea");
     const keys = try short_packet.derivePacketKeys(.aes128_gcm_sha256, &secret);
 
-    var bytes = [_]u8{0x40} ++ [_]u8{0} ** 31; // first byte 0x40 → short header
+    var bytes = [_]u8{0x40} ++ @as([31]u8, @splat(0)); // first byte 0x40 → short header
     var pt: [64]u8 = undefined;
     try testing.expectError(
         Error.NotInitialPacket,

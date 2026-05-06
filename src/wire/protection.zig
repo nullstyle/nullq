@@ -259,7 +259,7 @@ test "applyHpMask: short header masks 5 bits of first byte" {
 }
 
 test "applyHpMask rejects invalid pn_length" {
-    var packet = [_]u8{0} ** 16;
+    var packet = @as([16]u8, @splat(0));
     const mask: [mask_len]u8 = @splat(0);
     try std.testing.expectError(Error.InvalidPnLength, applyHpMask(&packet, .long, 0, 0, mask));
     try std.testing.expectError(Error.InvalidPnLength, applyHpMask(&packet, .long, 0, 5, mask));
@@ -328,7 +328,7 @@ test "full pipeline: protect then unprotect a synthetic Initial" {
     const pn_offset: usize = header_bytes.len - pn_length;
 
     // Plaintext payload that would normally be CRYPTO+PADDING.
-    const plaintext = "the quick brown fox jumps over the lazy dog" ** 2;
+    const plaintext = "the quick brown fox jumps over the lazy dogthe quick brown fox jumps over the lazy dog";
 
     // AEAD-seal: ciphertext goes immediately after the header.
     const ct_start = header_bytes.len;

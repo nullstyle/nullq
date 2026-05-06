@@ -8194,18 +8194,18 @@ test "stateless reset matcher requires short packet with known token" {
     conn.cached_peer_transport_params = .{ .stateless_reset_token = token };
     try conn.setPeerDcid(&.{0xaa});
 
-    var long_packet = [_]u8{0} ** 24;
+    var long_packet = @as([24]u8, @splat(0));
     long_packet[0] = 0xc0;
     @memcpy(long_packet[long_packet.len - 16 ..], &token);
     try std.testing.expect(!conn.isKnownStatelessReset(long_packet[0..]));
 
-    var unknown_short = [_]u8{0} ** 24;
+    var unknown_short = @as([24]u8, @splat(0));
     unknown_short[0] = 0x40;
     const unknown_token: [16]u8 = @splat(0xee);
     @memcpy(unknown_short[unknown_short.len - 16 ..], &unknown_token);
     try std.testing.expect(!conn.isKnownStatelessReset(unknown_short[0..]));
 
-    var short_packet = [_]u8{0} ** 24;
+    var short_packet = @as([24]u8, @splat(0));
     short_packet[0] = 0x40;
     @memcpy(short_packet[short_packet.len - 16 ..], &token);
     try std.testing.expect(conn.isKnownStatelessReset(short_packet[0..]));
@@ -11129,7 +11129,7 @@ test "pollDatagram can select a non-zero application path" {
 
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
-    const path_id = try conn.openPath(.{ .bytes = .{ 1, 2, 3, 4 } ++ .{0} ** 18 }, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
+    const path_id = try conn.openPath(.{ .bytes = .{ 1, 2, 3, 4 } ++ @as([18]u8, @splat(0)) }, .{}, ConnectionId.fromSlice(&.{0x01}), ConnectionId.fromSlice(&.{0xbb}));
     try std.testing.expect(conn.markPathValidated(path_id));
     try std.testing.expect(conn.setActivePath(path_id));
     try conn.queuePathStatus(path_id, true, 1);
@@ -11221,8 +11221,8 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
 
     try installTestApplicationReadSecret(&conn);
     try conn.setLocalScid(&.{0xa0});
-    const old_addr = Address{ .bytes = .{ 1, 2, 3, 4 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 5, 6, 7, 8 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 1, 2, 3, 4 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     path.path.rtt.smoothed_rtt_us = 50_000;
@@ -11276,8 +11276,8 @@ test "unvalidated rebound path obeys anti-amplification before polling" {
 
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
-    const old_addr = Address{ .bytes = .{ 1, 1, 1, 1 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 2, 2, 2, 2 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 1, 1, 1, 1 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 2, 2, 2, 2 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     try conn.handlePeerAddressChange(path, new_addr, 1, 1_000_000);
@@ -11317,7 +11317,7 @@ test "unvalidated path enforces anti-amplification on Initial sends" {
     try conn.setLocalScid(&.{0xc1});
     try conn.setPeerDcid(&odcid);
 
-    const crypto_bytes = try allocator.dupe(u8, &([_]u8{0xab} ** 800));
+    const crypto_bytes = try allocator.dupe(u8, &(@as([800]u8, @splat(0xab))));
     try conn.crypto_retx[EncryptionLevel.initial.idx()].append(allocator, .{
         .offset = 0,
         .data = crypto_bytes,
@@ -11353,7 +11353,7 @@ test "validated path is not constrained by anti-amplification" {
     try conn.setLocalScid(&.{0xc1});
     try conn.setPeerDcid(&odcid);
 
-    const crypto_bytes = try allocator.dupe(u8, &([_]u8{0xab} ** 800));
+    const crypto_bytes = try allocator.dupe(u8, &(@as([800]u8, @splat(0xab))));
     try conn.crypto_retx[EncryptionLevel.initial.idx()].append(allocator, .{
         .offset = 0,
         .data = crypto_bytes,
@@ -11373,8 +11373,8 @@ test "failed NAT rebinding validation rolls back to the previous address" {
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
-    const old_addr = Address{ .bytes = .{ 3, 3, 3, 3 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 4, 4, 4, 4 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 3, 3, 3, 3 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 4, 4, 4, 4 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     path.path.markValidated();
@@ -11420,8 +11420,8 @@ test "old address packets during pending rebinding do not lift new path anti-amp
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
-    const old_addr = Address{ .bytes = .{ 7, 7, 7, 7 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 8, 8, 8, 8 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 7, 7, 7, 7 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 8, 8, 8, 8 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     path.path.markValidated();
@@ -11448,8 +11448,8 @@ test "PATH_RESPONSE during pending rebinding is sent to the challenge address" {
 
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{0xaa});
-    const old_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 1, 0, 1, 0 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 1, 0, 1, 0 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     path.path.markValidated();
@@ -11494,7 +11494,7 @@ test "queued path CIDs participate in incoming short-header routing and retireme
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xbb}));
     try conn.queuePathNewConnectionId(path_id, 1, 0, &.{0xc2}, @splat(0));
 
-    const bytes = [_]u8{ 0x40, 0xc2, 0, 0, 0, 0 } ++ [_]u8{0} ** 16;
+    const bytes = [_]u8{ 0x40, 0xc2, 0, 0, 0, 0 } ++ @as([16]u8, @splat(0));
     try std.testing.expectEqual(path_id, conn.incomingShortPath(&bytes).?.id);
 
     conn.handlePathRetireConnectionId(.{
@@ -12420,8 +12420,8 @@ test "migration callback: allow lets path validation start as usual" {
     var recorder: TestQlogRecorder = .{};
     conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
 
-    const old_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 10, 0, 0, 2 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 10, 0, 0, 2 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     path.path.markValidated();
@@ -12464,8 +12464,8 @@ test "migration callback: deny skips PATH_CHALLENGE and keeps the old 4-tuple li
     var recorder: TestQlogRecorder = .{};
     conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
 
-    const old_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 192, 168, 9, 9 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 192, 168, 9, 9 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     path.path.markValidated();
@@ -12520,8 +12520,8 @@ test "migration callback: no callback installed preserves prior migration behavi
     // succeeds without one, identically.
     try std.testing.expect(conn.migration_callback == null);
 
-    const old_addr = Address{ .bytes = .{ 7, 7, 7, 7 } ++ .{0} ** 18 };
-    const new_addr = Address{ .bytes = .{ 8, 8, 8, 8 } ++ .{0} ** 18 };
+    const old_addr = Address{ .bytes = .{ 7, 7, 7, 7 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 8, 8, 8, 8 } ++ @as([18]u8, @splat(0)) };
     const path = conn.primaryPath();
     path.setPeerAddress(old_addr);
     path.path.markValidated();

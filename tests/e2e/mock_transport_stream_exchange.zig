@@ -871,9 +871,9 @@ test "single-path NAT rebinding survives loss and reordering" {
 
     var net = RebindingNet.init(
         allocator,
-        .{ .bytes = .{ 10, 0, 0, 1 } ++ .{0} ** 18 },
-        .{ .bytes = .{ 10, 0, 0, 2 } ++ .{0} ** 18 },
-        .{ .bytes = .{ 10, 0, 0, 99 } ++ .{0} ** 18 },
+        .{ .bytes = .{ 10, 0, 0, 1 } ++ @as([18]u8, @splat(0)) },
+        .{ .bytes = .{ 10, 0, 0, 2 } ++ @as([18]u8, @splat(0)) },
+        .{ .bytes = .{ 10, 0, 0, 99 } ++ @as([18]u8, @splat(0)) },
     );
     defer net.deinit();
 

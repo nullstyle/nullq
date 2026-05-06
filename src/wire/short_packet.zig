@@ -578,7 +578,7 @@ test "derivePacketKeys and key updates support every QUIC v1 suite" {
 }
 
 test "derivePacketKeys rejects mis-sized secrets" {
-    const tiny = [_]u8{0} ** 16;
+    const tiny = @as([16]u8, @splat(0));
     try testing.expectError(
         Error.SecretWrongLength,
         derivePacketKeys(.aes128_gcm_sha256, &tiny),
@@ -818,7 +818,7 @@ test "open1Rtt rejects long-header bytes" {
         "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea",
     );
     const keys = try derivePacketKeys(.aes128_gcm_sha256, &secret);
-    var bytes = [_]u8{0xc1} ++ [_]u8{0} ** 31; // first byte 0xc1 → long header
+    var bytes = [_]u8{0xc1} ++ @as([31]u8, @splat(0)); // first byte 0xc1 → long header
     var pt: [64]u8 = undefined;
     try testing.expectError(
         Error.NotShortHeader,

@@ -60,7 +60,7 @@ test "Server.feed drops non-Initial bytes silently" {
     defer srv.deinit();
 
     // Random bytes that don't parse as a long-header Initial.
-    var junk = [_]u8{ 0x40, 0xaa, 0xbb, 0xcc, 0xdd } ++ [_]u8{0} ** 32;
+    var junk = [_]u8{ 0x40, 0xaa, 0xbb, 0xcc, 0xdd } ++ @as([32]u8, @splat(0));
     const outcome = try srv.feed(&junk, null, 0);
     try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
