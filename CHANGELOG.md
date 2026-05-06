@@ -26,6 +26,15 @@ breaking changes; see notes per release.
   Existing `migration_path_failed` emit sites now populate
   `.timeout`; the new `policy_denied` value comes from the
   migration-callback deny path.
+- `nullq.Server.Slot` distributed-tracing surface for embedders
+  building W3C tracecontext / OpenTelemetry pipelines. Each slot now
+  carries a server-local monotonic `slot_id: u64` stamped at accept
+  time (stable for the slot's lifetime, suitable as the primary key
+  in operational logs without depending on peer-chosen CIDs), plus
+  optional `trace_id: ?[16]u8` and `parent_span_id: ?[8]u8` fields
+  the embedder attaches via the new `Slot.setTraceContext(trace_id,
+  parent_span_id)` method. nullq treats both as opaque metadata —
+  they are never read or forwarded into qlog or onto the wire.
 
 ## [0.1.0-pre.1] - 2026-05-05
 

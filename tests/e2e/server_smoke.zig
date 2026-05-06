@@ -512,3 +512,170 @@ test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
 }
+
+// -- distributed-tracing surface ------------------------------------
+//
+// `Slot.slot_id` is a server-local monotonic id stamped at slot
+// creation; embedders use it as the primary key in operational logs
+// and for trace correlation. `Slot.trace_id` / `Slot.parent_span_id`
+// are opaque W3C tracecontext bytes the embedder attaches via
+// `Slot.setTraceContext`. nullq does not interpret either.
+
+/// Drive a real `nullq.Client` through to the first Initial and feed
+/// it to `srv` so a slot opens. Returns the freshly accepted slot
+/// pointer. The client is owned by the caller (deinit on cleanup).
+fn acceptOneSlot(
+    srv: *nullq.Server,
+    client: *nullq.Client,
+    addr: nullq.conn.path.Address,
+    now_us: u64,
+) !*nullq.Server.Slot {
+    try client.conn.advance();
+    var initial: [2048]u8 = undefined;
+    const n = (try client.conn.poll(&initial, now_us)) orelse
+        return error.NoInitialEmitted;
+    const before = srv.connectionCount();
+    const outcome = try srv.feed(initial[0..n], addr, now_us);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.accepted, outcome);
+    try std.testing.expectEqual(before + 1, srv.connectionCount());
+    return srv.iterator()[srv.iterator().len - 1];
+}
+
+test "Slot.slot_id is stable across feeds for the same connection" {
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    var client = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client.deinit();
+
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const slot = try acceptOneSlot(&srv, &client, addr, 1_000);
+    const first_id = slot.slot_id;
+
+    // Drive a follow-up datagram from the same client. `Client.poll`
+    // may emit ACK / handshake continuation; whatever it emits routes
+    // to the same slot via `cid_table`. The slot_id must not change.
+    var follow: [2048]u8 = undefined;
+    if (try client.conn.poll(&follow, 2_000)) |n| {
+        const outcome = try srv.feed(follow[0..n], addr, 2_000);
+        try std.testing.expectEqual(nullq.Server.FeedOutcome.routed, outcome);
+        try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+        try std.testing.expectEqual(first_id, srv.iterator()[0].slot_id);
+    }
+}
+
+test "Slot.slot_id is monotonic and unique across multiple accepts" {
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    var client_a = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client_a.deinit();
+
+    var client_b = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client_b.deinit();
+
+    var client_c = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client_c.deinit();
+
+    const addr_a = nullq.conn.path.Address{ .bytes = @splat(0xa0) };
+    const addr_b = nullq.conn.path.Address{ .bytes = @splat(0xb0) };
+    const addr_c = nullq.conn.path.Address{ .bytes = @splat(0xc0) };
+
+    const slot_a = try acceptOneSlot(&srv, &client_a, addr_a, 1_000);
+    const id_a = slot_a.slot_id;
+    const slot_b = try acceptOneSlot(&srv, &client_b, addr_b, 2_000);
+    const id_b = slot_b.slot_id;
+    const slot_c = try acceptOneSlot(&srv, &client_c, addr_c, 3_000);
+    const id_c = slot_c.slot_id;
+
+    // Strictly monotonic and unique.
+    try std.testing.expect(id_a < id_b);
+    try std.testing.expect(id_b < id_c);
+    try std.testing.expect(id_a != id_b);
+    try std.testing.expect(id_b != id_c);
+    try std.testing.expect(id_a != id_c);
+}
+
+test "Slot.setTraceContext round-trips and defaults are null" {
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    var client = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client.deinit();
+
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const slot = try acceptOneSlot(&srv, &client, addr, 1_000);
+
+    // Defaults: a freshly accepted slot has no trace metadata
+    // attached. nullq never sets these itself.
+    try std.testing.expectEqual(@as(?[16]u8, null), slot.trace_id);
+    try std.testing.expectEqual(@as(?[8]u8, null), slot.parent_span_id);
+
+    // Round-trip: embedder attaches a tracecontext, reads it back
+    // verbatim. The values are arbitrary 16 / 8 byte blobs.
+    const trace_id: [16]u8 = .{
+        0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6,
+        0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36,
+    };
+    const parent_span_id: [8]u8 = .{
+        0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7,
+    };
+    slot.setTraceContext(trace_id, parent_span_id);
+
+    try std.testing.expect(slot.trace_id != null);
+    try std.testing.expect(slot.parent_span_id != null);
+    try std.testing.expectEqualSlices(u8, &trace_id, &slot.trace_id.?);
+    try std.testing.expectEqualSlices(u8, &parent_span_id, &slot.parent_span_id.?);
+}

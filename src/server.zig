@@ -311,6 +311,31 @@ const SlotImpl = struct {
     /// can use this to enforce idle timeouts beyond what QUIC's own
     /// idle timer covers.
     last_activity_us: u64 = 0,
+    /// Server-local monotonic id assigned at slot creation. Stable
+    /// for the slot's lifetime; embedders can use this as the
+    /// primary key in operational logs and trace correlation
+    /// without depending on peer-chosen CIDs.
+    slot_id: u64,
+    /// W3C traceparent trace-id (16 bytes), or null if the embedder
+    /// has not associated a trace with this slot. Embedders set via
+    /// `setTraceContext`; nullq itself never reads it.
+    trace_id: ?[16]u8 = null,
+    /// W3C traceparent parent-span-id (8 bytes), or null.
+    parent_span_id: ?[8]u8 = null,
+
+    /// Attach a W3C tracecontext to this slot. Embedders typically
+    /// call this after `Server.feed` returns `.accepted` and the
+    /// upstream service has assigned trace identifiers. nullq does
+    /// not interpret these bytes — they are pure metadata for
+    /// embedder-side correlation.
+    pub fn setTraceContext(
+        self: *SlotImpl,
+        trace_id: [16]u8,
+        parent_span_id: [8]u8,
+    ) void {
+        self.trace_id = trace_id;
+        self.parent_span_id = parent_span_id;
+    }
 };
 
 /// Outcome of feeding a single datagram to the server. Re-exported
@@ -438,6 +463,11 @@ pub const Server = struct {
     /// deterministic CIDs (interop fixtures, fuzzers) can swap this.
     random: std.Random,
     rng_state: std.Random.DefaultPrng,
+
+    /// Monotonic, server-local slot id. Bumped on every accepted
+    /// slot; stable for the slot's lifetime. NOT a CID — it's purely
+    /// a routing key for embedder logs/tracing.
+    next_slot_id: u64 = 0,
 
     pub fn init(config: Config) Error!Server {
         if (config.alpn_protocols.len == 0) return Error.InvalidConfig;
@@ -794,7 +824,9 @@ pub const Server = struct {
             .initial_dcid = initial_dcid,
             .peer_addr = from,
             .last_activity_us = now_us,
+            .slot_id = self.next_slot_id,
         };
+        self.next_slot_id +%= 1;
 
         // Reserve a slot in the CID table for the initial DCID. If
         // this fails, the slot was never made visible to the router
