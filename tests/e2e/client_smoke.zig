@@ -12,19 +12,9 @@
 
 const std = @import("std");
 const nullq = @import("nullq");
+const common = @import("common.zig");
 
-fn defaultParams() nullq.tls.TransportParams {
-    return .{
-        .max_idle_timeout_ms = 30_000,
-        .initial_max_data = 1 << 20,
-        .initial_max_stream_data_bidi_local = 1 << 18,
-        .initial_max_stream_data_bidi_remote = 1 << 18,
-        .initial_max_stream_data_uni = 1 << 18,
-        .initial_max_streams_bidi = 100,
-        .initial_max_streams_uni = 100,
-        .active_connection_id_limit = 4,
-    };
-}
+const defaultParams = common.defaultParams;
 
 test "Client.connect succeeds and yields a tickable Connection" {
     const protos = [_][]const u8{"hq-test"};

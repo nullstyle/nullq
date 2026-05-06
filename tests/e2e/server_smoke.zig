@@ -7,22 +7,11 @@
 
 const std = @import("std");
 const nullq = @import("nullq");
+const common = @import("common.zig");
 
-const test_cert_pem = @embedFile("../data/test_cert.pem");
-const test_key_pem = @embedFile("../data/test_key.pem");
-
-fn defaultParams() nullq.tls.TransportParams {
-    return .{
-        .max_idle_timeout_ms = 30_000,
-        .initial_max_data = 1 << 20,
-        .initial_max_stream_data_bidi_local = 1 << 18,
-        .initial_max_stream_data_bidi_remote = 1 << 18,
-        .initial_max_stream_data_uni = 1 << 18,
-        .initial_max_streams_bidi = 100,
-        .initial_max_streams_uni = 100,
-        .active_connection_id_limit = 4,
-    };
-}
+const test_cert_pem = common.test_cert_pem;
+const test_key_pem = common.test_key_pem;
+const defaultParams = common.defaultParams;
 
 test "Server.init + deinit on a real cert/key pair" {
     const protos = [_][]const u8{"hq-test"};

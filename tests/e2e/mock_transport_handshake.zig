@@ -8,9 +8,10 @@
 const std = @import("std");
 const nullq = @import("nullq");
 const boringssl = @import("boringssl");
+const common = @import("common.zig");
 
-const test_cert_pem = @embedFile("../data/test_cert.pem");
-const test_key_pem = @embedFile("../data/test_key.pem");
+const test_cert_pem = common.test_cert_pem;
+const test_key_pem = common.test_key_pem;
 
 test "two nullq.Connections handshake to TLS 1.3 finished with application keys" {
     const allocator = std.testing.allocator;
