@@ -2029,7 +2029,10 @@ pub const Connection = struct {
     /// Returns the number of CIDs actually written (`min(dst.len,
     /// localScidCount())`). Caller is responsible for sizing `dst`
     /// large enough; oversize is fine, undersize silently truncates.
-    /// CIDs are returned in arbitrary order.
+    /// CIDs are returned in insertion order — the initial SCID is
+    /// at index 0, with subsequent NEW_CONNECTION_ID-issued CIDs
+    /// following in the order they were minted, modulo retirements
+    /// (which compact the list).
     pub fn localScids(self: *const Connection, dst: []ConnectionId) usize {
         const n = @min(dst.len, self.local_cids.items.len);
         for (0..n) |i| dst[i] = self.local_cids.items[i].cid;
@@ -2176,9 +2179,9 @@ pub const Connection = struct {
     ) Error!void {
         if (self.role != .server) return Error.NotServerContext;
         if (bytes.len < 6) return Error.InsufficientBytes;
-        if ((bytes[0] & 0x80) == 0) return Error.NotShortHeader; // not a long header
+        if ((bytes[0] & 0x80) == 0) return Error.NotInitialPacket; // bit 7 clear → short header
         const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
-        if (long_type_bits != 0) return Error.NotShortHeader;
+        if (long_type_bits != 0) return Error.NotInitialPacket; // long header but type ≠ Initial
 
         const dcid_len = bytes[5];
         if (dcid_len > path_mod.max_cid_len) return Error.DcidTooLong;
@@ -2203,7 +2206,7 @@ pub const Connection = struct {
         scid: []const u8,
     } {
         if (bytes.len < 6) return Error.InsufficientBytes;
-        if ((bytes[0] & 0x80) == 0) return Error.NotShortHeader;
+        if ((bytes[0] & 0x80) == 0) return Error.NotInitialPacket;
         const version = std.mem.readInt(u32, bytes[1..5], .big);
 
         const dcid_len = bytes[5];

@@ -99,8 +99,20 @@ const max_stateless_response_bytes: usize = 256;
 
 /// Bound on the stateless-response queue. Reached only when the
 /// embedder is feeding faster than they drain; on overflow the
-/// oldest entry is evicted to keep latency bounded.
+/// oldest VN entry is evicted in preference to any Retry entry, so
+/// a flood of unsupported-version probes cannot crowd out Retry
+/// responses to legitimate v1 peers. If the queue is full of
+/// Retry entries (no VN to evict), the oldest Retry is dropped.
 const stateless_response_queue_capacity: usize = 64;
+
+/// What kind of stateless response this entry carries. Used by the
+/// queue's overflow eviction policy to prefer dropping VN over
+/// Retry when both are queued, since VN traffic is cheaper for
+/// peers to retry than Retry round-trips.
+pub const StatelessResponseKind = enum {
+    version_negotiation,
+    retry,
+};
 
 /// One queued stateless server response (VN or Retry), held by
 /// value so the embedder can drain across multiple `feed` calls.
@@ -112,6 +124,9 @@ const StatelessResponseImpl = struct {
     dst: Address,
     /// Length of the valid bytes prefix in `bytes`.
     len: usize,
+    /// Whether this is a Version Negotiation or Retry response.
+    /// Drives queue-overflow eviction policy.
+    kind: StatelessResponseKind = .version_negotiation,
     bytes: [max_stateless_response_bytes]u8 = @splat(0),
 
     /// Borrowed view of the encoded packet. Valid until the next
@@ -144,9 +159,13 @@ const RetryStateEntry = struct {
 
 /// Maximum number of routing CIDs a slot tracks at once. Bounded
 /// by the peer's `active_connection_id_limit` (default 8 in nullq);
-/// 16 leaves headroom for in-flight retires and gives the router a
-/// fixed, alloc-free slot footprint.
-const max_tracked_cids_per_slot: usize = 16;
+/// 32 leaves headroom for embedders that lift the limit and for
+/// in-flight retires, while keeping the router a fixed, alloc-free
+/// slot footprint. If a `Connection` ever issues more than this
+/// many active SCIDs, `resyncSlotCids` asserts in debug builds and
+/// truncates in release — bump this constant if you bump
+/// `active_connection_id_limit` toward 32 or beyond.
+const max_tracked_cids_per_slot: usize = 32;
 
 /// Length-prefixed packed CID key used as the `cid_table` HashMap
 /// key. Byte 0 is the CID length (1..20); bytes 1..1+len are the
@@ -831,11 +850,14 @@ pub const Server = struct {
     fn resyncSlotCids(self: *Server, slot: *Slot) Error!void {
         var snapshot_buf: [max_tracked_cids_per_slot]ConnectionId = undefined;
         const total = slot.conn.localScidCount();
-        // If the connection has issued more SCIDs than our slot's
-        // bounded array can track, take the first `max` and call it
-        // a TODO: nullq's default limits keep this well under 16,
-        // and a runtime overflow would be a real configuration
-        // problem worth surfacing.
+        // Default `active_connection_id_limit=8` keeps `total` well
+        // under the bound. If an embedder lifts the limit beyond
+        // `max_tracked_cids_per_slot`, the router will silently miss
+        // SCIDs past the cap and the peer could lose connectivity
+        // after a CID rotation. Surface the misconfiguration loudly
+        // in debug builds; release builds still truncate (no
+        // panic), but the configuration is broken either way.
+        std.debug.assert(total <= max_tracked_cids_per_slot);
         const n = slot.conn.localScids(snapshot_buf[0..@min(total, max_tracked_cids_per_slot)]);
         const snapshot = snapshot_buf[0..n];
 
@@ -970,7 +992,7 @@ pub const Server = struct {
         client_packet: []const u8,
     ) !void {
         const ids = peekLongHeaderIds(client_packet) orelse return error.InvalidVersionNegotiation;
-        var entry: StatelessResponse = .{ .dst = dst_addr, .len = 0 };
+        var entry: StatelessResponse = .{ .dst = dst_addr, .len = 0, .kind = .version_negotiation };
 
         // Single supported version: QUIC v1. We encode through the
         // wire-level helper directly so we don't have to keep a
@@ -1091,10 +1113,17 @@ pub const Server = struct {
         now_us: u64,
         key_ptr: *const RetryTokenKey,
     ) RetryMintError!void {
-        // Lazy eviction when the retry-state table is at capacity,
-        // mirroring the source-rate limiter pattern.
+        // Bound the table without letting forged-source floods
+        // evict legitimate-peer Retry round-trips. First sweep
+        // anything older than the token lifetime — those entries
+        // are already useless because their tokens won't validate.
+        // Only fall back to oldest-eviction if the table is still
+        // at capacity (i.e., every entry is within its lifetime).
         if (self.retry_state_table.count() >= self.retry_state_table_capacity) {
-            self.evictOldestRetryState();
+            self.pruneExpiredRetryState(now_us);
+            if (self.retry_state_table.count() >= self.retry_state_table_capacity) {
+                self.evictOldestRetryState();
+            }
         }
 
         // Pick a fresh server-issued SCID for this Retry. The peer
@@ -1117,7 +1146,7 @@ pub const Server = struct {
             .retry_scid = retry_scid[0..retry_scid_len],
         }) catch return error.RetryEncodeFailed;
 
-        var entry: StatelessResponse = .{ .dst = addr, .len = 0 };
+        var entry: StatelessResponse = .{ .dst = addr, .len = 0, .kind = .retry };
         const written = wire.long_packet.sealRetry(&entry.bytes, .{
             .original_dcid = ids.dcid,
             .dcid = ids.scid,
@@ -1152,13 +1181,52 @@ pub const Server = struct {
         if (oldest_addr) |a| _ = self.retry_state_table.remove(a);
     }
 
+    /// Drop every retry-state entry whose token has expired
+    /// (`now_us - minted_at_us > retry_token_lifetime_us`).
+    /// Expired entries can never validate a peer's echoed token,
+    /// so freeing their slot is always safe and means the table
+    /// fills with usable round-trips before any eviction policy
+    /// has to fire.
+    fn pruneExpiredRetryState(self: *Server, now_us: u64) void {
+        const lifetime = self.retry_token_lifetime_us;
+        var stale_buf: [32]Address = undefined;
+        while (true) {
+            var n: usize = 0;
+            var it = self.retry_state_table.iterator();
+            while (it.next()) |entry| {
+                if (n >= stale_buf.len) break;
+                const age = now_us -% entry.value_ptr.minted_at_us;
+                if (age > lifetime) {
+                    stale_buf[n] = entry.key_ptr.*;
+                    n += 1;
+                }
+            }
+            if (n == 0) return;
+            for (stale_buf[0..n]) |addr| _ = self.retry_state_table.remove(addr);
+            // If we evicted a full batch there may be more — loop
+            // to keep sweeping. Bounded by the table size, so
+            // this terminates.
+            if (n < stale_buf.len) return;
+        }
+    }
+
     // -- stateless response queue --------------------------------------
 
     fn queueStatelessResponse(self: *Server, entry: StatelessResponse) Error!void {
-        // Bound the queue: drop the oldest entry on overflow so
-        // ingest latency doesn't stall on a slow draining embedder.
+        // Bound the queue: on overflow, prefer evicting the oldest
+        // VN entry over any Retry. This stops a flood of
+        // unsupported-version probes from starving Retry responses
+        // to legitimate v1 peers. If no VN is queued (the queue is
+        // all Retry), evict the oldest Retry — falling back to FIFO
+        // is still better than refusing the new entry.
         if (self.stateless_responses.items.len >= stateless_response_queue_capacity) {
-            _ = self.stateless_responses.orderedRemove(0);
+            const evict_idx: usize = blk: {
+                for (self.stateless_responses.items, 0..) |*e, i| {
+                    if (e.kind == .version_negotiation) break :blk i;
+                }
+                break :blk 0;
+            };
+            _ = self.stateless_responses.orderedRemove(evict_idx);
         }
         try self.stateless_responses.append(self.allocator, entry);
     }
