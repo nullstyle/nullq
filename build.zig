@@ -1,5 +1,26 @@
 const std = @import("std");
 
+// Build-mode policy (hardening guide §3.1).
+//
+// `b.standardOptimizeOption` defaults to `Debug` so iterative
+// development (`zig build test`, embedder smoke runs, interop
+// fixtures) is fast and prints useful panic stacks. **Production /
+// internet-facing builds MUST pass `-Doptimize=ReleaseSafe`** to
+// keep Zig's runtime safety checks enabled (integer overflow,
+// out-of-bounds slicing, optional unwrap, `unreachable`,
+// `@setRuntimeSafety` toggles) while optimizing.
+//
+// `ReleaseFast` and `ReleaseSmall` are forbidden for the network-
+// input parser surface. Both compile out runtime safety, which means
+// the residual `unreachable` paths in `wire/`, `frame/`, and
+// `conn/state.zig` (documented as non-peer-reachable invariants)
+// stop being trapped — `unreachable` becomes "the optimizer assumes
+// this is impossible". An adversarial input that reaches one of
+// those sites in `ReleaseFast` produces undefined behavior instead
+// of a controlled panic. The benchmark harness below explicitly
+// re-instantiates the tree under `ReleaseFast` because bench numbers
+// in `Debug` are meaningless, but bench is internal-only and never
+// touches peer input.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

@@ -364,9 +364,15 @@ Each item: PASS / FAIL / N/A with citation.
 
 2. ReleaseFast disables runtime safety in packet/frame/QPACK/transport
    parsing. — **PASS.** `build.zig` does not pin any module to
-   ReleaseFast; the default optimize step is the user's choice. Build
-   mode policy is documented in CHANGELOG/README only as "build with
-   ReleaseSafe for production." No internal `@setRuntimeSafety(false)`.
+   ReleaseFast (the bench harness explicitly re-instantiates the tree
+   under ReleaseFast for meaningful numbers but bench never touches
+   peer input). Default `b.standardOptimizeOption` is Debug; the
+   build-mode policy comment block at the top of `build.zig` spells
+   out that production / internet-facing builds MUST pass
+   `-Doptimize=ReleaseSafe` and that ReleaseFast/ReleaseSmall are
+   forbidden for the network-input parser surface (residual
+   `unreachable` invariants stop being trapped under no-safety
+   modes). No internal `@setRuntimeSafety(false)`.
 
 3. Any peer-controlled length can allocate before limit validation. —
    **PASS.** Every reassembly path checks the configured limit before
