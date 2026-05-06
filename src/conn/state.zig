@@ -3946,16 +3946,8 @@ pub const Connection = struct {
         return self.paths.active();
     }
 
-    fn activePathConst(self: *const Connection) *const PathState {
-        return self.paths.activeConst();
-    }
-
     fn pathForId(self: *Connection, path_id: u32) *PathState {
         return self.paths.get(path_id) orelse self.primaryPath();
-    }
-
-    fn pathForIdConst(self: *const Connection, path_id: u32) *const PathState {
-        return self.paths.getConst(path_id) orelse self.primaryPathConst();
     }
 
     fn applicationPathForPoll(self: *Connection) *PathState {
@@ -4174,15 +4166,6 @@ pub const Connection = struct {
         return &app_path.app_pn_space;
     }
 
-    fn pnSpaceForLevelOnPathConst(
-        self: *const Connection,
-        lvl: EncryptionLevel,
-        app_path: *const PathState,
-    ) *const PnSpace {
-        if (connPnIdx(lvl)) |idx| return &self.pn_spaces[idx];
-        return &app_path.app_pn_space;
-    }
-
     fn sentForLevel(self: *Connection, lvl: EncryptionLevel) *SentPacketTracker {
         if (connPnIdx(lvl)) |idx| return &self.sent[idx];
         return &self.primaryPath().sent;
@@ -4198,15 +4181,6 @@ pub const Connection = struct {
         lvl: EncryptionLevel,
         app_path: *PathState,
     ) *SentPacketTracker {
-        if (connPnIdx(lvl)) |idx| return &self.sent[idx];
-        return &app_path.sent;
-    }
-
-    fn sentForLevelOnPathConst(
-        self: *const Connection,
-        lvl: EncryptionLevel,
-        app_path: *const PathState,
-    ) *const SentPacketTracker {
         if (connPnIdx(lvl)) |idx| return &self.sent[idx];
         return &app_path.sent;
     }
@@ -8203,11 +8177,6 @@ const method: boringssl.tls.quic.Method = .{
     .flush_flight = flushFlight,
     .send_alert = sendAlert,
 };
-
-fn installMethod(conn: *Connection) !void {
-    try conn.inner.setUserData(conn);
-    try conn.inner.setQuicMethod(&method);
-}
 
 // -- tests ---------------------------------------------------------------
 
