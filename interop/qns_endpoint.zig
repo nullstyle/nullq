@@ -14,6 +14,48 @@ const retry_token_key = [_]u8{
     0x10, 0xe1, 0x44, 0x58, 0x73, 0x88, 0x2b, 0x31,
 };
 const retry_token_lifetime_us: u64 = 30_000_000;
+
+// NEW_TOKEN issuance configuration (RFC 9000 §8.1.3 / hardening A.5).
+//
+// The QNS endpoint emits one NEW_TOKEN per server-side session as soon
+// as the handshake is confirmed; returning interop clients echo the
+// token in a future Initial's long-header Token field so the server
+// can skip the Retry round-trip on that next connection. Validation
+// runs before the Retry gate in the QNS Initial-handling loop so a
+// valid NEW_TOKEN bypasses Retry entirely; on any failure
+// (.malformed, .expired, .invalid) we fall through to Retry exactly
+// the way `Server.applyRetryGate` does, so a stale or wrong-source
+// token never closes the connection — it simply pays a fresh Retry
+// round-trip.
+//
+// The key below is a deterministic 32-byte constant chosen to match
+// the interop reproducibility posture of `retry_token_key`: the
+// official QUIC interop runner spawns a fresh server process per
+// scenario, so per-process random keys would break cross-test reuse
+// of NEW_TOKENs even within a single run. Operators deploying nullq
+// outside the interop runner should generate a key with
+// `boringssl.crypto.rand.fillBytes` and persist it across restarts —
+// the per-process choice here is interop-test territory only.
+//
+// Token persistence policy (caveat for the interop runner):
+//   * Lifetime: 1 hour. The interop runner's longest sequence (e.g.
+//     handshake + transfer + resumption) finishes well within this
+//     window, so a token minted on the first connection of a test
+//     remains valid for every subsequent connection.
+//   * Rotation: keys never rotate within a process. The interop
+//     runner expects deterministic behaviour across the `server`
+//     and follow-up `client` invocations; rotation would force a
+//     Retry round-trip that the runner doesn't budget for.
+//   * Distinct from `retry_token_key`: NEW_TOKEN typically outlives
+//     a Retry token by orders of magnitude, and operators rotate the
+//     two on different cadences (see `src/conn/new_token.zig`).
+const new_token_key = [_]u8{
+    0x4e, 0x55, 0x4c, 0x4c, 0x51, 0x2d, 0x51, 0x4e,
+    0x53, 0x2d, 0x4e, 0x45, 0x57, 0x54, 0x4b, 0x21,
+    0xc1, 0x09, 0x66, 0xb4, 0x7e, 0x53, 0x82, 0x90,
+    0x4d, 0x21, 0x9a, 0x6f, 0xee, 0x71, 0x18, 0x42,
+};
+const new_token_lifetime_us: u64 = 3600 * 1_000_000;
 const endpoint_udp_payload_size = 1350;
 const endpoint_connection_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
@@ -56,6 +98,14 @@ const ClientConnectionOptions = struct {
     early_data: bool = false,
     wait_for_ticket: ?*TicketStore = null,
     qlog_sink: ?*QlogSink = null,
+    /// Capture inbound NEW_TOKEN frames for replay on a follow-up
+    /// connection within the same test run.
+    new_token_store: ?*NewTokenStore = null,
+    /// Optional pre-captured NEW_TOKEN bytes to embed in the first
+    /// Initial's long-header Token field. Lets a follow-up connection
+    /// in `resumption` / `zerortt` testcases skip the server's Retry
+    /// round-trip when the peer issues NEW_TOKENs.
+    initial_token: ?[]const u8 = null,
 };
 
 var keylog_io: ?std.Io = null;
@@ -136,6 +186,43 @@ const TicketStore = struct {
         if (self.failed) return error.SessionTicketCaptureFailed;
         const bytes = self.latest orelse return error.NoSessionTicket;
         return try boringssl.tls.Session.fromBytes(ctx, bytes);
+    }
+};
+
+/// Process-local capture store for NEW_TOKEN bytes received on a
+/// client-mode connection. The `resumption` and `zerortt` interop
+/// scenarios open two back-to-back connections to the same server;
+/// when nullq pairs with itself or with a peer that issues NEW_TOKEN,
+/// we capture the token on the first connection and replay it on
+/// the second via `Connection.setInitialToken`. The bytes are
+/// borrowed-only inside the callback (per
+/// `Connection.setNewTokenCallback`'s contract), so we copy them.
+const NewTokenStore = struct {
+    allocator: std.mem.Allocator,
+    latest: ?[]u8 = null,
+    failed: bool = false,
+
+    fn init(allocator: std.mem.Allocator) NewTokenStore {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *NewTokenStore) void {
+        if (self.latest) |bytes| self.allocator.free(bytes);
+        self.* = undefined;
+    }
+
+    fn capture(self: *NewTokenStore, token: []const u8) void {
+        const owned = self.allocator.dupe(u8, token) catch {
+            self.failed = true;
+            return;
+        };
+        if (self.latest) |old| self.allocator.free(old);
+        self.latest = owned;
+    }
+
+    fn callback(user_data: ?*anyopaque, token: []const u8) void {
+        const self: *NewTokenStore = @ptrCast(@alignCast(user_data.?));
+        self.capture(token);
     }
 };
 
@@ -251,6 +338,12 @@ const ServerConn = struct {
     initial_server_cid: [server_cid_len]u8,
     next_cid_seq: u8 = 1,
     last_activity_us: u64,
+    /// Latches once we've minted and queued a NEW_TOKEN on this
+    /// session. Mirrors `Server.Slot.new_token_emitted` so we issue
+    /// at most one NEW_TOKEN per server-side connection (the simplest
+    /// policy that still removes the Retry round-trip for returning
+    /// clients).
+    new_token_emitted: bool = false,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -279,6 +372,7 @@ const ServerConn = struct {
         self.retry_source_cid = retrySourceCid(&self.initial_server_cid);
         self.next_cid_seq = 1;
         self.last_activity_us = now_us;
+        self.new_token_emitted = false;
 
         if (qlog_sink) |sink| self.conn.setQlogCallback(QlogSink.callback, sink);
         try self.conn.bind();
@@ -535,7 +629,24 @@ fn runServer(
                     continue;
                 }
 
-                if (opts.retry and !sc.retry_sent) {
+                // NEW_TOKEN check first: a returning interop client
+                // that captured a NEW_TOKEN on a prior connection echoes
+                // it in this Initial's long-header Token field. A valid
+                // NEW_TOKEN means the source is already address-validated
+                // and we skip the Retry round-trip even when `-retry` is
+                // on. On any failure (.malformed/.expired/.invalid) we
+                // fall through to the Retry gate, mirroring
+                // `Server.applyRetryGate` so a stale stored token
+                // gracefully degrades to a fresh Retry rather than
+                // dropping the connection.
+                const presented_token = peekInitialToken(msg.data);
+                const new_token_validated = blk: {
+                    const t = presented_token orelse break :blk false;
+                    if (t.len == 0) break :blk false;
+                    break :blk validNewToken(msg.from, now_us, t);
+                };
+
+                if (opts.retry and !sc.retry_sent and !new_token_validated) {
                     sc.retry_original_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
                     const token = try retryToken(msg.from, now_us, ids.dcid, &sc.retry_source_cid);
                     const n = try sc.conn.writeRetry(&tx, msg.data, &sc.retry_source_cid, &token);
@@ -582,7 +693,10 @@ fn runServer(
         var i: usize = 0;
         while (i < conns.items.len) {
             const sc = conns.items[i];
-            if (sc.conn.handshakeDone()) try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, endpoint_server_cid_desired_last_seq, &sc.initial_server_cid);
+            if (sc.conn.handshakeDone()) {
+                try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, endpoint_server_cid_desired_last_seq, &sc.initial_server_cid);
+                maybeIssueNewToken(sc, now_us);
+            }
             try sc.app.process(&sc.conn);
             while (try sc.conn.poll(&tx, now_us)) |n| {
                 try sock.send(io, &sc.peer, tx[0..n]);
@@ -648,6 +762,13 @@ fn runClient(
     if (opts.qlog_dir) |dir| qlog_sink = try QlogSink.init(io, dir, "client");
     defer if (qlog_sink) |*sink| sink.deinit();
 
+    // NEW_TOKEN capture (RFC 9000 §8.1.3): inbound NEW_TOKEN frames
+    // land here and are replayed on the second connection of
+    // resumption / zerortt scenarios. The store outlives both
+    // connection invocations.
+    var new_tokens = NewTokenStore.init(allocator);
+    defer new_tokens.deinit();
+
     switch (mode) {
         .normal => try runClientConnection(
             allocator,
@@ -657,7 +778,10 @@ fn runClient(
             server_addr,
             downloads_dir,
             downloads,
-            .{ .qlog_sink = if (qlog_sink) |*sink| sink else null },
+            .{
+                .qlog_sink = if (qlog_sink) |*sink| sink else null,
+                .new_token_store = &new_tokens,
+            },
         ),
         .resumption, .zerortt => {
             if (downloads.len < 2) return error.ResumptionRequiresMultipleRequests;
@@ -672,6 +796,7 @@ fn runClient(
                 .{
                     .wait_for_ticket = &tickets,
                     .qlog_sink = if (qlog_sink) |*sink| sink else null,
+                    .new_token_store = &new_tokens,
                 },
             );
             var session = try tickets.session(client_tls);
@@ -688,6 +813,8 @@ fn runClient(
                     .session = session,
                     .early_data = mode == .zerortt,
                     .qlog_sink = if (qlog_sink) |*sink| sink else null,
+                    .new_token_store = &new_tokens,
+                    .initial_token = new_tokens.latest,
                 },
             );
         },
@@ -744,6 +871,12 @@ fn runClientConnection(
     if (conn_opts.qlog_sink) |sink| conn.setQlogCallback(QlogSink.callback, sink);
     if (conn_opts.session) |session| try conn.setSession(session);
     if (conn_opts.early_data) conn.setEarlyDataEnabled(true);
+    if (conn_opts.new_token_store) |store| {
+        conn.setNewTokenCallback(NewTokenStore.callback, store);
+    }
+    if (conn_opts.initial_token) |token_bytes| {
+        try conn.setInitialToken(token_bytes);
+    }
     try conn.bind();
 
     var initial_dcid: [8]u8 = undefined;
@@ -1291,6 +1424,59 @@ fn retryAddressContext(dst: []u8, peer: Net.IpAddress) []const u8 {
     return dst[0..pos];
 }
 
+/// Mint a NEW_TOKEN bound to `peer`. The address-binding shape mirrors
+/// `nullq.Server.addressContext` (the full 22-byte `path.Address`
+/// buffer) so a NEW_TOKEN minted by the QNS endpoint round-trips
+/// identically through `Server.applyRetryGate`'s NEW_TOKEN path on a
+/// follow-up connection — useful when the interop runner pairs a
+/// nullq server with a third-party client that simply echoes the
+/// token bytes verbatim.
+fn newToken(peer: Net.IpAddress, now_us: u64) !nullq.conn.NewTokenBlob {
+    const addr = netAddressToPathAddress(peer);
+    var token: nullq.conn.NewTokenBlob = undefined;
+    _ = try nullq.conn.new_token.mint(&token, .{
+        .key = &new_token_key,
+        .now_us = now_us,
+        .lifetime_us = new_token_lifetime_us,
+        .client_address = &addr.bytes,
+    });
+    return token;
+}
+
+fn validNewToken(peer: Net.IpAddress, now_us: u64, token: []const u8) bool {
+    return newTokenValidationResult(peer, now_us, token) == .valid;
+}
+
+fn newTokenValidationResult(
+    peer: Net.IpAddress,
+    now_us: u64,
+    token: []const u8,
+) nullq.conn.NewTokenValidationResult {
+    const addr = netAddressToPathAddress(peer);
+    return nullq.conn.new_token.validate(token, .{
+        .key = &new_token_key,
+        .now_us = now_us,
+        .client_address = &addr.bytes,
+    });
+}
+
+/// Mint a single NEW_TOKEN once the handshake is confirmed and queue
+/// it for transmission on `sc.conn`. Idempotent: the
+/// `new_token_emitted` latch ensures we issue at most one per session.
+/// Mirror to `Server.maybeIssueNewToken`. All failure modes here are
+/// not peer-reachable (BoringSSL CSPRNG + AEAD seal under fixed-size
+/// inputs); we silently skip issuance and the source pays a fresh
+/// Retry round-trip on its next connection — exactly the gracefully-
+/// degrades posture documented at the NEW_TOKEN config block above.
+fn maybeIssueNewToken(sc: *ServerConn, now_us: u64) void {
+    if (sc.new_token_emitted) return;
+    if (!sc.conn.handshakeDone()) return;
+
+    var token = newToken(sc.peer, now_us) catch return;
+    sc.conn.queueNewToken(&token) catch return;
+    sc.new_token_emitted = true;
+}
+
 fn peekInitialToken(bytes: []const u8) ?[]const u8 {
     const parsed = nullq.wire.header.parse(bytes, 0) catch return null;
     return switch (parsed.header) {
@@ -1368,6 +1554,66 @@ test "Retry-token endpoint validation rejects malformed and replayed probes" {
         &retry_scid,
         &wrong_version_token,
     ));
+}
+
+test "NEW_TOKEN endpoint validation accepts a fresh token, rejects expired, rejects address mismatch" {
+    const peer = try Net.IpAddress.parseLiteral("127.0.0.1:4444");
+    const wrong_peer = try Net.IpAddress.parseLiteral("127.0.0.1:4445");
+
+    // Fresh mint at t=1_000_000 with the QNS endpoint's lifetime.
+    const token = try newToken(peer, 1_000_000);
+
+    // Same peer, well within the lifetime window: .valid.
+    try std.testing.expect(validNewToken(peer, 2_000_000, &token));
+    try std.testing.expectEqual(
+        nullq.conn.NewTokenValidationResult.valid,
+        newTokenValidationResult(peer, 2_000_000, &token),
+    );
+
+    // Different source address (different port — `path.Address.bytes`
+    // includes the port at offset 5..7 for IPv4) -> .invalid.
+    try std.testing.expectEqual(
+        nullq.conn.NewTokenValidationResult.invalid,
+        newTokenValidationResult(wrong_peer, 2_000_000, &token),
+    );
+
+    // Past the issuance lifetime -> .expired.
+    try std.testing.expectEqual(
+        nullq.conn.NewTokenValidationResult.expired,
+        newTokenValidationResult(peer, 1_000_000 + new_token_lifetime_us + 1, &token),
+    );
+
+    // Truncating the wire blob breaks the fixed-length gate -> .malformed.
+    try std.testing.expectEqual(
+        nullq.conn.NewTokenValidationResult.malformed,
+        newTokenValidationResult(peer, 2_000_000, token[0 .. token.len - 1]),
+    );
+
+    // Sanity: the gate-side `validNewToken` helper used by the
+    // Initial-handling loop returns false for every non-`.valid`
+    // outcome (matches `Server.applyRetryGate`'s NEW_TOKEN
+    // fall-through posture).
+    try std.testing.expect(!validNewToken(wrong_peer, 2_000_000, &token));
+    try std.testing.expect(!validNewToken(peer, 1_000_000 + new_token_lifetime_us + 1, &token));
+    try std.testing.expect(!validNewToken(peer, 2_000_000, token[0 .. token.len - 1]));
+
+    // §4.3-style cross-version mismatch: a token minted under QUIC v2
+    // wire-shape must not authenticate against the QNS endpoint's
+    // v1-only validator (NEW_TOKEN binds the version inside the AEAD
+    // plaintext, not the on-wire format).
+    const addr = netAddressToPathAddress(peer);
+    var v2_token: nullq.conn.NewTokenBlob = undefined;
+    _ = try nullq.conn.new_token.mint(&v2_token, .{
+        .key = &new_token_key,
+        .now_us = 1_000_000,
+        .lifetime_us = new_token_lifetime_us,
+        .client_address = &addr.bytes,
+        .quic_version = 0x6b3343cf,
+    });
+    try std.testing.expectEqual(
+        nullq.conn.NewTokenValidationResult.wrong_version,
+        newTokenValidationResult(peer, 2_000_000, &v2_token),
+    );
 }
 
 const LongHeaderIds = struct {
