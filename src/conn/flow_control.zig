@@ -245,3 +245,87 @@ test "StreamCount: peer opening enforces local_max" {
     try sc.recordPeerOpened(1);
     try std.testing.expectError(Error.PeerExceededLimit, sc.recordPeerOpened(2));
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `ConnectionData` with arbitrary (op, n) pairs and assert the
+// state machine's structural invariants survive. Properties:
+//
+// - No panic, no overflow trap (every internal `+` is guarded).
+// - On `recordSent` success, `we_sent` ≤ `peer_max`.
+// - On `recordPeerSent` success, `peer_sent` ≤ `local_max`.
+// - `weCanSend(n)` answers consistently with what `recordSent(n)` does.
+// - `allowance() == peer_max - we_sent` (saturating to 0).
+// - `onMaxData` / `raiseLocalMax` are monotonic.
+//
+// The fuzzer chooses one of five ops on each step; values are full-
+// width u64s so overflow paths are routinely exercised.
+
+test "fuzz: flow_control ConnectionData state-machine invariants" {
+    try std.testing.fuzz({}, fuzzConnectionData, .{});
+}
+
+fn fuzzConnectionData(_: void, smith: *std.testing.Smith) anyerror!void {
+    var c = ConnectionData.init(
+        smith.value(u64),
+        smith.value(u64),
+    );
+
+    var steps: u32 = 0;
+    while (steps < 256 and !smith.eos()) : (steps += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 4);
+        const n = smith.value(u64);
+
+        const before_local_max = c.local_max;
+        const before_peer_max = c.peer_max;
+        const before_we_sent = c.we_sent;
+        const before_peer_sent = c.peer_sent;
+
+        switch (op) {
+            0 => {
+                // recordSent: expect to agree with weCanSend.
+                const can = c.weCanSend(n);
+                if (c.recordSent(n)) |_| {
+                    try std.testing.expect(can);
+                    try std.testing.expect(c.we_sent >= before_we_sent);
+                    try std.testing.expect(c.we_sent <= c.peer_max);
+                } else |_| {
+                    try std.testing.expect(!can);
+                    // State unchanged on error.
+                    try std.testing.expectEqual(before_we_sent, c.we_sent);
+                }
+            },
+            1 => {
+                if (c.recordPeerSent(n)) |_| {
+                    try std.testing.expect(c.peer_sent >= before_peer_sent);
+                    try std.testing.expect(c.peer_sent <= c.local_max);
+                } else |_| {
+                    // State unchanged on error.
+                    try std.testing.expectEqual(before_peer_sent, c.peer_sent);
+                }
+            },
+            2 => {
+                c.onMaxData(n);
+                // Monotonic in peer_max.
+                try std.testing.expect(c.peer_max >= before_peer_max);
+            },
+            3 => {
+                c.raiseLocalMax(n);
+                // Monotonic in local_max.
+                try std.testing.expect(c.local_max >= before_local_max);
+            },
+            4 => {
+                // weCanSend never traps.
+                _ = c.weCanSend(n);
+            },
+            else => unreachable,
+        }
+
+        // Cross-cutting invariants checked after every step.
+        const expected_allowance: u64 =
+            if (c.we_sent >= c.peer_max) 0 else c.peer_max - c.we_sent;
+        try std.testing.expectEqual(expected_allowance, c.allowance());
+        try std.testing.expect(c.we_sent <= c.peer_max);
+        try std.testing.expect(c.peer_sent <= c.local_max);
+    }
+}

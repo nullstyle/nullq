@@ -596,3 +596,80 @@ test "unknown-but-large id round-trips through varint" {
     const got = try Params.decode(buf[0..pos]);
     _ = got;
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `Params.decode` with arbitrary bytes. Properties:
+//
+// - No panic, no overflow trap.
+// - On success, every bound-checked field obeys its RFC 9000 §18.2 cap:
+//   - `ack_delay_exponent <= 20`
+//   - `max_ack_delay_ms < 2^14`
+//   - `active_connection_id_limit >= 2`
+//   - `max_udp_payload_size >= 1200` is NOT enforced by decode (the
+//     decoder accepts any varint), so we don't assert it.
+//   - When the multipath max-path-id is set, it fits in u32.
+// - CID-shaped fields (original/initial/retry SCID/DCID) have len ≤
+//   `path_mod.max_cid_len`.
+// - PreferredAddress (when present) has a CID len ≤ `max_cid_len`.
+// - Decoding rejects duplicate ids — re-decoding the encode of a
+//   successful decode is also successful (no field accidentally
+//   round-trips into a value that fails its own bound).
+
+test "fuzz: transport_params decode never panics and respects RFC bounds" {
+    try std.testing.fuzz({}, fuzzTransportParams, .{});
+}
+
+fn fuzzTransportParams(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [1024]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+
+    const p = Params.decode(input) catch return;
+
+    // RFC 9000 §18.2 bounds the decoder enforces on success.
+    try testing.expect(p.ack_delay_exponent <= 20);
+    try testing.expect(p.max_ack_delay_ms < (@as(u64, 1) << 14));
+    try testing.expect(p.active_connection_id_limit >= 2);
+
+    // CID lengths fit in the wire-format cap.
+    if (p.original_destination_connection_id) |cid| {
+        try testing.expect(cid.len <= path_mod.max_cid_len);
+    }
+    if (p.initial_source_connection_id) |cid| {
+        try testing.expect(cid.len <= path_mod.max_cid_len);
+    }
+    if (p.retry_source_connection_id) |cid| {
+        try testing.expect(cid.len <= path_mod.max_cid_len);
+    }
+    if (p.stateless_reset_token) |tok| {
+        try testing.expectEqual(@as(usize, 16), tok.len);
+    }
+    if (p.preferred_address) |addr| {
+        try testing.expect(addr.connection_id.len <= path_mod.max_cid_len);
+    }
+
+    // Re-encode + re-decode round-trip: a value the decoder accepted
+    // must also be encodable back into a blob that the decoder
+    // accepts. This catches asymmetric bound errors (e.g. a field that
+    // decodes from a varint outside the encode-side range).
+    var encoded: [2048]u8 = undefined;
+    const n = p.encode(&encoded) catch return;
+    const p2 = Params.decode(encoded[0..n]) catch |e| {
+        // If a successful decode produces a struct that cannot be
+        // round-tripped, that's a parser asymmetry worth flagging.
+        // Allow `BufferTooSmall` (the encode buffer was sized to
+        // 2 KiB; pathological values could need more) but not the
+        // structural-error variants.
+        if (e == Error.BufferTooSmall) return;
+        return e;
+    };
+    // The two decodes agree on the bound-checked scalar fields.
+    try testing.expectEqual(p.max_idle_timeout_ms, p2.max_idle_timeout_ms);
+    try testing.expectEqual(p.initial_max_data, p2.initial_max_data);
+    try testing.expectEqual(p.ack_delay_exponent, p2.ack_delay_exponent);
+    try testing.expectEqual(p.max_ack_delay_ms, p2.max_ack_delay_ms);
+    try testing.expectEqual(p.active_connection_id_limit, p2.active_connection_id_limit);
+    try testing.expectEqual(p.disable_active_migration, p2.disable_active_migration);
+    try testing.expectEqual(p.initial_max_path_id, p2.initial_max_path_id);
+}

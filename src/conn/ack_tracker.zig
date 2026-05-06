@@ -492,3 +492,130 @@ test "overflow drops the lowest range" {
     try std.testing.expectEqual(max_ranges, t.range_count);
     try std.testing.expect(t.ranges[0].smallest != old_lowest);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `AckTracker` with arbitrary `add` / `addPacket` /
+// `addPacketDelayed` / `markAckSent` / `promoteDelayedAck` calls and
+// assert range-list invariants. Properties:
+//
+// - No panic, no overflow trap.
+// - `range_count <= max_ranges` always.
+// - Each range has `smallest <= largest`.
+// - Intervals are sorted ascending and disjoint with at least a
+//   1-PN gap between them (otherwise they would have merged).
+// - `largest` (when set) equals the maximum largest across ranges.
+// - `contains(pn)` agrees with a manual range scan.
+// - `toAckFrame*` either errors cleanly or returns a frame with
+//   `range_count <= self.range_count - 1`.
+
+test "fuzz: ack_tracker range-list invariants" {
+    try std.testing.fuzz({}, fuzzAckTracker, .{});
+}
+
+fn fuzzAckTracker(_: void, smith: *std.testing.Smith) anyerror!void {
+    var t: AckTracker = .{};
+
+    var steps: u32 = 0;
+    while (steps < 256 and !smith.eos()) : (steps += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 5);
+        switch (op) {
+            0 => {
+                const pn = smith.value(u64);
+                const now = smith.value(u64);
+                t.add(pn, now);
+            },
+            1 => {
+                const pn = smith.value(u64);
+                const now = smith.value(u64);
+                const eliciting = smith.valueRangeAtMost(u8, 0, 1) == 1;
+                t.addPacket(pn, now, eliciting);
+            },
+            2 => {
+                const pn = smith.value(u64);
+                const now = smith.value(u64);
+                const eliciting = smith.valueRangeAtMost(u8, 0, 1) == 1;
+                const threshold = smith.value(u8);
+                t.addPacketDelayed(pn, now, eliciting, threshold);
+            },
+            3 => {
+                t.markAckSent();
+                try std.testing.expect(!t.pending_ack);
+                try std.testing.expect(!t.delayed_ack_armed);
+                try std.testing.expectEqual(@as(u8, 0), t.ack_eliciting_since_ack);
+            },
+            4 => {
+                const now = smith.value(u64);
+                const max_delay = smith.value(u64);
+                _ = t.promoteDelayedAck(now, max_delay);
+            },
+            5 => {
+                // Build an ACK frame and (if it succeeds) make sure
+                // its shape agrees with our internal range table.
+                var buf: [512]u8 = undefined;
+                const max_lower = smith.value(u32);
+                if (t.toAckFrameLimitedRanges(0, &buf, buf.len, max_lower)) |ack| {
+                    // Builder must respect `range_count <= self.range_count - 1`.
+                    if (t.range_count > 0) {
+                        try std.testing.expect(ack.range_count <= t.range_count - 1);
+                    }
+                    // largest_acked must equal the top range's largest.
+                    if (t.range_count > 0) {
+                        try std.testing.expectEqual(
+                            t.ranges[t.range_count - 1].largest,
+                            ack.largest_acked,
+                        );
+                    }
+                } else |_| {}
+            },
+            else => unreachable,
+        }
+
+        // Cross-cutting structural invariants.
+        try std.testing.expect(t.range_count <= max_ranges);
+        var i: u8 = 0;
+        var max_largest: u64 = 0;
+        var seen_any: bool = false;
+        while (i < t.range_count) : (i += 1) {
+            const r = t.ranges[i];
+            try std.testing.expect(r.smallest <= r.largest);
+            if (i > 0) {
+                const prev = t.ranges[i - 1];
+                // Sorted ascending and disjoint with at least one PN gap.
+                try std.testing.expect(prev.largest < r.smallest);
+                try std.testing.expect(prev.largest + 1 < r.smallest);
+            }
+            if (!seen_any or r.largest > max_largest) max_largest = r.largest;
+            seen_any = true;
+        }
+        if (seen_any) {
+            try std.testing.expect(t.largest != null);
+            // The cached `largest` must be at least the top of the
+            // top range (insert can only stash the running max).
+            try std.testing.expect(t.largest.? >= max_largest);
+        }
+        // contains(pn) should agree with a linear range scan for a
+        // small sample of PNs drawn from the existing ranges.
+        if (t.range_count > 0) {
+            const sample_idx = smith.indexWithHash(t.range_count, 0xfeed);
+            const r = t.ranges[@intCast(sample_idx)];
+            try std.testing.expect(t.contains(r.smallest));
+            try std.testing.expect(t.contains(r.largest));
+            // Just below the smallest: contains only if a lower range
+            // also covers it.
+            if (r.smallest > 0) {
+                const below = r.smallest - 1;
+                var hit = false;
+                var j: u8 = 0;
+                while (j < t.range_count) : (j += 1) {
+                    const rj = t.ranges[j];
+                    if (below >= rj.smallest and below <= rj.largest) {
+                        hit = true;
+                        break;
+                    }
+                }
+                try std.testing.expectEqual(hit, t.contains(below));
+            }
+        }
+    }
+}

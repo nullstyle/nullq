@@ -157,3 +157,90 @@ test "beginChallenge resets after a prior outcome" {
     const matched = try v.recordResponse(token2);
     try std.testing.expect(matched);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `PathValidator` with arbitrary `beginChallenge` /
+// `recordResponse` / `tick` calls and assert state-machine invariants.
+// Properties:
+//
+// - No panic, no overflow trap.
+// - Status is always one of {idle, pending, validated, failed}.
+// - `validated` is terminal: once entered, neither tick nor a fresh
+//   recordResponse drops it (only `beginChallenge` can re-arm).
+// - `recordResponse` outside `pending` returns `NotPending`.
+// - `isValidated()` agrees with `status == .validated`.
+// - The matched bool from recordResponse only flips status to
+//   .validated.
+
+test "fuzz: path_validator state-machine invariants" {
+    try std.testing.fuzz({}, fuzzPathValidator, .{});
+}
+
+fn fuzzPathValidator(_: void, smith: *std.testing.Smith) anyerror!void {
+    var v: PathValidator = .{};
+
+    var steps: u32 = 0;
+    while (steps < 64 and !smith.eos()) : (steps += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 2);
+        const before_status = v.status;
+
+        switch (op) {
+            0 => {
+                // beginChallenge — always re-arms.
+                var tok: [8]u8 = undefined;
+                smith.bytes(&tok);
+                const now = smith.value(u64);
+                const timeout = smith.value(u64);
+                v.beginChallenge(tok, now, timeout);
+                try std.testing.expectEqual(Status.pending, v.status);
+            },
+            1 => {
+                // recordResponse — fuzzer picks a token, sometimes the
+                // pending one (tampered or fresh).
+                var tok: [8]u8 = undefined;
+                smith.bytes(&tok);
+                if (smith.valueRangeAtMost(u8, 0, 3) == 0) {
+                    // Bias toward the matching token to actually exercise
+                    // the validated-transition branch sometimes.
+                    tok = v.pending_token;
+                }
+                if (v.recordResponse(tok)) |matched| {
+                    if (matched) {
+                        try std.testing.expectEqual(Status.validated, v.status);
+                    } else {
+                        // No match: stays pending (or whatever it was).
+                        try std.testing.expectEqual(before_status, v.status);
+                    }
+                } else |e| {
+                    try std.testing.expectEqual(Error.NotPending, e);
+                    // Status unchanged on error.
+                    try std.testing.expectEqual(before_status, v.status);
+                }
+            },
+            2 => {
+                const now = smith.value(u64);
+                v.tick(now);
+                // tick is a no-op in any state except .pending.
+                if (before_status != .pending) {
+                    try std.testing.expectEqual(before_status, v.status);
+                }
+                // tick can never un-fail or un-validate.
+                if (before_status == .failed or before_status == .validated) {
+                    try std.testing.expectEqual(before_status, v.status);
+                }
+            },
+            else => unreachable,
+        }
+
+        // Status is always one of the valid enum values (the type
+        // system enforces this, but assert isValidated agrees).
+        try std.testing.expectEqual(v.status == .validated, v.isValidated());
+        // validated is terminal across this entire sweep — once we
+        // hit it the only way out is beginChallenge. Sample-check the
+        // current step.
+        if (before_status == .validated and op != 0) {
+            try std.testing.expectEqual(Status.validated, v.status);
+        }
+    }
+}

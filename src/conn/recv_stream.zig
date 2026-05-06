@@ -597,3 +597,101 @@ test "stress: 64 KiB random shuffle reassembles in order with FIN" {
     try testing.expectEqual(total, consumed);
     try testing.expectEqual(State.data_recvd, s.state);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `RecvStream` with arbitrary `recv` / `read` / `resetStream`
+// operations and assert reassembly invariants. Properties:
+//
+// - No panic, no overflow trap.
+// - `read_offset` is monotonic (only ever advances).
+// - `read_offset <= end_offset` always.
+// - When `final_size` is set, no range extends beyond it.
+// - `bytes.items.len` matches the buffered span (a function of
+//   `read_offset` and the highest range end).
+// - Range list stays sorted, disjoint, non-empty.
+//
+// Offsets and lengths are kept small enough to actually exercise
+// reassembly without hitting `BufferLimitExceeded` on every call.
+
+test "fuzz: recv_stream reassembly invariants" {
+    try std.testing.fuzz({}, fuzzRecvStream, .{});
+}
+
+fn fuzzRecvStream(_: void, smith: *std.testing.Smith) anyerror!void {
+    var s = RecvStream.init(test_alloc);
+    defer s.deinit();
+    s.max_buffered_span = 1024;
+
+    var steps: u32 = 0;
+    while (steps < 64 and !smith.eos()) : (steps += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 3);
+        switch (op) {
+            0 => {
+                // recv: pick offset within plausible bounds, fuzzer-chosen
+                // length and FIN flag.
+                const offset = smith.valueRangeAtMost(u64, 0, 512);
+                var data: [64]u8 = undefined;
+                const data_len = smith.slice(&data);
+                const fin = smith.valueRangeAtMost(u8, 0, 1) == 1;
+                const before_read_offset = s.read_offset;
+                _ = s.recv(offset, data[0..data_len], fin) catch {};
+                // read_offset never moves on recv.
+                try testing.expectEqual(before_read_offset, s.read_offset);
+            },
+            1 => {
+                var dst: [64]u8 = undefined;
+                const dst_len = smith.valueRangeAtMost(u32, 0, 64);
+                const before_read_offset = s.read_offset;
+                const n = s.read(dst[0..dst_len]);
+                try testing.expect(n <= dst_len);
+                // Monotonic read_offset advance.
+                try testing.expect(s.read_offset >= before_read_offset);
+                try testing.expectEqual(before_read_offset + @as(u64, @intCast(n)), s.read_offset);
+            },
+            2 => {
+                const code = smith.value(u64);
+                const final_size_in = smith.valueRangeAtMost(u64, 0, 1024);
+                _ = s.resetStream(code, final_size_in) catch {};
+            },
+            3 => {
+                // Pure offset-overflow probe — must not panic.
+                const offset = smith.value(u64);
+                var data: [4]u8 = undefined;
+                const data_len = smith.valueRangeAtMost(u32, 0, 4);
+                _ = s.recv(offset, data[0..data_len], false) catch {};
+            },
+            else => unreachable,
+        }
+
+        // Cross-cutting invariants.
+        try testing.expect(s.read_offset <= s.end_offset);
+        // Buffered span equals end-of-highest-range minus read_offset
+        // (or 0 if there are no ranges).
+        if (s.ranges.items.len == 0) {
+            try testing.expectEqual(@as(usize, 0), s.bytes.items.len);
+        } else {
+            const top = s.ranges.items[s.ranges.items.len - 1].end;
+            try testing.expect(top >= s.read_offset);
+            const expected_buf: u64 = top - s.read_offset;
+            try testing.expectEqual(@as(usize, @intCast(expected_buf)), s.bytes.items.len);
+        }
+        // Range list invariants: sorted, disjoint, non-empty intervals,
+        // bounded by [read_offset, final_size or end_offset].
+        if (s.ranges.items.len > 0) {
+            var prev_end: u64 = 0;
+            for (s.ranges.items, 0..) |r, i| {
+                try testing.expect(r.offset < r.end);
+                try testing.expect(r.offset >= s.read_offset);
+                if (i > 0) try testing.expect(r.offset > prev_end); // disjoint, sorted
+                if (s.final_size) |fs| try testing.expect(r.end <= fs);
+                try testing.expect(r.end <= s.end_offset);
+                prev_end = r.end;
+            }
+        }
+        if (s.final_size) |fs| {
+            try testing.expect(s.end_offset <= fs);
+            try testing.expect(s.read_offset <= fs);
+        }
+    }
+}

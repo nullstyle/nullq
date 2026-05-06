@@ -794,3 +794,100 @@ test "write fully accepts when max_buffered exceeds payload (default 1 MiB)" {
     try testing.expectEqual(@as(usize, 5), try s.write("hello"));
     try testing.expectEqual(@as(u64, 5), s.writtenBytes());
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `SendStream` with a fuzzer-chosen sequence of `write`,
+// `peekChunk`, `recordSent`, `onPacketAcked`, `onPacketLost`, `finish`,
+// and `resetStream` calls. Properties:
+//
+// - No panic, no overflow trap.
+// - `base_offset` ≤ `write_offset` always.
+// - `bytes.items.len == write_offset - base_offset` always.
+// - When `final_size` is set, `write_offset == final_size`.
+// - `pending` ranges all sit inside [base_offset, write_offset).
+// - On terminal state (`data_recvd`/`reset_recvd`), `isTerminal()` true.
+//
+// `max_buffered` is forced low so the back-pressure path is hit
+// frequently. PNs come from a small pool so duplicate-PN error paths
+// are exercised.
+
+test "fuzz: send_stream lifecycle invariants" {
+    try std.testing.fuzz({}, fuzzSendStream, .{});
+}
+
+fn fuzzSendStream(_: void, smith: *std.testing.Smith) anyerror!void {
+    var s = SendStream.init(test_alloc);
+    defer s.deinit();
+    s.max_buffered = 64;
+
+    var steps: u32 = 0;
+    while (steps < 64 and !smith.eos()) : (steps += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 6);
+        switch (op) {
+            0 => {
+                // write up to 16 bytes of fuzzer-chosen content.
+                var buf: [16]u8 = undefined;
+                const n = smith.slice(&buf);
+                _ = s.write(buf[0..n]) catch {};
+            },
+            1 => {
+                // peek with a fuzzer-chosen cap. No state mutation, just
+                // sanity-check the chunk shape.
+                const cap: usize = smith.valueRangeAtMost(u32, 0, 256);
+                if (s.peekChunk(cap)) |c| {
+                    try testing.expect(c.length <= cap);
+                    if (c.length > 0) {
+                        try testing.expect(c.offset >= s.base_offset);
+                        try testing.expect(c.offset + c.length <= s.write_offset);
+                    }
+                    if (c.fin) try testing.expect(s.final_size != null);
+                }
+            },
+            2 => {
+                // recordSent the current peek with a fuzzer-chosen PN.
+                const pn = smith.valueRangeAtMost(u64, 0, 15);
+                const cap: usize = smith.valueRangeAtMost(u32, 0, 64);
+                const c = s.peekChunk(cap) orelse continue;
+                _ = s.recordSent(pn, c) catch {};
+            },
+            3 => {
+                const pn = smith.valueRangeAtMost(u64, 0, 15);
+                _ = s.onPacketAcked(pn) catch {};
+            },
+            4 => {
+                const pn = smith.valueRangeAtMost(u64, 0, 15);
+                _ = s.onPacketLost(pn) catch {};
+            },
+            5 => {
+                _ = s.finish() catch {};
+            },
+            6 => {
+                const code = smith.value(u64);
+                _ = s.resetStream(code) catch {};
+            },
+            else => unreachable,
+        }
+
+        // Cross-cutting invariants. These hold regardless of how we got here.
+        try testing.expect(s.base_offset <= s.write_offset);
+        const live_len: u64 = @intCast(s.bytes.items.len);
+        try testing.expectEqual(s.write_offset - s.base_offset, live_len);
+        if (s.final_size) |fs| {
+            try testing.expectEqual(fs, s.write_offset);
+        }
+        for (s.pending.items) |r| {
+            try testing.expect(r.offset >= s.base_offset);
+            try testing.expect(r.end <= s.write_offset);
+            try testing.expect(r.offset < r.end);
+        }
+        for (s.acked_above.items) |r| {
+            try testing.expect(r.offset > s.base_offset);
+            try testing.expect(r.end <= s.write_offset);
+            try testing.expect(r.offset < r.end);
+        }
+        // Terminal flag agrees with state.
+        const term = s.state == .data_recvd or s.state == .reset_recvd;
+        try testing.expectEqual(term, s.isTerminal());
+    }
+}

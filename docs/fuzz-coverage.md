@@ -24,7 +24,7 @@ Scope notes:
 ## 1. Inventory of `std.testing.fuzz` sites
 
 Verified via `rg "std.testing.fuzz" /Users/nullstyle/prj/ai-workspace/nullq/src`.
-Seven harnesses across four files:
+Fourteen harnesses across nine files:
 
 | # | File | Test name | Target |
 |---|---|---|---|
@@ -35,6 +35,13 @@ Seven harnesses across four files:
 | 5 | `src/server.zig:2051` | `fuzz: peekLongHeaderIds never panics` | `peekLongHeaderIds` on arbitrary bytes; checks returned CID slices alias into input |
 | 6 | `src/server.zig:2070` | `fuzz: isInitialLongHeader never panics` | `isInitialLongHeader` on arbitrary bytes; bool result, no panic |
 | 7 | `src/server.zig:2081` | `fuzz: peekDcidForServer never panics across all CID lengths` | `peekDcidForServer` with fuzzer-chosen `local_cid_len`; returned slice aliases into input |
+| 8 | `src/wire/long_packet.zig:973` | `fuzz: coalesced long-header walker terminates with bounded advance` | Structural coalesce walker; bounded iteration, in-bounds advance, terminates on Retry/VN/short |
+| 9 | `src/conn/flow_control.zig:264` | `fuzz: flow_control ConnectionData state-machine invariants` | `ConnectionData.recordSent` / `recordPeerSent` / `weCanSend` / `onMaxData` / `raiseLocalMax` driven with arbitrary u64 values; asserts no overflow trap, monotonic limits, `we_sent <= peer_max`, `peer_sent <= local_max`, `weCanSend` agrees with `recordSent`, `allowance` formula |
+| 10 | `src/conn/send_stream.zig:815` | `fuzz: send_stream lifecycle invariants` | Mixed `write` / `peekChunk` / `recordSent` / `onPacketAcked` / `onPacketLost` / `finish` / `resetStream` in fuzzer-chosen order; asserts `base_offset <= write_offset`, `bytes.items.len == write_offset - base_offset`, pending/acked range bounds, terminal-state coherence |
+| 11 | `src/conn/recv_stream.zig:617` | `fuzz: recv_stream reassembly invariants` | Arbitrary `recv` / `read` / `resetStream` with fuzzer-chosen offset/length/fin; asserts `read_offset` monotonic, sorted-disjoint range list, `bytes.items.len` matches buffered span, no out-of-order delivery past `final_size` |
+| 12 | `src/conn/path_validator.zig:176` | `fuzz: path_validator state-machine invariants` | Arbitrary `beginChallenge` / `recordResponse` / `tick` ops with fuzzer-chosen tokens and timestamps; asserts state is one of {idle, pending, validated, failed}, `validated` is terminal across non-`beginChallenge` ops, `recordResponse` outside `pending` returns `NotPending` without state mutation |
+| 13 | `src/conn/ack_tracker.zig:512` | `fuzz: ack_tracker range-list invariants` | Arbitrary `add` / `addPacket` / `addPacketDelayed` / `markAckSent` / `promoteDelayedAck` / `toAckFrameLimitedRanges`; asserts `range_count <= max_ranges`, sorted-disjoint intervals with ≥1-PN gaps, `largest >= smallest` per interval, `contains` agrees with linear scan, builder respects `range_count <= self.range_count - 1` |
+| 14 | `src/tls/transport_params.zig:619` | `fuzz: transport_params decode never panics and respects RFC bounds` | `Params.decode` on arbitrary bytes; asserts no panic, RFC 9000 §18.2 bounds (`ack_delay_exponent <= 20`, `max_ack_delay_ms < 2^14`, `active_connection_id_limit >= 2`), CID-length caps, encode→decode round-trip preserves scalar fields |
 
 The `tests/fuzz_smoke.zig` harness adds nine deterministic randomized
 round-trip tests covering varint, frame, transport-parameter, packet
@@ -60,9 +67,9 @@ Status legend:
 | 2 | Long-header parser | COVERED | `src/wire/header.zig:836` (handles all six variants) and `src/server.zig:2051` (peek surface) |
 | 3 | Short-header parser | COVERED | `src/wire/header.zig:836` walks short headers under fuzzer-chosen DCID length; `src/server.zig:2081` is the routing-level peek |
 | 4 | Coalesced datagram parser | COVERED | `src/wire/long_packet.zig:973` `fuzz: coalesced long-header walker terminates with bounded advance` — structural walker mirrors the receive-path coalesce loop (parse header, advance by `pn_offset + payload_length`); asserts bounded iteration, in-bounds advance, and termination on Retry/VN/short. Plus the original positive `bytes_consumed` test at `src/wire/long_packet.zig:918`. |
-| 5 | Transport parameter parser | PARTIAL | `tests/fuzz_smoke.zig:217` round-trips generated params; `tests/fuzz_smoke.zig:276` deterministically fuzzes malformed buffers. No `std.testing.fuzz` harness — only fixed-seed sweeps. |
+| 5 | Transport parameter parser | COVERED | `src/tls/transport_params.zig:619` `fuzz: transport_params decode never panics and respects RFC bounds` — drives `Params.decode` with arbitrary bytes; asserts RFC 9000 §18.2 bounds and encode→decode round-trip stability. Plus the deterministic `tests/fuzz_smoke.zig:217/276` round-trip and malformed-buffer sweeps. |
 | 6 | Retry token parser | PARTIAL | `src/conn/retry_token.zig` has 3 negative tests at lines 178, 197, 230 (wrong address, wrong CIDs, wrong version, expired, future, malformed prefix). No fuzzer drives `validate` with arbitrary bytes. |
-| 7 | ACK frame parser | PARTIAL | The ACK frame is decoded inside `frame.decode` (covered) — its parser is exercised. The ACK *range iterator* has deterministic property coverage in `tests/fuzz_smoke.zig:390` plus invariant tests in `src/frame/ack_range.zig:127–207`. No coverage-guided harness on the iterator. |
+| 7 | ACK frame parser | COVERED | The ACK frame is decoded inside `frame.decode` (covered). The ACK *range tracker* now has a coverage-guided harness at `src/conn/ack_tracker.zig:512` `fuzz: ack_tracker range-list invariants` — drives `add` / `addPacket` / `addPacketDelayed` / `markAckSent` / `promoteDelayedAck` / `toAckFrameLimitedRanges` with arbitrary u64 PNs; asserts sorted-disjoint range list, `range_count <= max_ranges`, `largest >= smallest` per interval, no overlap. Iterator correctness still backed by `tests/fuzz_smoke.zig:390` and `src/frame/ack_range.zig:127–207`. |
 | 8 | CRYPTO frame reassembly | PARTIAL | Reassembly logic has unit tests at `src/conn/state.zig:8667, 8711, 8735` (out-of-order, duplicate, shuffled fragments) and a bound check at `src/conn/state.zig:10139`. No fuzzer drives offsets / overlaps / duplicates against `handleCrypto`. |
 | 9 | STREAM frame parser | PARTIAL | The frame-level decoder is in `src/frame/decode.zig` (covered). `RecvStream` reassembly has a deterministic shuffle test in `tests/fuzz_smoke.zig:435` and offset/overlap unit tests in `src/conn/recv_stream.zig`. No dedicated harness on `Connection.handleStream` |
 | 10 | HTTP/3 frame parser | MISSING (no impl) | nullq has no HTTP/3 layer. |
@@ -72,10 +79,10 @@ Status legend:
 | 14 | QPACK encoder stream parser | MISSING (no impl) | nullq has no QPACK layer. |
 | 15 | QPACK decoder stream parser | MISSING (no impl) | nullq has no QPACK layer. |
 | 16 | QPACK field section decoder | MISSING (no impl) | nullq has no QPACK layer. |
-| 17 | Flow-control state machine | PARTIAL | `src/conn/flow_control.zig:185–229` covers monotonic/refuse cases. `src/conn/state.zig:10309–10523` covers send-side, receive-side, blocked-frame queueing, MAX-update pacing. No fuzzer drives sequences of `MAX_DATA` / `MAX_STREAM_DATA` / `STREAM` against the state machine. |
-| 18 | Stream lifecycle state machine | PARTIAL | `src/conn/recv_stream.zig:379–561` and `src/conn/send_stream.zig:411–697` cover happy paths, FIN, RESET, sparse offsets, overflow, duplicates, drain-and-credit, and a 256 KiB stress with random ACK order. No fuzzer drives random orderings of recv/read/reset across the lifecycle enum. |
+| 17 | Flow-control state machine | COVERED | `src/conn/flow_control.zig:264` `fuzz: flow_control ConnectionData state-machine invariants` — drives `recordSent` / `recordPeerSent` / `weCanSend` / `onMaxData` / `raiseLocalMax` with arbitrary u64s; asserts no overflow trap, monotonic limits, post-state invariants. Plus the deterministic `src/conn/flow_control.zig:198–246` happy-path tests and the connection-level integration coverage at `src/conn/state.zig:10309–10523`. |
+| 18 | Stream lifecycle state machine | COVERED | `src/conn/send_stream.zig:815` `fuzz: send_stream lifecycle invariants` and `src/conn/recv_stream.zig:617` `fuzz: recv_stream reassembly invariants` drive randomized op sequences across the full per-stream state machine and assert structural invariants (offset monotonicity, range-list bounds, terminal-state coherence). Deterministic happy-path coverage retained at `src/conn/recv_stream.zig:379–599` and `src/conn/send_stream.zig:441–797`. |
 | 19 | Connection ID lifecycle | PARTIAL | `src/conn/state.zig:11487–11904` covers issuance, retirement, retire-prior-to per path, sequence-reuse rejection. No fuzzer drives random `NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID` / `PATH_NEW_CONNECTION_ID` interleavings. |
-| 20 | Path migration state machine | PARTIAL | `src/conn/path_validator.zig:92–147` and `src/conn/path.zig:674–750` cover anti-amp, validator transitions, CID retirement. Migration callback variants tested at `src/conn/state.zig:12410–12538`. No fuzzer drives random `PATH_CHALLENGE` / `PATH_RESPONSE` / address rebinding sequences against `Connection.handle`. |
+| 20 | Path migration state machine | PARTIAL | `src/conn/path_validator.zig:176` `fuzz: path_validator state-machine invariants` covers the validator state machine (idle/pending/validated/failed transitions, `validated` terminal, `recordResponse` on non-pending). Deterministic coverage at `src/conn/path_validator.zig:92–158` and `src/conn/path.zig:674–750`. Migration callback variants tested at `src/conn/state.zig:12410–12538`. Still missing: a fuzzer that drives random `PATH_CHALLENGE` / `PATH_RESPONSE` / address-rebinding sequences against `Connection.handle` end-to-end. |
 
 ## 3. §11.2 regression classes
 
@@ -164,17 +171,15 @@ challenges at any encryption level. Two new regression tests in
 2. Send a `PATH_CHALLENGE` from a new 4-tuple at Handshake encryption
    level, assert it does not start migration.
 
-### Priority 5: Transport-parameter coverage-guided fuzz harness (§11.1.5)
+### Priority 5: Transport-parameter coverage-guided fuzz harness (§11.1.5) — DONE
 
-**Risk: medium. Readiness: ready.** Transport parameters are read on
-every handshake and decoded with a bespoke parser
-(`src/tls/transport_params.zig`). Today's coverage is the deterministic
-sweep at `tests/fuzz_smoke.zig:276` — high signal but not
-coverage-guided, so it can plateau. A `std.testing.fuzz` harness on
-`Params.decode` mirrors the existing `varint` and `header` harnesses
-and ought to live in `src/tls/transport_params.zig` itself. Catches
-duplicate-id, length-mismatch, and preferred-address-truncation cases
-that the deterministic sweep would not minimize.
+**Landed.** `src/tls/transport_params.zig:619` `fuzz: transport_params
+decode never panics and respects RFC bounds`. Drives `Params.decode`
+with arbitrary bytes, asserts the RFC 9000 §18.2 bounds the decoder
+enforces (`ack_delay_exponent <= 20`, `max_ack_delay_ms < 2^14`,
+`active_connection_id_limit >= 2`), CID-length caps, and an encode→
+decode round-trip that catches asymmetric bound errors. Complements
+the deterministic sweep at `tests/fuzz_smoke.zig:276`.
 
 ## Appendix: out-of-scope rows
 
