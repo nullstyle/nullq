@@ -47,7 +47,8 @@ pub const ConnectionData = struct {
 
     /// True iff sending `n` more bytes would still fit under `peer_max`.
     pub fn weCanSend(self: *const ConnectionData, n: u64) bool {
-        return self.we_sent + n <= self.peer_max;
+        const total = std.math.add(u64, self.we_sent, n) catch return false;
+        return total <= self.peer_max;
     }
 
     /// Remaining bytes we may send before hitting the peer's limit.
@@ -73,8 +74,10 @@ pub const ConnectionData = struct {
     /// Errors with `PeerExceededLimit` if the peer overran our cap
     /// (FLOW_CONTROL_ERROR per §4.1).
     pub fn recordPeerSent(self: *ConnectionData, n: u64) Error!void {
-        if (self.peer_sent + n > self.local_max) return Error.PeerExceededLimit;
-        self.peer_sent += n;
+        const total = std.math.add(u64, self.peer_sent, n) catch
+            return Error.PeerExceededLimit;
+        if (total > self.local_max) return Error.PeerExceededLimit;
+        self.peer_sent = total;
     }
 
     /// Lift the local advertised limit, e.g. before sending a new
@@ -111,8 +114,10 @@ pub const StreamData = struct {
     /// Charge `n` bytes against the peer's stream limit. Errors with
     /// `FlowControlExceeded` on overrun.
     pub fn recordSent(self: *StreamData, n: u64) Error!void {
-        if (self.we_sent + n > self.peer_max) return Error.FlowControlExceeded;
-        self.we_sent += n;
+        const total = std.math.add(u64, self.we_sent, n) catch
+            return Error.FlowControlExceeded;
+        if (total > self.peer_max) return Error.FlowControlExceeded;
+        self.we_sent = total;
     }
 
     /// Apply an incoming MAX_STREAM_DATA frame (RFC 9000 §19.10).
@@ -124,8 +129,10 @@ pub const StreamData = struct {
     /// Charge `n` bytes from the peer against our advertised stream
     /// limit. Errors with `PeerExceededLimit` on overrun.
     pub fn recordPeerSent(self: *StreamData, n: u64) Error!void {
-        if (self.peer_sent + n > self.local_max) return Error.PeerExceededLimit;
-        self.peer_sent += n;
+        const total = std.math.add(u64, self.peer_sent, n) catch
+            return Error.PeerExceededLimit;
+        if (total > self.local_max) return Error.PeerExceededLimit;
+        self.peer_sent = total;
     }
 
     /// Lift our advertised stream limit. Monotonic.
@@ -176,7 +183,13 @@ pub const StreamCount = struct {
     /// number is at or past our advertised cap (STREAM_LIMIT_ERROR).
     pub fn recordPeerOpened(self: *StreamCount, stream_index: u64) Error!void {
         if (stream_index >= self.local_max) return Error.PeerExceededLimit;
-        if (stream_index >= self.peer_opened) self.peer_opened = stream_index + 1;
+        if (stream_index >= self.peer_opened) {
+            // local_max is bounded well below 2^64, so the increment
+            // never overflows in practice. Use checked add anyway so
+            // a future loosening of local_max can't reach UB.
+            self.peer_opened = std.math.add(u64, stream_index, 1) catch
+                return Error.PeerExceededLimit;
+        }
     }
 };
 

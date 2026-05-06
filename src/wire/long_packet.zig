@@ -425,7 +425,11 @@ pub fn retryIntegrityTag(original_dcid: []const u8, retry_without_tag: []const u
     defer aead.deinit();
     var out: [16]u8 = undefined;
     const n = try aead.seal(&out, &retry_integrity_nonce_v1, pseudo[0..pos], "");
-    std.debug.assert(n == out.len);
+    // BoringSSL contract: AesGcm128.seal with empty plaintext writes
+    // exactly the 16-byte tag. Reachable from peer-input via Retry
+    // integrity validation; surface as a typed error rather than
+    // assert so a misbehaving AEAD library can't panic the process.
+    if (n != out.len) return Error.OutputTooSmall;
     return out;
 }
 

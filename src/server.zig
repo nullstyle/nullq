@@ -333,10 +333,14 @@ const max_tracked_cids_per_slot: usize = 32;
 const CidKey = [21]u8;
 
 fn cidKeyFromSlice(cid: []const u8) CidKey {
-    std.debug.assert(cid.len <= 20);
+    // Defensive: callers (peekDcidForServer, ConnectionId.slice, etc.)
+    // already bound CID length to ≤ 20 via header parse and config
+    // validation, but we clamp here so a future caller that forgets
+    // can't reach a buffer overflow on a peer-controlled length.
+    const n = @min(cid.len, 20);
     var k: CidKey = @splat(0);
-    k[0] = @intCast(cid.len);
-    @memcpy(k[1 .. 1 + cid.len], cid);
+    k[0] = @intCast(n);
+    @memcpy(k[1 .. 1 + n], cid[0..n]);
     return k;
 }
 
@@ -407,8 +411,11 @@ const ConfigImpl = struct {
 
     /// Optional override of the underlying `boringssl.tls.Context`.
     /// When null, `Server.init` constructs a TLS-1.3-only server
-    /// context with `verify=.none` and the supplied ALPN list. Pass
-    /// your own to enable, e.g., 0-RTT or session-ticket callbacks.
+    /// context with `verify=.none` and the supplied ALPN list. The
+    /// auto-built context's early-data posture is gated by
+    /// `Config.enable_0rtt` (off by default; §5.2 / §12 hardening).
+    /// Pass your own to enable session-ticket callbacks or any other
+    /// TLS-context behavior the auto-built path doesn't expose.
     tls_context_override: ?boringssl.tls.Context = null,
 
     /// Per-source-address Initial-acceptance cap. Null disables the
@@ -451,6 +458,20 @@ const ConfigImpl = struct {
     /// evict the oldest entry. Only consulted when
     /// `retry_token_key` is non-null.
     retry_state_table_capacity: u32 = 4096,
+
+    /// Enable QUIC 0-RTT (early data) on the auto-built TLS context.
+    /// Off by default to satisfy the §5.2 / §12 hardening posture:
+    /// 0-RTT is replayable and unsuitable for state-changing requests
+    /// without an application-level anti-replay mechanism (RFC 9001
+    /// §5.6 / RFC 8446 §8). Embedders that want 0-RTT must opt in
+    /// here AND set a per-connection allow via
+    /// `Connection.setEarlyDataEnabled(true)` after installing the
+    /// 0-RTT replay context.
+    ///
+    /// Only consulted when `tls_context_override` is null. Embedders
+    /// supplying their own `boringssl.tls.Context` are responsible for
+    /// configuring its early-data posture themselves.
+    enable_0rtt: bool = false,
 };
 
 /// Argument to `Server.replaceTlsContext`. Either fresh PEM bytes
@@ -461,10 +482,11 @@ const TlsReloadImpl = union(enum) {
     /// Rebuild a fresh server context from PEM-encoded cert chain
     /// and private key. The new context is configured identically to
     /// `Server.init`'s default path: TLS-1.3 only, `verify=.none`,
-    /// `early_data_enabled = true`, and the server's currently-cached
-    /// ALPN list. The Server takes ownership of the resulting context
-    /// and `deinit`s it (after refcounted draining) on `Server.deinit`
-    /// or on a subsequent `replaceTlsContext`.
+    /// the server's currently-cached ALPN list, and the early-data
+    /// posture the Server was originally initialized with via
+    /// `Config.enable_0rtt`. The Server takes ownership of the
+    /// resulting context and `deinit`s it (after refcounted draining)
+    /// on `Server.deinit` or on a subsequent `replaceTlsContext`.
     pem: struct {
         /// PEM-encoded certificate chain (leaf first, then any
         /// intermediates). Must outlive only this call — the new
@@ -703,6 +725,13 @@ pub const Server = struct {
     retry_token_lifetime_us: u64,
     retry_state_table_capacity: u32,
 
+    /// Captured `Config.enable_0rtt` from `init`. Drives the
+    /// `early_data_enabled` knob on TLS contexts auto-built by
+    /// `replaceTlsContext({.pem = ...})` so reloads preserve the
+    /// original 0-RTT posture without forcing the embedder to pass
+    /// it again.
+    enable_0rtt: bool,
+
     /// Bounded FIFO of stateless responses (VN, Retry) queued for
     /// the embedder to drain via `drainStatelessResponse`. Bounded
     /// at `stateless_response_queue_capacity`; on overflow the
@@ -780,7 +809,7 @@ pub const Server = struct {
                 .min_version = boringssl.raw.TLS1_3_VERSION,
                 .max_version = boringssl.raw.TLS1_3_VERSION,
                 .alpn = config.alpn_protocols,
-                .early_data_enabled = true,
+                .early_data_enabled = config.enable_0rtt,
             });
             errdefer tls_ctx.deinit();
             try tls_ctx.loadCertChainAndKey(config.tls_cert_pem, config.tls_key_pem);
@@ -839,6 +868,7 @@ pub const Server = struct {
             .retry_token_key = config.retry_token_key,
             .retry_token_lifetime_us = config.retry_token_lifetime_us,
             .retry_state_table_capacity = config.retry_state_table_capacity,
+            .enable_0rtt = config.enable_0rtt,
             .stateless_responses = .empty,
             .random = prng.random(),
             .rng_state = prng,
@@ -1195,7 +1225,7 @@ pub const Server = struct {
                     .min_version = boringssl.raw.TLS1_3_VERSION,
                     .max_version = boringssl.raw.TLS1_3_VERSION,
                     .alpn = self.alpn_protocols,
-                    .early_data_enabled = true,
+                    .early_data_enabled = self.enable_0rtt,
                 });
                 errdefer ctx.deinit();
                 try ctx.loadCertChainAndKey(pem.cert_pem, pem.key_pem);

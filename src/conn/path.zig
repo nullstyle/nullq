@@ -44,13 +44,17 @@ pub const ConnectionId = struct {
     bytes: [max_cid_len]u8 = @splat(0),
     len: u8 = 0,
 
-    /// Build a ConnectionId from the given slice. `s.len` must not
-    /// exceed `max_cid_len` (asserted in debug builds).
+    /// Build a ConnectionId from the given slice. Lengths above
+    /// `max_cid_len` are clamped: every documented caller (header
+    /// parser, transport-parameter decoder, frame decoder) already
+    /// rejects oversized peer CIDs with a typed error, but the clamp
+    /// keeps a hypothetical missed validation from indexing past the
+    /// inline buffer on a peer-controlled length.
     pub fn fromSlice(s: []const u8) ConnectionId {
-        std.debug.assert(s.len <= max_cid_len);
+        const n = @min(s.len, max_cid_len);
         var cid: ConnectionId = .{};
-        @memcpy(cid.bytes[0..s.len], s);
-        cid.len = @intCast(s.len);
+        @memcpy(cid.bytes[0..n], s[0..n]);
+        cid.len = @intCast(n);
         return cid;
     }
 

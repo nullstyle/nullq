@@ -186,6 +186,9 @@ pub const SentPacketTracker = struct {
     pub fn record(self: *SentPacketTracker, p: SentPacket) Error!void {
         if (self.count >= max_tracked) return Error.TooManyInFlight;
         if (self.count > 0) {
+            // invariant: caller is the send path, which draws PNs
+            // from a monotonically-incrementing nextPn() and never
+            // reuses one. Not peer-controlled; pure local data.
             std.debug.assert(p.pn > self.packets[self.count - 1].pn);
         }
         self.packets[self.count] = p;
@@ -198,6 +201,8 @@ pub const SentPacketTracker = struct {
 
     /// Remove a tracked packet by index. Returns the removed entry.
     pub fn removeAt(self: *SentPacketTracker, idx: u32) SentPacket {
+        // invariant: callers walk via indexOf/lowerBound/forward
+        // scan, all of which yield indices already < count.
         std.debug.assert(idx < self.count);
         const p = self.packets[idx];
         var k: u32 = idx;

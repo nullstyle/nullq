@@ -69,11 +69,13 @@ const ConfigImpl = struct {
 
     /// Optional override of the underlying `boringssl.tls.Context`.
     /// When null, `Client.connect` constructs a TLS-1.3-only client
-    /// context with the supplied ALPN list, the verification mode
-    /// derived from `ca_pem`, and `early_data_enabled = true` so
-    /// 0-RTT is available when `session_ticket` is supplied. Pass
-    /// your own to enable, e.g., custom session-ticket capture or
-    /// keylog wiring (see the QNS endpoint).
+    /// context with the supplied ALPN list and the verification mode
+    /// derived from `ca_pem`. The auto-built context's
+    /// `early_data_enabled` flag follows whether `session_ticket` is
+    /// non-null — 0-RTT is only enabled at the TLS layer when the
+    /// embedder actually plans to use it (§5.2 / §12 hardening).
+    /// Pass your own to enable, e.g., custom session-ticket capture
+    /// or keylog wiring (see the QNS endpoint).
     tls_context_override: ?boringssl.tls.Context = null,
 
     /// Optional CA bundle (PEM) for verifying the server's
@@ -98,8 +100,10 @@ const ConfigImpl = struct {
     /// flight. Bytes must come from `Session.toBytes` of a previous
     /// session captured against `tls_context_override` (or a context
     /// configured equivalently). When `tls_context_override` is null,
-    /// `Client` constructs a context with `early_data_enabled = true`
-    /// so this path works out of the box.
+    /// the presence of this field also drives `early_data_enabled` on
+    /// the auto-built TLS context so the path works out of the box;
+    /// embedders without a ticket get `early_data_enabled = false`
+    /// per the §5.2 / §12 hardening posture.
     session_ticket: ?[]const u8 = null,
 };
 
@@ -186,12 +190,20 @@ pub const Client = struct {
                 if (config.ca_pem != null) break :blk .system;
                 break :blk .none;
             };
+            // Only enable early-data on the auto-built TLS context
+            // when the embedder actually plans to use it (i.e. they
+            // supplied a 0-RTT session ticket). This is the §5.2 /
+            // §12 secure-default posture: 0-RTT off unless
+            // explicitly opted into. Embedders that want 0-RTT
+            // capability without a ticket on this attempt can pass
+            // their own `tls_context_override` with
+            // `early_data_enabled = true`.
             tls_ctx = try boringssl.tls.Context.initClient(.{
                 .verify = verify,
                 .min_version = boringssl.raw.TLS1_3_VERSION,
                 .max_version = boringssl.raw.TLS1_3_VERSION,
                 .alpn = config.alpn_protocols,
-                .early_data_enabled = true,
+                .early_data_enabled = config.session_ticket != null,
             });
             owns_tls = true;
         }
