@@ -32,6 +32,23 @@ pub const MaxStreamDataItem = struct {
     maximum_stream_data: u64,
 };
 
+/// One queued NEW_TOKEN frame (RFC 9000 §19.7). The token payload is
+/// stored inline as a fixed 96-byte buffer (matches
+/// `conn.new_token.max_token_len`) plus a `len`. nullq mints a single
+/// fixed-shape format so a heap allocation isn't needed.
+pub const NewTokenItem = struct {
+    /// Maximum supported NEW_TOKEN length on the wire. Matches
+    /// `conn.new_token.max_token_len`. Tracked here to keep
+    /// `pending_frames` self-contained.
+    pub const max_len: usize = 96;
+    bytes: [max_len]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn slice(self: *const NewTokenItem) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
 /// One queued NEW_CONNECTION_ID frame (RFC 9000 §19.15) the embedder has handed
 /// to the connection and is awaiting transmission.
 pub const PendingNewConnectionId = struct {
@@ -78,6 +95,17 @@ pub const PendingFrameQueues = struct {
     // -- stop sending (RFC 9000 §19.5) --
     /// STOP_SENDING frames we owe the peer (one per stream id).
     stop_sending: std.ArrayList(StopSendingItem) = .empty,
+
+    // -- NEW_TOKEN (RFC 9000 §19.7) --
+    /// NEW_TOKEN payload the server has queued for emission. Single
+    /// slot — nullq emits at most one NEW_TOKEN per session by
+    /// default, so the queue is a fixed buffer holding the 96-byte
+    /// AEAD-sealed token plus its length. `Connection.queueNewToken`
+    /// stages bytes here; the application-level drain in
+    /// `pollLevel` clears the slot once the frame is on the wire and
+    /// pushes a retransmit copy onto the sent-packet bookkeeping
+    /// instead of leaving the slot armed.
+    new_token: ?NewTokenItem = null,
 
     // -- connection ID issuance/retirement (RFC 9000 §19.15 / §19.16) --
     new_connection_ids: std.ArrayList(PendingNewConnectionId) = .empty,

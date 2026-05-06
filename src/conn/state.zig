@@ -121,6 +121,21 @@ pub const Error = error{
     /// `transport_error_excessive_load` and a redacted reason before
     /// the over-cap allocation lands.
     ExcessiveLoad,
+    /// `Connection.setNewTokenCallback` /
+    /// `Connection.queueNewToken` / `Connection.setInitialToken` were
+    /// called on a connection in the wrong role (e.g. queueing a
+    /// NEW_TOKEN on a client). Embedder-side misuse — peer input
+    /// can never produce this.
+    NotServerContext,
+    NotClientContext,
+    /// `Connection.queueNewToken` was called with a zero-length
+    /// token, which RFC 9000 §19.7 forbids.
+    ZeroLengthNewToken,
+    /// `Connection.queueNewToken` was called with a token longer
+    /// than `pending_frames.NewTokenItem.max_len`. nullq mints
+    /// fixed-shape 96-byte tokens via `conn.new_token.mint`; only
+    /// custom embedder formats can hit this.
+    NewTokenTooLong,
 } || boringssl.tls.Error ||
     boringssl.crypto.rand.Error ||
     short_packet_mod.Error ||
@@ -772,6 +787,19 @@ pub const MigrationCallback = *const fn (
     current_addr: ?Address,
 ) MigrationDecision;
 
+/// Callback fired when a client connection receives a NEW_TOKEN frame
+/// (RFC 9000 §8.1.3). The embedder typically stashes the bytes
+/// alongside the server's session ticket; on the next attempt to the
+/// same server, supplying these bytes back via
+/// `Client.Config.new_token` lets the server skip the Retry round
+/// trip. Tokens are opaque to the client — treat the slice as a
+/// blob.
+///
+/// The slice is borrowed from the inbound packet's decoded frame; if
+/// the embedder needs to keep it past the callback's return,
+/// it MUST copy.
+pub const NewTokenCallback = *const fn (user_data: ?*anyopaque, token: []const u8) void;
+
 const ApplicationKeyEpoch = struct {
     material: SecretMaterial,
     keys: PacketKeys,
@@ -1149,6 +1177,14 @@ pub const Connection = struct {
     /// hot-path drain in `pollLevel` walks each subqueue in order.
     pending_frames: pending_frames_mod.PendingFrameQueues = .empty,
 
+    /// Client-side callback fired when a NEW_TOKEN frame arrives at
+    /// application encryption level (RFC 9000 §8.1.3). Embedders
+    /// stash the bytes for use as the long-header Token on a future
+    /// connection's first Initial. Server-side connections never
+    /// fire this — peers MUST NOT send NEW_TOKEN to a server.
+    new_token_callback: ?NewTokenCallback = null,
+    new_token_user_data: ?*anyopaque = null,
+
     /// Build a client-side `Connection`. `tls_ctx` must be a
     /// client-mode `boringssl.tls.Context` and stays caller-owned;
     /// `server_name` becomes the SNI hostname. The returned
@@ -1383,6 +1419,57 @@ pub const Connection = struct {
     pub fn setSession(self: *Connection, session: Session) !void {
         if (self.role != .client) return error.NotClientContext;
         try self.inner.setSession(session);
+    }
+
+    /// Install a callback fired when the (client-side) connection
+    /// receives a NEW_TOKEN frame (RFC 9000 §8.1.3). The embedder
+    /// typically stashes the bytes alongside their session ticket so
+    /// the next connection to the same server can present the token
+    /// in its long-header Token field and skip the server's Retry
+    /// round trip.
+    ///
+    /// `cb` may be null to clear an existing callback. Server-side
+    /// connections never fire the callback (NEW_TOKEN from a peer is
+    /// a client-only event).
+    pub fn setNewTokenCallback(
+        self: *Connection,
+        cb: ?NewTokenCallback,
+        user_data: ?*anyopaque,
+    ) void {
+        self.new_token_callback = cb;
+        self.new_token_user_data = user_data;
+    }
+
+    /// Server-side helper: pre-load the client's first Initial Token
+    /// field with `token` (a Retry token or a NEW_TOKEN from a prior
+    /// connection). Idempotent. Used by `Client` to wire up
+    /// `Client.Config.new_token` ahead of the first `advance`.
+    pub fn setInitialToken(self: *Connection, token: []const u8) Error!void {
+        if (self.role != .client) return Error.NotClientContext;
+        try self.retry_token.resize(self.allocator, token.len);
+        @memcpy(self.retry_token.items, token);
+    }
+
+    /// Server-side helper: queue a NEW_TOKEN frame for transmission at
+    /// application encryption level (RFC 9000 §19.7). Idempotent — a
+    /// second call before the first one drains overwrites the queued
+    /// payload (we only ever owe one NEW_TOKEN per session by
+    /// default). The bytes are copied into the per-connection
+    /// pending-frames slot, so `token` does not need to outlive this
+    /// call.
+    pub fn queueNewToken(self: *Connection, token: []const u8) Error!void {
+        if (self.role != .server) return Error.NotServerContext;
+        // RFC 9000 §19.7: NEW_TOKEN MUST NOT carry a zero-length token
+        // (a peer that received one would close with FRAME_ENCODING).
+        // We also bound the upper end to the inline-buffer capacity;
+        // server callers fed by `new_token.mint` always emit exactly
+        // `new_token.max_token_len = 96`, which fits.
+        if (token.len == 0) return Error.ZeroLengthNewToken;
+        if (token.len > pending_frames_mod.NewTokenItem.max_len) return Error.NewTokenTooLong;
+        var item: pending_frames_mod.NewTokenItem = .{};
+        @memcpy(item.bytes[0..token.len], token);
+        item.len = @intCast(token.len);
+        self.pending_frames.new_token = item;
     }
 
     /// Per-connection 0-RTT toggle. This deliberately gates nullq's
@@ -4797,6 +4884,7 @@ pub const Connection = struct {
         if (self.pending_frames.new_connection_ids.items.len > 0) return true;
         if (self.pending_frames.retire_connection_ids.items.len > 0) return true;
         if (self.pending_frames.stop_sending.items.len > 0) return true;
+        if (self.pending_frames.new_token != null) return true;
         if (self.pending_frames.path_response != null) return true;
         if (self.pending_frames.path_challenge != null) return true;
         if (self.pending_frames.path_abandons.items.len > 0) return true;
@@ -5160,6 +5248,31 @@ pub const Connection = struct {
             self.pending_handshake_done = false;
             ack_eliciting = true;
         }
+
+        // 1c) Server NEW_TOKEN issuance (RFC 9000 §19.7). The frame
+        // is application-level, ack-eliciting, and retransmittable;
+        // we emit at most one per session. Frame layout: type byte
+        // (0x07) + varint(token.len) + token bytes.
+        if (!app_control_blocked and lvl == .application) if (self.pending_frames.new_token) |item| {
+            const overhead_nt: usize = 1 + varint.encodedLen(item.len) + item.len;
+            if (max_payload >= pl_pos + overhead_nt) {
+                const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
+                    .new_token = .{ .token = item.slice() },
+                });
+                pl_pos += wrote;
+                // Stash a copy in the retransmit slot so loss
+                // recovery can requeue from the captured bytes
+                // (the pending-frames slot is about to be cleared).
+                var retx_item: sent_packets_mod.NewTokenRetransmit = .{};
+                @memcpy(retx_item.bytes[0..item.len], item.slice());
+                retx_item.len = item.len;
+                try sent_packet.addRetransmitFrame(self.allocator, .{
+                    .new_token = retx_item,
+                });
+                self.pending_frames.new_token = null;
+                ack_eliciting = true;
+            }
+        };
 
         // 2) CRYPTO frame: retransmit lost data first, then drain
         // fresh outbox bytes at this level into one frame.
@@ -6625,7 +6738,7 @@ pub const Connection = struct {
                     );
                 },
                 .retire_connection_id => |rc| self.handleRetireConnectionId(rc),
-                .new_token => {},
+                .new_token => |nt| self.handleNewToken(nt),
             }
         }
         if (debugFrames() != null) {
@@ -6861,6 +6974,32 @@ pub const Connection = struct {
         }
         self.retireLocalCidFromPeer(0, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(0, rc.sequence_number);
+    }
+
+    /// RFC 9000 §19.7 — server-issued NEW_TOKEN. The frame is only
+    /// legal at application encryption level (filtered upstream by
+    /// the level-allowed-frames check). Servers MUST NOT receive
+    /// NEW_TOKEN; if a peer-acting-as-server sends it to us we
+    /// silently drop the bytes. Clients hand the borrowed slice
+    /// straight to the embedder callback if one is installed.
+    fn handleNewToken(self: *Connection, nt: frame_types.NewToken) void {
+        if (self.role != .client) {
+            // Per §19.7: receiving NEW_TOKEN with role=server is a
+            // PROTOCOL_VIOLATION. The frame-level check is here so
+            // we don't bake server-side state on a malicious peer
+            // sending the wrong-direction frame.
+            self.close(true, transport_error_protocol_violation, "new_token from peer to server");
+            return;
+        }
+        if (nt.token.len == 0) {
+            // Zero-length NEW_TOKEN is FRAME_ENCODING_ERROR per
+            // §19.7. We could emit a more specific code; nullq
+            // already wires PROTOCOL_VIOLATION for parse-shape
+            // issues so reuse it.
+            self.close(true, transport_error_frame_encoding, "zero-length new_token");
+            return;
+        }
+        if (self.new_token_callback) |cb| cb(self.new_token_user_data, nt.token);
     }
 
     fn pathAckToAck(pa: frame_types.PathAck) frame_types.Ack {
@@ -7806,6 +7945,19 @@ pub const Connection = struct {
                 .path_cids_blocked => |pcb| {
                     self.queuePathCidsBlocked(pcb.path_id, pcb.next_sequence_number);
                     any = true;
+                },
+                .new_token => |item| {
+                    // RFC 9000 §13.3 puts NEW_TOKEN on the
+                    // retransmittable list; if the application
+                    // hasn't already queued a fresh NEW_TOKEN over
+                    // the top, restage the bytes from the lost copy.
+                    if (self.pending_frames.new_token == null) {
+                        var stage: pending_frames_mod.NewTokenItem = .{};
+                        @memcpy(stage.bytes[0..item.len], item.slice());
+                        stage.len = item.len;
+                        self.pending_frames.new_token = stage;
+                        any = true;
+                    }
                 },
             }
         }

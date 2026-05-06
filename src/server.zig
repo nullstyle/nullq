@@ -81,6 +81,7 @@ const conn_mod = @import("conn/root.zig");
 const tls_mod = @import("tls/root.zig");
 const wire = @import("wire/root.zig");
 const retry_token_mod = conn_mod.retry_token;
+const new_token_mod = conn_mod.new_token;
 const lifecycle = conn_mod.lifecycle;
 
 const Connection = conn_mod.Connection;
@@ -510,6 +511,28 @@ const ConfigImpl = struct {
     /// `retry_token_key` is non-null.
     retry_state_table_capacity: u32 = 4096,
 
+    /// AES-GCM-256 key used to mint and validate NEW_TOKEN frames
+    /// (RFC 9000 §8.1.3). When null, NEW_TOKEN issuance is disabled
+    /// and Initial-token validation falls through to the Retry
+    /// token gate. When set, the server emits one NEW_TOKEN per
+    /// successfully-handshake-confirmed connection, and accepts
+    /// returning clients presenting a valid NEW_TOKEN as already
+    /// address-validated (no Retry round-trip).
+    ///
+    /// This key is **distinct from `retry_token_key`** by design:
+    /// NEW_TOKENs typically outlive Retry tokens by orders of
+    /// magnitude (hours/days vs. seconds), so they need their own
+    /// rotation policy. Sharing the key would force NEW_TOKEN
+    /// rotation every time the operator rotated the Retry key.
+    new_token_key: ?conn_mod.NewTokenKey = null,
+    /// Lifetime of a minted NEW_TOKEN in microseconds. Returning
+    /// clients presenting a token older than this fall through to
+    /// the Retry gate (or the no-validation accept path, if Retry
+    /// is also disabled). Default 24 hours — long enough that a
+    /// returning user a day later still skips Retry, short enough
+    /// that a stolen token's window of misuse is bounded.
+    new_token_lifetime_us: u64 = 24 * 3600 * 1_000_000,
+
     /// Enable QUIC 0-RTT (early data) on the auto-built TLS context.
     /// Off by default to satisfy the §5.2 / §12 hardening posture:
     /// 0-RTT is replayable and unsuitable for state-changing requests
@@ -659,6 +682,12 @@ const SlotImpl = struct {
     /// generation tells us which draining context (if any) loses a
     /// reference.
     tls_generation: u32 = 0,
+    /// True once this slot has queued its single NEW_TOKEN frame.
+    /// `Server.feed` flips this on the first datagram routed to a
+    /// slot whose connection has just confirmed the handshake (so
+    /// every subsequent datagram skips the mint cost). Stays false
+    /// for the slot's lifetime when `Server.new_token_key` is null.
+    new_token_emitted: bool = false,
 
     /// Attach a W3C tracecontext to this slot. Embedders typically
     /// call this after `Server.feed` returns `.accepted` and the
@@ -837,6 +866,13 @@ pub const Server = struct {
     retry_token_lifetime_us: u64,
     retry_state_table_capacity: u32,
 
+    /// Captured `Config.new_token_key`. Null disables NEW_TOKEN
+    /// issuance. Hardening guide §4.3 / RFC 9000 §8.1.3.
+    new_token_key: ?conn_mod.NewTokenKey,
+    /// Captured `Config.new_token_lifetime_us`. Only consulted when
+    /// `new_token_key` is non-null.
+    new_token_lifetime_us: u64,
+
     /// Captured `Config.enable_0rtt` from `init`. Drives the
     /// `early_data_enabled` knob on TLS contexts auto-built by
     /// `replaceTlsContext({.pem = ...})` so reloads preserve the
@@ -956,6 +992,13 @@ pub const Server = struct {
             if (config.retry_token_lifetime_us == 0) return Error.InvalidConfig;
             if (config.retry_state_table_capacity == 0) return Error.InvalidConfig;
         }
+        if (config.new_token_key != null) {
+            // NEW_TOKEN with a zero lifetime would expire on the next
+            // microsecond — the feature degenerates into "always
+            // invalid" but the embedder might never notice. Treat
+            // that as misconfiguration.
+            if (config.new_token_lifetime_us == 0) return Error.InvalidConfig;
+        }
         // Hardening guide §4.1: cap=0 is meaningless for the listener
         // rate limit — it would drop every datagram. Surface it as
         // `InvalidConfig` instead of letting it silently DoS the
@@ -1038,6 +1081,8 @@ pub const Server = struct {
             .retry_token_key = config.retry_token_key,
             .retry_token_lifetime_us = config.retry_token_lifetime_us,
             .retry_state_table_capacity = config.retry_state_table_capacity,
+            .new_token_key = config.new_token_key,
+            .new_token_lifetime_us = config.new_token_lifetime_us,
             .enable_0rtt = config.enable_0rtt,
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .max_connection_memory = config.max_connection_memory,
@@ -1066,6 +1111,12 @@ pub const Server = struct {
         // linger in a freed allocation that the host allocator might
         // reuse for unrelated data (or surface in a core dump).
         if (self.retry_token_key) |*key| {
+            std.crypto.secureZero(u8, key[0..]);
+        }
+        // Same hardening rationale for the NEW_TOKEN AES-GCM-256
+        // key — a peer-mintable token's worth of crypto state must
+        // not linger after the Server struct is freed.
+        if (self.new_token_key) |*key| {
             std.crypto.secureZero(u8, key[0..]);
         }
         // Draining contexts always represent ownership the Server
@@ -1174,6 +1225,13 @@ pub const Server = struct {
             if (from) |addr| slot.peer_addr = addr;
             try self.dispatchToSlot(slot, bytes, from, now_us);
             try self.resyncSlotCids(slot);
+            // RFC 9000 §8.1.3: once the handshake is confirmed, the
+            // server MAY issue NEW_TOKEN frames usable on the peer's
+            // future first Initial. We emit exactly one per session
+            // (the simplest policy that still removes the Retry
+            // round-trip for returning clients); the slot's
+            // `new_token_emitted` flag latches at first issuance.
+            self.maybeIssueNewToken(slot, from, now_us);
             self.feeds_routed += 1;
             return .routed;
         }
@@ -1253,12 +1311,14 @@ pub const Server = struct {
             }
         }
 
-        // Retry-token gate runs before the Connection is allocated.
-        // Returns `.retry_sent` after queuing a Retry, `.dropped` for
-        // an invalid echoed token, or null when validation passed
-        // (i.e. proceed to slot creation with the post-Retry context).
+        // Retry / NEW_TOKEN gate runs before the Connection is
+        // allocated. `.sent` queues a Retry; `.drop` rejects a
+        // wrong-source token; `.echo` accepts a Retry-validated
+        // Initial; `.new_token_skip` accepts a NEW_TOKEN-validated
+        // Initial directly (no Retry round-trip). `.none` is the
+        // gate-disabled fall-through.
         var retry_ctx: ?RetryEcho = null;
-        if (self.retry_token_key) |_| {
+        if (self.retry_token_key != null or self.new_token_key != null) {
             if (from) |addr| {
                 switch (try self.applyRetryGate(addr, bytes, now_us)) {
                     .sent => {
@@ -1278,6 +1338,15 @@ pub const Server = struct {
                     },
                     .none => {},
                     .echo => |echo| retry_ctx = echo,
+                    .new_token_skip => {
+                        // The peer presented a valid NEW_TOKEN; treat
+                        // them as already address-validated and
+                        // proceed to slot creation as if no Retry was
+                        // ever required. No `retry_ctx` is set —
+                        // there is no Retry SCID to bind to and the
+                        // initial transport parameters skip the
+                        // `retry_source_connection_id` echo.
+                    },
                 }
             }
             // No `from`: pass-through to the legacy accept path so
@@ -1306,6 +1375,11 @@ pub const Server = struct {
         }
         try self.dispatchToSlot(slot, bytes, from, now_us);
         try self.resyncSlotCids(slot);
+        // Same NEW_TOKEN issuance check the routed path runs — a
+        // pathological 0-RTT-only handshake might confirm in the
+        // very first received datagram, in which case there is no
+        // later "routed" feed to trip the issuance check.
+        self.maybeIssueNewToken(slot, from, now_us);
         self.feeds_accepted += 1;
         // Emit *after* slot is fully visible in the routing table so
         // the callback can index into `slots` if it wants to.
@@ -1918,6 +1992,58 @@ pub const Server = struct {
         try self.queueStatelessResponse(entry);
     }
 
+    // -- NEW_TOKEN ------------------------------------------------------
+
+    /// Mint and queue a single NEW_TOKEN on `slot`'s connection if all
+    /// prerequisites are satisfied:
+    ///  - `Server.new_token_key` is non-null (feature opt-in).
+    ///  - The slot's connection has confirmed the handshake.
+    ///  - This slot has not already emitted its NEW_TOKEN.
+    ///  - We have a peer address to bind into the token (no `from`,
+    ///    no NEW_TOKEN — the embedder is in a hermetic-test path).
+    ///
+    /// Called from the routed and accepted feed paths; idempotent
+    /// across retries via the slot's `new_token_emitted` latch.
+    fn maybeIssueNewToken(
+        self: *Server,
+        slot: *Slot,
+        from: ?Address,
+        now_us: u64,
+    ) void {
+        const key_ptr = if (self.new_token_key) |*k| k else return;
+        if (slot.new_token_emitted) return;
+        if (!slot.conn.handshakeDone()) return;
+        const addr = from orelse return;
+
+        var addr_buf: [22]u8 = undefined;
+        const ctx = addressContext(&addr_buf, addr);
+        var token: new_token_mod.Token = undefined;
+        _ = new_token_mod.mint(&token, .{
+            .key = key_ptr,
+            .now_us = now_us,
+            .lifetime_us = self.new_token_lifetime_us,
+            .client_address = ctx,
+        }) catch {
+            // Mint failure is not peer-reachable in practice (output
+            // buffer is fixed-size, address is fixed-size, the only
+            // realistic failure is a BoringSSL CSPRNG hiccup). Skip
+            // issuance for this slot; the slot stays usable, and
+            // future Initials from the same address will fall
+            // through to the Retry gate as if NEW_TOKEN was never
+            // issued.
+            return;
+        };
+
+        slot.conn.queueNewToken(&token) catch {
+            // Same not-peer-reachable rationale; the queue holds at
+            // most one entry, the bytes are fixed-size, and the
+            // role check has already passed (we minted on a
+            // server-role slot).
+            return;
+        };
+        slot.new_token_emitted = true;
+    }
+
     // -- Retry ----------------------------------------------------------
 
     /// What `applyRetryGate` decided. `none` means proceed with the
@@ -1925,13 +2051,17 @@ pub const Server = struct {
     /// is disabled, or the source already passed validation in a
     /// prior datagram). `sent` means we queued a Retry. `drop` means
     /// the echoed token was malformed/expired/wrong-source. `echo`
-    /// means the token validated and the caller should accept this
-    /// Initial as the post-Retry continuation.
+    /// means the Retry token validated and the caller should accept
+    /// this Initial as the post-Retry continuation.
+    /// `new_token_skip` means a valid NEW_TOKEN was presented, so
+    /// the source is treated as already address-validated and the
+    /// caller skips the Retry round-trip (RFC 9000 §8.1.3).
     const RetryDecision = union(enum) {
         none,
         sent,
         drop,
         echo: RetryEcho,
+        new_token_skip,
     };
 
     /// Captured server-side context for an Initial that successfully
@@ -1943,22 +2073,62 @@ pub const Server = struct {
         original_dcid: ConnectionId,
     };
 
-    /// Run the Retry-token gate for an Initial from `addr`. Either
-    /// queues a Retry (and returns `.sent`), validates an echoed
-    /// token (and returns `.echo` with the per-source context), or
-    /// returns `.drop` for a malformed/expired/wrong-source token.
-    /// Returns `.none` only if Retry is disabled (caller checks
-    /// before invoking).
+    /// Run the Retry / NEW_TOKEN gate for an Initial from `addr`.
+    /// Either queues a Retry (`.sent`), validates an echoed Retry
+    /// token (`.echo`), validates an echoed NEW_TOKEN
+    /// (`.new_token_skip`, accept directly), or returns `.drop` for
+    /// a malformed/expired/wrong-source token. Returns `.none` only
+    /// if both gates are disabled (caller checks before invoking).
+    ///
+    /// Token-disambiguation: if `new_token_key` is set, NEW_TOKEN
+    /// validation runs first; on `.valid` we skip Retry. On
+    /// `.malformed` (also covers a Retry-token blob in a fresh
+    /// session — distinct domain separator), we fall through to
+    /// Retry. Other NEW_TOKEN failures (`.expired`, `.invalid`,
+    /// etc.) ALSO fall through so a stale stored token sends the
+    /// peer through a fresh Retry round-trip rather than dropping
+    /// the connection.
     fn applyRetryGate(
         self: *Server,
         addr: Address,
         bytes: []const u8,
         now_us: u64,
     ) Error!RetryDecision {
-        const key_ptr = if (self.retry_token_key) |*k| k else return .none;
-        const ids = peekLongHeaderIds(bytes) orelse return .drop;
+        const retry_key = if (self.retry_token_key) |*k| k else null;
+        const new_token_key = if (self.new_token_key) |*k| k else null;
+        if (retry_key == null and new_token_key == null) return .none;
 
+        const ids = peekLongHeaderIds(bytes) orelse return .drop;
         const token = peekInitialToken(bytes);
+
+        // NEW_TOKEN check first — if a returning client presents a
+        // valid NEW_TOKEN, we want to accept it directly without
+        // burning a Retry round-trip. On any failure we fall
+        // through; a stale or wrong-address NEW_TOKEN should never
+        // close the connection (the peer expected to be accepted
+        // and would re-handshake gracefully on a Retry).
+        if (token != null and token.?.len > 0) {
+            if (new_token_key) |nt_key| {
+                var addr_buf: [22]u8 = undefined;
+                const ctx = addressContext(&addr_buf, addr);
+                const result = new_token_mod.validate(token.?, .{
+                    .key = nt_key,
+                    .now_us = now_us,
+                    .client_address = ctx,
+                });
+                if (result == .valid) return .new_token_skip;
+                // Fall through to Retry validation on malformed,
+                // expired, invalid, etc.
+            }
+        }
+
+        // Retry-token path. If Retry is disabled, an Initial
+        // carrying a non-NEW_TOKEN token is treated as if no token
+        // were present (we can't validate it; falling back to
+        // accept-without-validation is the only safe move when the
+        // operator opted out of Retry).
+        const key_ptr = retry_key orelse return .none;
+
         const existing = self.retry_state_table.get(addr);
 
         // No echoed token: the peer is on its first Initial. Mint a

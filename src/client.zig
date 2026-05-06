@@ -112,6 +112,22 @@ const ConfigImpl = struct {
     /// implementation detail to the peer. Local introspection via
     /// close events is unaffected.
     reveal_close_reason_on_wire: bool = false,
+
+    /// Optional NEW_TOKEN bytes from a prior connection to the same
+    /// server (RFC 9000 §8.1.3). When set, the client embeds the
+    /// token in its first Initial's long-header Token field so the
+    /// server can skip its Retry round trip. Embedders typically
+    /// capture the bytes from the previous connection's
+    /// `new_token_callback` and persist them alongside the TLS
+    /// session ticket.
+    new_token: ?[]const u8 = null,
+    /// Optional callback fired when this connection receives a
+    /// NEW_TOKEN frame. Embedders capture the bytes (which are only
+    /// borrowed for the duration of the call) for use as the
+    /// `new_token` field on a future connection. See
+    /// `Connection.setNewTokenCallback` for the lifetime contract.
+    new_token_callback: ?conn_mod.NewTokenCallback = null,
+    new_token_user_data: ?*anyopaque = null,
 };
 
 /// Errors produced by `Client.connect`. Distinct from
@@ -233,6 +249,26 @@ pub const Client = struct {
         conn_ptr.reveal_close_reason_on_wire = config.reveal_close_reason_on_wire;
 
         if (config.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, config.qlog_user_data);
+
+        // NEW_TOKEN receive callback — wire it before any frame
+        // could be processed. Server-side connections never fire
+        // this; the role check inside `setNewTokenCallback` would
+        // accept it on a server connection too, but `Connection`
+        // is in client mode here.
+        if (config.new_token_callback) |cb| {
+            conn_ptr.setNewTokenCallback(cb, config.new_token_user_data);
+        }
+
+        // NEW_TOKEN replay on the first Initial — RFC 9000 §8.1.3
+        // lets a returning client present a previously-issued
+        // token in the Initial's long-header Token field. nullq
+        // reuses the `retry_token` storage on Connection because
+        // the wire mechanism is identical (Token field on
+        // long-header Initial). The Server's gate distinguishes
+        // by trying NEW_TOKEN.validate first.
+        if (config.new_token) |nt_bytes| {
+            try conn_ptr.setInitialToken(nt_bytes);
+        }
 
         // Attach the resumption session before `bind` so BoringSSL
         // sees it during handshake initiation. `setSession` upref's

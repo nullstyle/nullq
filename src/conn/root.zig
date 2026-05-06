@@ -55,6 +55,10 @@ pub const recv_stream = @import("recv_stream.zig");
 pub const path = @import("path.zig");
 /// RFC 9000 §8.1.2 stateless Retry token mint/validate.
 pub const retry_token = @import("retry_token.zig");
+/// RFC 9000 §8.1.3 / §19.7 NEW_TOKEN issuance helpers — server mint
+/// + client-side opaque blob, distinct from `retry_token` so its key
+/// can be rotated independently.
+pub const new_token = @import("new_token.zig");
 /// RFC 9000 §10.3 stateless-reset token derivation
 /// (default-safe HMAC-SHA256 over CID).
 pub const stateless_reset = @import("stateless_reset.zig");
@@ -115,6 +119,10 @@ pub const QlogMigrationFailReason = state.QlogMigrationFailReason;
 pub const MigrationCallback = state.MigrationCallback;
 /// Allow / deny verdict returned by `MigrationCallback`.
 pub const MigrationDecision = state.MigrationDecision;
+/// Client-side callback fired when a NEW_TOKEN frame arrives
+/// (RFC 9000 §8.1.3). Embedders persist the bytes for use as
+/// `Client.Config.new_token` on a future connection.
+pub const NewTokenCallback = state.NewTokenCallback;
 /// Phase of the per-path congestion controller (slow-start, recovery, etc.).
 pub const CongestionState = path.CongestionState;
 /// How a new connection ID was provisioned (initial, server-assigned, user-assigned).
@@ -163,6 +171,12 @@ pub const RetryToken = retry_token.Token;
 pub const RetryTokenKey = retry_token.Key;
 /// Outcome of `retry_token.validate` (valid, expired, invalid, etc.).
 pub const RetryTokenValidationResult = retry_token.ValidationResult;
+/// 96-byte NEW_TOKEN (re-export).
+pub const NewTokenBlob = new_token.Token;
+/// 32-byte AES-GCM-256 key for NEW_TOKEN mint/validate (re-export).
+pub const NewTokenKey = new_token.Key;
+/// Outcome of `new_token.validate` (valid, expired, invalid, etc.).
+pub const NewTokenValidationResult = new_token.ValidationResult;
 
 test {
     _ = state;
@@ -179,6 +193,7 @@ test {
     _ = recv_stream;
     _ = path;
     _ = retry_token;
+    _ = new_token;
     _ = stateless_reset;
     _ = event_queue;
     _ = pending_frames;

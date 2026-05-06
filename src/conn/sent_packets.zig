@@ -39,6 +39,26 @@ pub const RetransmitFrame = union(enum) {
     max_path_id: frame_types.MaxPathId,
     paths_blocked: frame_types.PathsBlocked,
     path_cids_blocked: frame_types.PathCidsBlocked,
+    /// NEW_TOKEN retransmit slot. Stores the token by value (max 96
+    /// bytes) so the loss-recovery requeue path doesn't need to
+    /// chase a borrowed slice that may have been overwritten when
+    /// `pending_frames.new_token` was cleared on first emit.
+    new_token: NewTokenRetransmit,
+};
+
+/// Inline NEW_TOKEN payload for `RetransmitFrame.new_token`. Mirrors
+/// `pending_frames.NewTokenItem` so the requeue path can stamp the
+/// bytes back into the pending slot byte-for-byte. Kept here (instead
+/// of importing the queue type) to avoid a circular import between
+/// `sent_packets` and `pending_frames`.
+pub const NewTokenRetransmit = struct {
+    pub const max_len: usize = 96;
+    bytes: [max_len]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn slice(self: *const NewTokenRetransmit) []const u8 {
+        return self.bytes[0..self.len];
+    }
 };
 
 /// Reference to a DATAGRAM frame the application owns. Surfaces
