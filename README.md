@@ -323,8 +323,8 @@ fn onQlogEvent(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
 - The QUIC **transport**: streams, datagrams, packet protection, loss
   recovery, congestion control. HTTP/3 is **not** part of nullq.
 - I/O-decoupled state machine. The library does not own a socket or
-  an event loop; the embedder drives `handleIncoming` /
-  `pollOutgoing` against a `Clock`.
+  an event loop; the embedder drives `Connection.handle` /
+  `Connection.poll` / `Connection.tick` against a monotonic clock.
 - Pure Zig for everything that isn't crypto. BoringSSL is called only
   for AEAD seal/open, HKDF, AES/ChaCha header protection, and TLS 1.3
   handshake.
@@ -333,13 +333,15 @@ fn onQlogEvent(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
 
 In scope for v0.1:
 - IETF QUIC v1 transport from RFCs 8999 / 9000 / 9001 / 9002.
-- 0-RTT (RFC 9001 §4.5/4.6) — Phase 8, initial implementation landed.
-- Connection migration (RFC 9000 §9) — Phase 9.
-- Multipath QUIC (draft-ietf-quic-multipath) — Phase 10. Tracks the
-  draft-ietf-quic-multipath-21 surface (`initial_max_path_id`,
+- 0-RTT (RFC 9001 §4.5/4.6) — initial implementation landed; rejection
+  hardening still in progress.
+- Connection migration (RFC 9000 §9) — landed; broader external soak
+  still in progress.
+- Multipath QUIC (draft-ietf-quic-multipath) — tracks
+  draft-ietf-quic-multipath-21 (`initial_max_path_id`,
   `multipath_draft_version = 21`); expect API churn until the spec is
   published as an RFC.
 
 Out of scope: HTTP/3, QPACK, Windows, FIPS, ECN, DPLPMTUD, BBR,
-performance optimizations. See the non-goals and Phase 11 sections
-of `INITIAL_PROMPT.md`.
+performance optimizations. See `INITIAL_PROMPT.md` for the full
+non-goals list and the historical phase plan.
