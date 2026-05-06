@@ -2037,3 +2037,60 @@ test "cidKey round-trips identical CIDs" {
     try std.testing.expect(!std.mem.eql(u8, &cidKeyFromSlice(&a), &cidKeyFromSlice(&c)));
     try std.testing.expect(!std.mem.eql(u8, &cidKeyFromSlice(&a), &cidKeyFromSlice(&d)));
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// `Server.feed` is the entry point an open-internet deployment exposes
+// to arbitrary bytes; the header-peek helpers (`peekLongHeaderIds`,
+// `isInitialLongHeader`, `peekDcidForServer`) gate it. None may panic
+// on hostile input. We stop short of a full `Server` end-to-end fuzz
+// (it would need a TLS context and an allocator-tracked
+// `boringssl.tls.Context`) — the wire-level peek surface is the
+// highest-yield target.
+
+test "fuzz: peekLongHeaderIds never panics" {
+    try std.testing.fuzz({}, fuzzPeekLongHeader, .{});
+}
+
+fn fuzzPeekLongHeader(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [256]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+
+    const ids = peekLongHeaderIds(input) orelse return;
+    // Returned CID slices must point into `input`.
+    try std.testing.expect(ids.dcid.len <= 20);
+    try std.testing.expect(ids.scid.len <= 20);
+    try std.testing.expect(@intFromPtr(ids.dcid.ptr) >= @intFromPtr(input.ptr));
+    try std.testing.expect(@intFromPtr(ids.dcid.ptr) + ids.dcid.len <= @intFromPtr(input.ptr) + input.len);
+    try std.testing.expect(@intFromPtr(ids.scid.ptr) >= @intFromPtr(input.ptr));
+    try std.testing.expect(@intFromPtr(ids.scid.ptr) + ids.scid.len <= @intFromPtr(input.ptr) + input.len);
+}
+
+test "fuzz: isInitialLongHeader never panics" {
+    try std.testing.fuzz({}, fuzzIsInitialLongHeader, .{});
+}
+
+fn fuzzIsInitialLongHeader(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [256]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+    _ = isInitialLongHeader(input);
+}
+
+test "fuzz: peekDcidForServer never panics across all CID lengths" {
+    try std.testing.fuzz({}, fuzzPeekDcid, .{});
+}
+
+fn fuzzPeekDcid(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [256]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+    const local_cid_len = smith.valueRangeAtMost(u8, 0, 20);
+
+    const dcid = peekDcidForServer(input, local_cid_len) orelse return;
+    // The returned slice must lie inside `input`.
+    try std.testing.expect(@intFromPtr(dcid.ptr) >= @intFromPtr(input.ptr));
+    try std.testing.expect(@intFromPtr(dcid.ptr) + dcid.len <= @intFromPtr(input.ptr) + input.len);
+    try std.testing.expect(dcid.len <= 20);
+}

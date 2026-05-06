@@ -116,4 +116,32 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Run nullq microbenchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // Fuzz harness. The `std.testing.fuzz` callbacks in
+    // `src/wire/varint.zig`, `src/wire/header.zig`,
+    // `src/frame/decode.zig`, and `src/server.zig` execute once each
+    // under `zig build test` with an empty input — that's enough to
+    // catch any compile-time regression in the harness code and to
+    // exercise the property checks for the empty-input edge case.
+    //
+    // Coverage-guided fuzzing (`-ffuzz`) is currently blocked on a
+    // Zig 0.16.0 stdlib bug in `lib/compiler/test_runner.zig`: the
+    // fuzz reporting path passes `*builtin.StackTrace` to
+    // `std.debug.writeStackTrace`, which now expects
+    // `*const debug.StackTrace`. Once we upgrade past 0.16.0 (or
+    // back-port a fix), uncomment the block below and add
+    // `.github/workflows/fuzz.yml` to drive it weekly.
+    //
+    //     const fuzz_nullq_mod = b.createModule(.{
+    //         .root_source_file = b.path("src/root.zig"),
+    //         .target = target,
+    //         .optimize = optimize,
+    //         .fuzz = true,
+    //     });
+    //     fuzz_nullq_mod.addImport("boringssl", boringssl_mod);
+    //     const fuzz_tests = b.addTest(.{ .root_module = fuzz_nullq_mod });
+    //     const fuzz_run = b.addRunArtifact(fuzz_tests);
+    //     if (b.args) |args| fuzz_run.addArgs(args);
+    //     const fuzz_step = b.step("fuzz", "Run nullq fuzz tests with coverage feedback");
+    //     fuzz_step.dependOn(&fuzz_run.step);
 }
