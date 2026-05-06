@@ -113,50 +113,54 @@ const ErrorImpl = error{
 } || boringssl.tls.Error || ConnectionError;
 
 /// I/O-agnostic helper that builds a freshly-initialized client-side
-/// `Connection`. Mirror to `Server`, but stateless on the calling
-/// side: `connect` returns a heap-allocated `*Connection` that the
-/// caller owns and drives directly through the standard
-/// `tick`/`poll`/`handle` loop.
+/// `Connection` and owns the supporting TLS context. Mirror to
+/// `Server`: returned by value from `connect`, owns its own
+/// allocations (the heap `*Connection` plus the BoringSSL TLS
+/// context when not overridden), torn down by `deinit`.
 ///
-/// `Client` itself is namespace-only — there's no `init`/`deinit`,
-/// no per-client table, no socket. A future `runUdpClient` helper
-/// would live here too.
+/// Lifecycle:
+///   1. `connect(config)` builds the TLS context, mints random
+///      DCID/SCID per RFC 9000 §7.2, calls `Connection.initClient`,
+///      runs `bind` / `setLocalScid` / `setInitialDcid` /
+///      `setPeerDcid` / `setTransportParams`, optionally installs a
+///      0-RTT session ticket, and returns a ready-to-tick `Client`.
+///   2. The embedder drives the handshake via `client.conn.advance` /
+///      `client.conn.poll` to emit the first Initial, then
+///      `client.conn.handle` on every received datagram.
+///   3. `client.deinit()` frees the heap `Connection` and (when the
+///      wrapper built one) the TLS context.
 pub const Client = struct {
     /// Re-exports of the helper types so `Client.Config` and
     /// `Client.Error` both resolve from the public API surface.
     pub const Config = ConfigImpl;
     pub const Error = ErrorImpl;
 
-    /// Build a freshly-initialized but un-handshaken `Connection`.
+    /// Allocator that backs the heap `Connection` and any per-client
+    /// transient allocations.
+    allocator: std.mem.Allocator,
+    /// BoringSSL TLS context used by the connection. Whether `Client`
+    /// owns it or it was passed in via `tls_context_override` is
+    /// captured by `owns_tls`.
+    tls_ctx: boringssl.tls.Context,
+    /// True if the TLS context was built by `Client.connect` and
+    /// must be torn down on `deinit`. False if the embedder supplied
+    /// `tls_context_override`.
+    owns_tls: bool,
+    /// The owned, freshly-bound `Connection`. Embedders drive the
+    /// handshake and per-stream I/O directly through this pointer
+    /// (`client.conn.advance`, `client.conn.poll`, `client.conn.handle`,
+    /// etc).
+    conn: *Connection,
+
+    /// Build the TLS context, mint the random DCID/SCID, and
+    /// initialize the underlying `Connection`. See the type
+    /// docstring for the post-condition shape. The returned `Client`
+    /// owns its allocations until `deinit` is called.
     ///
-    /// The returned `Connection` is heap-allocated and owned by the
-    /// caller — call `conn.deinit()` followed by
-    /// `config.allocator.destroy(conn)` when done. Drive the
-    /// handshake by calling `Connection.tick` and `Connection.poll`
-    /// to send the first Initial, then `Connection.handle` on
-    /// incoming datagrams. After the handshake completes, the full
-    /// `Connection` API (streams, datagrams, key updates, etc) is
-    /// available.
-    ///
-    /// On a successful return:
-    ///   - The TLS context is owned by the returned `Connection` if
-    ///     `tls_context_override` was null. The caller must keep the
-    ///     context alive for the lifetime of the `Connection` and
-    ///     deinit it after `conn.deinit()`. (Mirrors how `Server`
-    ///     surfaces `owns_tls`.) When `tls_context_override` is
-    ///     non-null, the caller already owns it.
-    ///   - `Connection.bind` has been called, so the connection is
-    ///     ready to `tick`.
-    ///   - `setLocalScid` / `setInitialDcid` / `setPeerDcid` /
-    ///     `setTransportParams` have all been applied with the
-    ///     random CIDs and the supplied transport params.
-    ///   - If `session_ticket` was non-null, the parsed session is
-    ///     installed and 0-RTT is enabled on this connection.
-    ///
-    /// The returned `Connection` does not retain a pointer to the
+    /// The returned `Client` does not retain a pointer to the
     /// supplied `config` — copy any fields you need into your own
     /// state before discarding it.
-    pub fn connect(config: Config) Error!*Connection {
+    pub fn connect(config: Config) Error!Client {
         if (config.server_name.len == 0) return Error.InvalidConfig;
         if (config.alpn_protocols.len == 0) return Error.InvalidConfig;
         if (config.initial_dcid_len < 8 or config.initial_dcid_len > 20) return Error.InvalidConfig;
@@ -249,7 +253,21 @@ pub const Client = struct {
         params.initial_source_connection_id = ConnectionId.fromSlice(client_scid);
         try conn_ptr.setTransportParams(params);
 
-        return conn_ptr;
+        return .{
+            .allocator = config.allocator,
+            .tls_ctx = tls_ctx,
+            .owns_tls = owns_tls,
+            .conn = conn_ptr,
+        };
+    }
+
+    /// Tear down the connection and (if owned) the TLS context.
+    /// After this returns, `self` is invalid.
+    pub fn deinit(self: *Client) void {
+        self.conn.deinit();
+        self.allocator.destroy(self.conn);
+        if (self.owns_tls) self.tls_ctx.deinit();
+        self.* = undefined;
     }
 };
 

@@ -224,11 +224,23 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
             // failure for the loop. The FeedOutcome is informational —
             // production embedders may want to plumb it into a metrics
             // counter, but the default loop just lets it ride.
-            //
-            // TODO(stateless-response): once `Server.drainStatelessResponse`
-            // lands, drain VN/Retry packets here and ship them via
-            // `sock.send` before falling through to the per-slot poll.
             _ = try server.feed(msg.data, from_addr, now_us);
+
+            // Drain any Version Negotiation / Retry packets that
+            // `feed` queued. Sending these via the same socket the
+            // datagram arrived on is part of the Server contract:
+            // they are stateless responses with no associated slot,
+            // so the per-slot poll loop below would never reach
+            // them.
+            while (server.drainStatelessResponse()) |response| {
+                const dest = pathAddressToIpAddress(response.dst) orelse continue;
+                sock.send(options.io, &dest, response.slice()) catch {
+                    // Send-side failures here are not fatal: VN/Retry
+                    // is best-effort. The peer will retry on its next
+                    // Initial. A persistent failure becomes visible
+                    // through the per-slot poll path soon enough.
+                };
+            }
         }
 
         // Drain every slot's outbox and tick its recovery clock in

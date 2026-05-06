@@ -560,7 +560,7 @@ pub const Server = struct {
         if (self.findSlotForDatagram(bytes)) |slot| {
             slot.last_activity_us = now_us;
             if (from) |addr| slot.peer_addr = addr;
-            self.dispatchToSlot(slot, bytes, from, now_us);
+            try self.dispatchToSlot(slot, bytes, from, now_us);
             try self.resyncSlotCids(slot);
             return .routed;
         }
@@ -630,7 +630,7 @@ pub const Server = struct {
         if (retry_ctx != null) {
             if (from) |addr| _ = self.retry_state_table.remove(addr);
         }
-        self.dispatchToSlot(slot, bytes, from, now_us);
+        try self.dispatchToSlot(slot, bytes, from, now_us);
         try self.resyncSlotCids(slot);
         return .accepted;
     }
@@ -793,12 +793,26 @@ pub const Server = struct {
         bytes: []u8,
         from: ?Address,
         now_us: u64,
-    ) void {
+    ) Error!void {
         _ = self;
-        slot.conn.handle(bytes, from, now_us) catch {
-            // Per-connection error: don't tear down the server. The
-            // connection itself transitions to .closed and the
-            // embedder will reap it on the next `reap()` call.
+        slot.conn.handle(bytes, from, now_us) catch |err| switch (err) {
+            // OOM is fatal for the whole server — propagate. The
+            // surrounding `feed` will return `OutOfMemory` to the
+            // embedder, who can decide whether to retry, scale, or
+            // bail.
+            error.OutOfMemory => return Error.OutOfMemory,
+            // Per-connection error (peer protocol violation, TLS
+            // hiccup, malformed input). Don't tear down the server.
+            // If Connection.handle didn't already transition the
+            // connection to `.closed`, force it so the slot gets
+            // reaped on the next `reap` call. RFC 9000 §20.1
+            // INTERNAL_ERROR (0x01) is the catch-all close code for
+            // local-side failures.
+            else => {
+                if (!slot.conn.isClosed()) {
+                    slot.conn.close(true, 0x01, "Server.handle failed");
+                }
+            },
         };
     }
 

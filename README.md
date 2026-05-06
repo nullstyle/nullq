@@ -207,7 +207,7 @@ pub fn dial(
 ) !void {
     const protos = [_][]const u8{"hq-interop"};
 
-    const conn = try nullq.Client.connect(.{
+    var client = try nullq.Client.connect(.{
         .allocator = allocator,
         .server_name = server_name,
         .alpn_protocols = &protos,
@@ -222,30 +222,27 @@ pub fn dial(
             .active_connection_id_limit = 4,
         },
     });
-    defer {
-        conn.deinit();
-        allocator.destroy(conn);
-    }
+    defer client.deinit();
 
     // Kick the handshake: emit the first Initial.
-    try conn.advance();
+    try client.conn.advance();
 
     var rx: [64 * 1024]u8 = undefined;
     var tx: [1350]u8 = undefined;
 
-    while (!conn.isClosed()) {
+    while (!client.conn.isClosed()) {
         const now_us = monotonicNowUs();
         if (try sock.recv(&rx)) |msg| {
-            try conn.handle(msg.bytes, null, now_us);
+            try client.conn.handle(msg.bytes, null, now_us);
         }
-        while (try conn.poll(&tx, now_us)) |n| {
+        while (try client.conn.poll(&tx, now_us)) |n| {
             try sock.send(server_addr, tx[0..n]);
         }
-        try conn.tick(now_us);
+        try client.conn.tick(now_us);
 
         // Once the handshake completes, open streams, send
-        // datagrams, etc. on `conn` directly.
-        if (conn.handshakeDone()) {
+        // datagrams, etc. on `client.conn` directly.
+        if (client.conn.handshakeDone()) {
             // ... application logic ...
         }
     }

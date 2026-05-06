@@ -19,53 +19,47 @@ const defaultParams = common.defaultParams;
 test "Client.connect succeeds and yields a tickable Connection" {
     const protos = [_][]const u8{"hq-test"};
 
-    const conn = try nullq.Client.connect(.{
+    var client = try nullq.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
         .transport_params = defaultParams(),
     });
-    defer {
-        conn.deinit();
-        std.testing.allocator.destroy(conn);
-    }
+    defer client.deinit();
 
     // The connection should be live (not closed) and `tick` should
     // be a no-op since no time has passed and no datagrams have
     // arrived. This proves `bind` ran and the inner SSL/QUIC method
     // is wired up.
-    try std.testing.expect(!conn.isClosed());
-    try conn.tick(0);
+    try std.testing.expect(!client.conn.isClosed());
+    try client.conn.tick(0);
 
     // After `connect`, the local SCID has been issued. `localScidCount`
     // returns >= 1 because `setLocalScid` registered the chosen
     // SCID as a routable CID.
-    try std.testing.expect(conn.localScidCount() >= 1);
+    try std.testing.expect(client.conn.localScidCount() >= 1);
 }
 
 test "Client.connect drives the first Initial out via poll" {
     const protos = [_][]const u8{"hq-test"};
 
-    const conn = try nullq.Client.connect(.{
+    var client = try nullq.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
         .transport_params = defaultParams(),
     });
-    defer {
-        conn.deinit();
-        std.testing.allocator.destroy(conn);
-    }
+    defer client.deinit();
 
     // Drive the handshake forward enough to produce the first
     // Initial. `Client.connect` does not call `advance` itself —
     // that's the embedder's first scheduler step, mirroring the
     // QNS pattern where the embedder may want to install
     // 0-RTT-bound STREAM data first.
-    try conn.advance();
+    try client.conn.advance();
 
     var tx: [1500]u8 = undefined;
-    const n = try conn.poll(&tx, 1) orelse return error.NoInitialEmitted;
+    const n = try client.conn.poll(&tx, 1) orelse return error.NoInitialEmitted;
     // First Initial is long-header, type=Initial (high bits 1100).
     try std.testing.expect(n > 0);
     try std.testing.expect((tx[0] & 0xc0) == 0xc0);
@@ -140,20 +134,17 @@ test "Client.connect honours transport params (ISCID is auto-filled)" {
     // should do it from the freshly-minted client SCID.
     params.initial_source_connection_id = .{};
 
-    const conn = try nullq.Client.connect(.{
+    var client = try nullq.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
         .transport_params = params,
         .local_cid_len = 12,
     });
-    defer {
-        conn.deinit();
-        std.testing.allocator.destroy(conn);
-    }
+    defer client.deinit();
 
     // The advertised SCID length matches the configured
     // `local_cid_len`. The actual bytes are random — we only check
     // that one was issued at the right length.
-    try std.testing.expectEqual(@as(u8, 12), conn.localDcidLen());
+    try std.testing.expectEqual(@as(u8, 12), client.conn.localDcidLen());
 }
