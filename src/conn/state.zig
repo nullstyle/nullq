@@ -7284,32 +7284,38 @@ pub const Connection = struct {
 
         var ack_it = ack_range_mod.iter(a);
         while (try ack_it.next()) |interval| {
-            var pn = interval.smallest;
-            while (true) {
-                if (sent.indexOf(pn)) |idx| {
-                    var acked = sent.removeAt(idx);
-                    defer acked.deinit(self.allocator);
-                    if (acked.pn == a.largest_acked) {
-                        largest_acked_send_time_us = acked.sent_time_us;
-                        largest_acked_ack_eliciting = acked.ack_eliciting;
-                    }
-                    if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
-                    if (acked.in_flight) {
-                        in_flight_bytes_acked += acked.bytes;
-                        if (acked.sent_time_us > newest_acked_sent_time_us) {
-                            newest_acked_sent_time_us = acked.sent_time_us;
-                        }
-                    }
-                    if (lvl == .application) {
-                        self.onApplicationPacketAckedForKeys(&acked, now_us);
-                        self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
-                    }
-                    self.discardSentCryptoForPacket(lvl, acked.pn);
-                    self.dispatchAckedControlFrames(&acked);
-                    self.recordDatagramAcked(&acked);
+            // Walk the (small, bounded) sent-packet tracker rather
+            // than every PN in [smallest, largest]. A peer-chosen
+            // first_range can stretch interval.smallest down to 0;
+            // iterating the PN range directly would let a single
+            // ACK force O(next_pn) work, which on a long-lived
+            // connection is a real DoS surface (RFC 9000 §13.1
+            // only constrains largest_acked < next_pn). Walking
+            // the tracker is O(K log N) where K = packets matched
+            // and N = tracker size, both bounded by our own send
+            // rate × CWND.
+            while (sent.lowerBound(interval.smallest)) |idx| {
+                if (sent.packets[idx].pn > interval.largest) break;
+                var acked = sent.removeAt(idx);
+                defer acked.deinit(self.allocator);
+                if (acked.pn == a.largest_acked) {
+                    largest_acked_send_time_us = acked.sent_time_us;
+                    largest_acked_ack_eliciting = acked.ack_eliciting;
                 }
-                if (pn == interval.largest) break;
-                pn += 1;
+                if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
+                if (acked.in_flight) {
+                    in_flight_bytes_acked += acked.bytes;
+                    if (acked.sent_time_us > newest_acked_sent_time_us) {
+                        newest_acked_sent_time_us = acked.sent_time_us;
+                    }
+                }
+                if (lvl == .application) {
+                    self.onApplicationPacketAckedForKeys(&acked, now_us);
+                    self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
+                }
+                self.discardSentCryptoForPacket(lvl, acked.pn);
+                self.dispatchAckedControlFrames(&acked);
+                self.recordDatagramAcked(&acked);
             }
         }
         if (largest_acked_send_time_us) |sent_time_us| {
@@ -7362,30 +7368,29 @@ pub const Connection = struct {
 
         var ack_it = ack_range_mod.iter(a);
         while (try ack_it.next()) |interval| {
-            var pn = interval.smallest;
-            while (true) {
-                if (path.sent.indexOf(pn)) |idx| {
-                    var acked = path.sent.removeAt(idx);
-                    defer acked.deinit(self.allocator);
-                    if (acked.pn == a.largest_acked) {
-                        largest_acked_send_time_us = acked.sent_time_us;
-                        largest_acked_ack_eliciting = acked.ack_eliciting;
-                    }
-                    if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
-                    if (acked.in_flight) {
-                        in_flight_bytes_acked += acked.bytes;
-                        if (acked.sent_time_us > newest_acked_sent_time_us) {
-                            newest_acked_sent_time_us = acked.sent_time_us;
-                        }
-                    }
-                    self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
-                    self.onApplicationPacketAckedForKeys(&acked, now_us);
-                    self.discardSentCryptoForPacket(.application, acked.pn);
-                    self.dispatchAckedControlFrames(&acked);
-                    self.recordDatagramAcked(&acked);
+            // See `handleAckAtLevel` above for the rationale; this
+            // is the per-application-path twin walk and uses the
+            // same tracker-bounded iteration.
+            while (path.sent.lowerBound(interval.smallest)) |idx| {
+                if (path.sent.packets[idx].pn > interval.largest) break;
+                var acked = path.sent.removeAt(idx);
+                defer acked.deinit(self.allocator);
+                if (acked.pn == a.largest_acked) {
+                    largest_acked_send_time_us = acked.sent_time_us;
+                    largest_acked_ack_eliciting = acked.ack_eliciting;
                 }
-                if (pn == interval.largest) break;
-                pn += 1;
+                if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
+                if (acked.in_flight) {
+                    in_flight_bytes_acked += acked.bytes;
+                    if (acked.sent_time_us > newest_acked_sent_time_us) {
+                        newest_acked_sent_time_us = acked.sent_time_us;
+                    }
+                }
+                self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
+                self.onApplicationPacketAckedForKeys(&acked, now_us);
+                self.discardSentCryptoForPacket(.application, acked.pn);
+                self.dispatchAckedControlFrames(&acked);
+                self.recordDatagramAcked(&acked);
             }
         }
         if (largest_acked_send_time_us) |sent_time_us| {
