@@ -248,6 +248,11 @@ const MetricsSnapshotImpl = struct {
     /// (`Config.max_datagrams_per_window`). Subset of `feeds_dropped`.
     /// Hardening guide §4.1.
     feeds_listener_rate_limited: u64,
+    /// Datagrams dropped at the listener-level byte rate limit
+    /// (`Config.max_bytes_per_window`). Subset of `feeds_dropped`.
+    /// Tracks bandwidth-flavored floods that the packet-count cap
+    /// would let through (few-but-large datagrams). Hardening guide §4.1.
+    feeds_listener_byte_rate_limited: u64,
     /// LogEvents the server dropped under the per-source log rate
     /// limit (`Config.max_log_events_per_source_per_window`).
     /// Distinct from `feeds_dropped` — feeding a datagram and emitting
@@ -600,10 +605,25 @@ const ConfigImpl = struct {
     /// growing. cap=0 fails `Server.init` with `InvalidConfig`.
     max_datagrams_per_window: ?u32 = null,
 
-    /// Window length for `max_datagrams_per_window` in microseconds.
-    /// Default 1 second. Smaller windows make the cap more
-    /// responsive at the cost of more reset jitter; larger windows
-    /// smooth bursty traffic.
+    /// Listener-level byte rate limit (hardening guide §4.1):
+    /// drop incoming UDP datagrams when the global per-window byte
+    /// total exceeds this cap. Off by default (`null`) so embedders
+    /// explicitly opt in for production. Shares
+    /// `listener_rate_window_us` with the packet-count cap; the
+    /// bucket is single-global (no per-source bookkeeping) so a
+    /// flood of few-but-large datagrams from any number of sources
+    /// is gated even when the per-packet cap is generous.
+    ///
+    /// Recommended: scale to ~2x peak observed bytes-per-window,
+    /// then alert on `MetricsSnapshot.feeds_listener_byte_rate_limited`
+    /// growing. cap=0 fails `Server.init` with `InvalidConfig`.
+    max_bytes_per_window: ?u64 = null,
+
+    /// Window length for `max_datagrams_per_window` /
+    /// `max_bytes_per_window` in microseconds. Default 1 second.
+    /// Smaller windows make the caps more responsive at the cost of
+    /// more reset jitter; larger windows smooth bursty traffic. Both
+    /// listener-level caps share this single window.
     listener_rate_window_us: u64 = 1_000_000,
 
     /// Per-source cap on `LogEvent` emissions per window (hardening
@@ -916,13 +936,21 @@ pub const Server = struct {
     /// inbound datagram (existing-slot routes included) at the very
     /// top of `feed`. Hardening guide §4.1.
     max_datagrams_per_window: ?u32,
-    /// Captured `Config.listener_rate_window_us`. Window length for
-    /// `max_datagrams_per_window`.
+    /// Captured `Config.max_bytes_per_window`. Null disables the
+    /// listener-level byte rate limit; otherwise gates *every* inbound
+    /// datagram by total bytes accumulated within the shared window.
+    /// Runs after the packet-count gate at the top of `feed`.
+    /// Hardening guide §4.1.
+    max_bytes_per_window: ?u64,
+    /// Captured `Config.listener_rate_window_us`. Window length shared
+    /// by `max_datagrams_per_window` and `max_bytes_per_window`.
     listener_rate_window_us: u64,
-    /// Sliding-window counters for `max_datagrams_per_window`. Single
-    /// global bucket — no per-source bookkeeping, so it stays cheap
-    /// even under floods from many sources.
+    /// Sliding-window counters for the listener-level caps. Single
+    /// global bucket per counter, sharing one window — no per-source
+    /// bookkeeping, so they stay cheap even under floods from many
+    /// sources.
     listener_rate_count: u32 = 0,
+    bytes_in_window: u64 = 0,
     listener_rate_window_start_us: u64 = 0,
 
     /// Captured `Config.max_log_events_per_source_per_window`. Null
@@ -981,6 +1009,10 @@ pub const Server = struct {
     /// (`Config.max_datagrams_per_window`). Subset of `feeds_dropped`.
     /// Spiking values point at a flood-style attack.
     feeds_listener_rate_limited: u64 = 0,
+    /// Datagrams dropped at the listener-level byte rate limit
+    /// (`Config.max_bytes_per_window`). Subset of `feeds_dropped`.
+    /// Spiking values point at a few-but-large bandwidth flood.
+    feeds_listener_byte_rate_limited: u64 = 0,
     /// LogEvents dropped by the per-source log rate limiter
     /// (`Config.max_log_events_per_source_per_window`). NOT a subset
     /// of `feeds_dropped` — log emission is a separate side effect
@@ -1021,10 +1053,14 @@ pub const Server = struct {
             if (config.new_token_lifetime_us == 0) return Error.InvalidConfig;
         }
         // Hardening guide §4.1: cap=0 is meaningless for the listener
-        // rate limit — it would drop every datagram. Surface it as
+        // rate limits — it would drop every datagram. Surface it as
         // `InvalidConfig` instead of letting it silently DoS the
         // server itself.
         if (config.max_datagrams_per_window) |cap| {
+            if (cap == 0) return Error.InvalidConfig;
+            if (config.listener_rate_window_us == 0) return Error.InvalidConfig;
+        }
+        if (config.max_bytes_per_window) |cap| {
             if (cap == 0) return Error.InvalidConfig;
             if (config.listener_rate_window_us == 0) return Error.InvalidConfig;
         }
@@ -1122,6 +1158,7 @@ pub const Server = struct {
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .max_connection_memory = config.max_connection_memory,
             .max_datagrams_per_window = config.max_datagrams_per_window,
+            .max_bytes_per_window = config.max_bytes_per_window,
             .listener_rate_window_us = config.listener_rate_window_us,
             .max_log_events_per_source = config.max_log_events_per_source_per_window,
             .stateless_responses = .empty,
@@ -1207,25 +1244,47 @@ pub const Server = struct {
         // Server-driven time. No-op when 0-RTT or anti-replay isn't
         // configured.
         if (self.early_data_anti_replay) |tracker| tracker.bumpClock(now_us);
-        // Hardening guide §4.1: listener-level packet rate limit. Runs
-        // *before* the empty-bytes check, before the 1200-byte Initial
-        // size gate, before slot lookup — every datagram entering the
-        // server passes here so a flood from many sources can't bleed
-        // through any of the per-source / per-slot gates downstream.
-        // Single global bucket on a sliding-by-reset window: cheap,
-        // and good enough for DoS deflection (the per-source gates
-        // own attribution; this owns the firehose).
-        if (self.max_datagrams_per_window) |cap| {
+        // Hardening guide §4.1: listener-level packet + byte rate
+        // limits. Runs *before* the empty-bytes check, before the
+        // 1200-byte Initial size gate, before slot lookup — every
+        // datagram entering the server passes here so a flood from
+        // many sources can't bleed through any of the per-source /
+        // per-slot gates downstream. Single global bucket on a
+        // sliding-by-reset window shared by both caps: cheap, and
+        // good enough for DoS deflection (the per-source gates own
+        // attribution; this owns the firehose).
+        //
+        // Order is packet-count first, byte-budget second so a
+        // few-but-large flood that also exceeds the packet cap is
+        // accounted to the packet counter (the cheaper signal to
+        // alert on).
+        if (self.max_datagrams_per_window != null or self.max_bytes_per_window != null) {
             const elapsed = now_us -% self.listener_rate_window_start_us;
-            if (elapsed >= self.listener_rate_window_us or self.listener_rate_count == 0) {
-                self.listener_rate_count = 1;
+            const window_reset =
+                elapsed >= self.listener_rate_window_us or
+                (self.listener_rate_count == 0 and self.bytes_in_window == 0);
+            if (window_reset) {
+                self.listener_rate_count = 0;
+                self.bytes_in_window = 0;
                 self.listener_rate_window_start_us = now_us;
-            } else if (self.listener_rate_count >= cap) {
-                self.feeds_listener_rate_limited += 1;
-                self.feeds_dropped += 1;
-                return .dropped;
-            } else {
+            }
+            if (self.max_datagrams_per_window) |cap| {
+                if (self.listener_rate_count >= cap) {
+                    self.feeds_listener_rate_limited += 1;
+                    self.feeds_dropped += 1;
+                    return .dropped;
+                }
                 self.listener_rate_count += 1;
+            }
+            if (self.max_bytes_per_window) |cap| {
+                // Increment before the gate so the gate fires on the
+                // byte that would push the budget over, not after.
+                self.bytes_in_window += bytes.len;
+                if (self.bytes_in_window > cap) {
+                    self.feeds_listener_byte_rate_limited += 1;
+                    self.feeds_dropped += 1;
+                    return .dropped;
+                }
             }
         }
         if (bytes.len == 0) {
@@ -2420,6 +2479,7 @@ pub const Server = struct {
             .feeds_initial_too_small = self.feeds_initial_too_small,
             .feeds_vn_rate_limited = self.feeds_vn_rate_limited,
             .feeds_listener_rate_limited = self.feeds_listener_rate_limited,
+            .feeds_listener_byte_rate_limited = self.feeds_listener_byte_rate_limited,
             .feeds_log_rate_limited = self.feeds_log_rate_limited,
             .retries_validated = self.retries_validated,
             .stateless_responses_evicted = self.stateless_responses_evicted,

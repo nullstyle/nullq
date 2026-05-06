@@ -1766,3 +1766,154 @@ test "Server log rate limit doesn't block log events for from=null paths" {
     const m = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 0), m.feeds_log_rate_limited);
 }
+
+// -- §4.1: listener-level byte rate limit -----------------------------
+
+test "Server listener byte rate limit drops datagrams past byte cap" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_bytes_per_window = 1500,
+        .listener_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    // 800-byte fixture leading with junk long-header bits — each
+    // datagram drops on later gates, but the byte budget is checked
+    // *first*, before any of those.
+    var buf: [800]u8 = @splat(0);
+    buf[0] = 0x40;
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x40) };
+
+    // First 800-byte feed: bytes_in_window = 800 ≤ 1500. Pass.
+    _ = try srv.feed(&buf, addr, 0);
+    var m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_byte_rate_limited);
+
+    // Second 800-byte feed: bytes_in_window = 1600 > 1500. Drop on
+    // the byte cap.
+    const outcome = try srv.feed(&buf, addr, 1);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_listener_byte_rate_limited);
+    try std.testing.expect(m.feeds_dropped >= 1);
+}
+
+test "Server listener byte and packet caps are independently enforced" {
+    const protos = [_][]const u8{"hq-test"};
+
+    // Phase 1: byte-cap=1500, packet-cap=null. Spray many tiny
+    // datagrams — total bytes stay under the cap, none drop.
+    {
+        var srv = try nullq.Server.init(.{
+            .allocator = std.testing.allocator,
+            .tls_cert_pem = test_cert_pem,
+            .tls_key_pem = test_key_pem,
+            .alpn_protocols = &protos,
+            .transport_params = defaultParams(),
+            .max_bytes_per_window = 1500,
+            .listener_rate_window_us = 1_000_000,
+        });
+        defer srv.deinit();
+
+        var one: [1]u8 = .{0x40};
+        const addr = nullq.conn.path.Address{ .bytes = @splat(0x50) };
+
+        // 1000 single-byte feeds — total 1000 bytes, well under 1500.
+        for (0..1000) |i| {
+            _ = try srv.feed(&one, addr, @intCast(i));
+        }
+
+        const m = srv.metricsSnapshot();
+        try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_byte_rate_limited);
+        try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_rate_limited);
+    }
+
+    // Phase 2: packet-cap=2, byte-cap=null. Spray small datagrams —
+    // the third drops on packet count even though bytes are minimal.
+    {
+        var srv = try nullq.Server.init(.{
+            .allocator = std.testing.allocator,
+            .tls_cert_pem = test_cert_pem,
+            .tls_key_pem = test_key_pem,
+            .alpn_protocols = &protos,
+            .transport_params = defaultParams(),
+            .max_datagrams_per_window = 2,
+            .listener_rate_window_us = 1_000_000,
+        });
+        defer srv.deinit();
+
+        var one: [1]u8 = .{0x40};
+        const addr = nullq.conn.path.Address{ .bytes = @splat(0x60) };
+
+        _ = try srv.feed(&one, addr, 0);
+        _ = try srv.feed(&one, addr, 1);
+
+        var m = srv.metricsSnapshot();
+        try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_rate_limited);
+        try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_byte_rate_limited);
+
+        // Third feed: trips the packet cap.
+        const outcome = try srv.feed(&one, addr, 2);
+        try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+        m = srv.metricsSnapshot();
+        try std.testing.expectEqual(@as(u64, 1), m.feeds_listener_rate_limited);
+        try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_byte_rate_limited);
+    }
+}
+
+test "Server listener byte rate limit window resets after elapsed" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_bytes_per_window = 1500,
+        .listener_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    var buf: [800]u8 = @splat(0);
+    buf[0] = 0x40;
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x70) };
+
+    // First window: two 800-byte feeds → bytes_in_window=1600 > 1500
+    // on the second. Counter bumps to 1 here.
+    _ = try srv.feed(&buf, addr, 0);
+    _ = try srv.feed(&buf, addr, 1);
+
+    var m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_listener_byte_rate_limited);
+
+    // Advance past the window. Both counters reset on the next feed,
+    // so the first post-reset 800-byte feed passes (bytes_in_window=800).
+    _ = try srv.feed(&buf, addr, 1_000_001);
+
+    m = srv.metricsSnapshot();
+    // No new drop — counter is sticky at 1 from the previous window,
+    // but the post-reset feed went through cleanly.
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_listener_byte_rate_limited);
+
+    // Second post-reset feed: bytes_in_window=1600 again → drop.
+    _ = try srv.feed(&buf, addr, 1_000_002);
+    m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 2), m.feeds_listener_byte_rate_limited);
+}
+
+test "Server.init rejects max_bytes_per_window=0" {
+    const protos = [_][]const u8{"hq-test"};
+    try std.testing.expectError(nullq.Server.Error.InvalidConfig, nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_bytes_per_window = 0,
+    }));
+}
