@@ -1,6 +1,19 @@
 # nullq interop status
 
-Current as of 2026-05-04.
+Current as of 2026-05-05.
+
+## Summary
+
+| Peer    | nullq-as-server          | nullq-as-client          |
+| ------- | ------------------------ | ------------------------ |
+| quic-go | ✓ (H, DC, C20, S, R, Z, M) | ✓ (H, DC, C20, S, R, Z, M) |
+| ngtcp2  | ✓ (H, DC)                | ✓ (H, DC)                |
+| quiche  | ✓ (H, DC)                | ✓ (H, DC)                |
+
+Test legend: H = handshake, D = transfer, C = close, C20 = ChaCha20,
+S = retry, R = resumption, Z = 0-RTT, M = multiplexing. See the
+[official QUIC interop matrix](https://interop.seemann.io) for the
+shared test definitions.
 
 ## Verified in this workspace
 

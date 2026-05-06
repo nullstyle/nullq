@@ -1,7 +1,7 @@
 //! Path — a 4-tuple-bound bundle of QUIC connection state
-//! (RFC 9000 §6, §8, §9). Each Connection holds at least one
-//! Path; Phase 9 (migration) and Phase 10 (multipath) widen the
-//! active set without restructuring the state machine.
+//! (RFC 9000 §6, §8, §9). Each Connection holds a `PathSet` with
+//! one or more Paths; migration switches the active path, multipath
+//! widens the active set without restructuring the state machine.
 //!
 //! A Path owns:
 //! - The peer + local address (the "4-tuple" minus the implicit
@@ -12,10 +12,8 @@
 //!   (`PathValidator`, RFC 9000 §8.2).
 //! - The path's own RTT estimator and congestion controller.
 //!
-//! Phase 5 keeps every Connection at exactly one Path. The
-//! address types here are placeholders sized for IPv6; Phase 6
-//! will refactor to `std.net.Address` once the POSIX UDP transport
-//! lands.
+//! Address fields are placeholders sized for IPv6; the POSIX UDP
+//! transport adapts these to `std.net.Address` at the boundary.
 
 const std = @import("std");
 

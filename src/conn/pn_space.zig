@@ -1,9 +1,10 @@
 //! QUIC packet number space (RFC 9000 §12.3).
 //!
-//! Each connection has up to four PN spaces — initial, handshake,
-//! application, and (Phase 10) per-multipath-path application —
-//! each with its own monotonically-increasing PN counter and its
-//! own ACK tracker for received PNs.
+//! Each connection has up to four PN-space kinds — initial,
+//! handshake, application, and per-path application (multipath,
+//! draft-ietf-quic-multipath-21) — each with its own
+//! monotonically-increasing PN counter and its own ACK tracker for
+//! received PNs.
 
 const std = @import("std");
 const ack_tracker_mod = @import("ack_tracker.zig");

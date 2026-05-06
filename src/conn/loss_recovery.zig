@@ -4,7 +4,7 @@
 //! Pure functions operating on caller-managed `SentPacketTracker`,
 //! `PnSpace`, and `RttEstimator`. Connection (state.zig) owns the
 //! state and ties these together via `onPacketSent` and
-//! `onAckReceived` orchestration in Phase 5's integration step.
+//! `onAckReceived` orchestration.
 
 const std = @import("std");
 const ack_range = @import("../frame/ack_range.zig");
