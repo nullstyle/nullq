@@ -496,9 +496,12 @@ const ConfigImpl = struct {
     /// 0-RTT is replayable and unsuitable for state-changing requests
     /// without an application-level anti-replay mechanism (RFC 9001
     /// §5.6 / RFC 8446 §8). Embedders that want 0-RTT must opt in
-    /// here AND set a per-connection allow via
-    /// `Connection.setEarlyDataEnabled(true)` after installing the
-    /// 0-RTT replay context.
+    /// here AND wire a `nullq.tls.AntiReplayTracker` (or equivalent)
+    /// into their server loop so duplicate early-data is rejected;
+    /// see that type's module docstring for the recommended
+    /// workflow. The transport ships the data structure but the
+    /// "is this 0-RTT bytes a replay?" check fires at the embedder's
+    /// application layer.
     ///
     /// Only consulted when `tls_context_override` is null. Embedders
     /// supplying their own `boringssl.tls.Context` are responsible for

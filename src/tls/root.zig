@@ -17,6 +17,11 @@ pub const level = @import("level.zig");
 pub const transport_params = @import("transport_params.zig");
 /// 0-RTT early-data context digest builder (RFC 9001 §4.6.1).
 pub const early_data_context = @import("early_data_context.zig");
+/// 0-RTT replay-protection cache (RFC 9001 §5.6 / RFC 8446 §8).
+/// Embedders that opt in to 0-RTT plug an `AntiReplayTracker` into
+/// their server loop and call `consume` per accepted early-data
+/// connection — see module docstring for the recommended workflow.
+pub const anti_replay = @import("anti_replay.zig");
 /// Re-export of `level.EncryptionLevel` — Initial / 0-RTT / Handshake / 1-RTT.
 pub const EncryptionLevel = level.EncryptionLevel;
 /// Re-export of `level.Direction` — read vs. write side of a derived secret.
@@ -27,9 +32,13 @@ pub const TransportParams = transport_params.Params;
 pub const EarlyDataContextOptions = early_data_context.Options;
 /// Re-export of `early_data_context.Digest` (the 32-byte SHA-256 output).
 pub const EarlyDataContextDigest = early_data_context.Digest;
+/// Re-export of `anti_replay.AntiReplayTracker` for the embedder's
+/// 0-RTT replay cache.
+pub const AntiReplayTracker = anti_replay.AntiReplayTracker;
 
 test {
     _ = level;
     _ = transport_params;
     _ = early_data_context;
+    _ = anti_replay;
 }
