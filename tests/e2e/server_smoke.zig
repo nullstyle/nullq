@@ -1365,3 +1365,399 @@ test "Server metricsSnapshot stateless_queue_high_water is sticky across drains"
     // High-water mark is sticky.
     try std.testing.expectEqual(@as(u64, 3), after.stateless_queue_high_water);
 }
+
+// -- §3.5 / §8: Connection.max_connection_memory cap -------------------
+
+test "Connection rejects CRYPTO bytes that would exceed max_connection_memory" {
+    // Hardening guide §3.5 / §8: the per-Connection resident-bytes
+    // budget is the aggregate guard above the per-buffer caps. Tiny
+    // cap here; push out-of-order CRYPTO totalling > cap so the
+    // reservation trips before the per-level CRYPTO cap (which is
+    // still 64 KiB) gets to gate anything. Connection should close
+    // with EXCESSIVE_LOAD (0x09).
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+
+    var conn = try nullq.Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+    conn.max_connection_memory = 1024;
+
+    // Push 1500 bytes of out-of-order CRYPTO at offset 5000 — this
+    // forces buffering (offset 0 hasn't arrived yet) so all 1500 bytes
+    // would go resident. 1500 > 1024 cap → EXCESSIVE_LOAD close.
+    var data: [1500]u8 = @splat('A');
+    try conn.handleCrypto(.initial, .{ .offset = 5000, .data = &data });
+
+    const ev = conn.closeEvent() orelse return error.TestExpectedClose;
+    try std.testing.expectEqual(
+        nullq.conn.state.transport_error_excessive_load,
+        ev.error_code,
+    );
+}
+
+test "Stream recv reassembly past max_connection_memory closes the connection" {
+    // Same backstop, exercised on the stream-recv-reassembly path.
+    // Peer-sent stream 1 carries enough bytes that the recv buffer
+    // lands above the 1 KiB cap. Connection closes with EXCESSIVE_LOAD.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+
+    var conn = try nullq.Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+    conn.max_connection_memory = 1024;
+    // Allow the stream + connection-level data to land — flow control
+    // and stream-count limits must not gate before the resident-bytes
+    // cap fires.
+    conn.local_max_data = 1 << 20;
+    conn.local_max_streams_bidi = 100;
+    // For peer-initiated bidi streams (client side: id&1==1), the
+    // initial stream-level recv credit comes from
+    // `initial_max_stream_data_bidi_remote`; default zero would close
+    // with FLOW_CONTROL before EXCESSIVE_LOAD has a chance.
+    conn.local_transport_params.initial_max_stream_data_bidi_remote = 1 << 20;
+
+    var data: [4096]u8 = @splat('B');
+    try conn.handleStream(.application, .{
+        .stream_id = 1, // server-initiated bidi from client's POV
+        .offset = 0,
+        .data = &data,
+        .fin = false,
+    });
+
+    const ev = conn.closeEvent() orelse return error.TestExpectedClose;
+    try std.testing.expectEqual(
+        nullq.conn.state.transport_error_excessive_load,
+        ev.error_code,
+    );
+}
+
+test "Frees release resident bytes so the cap is reusable" {
+    // Hardening guide §3.5 / §8: every reservation pairs with a
+    // release on the matching free path. Reserve a chunk that sits
+    // close to the cap, drain it via `receiveDatagramInfo` (the
+    // dequeue path that releases the corresponding bytes), then
+    // reserve again. The second reservation must succeed.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+
+    var conn = try nullq.Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+    conn.max_connection_memory = 800;
+
+    // Need DATAGRAM transport param so handleDatagram doesn't reject.
+    conn.local_transport_params.max_datagram_frame_size = 4096;
+
+    // First DATAGRAM: 600 bytes — well under the 800-byte cap.
+    var dg1: [600]u8 = @splat('C');
+    try conn.handleDatagram(.application, .{ .data = &dg1 });
+    try std.testing.expectEqual(@as(u64, 600), conn.bytes_resident);
+
+    // Second DATAGRAM with the buffer still full would overshoot
+    // 800. Verify we can drain and then reserve again — the cap is
+    // a soft ceiling on *resident* bytes, not a quota over the
+    // connection's lifetime.
+    var dg2: [400]u8 = @splat('D');
+    try conn.handleDatagram(.application, .{ .data = &dg2 });
+    // Connection should have closed with EXCESSIVE_LOAD; after
+    // draining, the budget recovers.
+    const ev1 = conn.closeEvent() orelse return error.TestExpectedClose;
+    try std.testing.expectEqual(
+        nullq.conn.state.transport_error_excessive_load,
+        ev1.error_code,
+    );
+
+    // Drain the queued DATAGRAM and confirm the budget drops back
+    // toward the floor.
+    var sink: [4096]u8 = undefined;
+    const got = conn.receiveDatagram(&sink) orelse return error.TestExpectedDatagram;
+    try std.testing.expectEqual(@as(usize, 600), got);
+    try std.testing.expectEqual(@as(u64, 0), conn.bytes_resident);
+}
+
+// -- §4.1: listener-level packet rate limit ---------------------------
+
+test "Server listener rate limit drops datagrams past cap" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_datagrams_per_window = 3,
+        .listener_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    // Use junk bytes so each datagram lands in `.dropped` for
+    // unrelated reasons too (won't open a slot). The rate limit
+    // applies *first*, so we should see the 4th call return
+    // .dropped *because of the rate limit* — surfaced via the new
+    // `feeds_listener_rate_limited` counter.
+    var junk = [_]u8{ 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x10) };
+
+    // First three: passes the listener gate (each then drops because
+    // the bytes don't parse as a valid Initial).
+    for (0..3) |i| {
+        _ = try srv.feed(&junk, addr, @intCast(i));
+    }
+    const before = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), before.feeds_listener_rate_limited);
+
+    // Fourth: trips the listener rate limit before any other gate.
+    const outcome = try srv.feed(&junk, addr, 4);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+
+    const after = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), after.feeds_listener_rate_limited);
+    try std.testing.expect(after.feeds_dropped > before.feeds_dropped);
+}
+
+test "Server listener rate limit window resets after elapsed" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_datagrams_per_window = 2,
+        .listener_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    var junk = [_]u8{ 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x20) };
+
+    // First window: fill it (2 calls), then over-cap at the 3rd.
+    _ = try srv.feed(&junk, addr, 0);
+    _ = try srv.feed(&junk, addr, 1);
+
+    var m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_rate_limited);
+
+    // Advance past the window (1 second + 1 µs) and try again — the
+    // bucket resets, so the next two calls pass without hitting the
+    // limiter.
+    _ = try srv.feed(&junk, addr, 1_000_001);
+    _ = try srv.feed(&junk, addr, 1_000_002);
+
+    m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_rate_limited);
+}
+
+test "Server listener rate limit is null-by-default" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        // No `max_datagrams_per_window` — the limiter is off.
+    });
+    defer srv.deinit();
+
+    var junk = [_]u8{ 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x30) };
+
+    // Flood with 100 datagrams; none should hit the listener limit.
+    for (0..100) |i| {
+        _ = try srv.feed(&junk, addr, @intCast(i));
+    }
+
+    const m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_rate_limited);
+}
+
+test "Server.init rejects max_datagrams_per_window=0" {
+    const protos = [_][]const u8{"hq-test"};
+    try std.testing.expectError(nullq.Server.Error.InvalidConfig, nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_datagrams_per_window = 0,
+    }));
+}
+
+// -- §9.4: per-source log-emission rate limit -------------------------
+
+test "Server log rate limiter drops events past cap from one source" {
+    const protos = [_][]const u8{"hq-test"};
+    var sink: LogSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        // Force log events on every call: tiny rate-limit cap so the
+        // first feed past it surfaces a `.feed_rate_limited` log.
+        .max_initials_per_source_per_window = 1,
+        // Cap log emission at 2 per source per window. The first 2
+        // log emissions land; subsequent ones drop silently.
+        .max_log_events_per_source_per_window = 2,
+        .source_rate_window_us = 1_000_000,
+        .log_callback = LogSink.cb,
+        .log_user_data = &sink,
+    });
+    defer srv.deinit();
+
+    var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x40) };
+
+    // Each call from the same source emits exactly one log event:
+    //   call 1: openSlot fails internally → `.dropped` (no log)
+    //   call 2 onward: rate-limited → emits `.feed_rate_limited`
+    // We do a bunch of calls and expect the captured log count to
+    // saturate at 2 (the per-source log cap), with the rest dropped.
+    for (0..10) |i| {
+        _ = try srv.feed(&initial, addr, @intCast(i));
+    }
+
+    // The rate limiter logs rapidly (call 2 onward); we expect 2
+    // emissions max from this source.
+    var feed_rate_limited_count: usize = 0;
+    for (sink.events.items) |ev| {
+        switch (ev) {
+            .feed_rate_limited => feed_rate_limited_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), feed_rate_limited_count);
+
+    const m = srv.metricsSnapshot();
+    try std.testing.expect(m.feeds_log_rate_limited > 0);
+}
+
+test "Server log rate limiter is per-source (different sources get fresh budgets)" {
+    const protos = [_][]const u8{"hq-test"};
+    var sink: LogSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_initials_per_source_per_window = 1,
+        .max_log_events_per_source_per_window = 1,
+        .source_rate_window_us = 1_000_000,
+        .log_callback = LogSink.cb,
+        .log_user_data = &sink,
+    });
+    defer srv.deinit();
+
+    var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
+    const peer_a = nullq.conn.path.Address{ .bytes = @splat(0x51) };
+    const peer_b = nullq.conn.path.Address{ .bytes = @splat(0x52) };
+
+    // Each peer sees: call 1 → drop with no log, call 2+ → first
+    // call past the Initial cap fires one log, subsequent are
+    // suppressed by the log-rate limiter (cap=1).
+    for (0..5) |i| _ = try srv.feed(&initial, peer_a, @intCast(i));
+    for (0..5) |i| _ = try srv.feed(&initial, peer_b, @intCast(100 + i));
+
+    // Each source should land exactly 1 log event (the cap); the
+    // other source's budget is independent.
+    var counts = [_]usize{ 0, 0 };
+    for (sink.events.items) |ev| {
+        if (ev != .feed_rate_limited) continue;
+        if (peer_a.eql(ev.feed_rate_limited.peer)) counts[0] += 1;
+        if (peer_b.eql(ev.feed_rate_limited.peer)) counts[1] += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), counts[0]);
+    try std.testing.expectEqual(@as(usize, 1), counts[1]);
+}
+
+test "Server log rate limit window resets after elapsed" {
+    const protos = [_][]const u8{"hq-test"};
+    var sink: LogSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_initials_per_source_per_window = 1,
+        .max_log_events_per_source_per_window = 1,
+        .source_rate_window_us = 1_000_000,
+        .log_callback = LogSink.cb,
+        .log_user_data = &sink,
+    });
+    defer srv.deinit();
+
+    var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
+    const peer = nullq.conn.path.Address{ .bytes = @splat(0x60) };
+
+    // Burn the cap inside the first window.
+    for (0..5) |i| _ = try srv.feed(&initial, peer, @intCast(i));
+    var first_count: usize = 0;
+    for (sink.events.items) |ev| {
+        if (ev == .feed_rate_limited and peer.eql(ev.feed_rate_limited.peer)) first_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), first_count);
+
+    // Advance well past the window — the log limiter resets.
+    for (0..5) |i| _ = try srv.feed(&initial, peer, @intCast(2_000_000 + i));
+    var second_count: usize = 0;
+    for (sink.events.items) |ev| {
+        if (ev == .feed_rate_limited and peer.eql(ev.feed_rate_limited.peer)) second_count += 1;
+    }
+    // First batch produced 1 log; second batch produced 1 more.
+    try std.testing.expectEqual(@as(usize, 2), second_count);
+}
+
+test "Server log rate limit doesn't block log events for from=null paths" {
+    // Hardening guide §9.4: events with no source attribution
+    // bypass the per-source log limiter. Verify by triggering a
+    // table-full event with `from = null` — the log fires unconditionally.
+    const protos = [_][]const u8{"hq-test"};
+    var sink: LogSink = .{ .allocator = std.testing.allocator };
+    defer sink.deinit();
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_concurrent_connections = 0,
+        // Aggressive cap — would suppress *every* per-source log.
+        .max_log_events_per_source_per_window = 1,
+        .source_rate_window_us = 1_000_000,
+        .log_callback = LogSink.cb,
+        .log_user_data = &sink,
+    });
+    defer srv.deinit();
+
+    var bytes = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 });
+
+    // 5 feeds with `from = null` — all should produce table_full
+    // logs because the limiter doesn't apply when source is null.
+    for (0..5) |i| {
+        const outcome = try srv.feed(&bytes, null, @intCast(i));
+        try std.testing.expectEqual(nullq.Server.FeedOutcome.table_full, outcome);
+    }
+
+    var table_full_count: usize = 0;
+    for (sink.events.items) |ev| {
+        if (ev == .table_full) table_full_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), table_full_count);
+
+    // No log events were rate-limited.
+    const m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_log_rate_limited);
+}

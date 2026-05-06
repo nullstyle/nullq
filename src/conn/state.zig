@@ -112,6 +112,15 @@ pub const Error = error{
     DatagramIdExhausted,
     InvalidStreamId,
     StreamLimitExceeded,
+    /// `tryReserveResidentBytes` would push the connection past
+    /// `max_connection_memory`. Hardening guide §3.5 / §8: peer-driven
+    /// allocations (CRYPTO reassembly, DATAGRAM queues, stream
+    /// reassembly / send queues) collectively must not exceed the
+    /// per-Connection budget. Returned from any handler that detects
+    /// an over-cap reservation; callers close the connection with
+    /// `transport_error_excessive_load` and a redacted reason before
+    /// the over-cap allocation lands.
+    ExcessiveLoad,
 } || boringssl.tls.Error ||
     boringssl.crypto.rand.Error ||
     short_packet_mod.Error ||
@@ -177,7 +186,23 @@ const transport_error_stream_state: u64 = 0x05;
 const transport_error_final_size: u64 = 0x06;
 const transport_error_frame_encoding: u64 = 0x07;
 const transport_error_transport_parameter: u64 = 0x08;
+/// RFC 9000 §20.1 / §3.5: a server that runs out of resource budget for
+/// peer-controlled state (CRYPTO reassembly, DATAGRAM queues, stream
+/// buffers) closes the connection with EXCESSIVE_LOAD (0x09) rather
+/// than spilling unbounded peer input into the host allocator. The
+/// hardening guide §8 calls this out as the "memory cap" backstop.
+pub const transport_error_excessive_load: u64 = 0x09;
 const transport_error_aead_limit_reached: u64 = 0x0f;
+
+/// Default per-Connection cap on bytes resident in peer-controlled
+/// reassembly buffers (CRYPTO, DATAGRAM, stream send/recv). Hits at
+/// 32 MiB — comfortably above the per-stream / per-CRYPTO-level
+/// budgets the per-buffer caps already enforce, so legitimate
+/// traffic stays inside it, but well below the host RSS that a
+/// flood of orthogonal buffers could otherwise push us into.
+/// Tuneable per `Connection` via `max_connection_memory`; the
+/// `Server.Config` default threads through to every accepted slot.
+pub const default_max_connection_memory: u64 = 32 * 1024 * 1024;
 
 /// Upper bound on AEAD plaintext for a single received packet. This
 /// implementation deliberately advertises and enforces the same 4 KiB
@@ -850,6 +875,35 @@ pub const Connection = struct {
     /// Embedders that want the reason on the wire (debug builds,
     /// internal load tests, etc.) can flip this to `true`.
     reveal_close_reason_on_wire: bool = false,
+
+    /// Hard ceiling on `bytes_resident` (hardening guide §3.5 / §8).
+    /// Sums every byte sitting in peer-controlled reassembly /
+    /// queue buffers — CRYPTO `crypto_pending`, RFC 9221 inbound
+    /// DATAGRAMs, and per-stream send/recv reassembly buffers. When
+    /// a fresh allocation would push the running total past this
+    /// cap, the handler closes the connection with
+    /// `transport_error_excessive_load` instead of letting the
+    /// allocation land. Defaults to `default_max_connection_memory`
+    /// (32 MiB); `Server.Config.max_connection_memory` threads onto
+    /// every accepted slot.
+    ///
+    /// Tuning note: per-buffer caps already exist
+    /// (`max_pending_crypto_bytes_per_level = 64 KiB`,
+    /// `max_pending_datagram_bytes = 64 KiB`,
+    /// `max_initial_stream_receive_window = 16 MiB`,
+    /// `default_max_buffered_send = 1 MiB`). This is the *aggregate*
+    /// guard that prevents a peer from opening many streams at once
+    /// and inflating the connection's host RSS even when each
+    /// individual buffer stays under its own cap.
+    max_connection_memory: u64 = default_max_connection_memory,
+
+    /// Running total of bytes currently resident in peer-controlled
+    /// buffers — see `max_connection_memory`. Mutated by
+    /// `tryReserveResidentBytes` / `releaseResidentBytes` at every
+    /// allocation / free site that holds peer-supplied bytes.
+    /// Monotonically non-negative — any release that would underflow
+    /// the counter clamps at zero and asserts in debug builds.
+    bytes_resident: u64 = 0,
 
     /// Pending hostname for client connections; applied during
     /// `bind` because we can't safely call `setHostname` before
@@ -2753,13 +2807,44 @@ pub const Connection = struct {
     /// Convenience: write `data` to the send half of stream `id`.
     pub fn streamWrite(self: *Connection, id: u64, data: []const u8) Error!usize {
         const s = self.streams.get(id) orelse return Error.StreamNotFound;
-        return try s.send.write(data);
+        // Hardening guide §3.5 / §8: pre-flight the resident-bytes
+        // budget against the bytes we'd accept. The per-stream
+        // `max_buffered` cap already gates a single stream; this
+        // shares one budget with CRYPTO / DATAGRAM / recv reassembly
+        // so opening many streams each near their per-stream cap
+        // can't bypass the connection-wide ceiling.
+        const before = s.send.bytes.items.len;
+        const headroom = s.send.max_buffered -| before;
+        const want = @min(data.len, headroom);
+        if (want > 0) {
+            try self.tryReserveResidentBytes(want);
+        }
+        const accepted = s.send.write(data) catch |err| {
+            self.releaseResidentBytes(want);
+            return err;
+        };
+        // `write` may accept fewer bytes than `want` if it short-writes
+        // (e.g. on its own internal cap); reconcile so we only hold
+        // budget for what actually landed in the buffer.
+        if (accepted < want) {
+            self.releaseResidentBytes(want - accepted);
+        }
+        return accepted;
     }
 
     /// Convenience: read from the receive half of stream `id`.
     pub fn streamRead(self: *Connection, id: u64, dst: []u8) Error!usize {
         const s = self.streams.get(id) orelse return Error.StreamNotFound;
+        const before = s.recv.bytes.items.len;
         const n = s.recv.read(dst);
+        // Hardening guide §3.5 / §8: every byte the app drains is
+        // bytes the connection no longer holds in its recv buffer.
+        // `RecvStream.read` shifts the buffer down and shrinks it to
+        // exactly the live tail, so the delta is the bytes actually
+        // freed.
+        if (s.recv.bytes.items.len < before) {
+            self.releaseResidentBytes(before - s.recv.bytes.items.len);
+        }
         if (n > 0) {
             self.recv_stream_bytes_read += n;
             if (shouldQueueReceiveCredit(
@@ -3338,6 +3423,11 @@ pub const Connection = struct {
     pub fn receiveDatagramInfo(self: *Connection, dst: []u8) ?IncomingDatagram {
         const item = self.pending_frames.popRecvDatagram() orelse return null;
         defer self.allocator.free(item.data);
+        // Hardening guide §3.5 / §8: pair the resident-bytes release
+        // with the queue dequeue. `popRecvDatagram` already decrements
+        // `recv_datagram_bytes`; this drops the matching cents from
+        // the global resident-bytes counter.
+        defer self.releaseResidentBytes(item.data.len);
         const n = @min(dst.len, item.data.len);
         @memcpy(dst[0..n], item.data[0..n]);
         return .{ .len = n, .arrived_in_early_data = item.arrived_in_early_data };
@@ -5944,6 +6034,44 @@ pub const Connection = struct {
         self.emitConnectionStateIfChanged();
     }
 
+    /// Try to reserve `n` bytes of resident-memory budget. Returns
+    /// `error.ExcessiveLoad` when the reservation would push
+    /// `bytes_resident` past `max_connection_memory` — callers should
+    /// then `close(true, transport_error_excessive_load, "...")` and
+    /// abandon the in-flight allocation rather than allow it to land.
+    /// The reason string is the wire reason: keep it generic
+    /// (`"excessive resource use"`) per hardening guide §9.1 / §14
+    /// to avoid leaking which buffer tripped the cap.
+    ///
+    /// Pair every successful `tryReserveResidentBytes(n)` with a
+    /// `releaseResidentBytes(n)` when the underlying bytes are freed.
+    /// The helper has no awareness of which buffer the bytes live in —
+    /// the call sites (handleCrypto / handleDatagram / handleStream /
+    /// streamRead / dispatchAckedToStreams) own the pairing.
+    pub fn tryReserveResidentBytes(self: *Connection, n: usize) Error!void {
+        if (n == 0) return;
+        const add: u64 = @intCast(n);
+        const cap = self.max_connection_memory;
+        // Saturating-add semantics: an attacker can't underflow the
+        // budget by exceeding u64::MAX, but the cap check below still
+        // fires once the running total overshoots `cap`.
+        if (self.bytes_resident > cap or add > cap - self.bytes_resident) {
+            return Error.ExcessiveLoad;
+        }
+        self.bytes_resident += add;
+    }
+
+    /// Release `n` bytes of resident-memory budget. Pairs with
+    /// `tryReserveResidentBytes`. Underflow is clamped at zero in
+    /// release builds (an unbalanced free is a bug, not a security
+    /// issue — the cap stays honored), and asserts in debug.
+    pub fn releaseResidentBytes(self: *Connection, n: usize) void {
+        if (n == 0) return;
+        const sub: u64 = @intCast(n);
+        std.debug.assert(self.bytes_resident >= sub);
+        self.bytes_resident -|= sub;
+    }
+
     /// Queue a STOP_SENDING for `stream_id` with the given app
     /// error code (RFC 9000 §19.5). Tells the peer to stop
     /// sending on the receiving half of the stream.
@@ -6933,7 +7061,11 @@ pub const Connection = struct {
         });
     }
 
-    fn handleDatagram(
+    /// Apply a peer-sent DATAGRAM frame (RFC 9221) to the inbound queue.
+    /// Public so per-connection hardening tests can drive the
+    /// resident-bytes accounting without crafting encrypted packets;
+    /// the production path is `handleOnePacket` → `handleApplication`.
+    pub fn handleDatagram(
         self: *Connection,
         lvl: EncryptionLevel,
         dg: frame_types.Datagram,
@@ -6953,8 +7085,22 @@ pub const Connection = struct {
             self.close(true, transport_error_protocol_violation, "datagram receive budget exhausted");
             return;
         }
-        const copy = try self.allocator.alloc(u8, dg.data.len);
-        errdefer self.allocator.free(copy);
+        // Hardening guide §3.5 / §8: the inbound DATAGRAM queue and
+        // every other peer-controlled buffer share one resident-bytes
+        // budget so a peer cannot bypass each per-buffer cap by
+        // ballooning many of them at once.
+        self.tryReserveResidentBytes(dg.data.len) catch {
+            self.close(true, transport_error_excessive_load, "excessive resource use");
+            return;
+        };
+        const copy = self.allocator.alloc(u8, dg.data.len) catch |err| {
+            self.releaseResidentBytes(dg.data.len);
+            return err;
+        };
+        errdefer {
+            self.releaseResidentBytes(dg.data.len);
+            self.allocator.free(copy);
+        }
         @memcpy(copy, dg.data);
         try self.pending_frames.recv_datagrams.append(self.allocator, .{
             .data = copy,
@@ -6963,7 +7109,11 @@ pub const Connection = struct {
         self.pending_frames.recv_datagram_bytes += dg.data.len;
     }
 
-    fn handleCrypto(
+    /// Apply a peer-sent CRYPTO frame's bytes at the given encryption
+    /// level. Public so per-connection hardening tests can drive the
+    /// reassembly path without crafting encrypted packets; the
+    /// production path is `handleOnePacket` → `handleInitial` etc.
+    pub fn handleCrypto(
         self: *Connection,
         lvl: EncryptionLevel,
         cr: frame_types.Crypto,
@@ -7006,8 +7156,24 @@ pub const Connection = struct {
                 self.close(true, transport_error_protocol_violation, "crypto reassembly exceeds limit");
                 return;
             }
-            const copy = try self.allocator.alloc(u8, eff_data.len);
-            errdefer self.allocator.free(copy);
+            // Hardening guide §3.5 / §8: reserve from the global
+            // resident-bytes budget *before* allocating. The per-level
+            // crypto cap above gates a single level; this gates the
+            // whole connection (CRYPTO + DATAGRAM + stream buffers
+            // sharing one budget so a peer can't open many small
+            // buffers and bypass each individual cap).
+            self.tryReserveResidentBytes(eff_data.len) catch {
+                self.close(true, transport_error_excessive_load, "excessive resource use");
+                return;
+            };
+            const copy = self.allocator.alloc(u8, eff_data.len) catch |err| {
+                self.releaseResidentBytes(eff_data.len);
+                return err;
+            };
+            errdefer {
+                self.releaseResidentBytes(eff_data.len);
+                self.allocator.free(copy);
+            }
             @memcpy(copy, eff_data);
             try self.crypto_pending[idx].append(self.allocator, .{
                 .offset = eff_offset,
@@ -7033,6 +7199,7 @@ pub const Connection = struct {
                 if (c_end <= my_off) {
                     // Wholly below the floor — drop.
                     self.crypto_pending_bytes[idx] -= chunk.data.len;
+                    self.releaseResidentBytes(chunk.data.len);
                     self.allocator.free(chunk.data);
                     _ = self.crypto_pending[idx].orderedRemove(i);
                     continue :outer;
@@ -7044,6 +7211,7 @@ pub const Connection = struct {
                     try self.inbox[idx].append(tail);
                     self.crypto_recv_offset[idx] += tail.len;
                     self.crypto_pending_bytes[idx] -= chunk.data.len;
+                    self.releaseResidentBytes(chunk.data.len);
                     self.allocator.free(chunk.data);
                     _ = self.crypto_pending[idx].orderedRemove(i);
                     continue :outer;
@@ -7081,7 +7249,13 @@ pub const Connection = struct {
         try self.refreshEarlyDataStatus();
     }
 
-    fn handleStream(
+    /// Apply a peer-sent STREAM frame to the matching stream's recv
+    /// reassembly buffer (creating the stream if it is peer-initiated
+    /// and not yet seen). Public so per-connection hardening tests can
+    /// drive the recv-reassembly path without crafting encrypted
+    /// packets; the production path is `handleOnePacket` →
+    /// `handleApplication`.
+    pub fn handleStream(
         self: *Connection,
         lvl: EncryptionLevel,
         s: frame_types.Stream,
@@ -7128,18 +7302,52 @@ pub const Connection = struct {
             self.close(true, transport_error_flow_control, "peer exceeded connection data limit");
             return;
         }
+        // Hardening guide §3.5 / §8: snapshot the recv-buffer length
+        // around `recv()` and reconcile the global resident-bytes
+        // budget. `RecvStream.recv` may grow its internal buffer to
+        // cover [read_offset, frame_end) — the diff captures whatever
+        // it actually allocated (overlapping ranges deduplicate, so
+        // the diff can be 0 or smaller than `s.data.len`).
+        const recv_before = ptr.recv.bytes.items.len;
         ptr.recv.recv(s.offset, s.data, s.fin) catch |err| switch (err) {
             error.BufferLimitExceeded => {
+                self.reconcileRecvResidentBytes(ptr, recv_before);
                 self.close(true, transport_error_protocol_violation, "stream reassembly exceeds allocation limit");
                 return;
             },
             error.BeyondFinalSize, error.FinalSizeChanged => {
+                self.reconcileRecvResidentBytes(ptr, recv_before);
                 self.close(true, transport_error_final_size, "stream final size changed");
                 return;
             },
-            else => return err,
+            else => {
+                self.reconcileRecvResidentBytes(ptr, recv_before);
+                return err;
+            },
         };
+        if (ptr.recv.bytes.items.len > recv_before) {
+            const grew = ptr.recv.bytes.items.len - recv_before;
+            self.tryReserveResidentBytes(grew) catch {
+                self.close(true, transport_error_excessive_load, "excessive resource use");
+                return;
+            };
+        } else if (ptr.recv.bytes.items.len < recv_before) {
+            self.releaseResidentBytes(recv_before - ptr.recv.bytes.items.len);
+        }
         self.peer_sent_stream_data += delta;
+    }
+
+    /// Best-effort reconciliation of the resident-bytes counter when
+    /// `RecvStream.recv` partially advanced its internal buffer before
+    /// returning an error. Releases bytes the recv buffer dropped on
+    /// the error path; if the buffer grew, the bytes are conceded to
+    /// the running total but the connection is closing immediately so
+    /// the over-count never leaks past `tick` / `reap`.
+    fn reconcileRecvResidentBytes(self: *Connection, ptr: *Stream, recv_before: usize) void {
+        const after = ptr.recv.bytes.items.len;
+        if (after < recv_before) {
+            self.releaseResidentBytes(recv_before - after);
+        }
     }
 
     fn handleResetStream(self: *Connection, rs: frame_types.ResetStream) Error!void {
@@ -7360,10 +7568,17 @@ pub const Connection = struct {
     fn dispatchAckedToStreams(self: *Connection, pn: u64) Error!void {
         var s_it = self.streams.iterator();
         while (s_it.next()) |entry| {
+            // Snapshot the send-buffer length so we can release the
+            // matching budget when the ack advances the stream's
+            // contiguous-acked floor (RFC 9000 §3.1: bytes ≤ floor are
+            // dropped from the in-memory buffer).
+            const before = entry.value_ptr.*.send.bytes.items.len;
             entry.value_ptr.*.send.onPacketAcked(pn) catch |e| switch (e) {
                 send_stream_mod.Error.UnknownPacket => {},
                 else => return e,
             };
+            const after = entry.value_ptr.*.send.bytes.items.len;
+            if (after < before) self.releaseResidentBytes(before - after);
         }
     }
 

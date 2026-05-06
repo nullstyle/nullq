@@ -243,6 +243,15 @@ const MetricsSnapshotImpl = struct {
     /// fired. A subset of `feeds_dropped`. Spiking values point at
     /// VN-flood probes.
     feeds_vn_rate_limited: u64,
+    /// Datagrams dropped at the listener-level packet rate limit
+    /// (`Config.max_datagrams_per_window`). Subset of `feeds_dropped`.
+    /// Hardening guide §4.1.
+    feeds_listener_rate_limited: u64,
+    /// LogEvents the server dropped under the per-source log rate
+    /// limit (`Config.max_log_events_per_source_per_window`).
+    /// Distinct from `feeds_dropped` — feeding a datagram and emitting
+    /// a log are separate side effects. Hardening guide §9.4.
+    feeds_log_rate_limited: u64,
     /// Echoed Retry tokens that successfully validated and led to a
     /// post-Retry `.accepted`. Always less than or equal to
     /// `feeds_retry_sent`.
@@ -361,10 +370,11 @@ fn cidKeyFromConnectionId(cid: ConnectionId) CidKey {
 
 /// Per-source rate-limit bookkeeping. One entry per active source
 /// address; entries older than `source_rate_window_us` are pruned
-/// lazily on each `feed`. Two independent (count, window_start) pairs
-/// track Initial-eligible and Version-Negotiation-eligible traffic
-/// separately — a peer that spams VN probes shouldn't burn the
-/// per-source Initial budget, and vice versa.
+/// lazily on each `feed`. Three independent (count, window_start)
+/// pairs track Initial-eligible, Version-Negotiation-eligible, and
+/// LogEvent-eligible traffic separately — a peer that spams VN
+/// probes shouldn't burn the per-source Initial budget, a peer that
+/// gets rate-limited shouldn't free up its VN budget, and so on.
 const SourceRateEntry = struct {
     /// Initial-driven slot creations attributed to this source
     /// within the current window.
@@ -377,6 +387,15 @@ const SourceRateEntry = struct {
     vn_count: u32 = 0,
     /// Wall-clock microseconds when the current VN window started.
     vn_window_start_us: u64 = 0,
+    /// LogEvents emitted on behalf of this source within the current
+    /// log window. Gated by `Config.max_log_events_per_source_per_window`.
+    /// Hardening guide §9.4: a flood of feed-rate-limited /
+    /// table-full / VN-rate-limited / etc. log events from one
+    /// address would otherwise let the peer flood the embedder's
+    /// log pipeline; this counter caps that.
+    log_count: u32 = 0,
+    /// Wall-clock microseconds when the current log window started.
+    log_window_start_us: u64 = 0,
 };
 
 /// Configuration handed to `Server.init`. Re-exported as
@@ -519,6 +538,48 @@ const ConfigImpl = struct {
     /// can also set `Connection.reveal_close_reason_on_wire` directly
     /// for finer-grained control (e.g. dev/debug builds).
     reveal_close_reason_on_wire: bool = false,
+
+    /// Per-Connection cap on bytes resident in peer-controlled
+    /// reassembly / queue buffers (CRYPTO, DATAGRAM, stream send /
+    /// recv). See `conn.state.default_max_connection_memory` and
+    /// `Connection.max_connection_memory` for the per-buffer
+    /// rationale. Threaded onto every accepted slot at
+    /// `openSlotFromInitial` time. 32 MiB by default — a healthy
+    /// upper bound that still leaves headroom for the per-buffer
+    /// caps to do their job before this aggregate cap fires.
+    max_connection_memory: u64 = conn_mod.state.default_max_connection_memory,
+
+    /// Listener-level packet rate limit (hardening guide §4.1):
+    /// drop incoming UDP datagrams when the global per-window count
+    /// exceeds this cap. Off by default (`null`) so embedders
+    /// explicitly opt in for production. The window length is
+    /// `listener_rate_window_us`; the bucket is single-global (no
+    /// per-source bookkeeping) so it shares state with nothing and
+    /// triggers cheaply on a flood from many spoofed sources.
+    ///
+    /// Recommended: scale to ~2x peak observed packets-per-window,
+    /// then alert on `MetricsSnapshot.feeds_listener_rate_limited`
+    /// growing. cap=0 fails `Server.init` with `InvalidConfig`.
+    max_datagrams_per_window: ?u32 = null,
+
+    /// Window length for `max_datagrams_per_window` in microseconds.
+    /// Default 1 second. Smaller windows make the cap more
+    /// responsive at the cost of more reset jitter; larger windows
+    /// smooth bursty traffic.
+    listener_rate_window_us: u64 = 1_000_000,
+
+    /// Per-source cap on `LogEvent` emissions per window (hardening
+    /// guide §9.4). When the cap fires, the log is dropped silently —
+    /// no nested log about the dropped log. Defaults to 16 events
+    /// per window per source; null disables. Reuses
+    /// `source_rate_window_us` (so the Initial / VN / log windows
+    /// all share one knob).
+    ///
+    /// Log events with `from = null` (no source attribution) bypass
+    /// the limiter — see `acceptLogRate`. Embedders that want a
+    /// global ceiling on null-source events should put one in their
+    /// own log_callback.
+    max_log_events_per_source_per_window: ?u32 = 16,
 };
 
 /// Argument to `Server.replaceTlsContext`. Either fresh PEM bytes
@@ -788,6 +849,36 @@ pub const Server = struct {
     /// redaction posture matches the embedder's choice.
     reveal_close_reason_on_wire: bool,
 
+    /// Captured `Config.max_connection_memory` — threaded onto every
+    /// Connection at slot-open time so `tryReserveResidentBytes` has
+    /// a per-connection cap. Hardening guide §3.5 / §8.
+    max_connection_memory: u64,
+
+    /// Captured `Config.max_datagrams_per_window`. Null disables the
+    /// listener-level packet rate limit; otherwise gates *every*
+    /// inbound datagram (existing-slot routes included) at the very
+    /// top of `feed`. Hardening guide §4.1.
+    max_datagrams_per_window: ?u32,
+    /// Captured `Config.listener_rate_window_us`. Window length for
+    /// `max_datagrams_per_window`.
+    listener_rate_window_us: u64,
+    /// Sliding-window counters for `max_datagrams_per_window`. Single
+    /// global bucket — no per-source bookkeeping, so it stays cheap
+    /// even under floods from many sources.
+    listener_rate_count: u32 = 0,
+    listener_rate_window_start_us: u64 = 0,
+
+    /// Captured `Config.max_log_events_per_source_per_window`. Null
+    /// disables the per-source log rate limit. Hardening guide §9.4.
+    max_log_events_per_source: ?u32,
+
+    /// Snapshot of the most recent `feed`'s `now_us` argument. Threaded
+    /// to `emitLog` so the per-source log rate limit fires its sliding
+    /// window against in-feed time even though `emitLog` itself takes
+    /// no clock argument. Set at the top of every `feed`; reads are
+    /// only valid inside the feed's call frame.
+    last_feed_now_us: u64 = 0,
+
     /// Bounded FIFO of stateless responses (VN, Retry) queued for
     /// the embedder to drain via `drainStatelessResponse`. Bounded
     /// at `stateless_response_queue_capacity`; on overflow the
@@ -829,6 +920,15 @@ pub const Server = struct {
     feeds_retry_sent: u64 = 0,
     feeds_initial_too_small: u64 = 0,
     feeds_vn_rate_limited: u64 = 0,
+    /// Datagrams dropped at the listener-level packet rate limit
+    /// (`Config.max_datagrams_per_window`). Subset of `feeds_dropped`.
+    /// Spiking values point at a flood-style attack.
+    feeds_listener_rate_limited: u64 = 0,
+    /// LogEvents dropped by the per-source log rate limiter
+    /// (`Config.max_log_events_per_source_per_window`). NOT a subset
+    /// of `feeds_dropped` — log emission is a separate side effect
+    /// from datagram disposition.
+    feeds_log_rate_limited: u64 = 0,
     retries_validated: u64 = 0,
     stateless_responses_evicted: u64 = 0,
     slots_reaped: u64 = 0,
@@ -855,6 +955,19 @@ pub const Server = struct {
         if (config.retry_token_key != null) {
             if (config.retry_token_lifetime_us == 0) return Error.InvalidConfig;
             if (config.retry_state_table_capacity == 0) return Error.InvalidConfig;
+        }
+        // Hardening guide §4.1: cap=0 is meaningless for the listener
+        // rate limit — it would drop every datagram. Surface it as
+        // `InvalidConfig` instead of letting it silently DoS the
+        // server itself.
+        if (config.max_datagrams_per_window) |cap| {
+            if (cap == 0) return Error.InvalidConfig;
+            if (config.listener_rate_window_us == 0) return Error.InvalidConfig;
+        }
+        if (config.max_log_events_per_source_per_window) |cap| {
+            if (cap == 0) return Error.InvalidConfig;
+            if (config.source_rate_window_us == 0) return Error.InvalidConfig;
+            if (config.source_rate_table_capacity == 0) return Error.InvalidConfig;
         }
 
         var tls_ctx: boringssl.tls.Context = undefined;
@@ -927,6 +1040,10 @@ pub const Server = struct {
             .retry_state_table_capacity = config.retry_state_table_capacity,
             .enable_0rtt = config.enable_0rtt,
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
+            .max_connection_memory = config.max_connection_memory,
+            .max_datagrams_per_window = config.max_datagrams_per_window,
+            .listener_rate_window_us = config.listener_rate_window_us,
+            .max_log_events_per_source = config.max_log_events_per_source_per_window,
             .stateless_responses = .empty,
         };
     }
@@ -994,6 +1111,31 @@ pub const Server = struct {
         from: ?Address,
         now_us: u64,
     ) Error!FeedOutcome {
+        // Stamp the feed's `now_us` so `emitLog` can run its per-source
+        // log rate limit against in-feed time without taking a separate
+        // clock argument.
+        self.last_feed_now_us = now_us;
+        // Hardening guide §4.1: listener-level packet rate limit. Runs
+        // *before* the empty-bytes check, before the 1200-byte Initial
+        // size gate, before slot lookup — every datagram entering the
+        // server passes here so a flood from many sources can't bleed
+        // through any of the per-source / per-slot gates downstream.
+        // Single global bucket on a sliding-by-reset window: cheap,
+        // and good enough for DoS deflection (the per-source gates
+        // own attribution; this owns the firehose).
+        if (self.max_datagrams_per_window) |cap| {
+            const elapsed = now_us -% self.listener_rate_window_start_us;
+            if (elapsed >= self.listener_rate_window_us or self.listener_rate_count == 0) {
+                self.listener_rate_count = 1;
+                self.listener_rate_window_start_us = now_us;
+            } else if (self.listener_rate_count >= cap) {
+                self.feeds_listener_rate_limited += 1;
+                self.feeds_dropped += 1;
+                return .dropped;
+            } else {
+                self.listener_rate_count += 1;
+            }
+        }
         if (bytes.len == 0) {
             self.feeds_dropped += 1;
             return .dropped;
@@ -1407,6 +1549,7 @@ pub const Server = struct {
         conn_ptr.* = try Connection.initServer(self.allocator, self.tls_ctx);
         errdefer conn_ptr.deinit();
         conn_ptr.reveal_close_reason_on_wire = self.reveal_close_reason_on_wire;
+        conn_ptr.max_connection_memory = self.max_connection_memory;
 
         try conn_ptr.bind();
         if (self.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, self.qlog_user_data);
@@ -1658,16 +1801,71 @@ pub const Server = struct {
         return true;
     }
 
+    /// Per-source log-emission rate gate. Mirrors `acceptSourceRate`
+    /// and `acceptVnRate` but uses the entry's tertiary
+    /// `log_count` / `log_window_start_us` pair so log floods don't
+    /// burn the Initial / VN budgets and vice versa. Returns `true`
+    /// when emission is permitted.
+    ///
+    /// Hardening guide §9.4: a peer that triggers many feed-rate-limit
+    /// or table-full or VN-rate-limit events from a single address
+    /// would otherwise let the attacker flood the embedder's log
+    /// pipeline (disk, stdout, structured-logging dependency, etc.).
+    /// On a denial of `false`, the caller drops the LogEvent silently
+    /// — there is no nested log about the dropped log.
+    fn acceptLogRate(
+        self: *Server,
+        addr: Address,
+        cap: u32,
+        now_us: u64,
+    ) bool {
+        // Lazy eviction shared with `acceptSourceRate` / `acceptVnRate`.
+        if (self.source_rate_table.count() >= self.source_rate_table_capacity) {
+            self.pruneSourceRate(now_us);
+            if (self.source_rate_table.count() >= self.source_rate_table_capacity) {
+                self.evictOldestSourceRate();
+            }
+        }
+
+        const gop = self.source_rate_table.getOrPut(self.allocator, addr) catch {
+            // OOM on the rate table: deny the log rather than risk
+            // unbounded emission. Mirrors `acceptSourceRate`.
+            return false;
+        };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{
+                .count = 0,
+                .window_start_us = 0,
+                .log_count = 1,
+                .log_window_start_us = now_us,
+            };
+            return true;
+        }
+
+        const elapsed = now_us -% gop.value_ptr.log_window_start_us;
+        if (elapsed >= self.source_rate_window_us) {
+            gop.value_ptr.log_count = 1;
+            gop.value_ptr.log_window_start_us = now_us;
+            return true;
+        }
+
+        if (gop.value_ptr.log_count >= cap) return false;
+        gop.value_ptr.log_count += 1;
+        return true;
+    }
+
     fn pruneSourceRate(self: *Server, now_us: u64) void {
         var it = self.source_rate_table.iterator();
         while (it.next()) |entry| {
             const init_elapsed = now_us -% entry.value_ptr.window_start_us;
             const vn_elapsed = now_us -% entry.value_ptr.vn_window_start_us;
-            // Only prune when both per-counter windows have elapsed —
-            // otherwise an entry that's only stale on one axis would
-            // lose its still-active counter on the other.
+            const log_elapsed = now_us -% entry.value_ptr.log_window_start_us;
+            // Only prune when *all three* per-counter windows have
+            // elapsed — otherwise an entry that's only stale on one
+            // axis would lose its still-active counters on the others.
             if (init_elapsed >= self.source_rate_window_us and
-                vn_elapsed >= self.source_rate_window_us)
+                vn_elapsed >= self.source_rate_window_us and
+                log_elapsed >= self.source_rate_window_us)
             {
                 _ = self.source_rate_table.remove(entry.key_ptr.*);
             }
@@ -1955,11 +2153,36 @@ pub const Server = struct {
 
     // -- observability -------------------------------------------------
 
-    /// Internal helper: invoke `log_callback` if installed. Inlined
-    /// at call sites so the no-callback path stays a single
-    /// optional-null check.
-    fn emitLog(self: *const Server, ev: LogEvent) void {
-        if (self.log_callback) |cb| cb(self.log_user_data, ev);
+    /// Internal helper: invoke `log_callback` if installed. Mediated
+    /// by the per-source log rate limit (hardening guide §9.4) when
+    /// the event carries a source address — events with `from = null`
+    /// (or a variant that doesn't bind to a peer) bypass the gate.
+    fn emitLog(self: *Server, ev: LogEvent) void {
+        if (self.log_callback == null) return;
+        if (self.max_log_events_per_source) |cap| {
+            if (logEventSource(ev)) |addr| {
+                // `acceptLogRate` allocates on first hit per source —
+                // OOM there denies the log rather than crash. We pass
+                // the most recent timestamp the caller surfaced via
+                // the in-flight feed; emitLog doesn't take a clock so
+                // we use the limiter's own `log_window_start_us`
+                // semantics where the comparison is against `now_us`
+                // captured at call time. Callers that want strict
+                // timing pass `now_us` to whichever feed-side gate
+                // upstream of this; here we use the source's most
+                // recent log-window start as a stand-in for "now".
+                //
+                // The simplest correct implementation: hand
+                // `acceptLogRate` an in-feed `now_us` via a ledger
+                // captured at feed entry. We do that via
+                // `last_feed_now_us`, set at the top of every `feed`.
+                if (!self.acceptLogRate(addr, cap, self.last_feed_now_us)) {
+                    self.feeds_log_rate_limited += 1;
+                    return;
+                }
+            }
+        }
+        self.log_callback.?(self.log_user_data, ev);
     }
 
     /// Snapshot the server's instrumentation gauges and counters.
@@ -1985,6 +2208,8 @@ pub const Server = struct {
             .feeds_retry_sent = self.feeds_retry_sent,
             .feeds_initial_too_small = self.feeds_initial_too_small,
             .feeds_vn_rate_limited = self.feeds_vn_rate_limited,
+            .feeds_listener_rate_limited = self.feeds_listener_rate_limited,
+            .feeds_log_rate_limited = self.feeds_log_rate_limited,
             .retries_validated = self.retries_validated,
             .stateless_responses_evicted = self.stateless_responses_evicted,
             .slots_reaped = self.slots_reaped,
@@ -2049,6 +2274,24 @@ pub const Server = struct {
         return snap;
     }
 };
+
+/// Extract the source address from a `LogEvent` for the per-source log
+/// rate limit. Returns null when the event has no source attribution
+/// (e.g. `stateless_queue_evicted`) or the source is itself null
+/// (`connection_closed` / `table_full` paths where the embedder
+/// didn't pass `from`). Hardening guide §9.4: events with no source
+/// bypass the limiter.
+fn logEventSource(ev: LogEventImpl) ?Address {
+    return switch (ev) {
+        .connection_accepted => |e| e.peer,
+        .connection_closed => |e| e.peer,
+        .feed_rate_limited => |e| e.peer,
+        .retry_minted => |e| e.peer,
+        .version_negotiated => |e| e.peer,
+        .stateless_queue_evicted => null,
+        .table_full => |e| e.peer,
+    };
+}
 
 // -- header-peek helpers ------------------------------------------------
 
