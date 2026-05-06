@@ -34,6 +34,7 @@ const path_mod = @import("path.zig");
 const congestion_mod = @import("congestion.zig");
 const rtt_mod = @import("rtt.zig");
 const flow_control_mod = @import("flow_control.zig");
+const pending_frames_mod = @import("pending_frames.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -407,25 +408,14 @@ const StoredCloseEvent = struct {
 };
 
 /// One queued STOP_SENDING frame (RFC 9000 §19.5) with its application error code.
-pub const StopSendingItem = struct {
-    stream_id: u64,
-    application_error_code: u64,
-};
+pub const StopSendingItem = pending_frames_mod.StopSendingItem;
 
 /// One queued MAX_STREAM_DATA frame (RFC 9000 §19.10) with the new credit value.
-pub const MaxStreamDataItem = struct {
-    stream_id: u64,
-    maximum_stream_data: u64,
-};
+pub const MaxStreamDataItem = pending_frames_mod.MaxStreamDataItem;
 
 /// One queued NEW_CONNECTION_ID frame (RFC 9000 §19.15) the embedder has handed
 /// to the connection and is awaiting transmission.
-pub const PendingNewConnectionId = struct {
-    sequence_number: u64,
-    retire_prior_to: u64,
-    connection_id: frame_types.ConnId,
-    stateless_reset_token: [16]u8,
-};
+pub const PendingNewConnectionId = pending_frames_mod.PendingNewConnectionId;
 
 /// Embedder-supplied bundle when calling `provideConnectionId`/`provisionPathConnectionId`
 /// to install a fresh local CID and its stateless reset token.
@@ -443,11 +433,7 @@ pub const PathCidsBlockedInfo = struct {
 };
 
 /// One queued PATH_AVAILABLE / PATH_BACKUP frame from draft-ietf-quic-multipath-21.
-pub const PendingPathStatus = struct {
-    path_id: u32,
-    sequence_number: u64,
-    available: bool,
-};
+pub const PendingPathStatus = pending_frames_mod.PendingPathStatus;
 
 /// Header-only descriptor returned from `pollDatagram` — paired with the bytes
 /// the caller wrote into the supplied buffer.
@@ -464,15 +450,8 @@ pub const IncomingDatagram = struct {
     arrived_in_early_data: bool = false,
 };
 
-const PendingRecvDatagram = struct {
-    data: []u8,
-    arrived_in_early_data: bool = false,
-};
-
-const PendingSendDatagram = struct {
-    id: u64,
-    data: []u8,
-};
+const PendingRecvDatagram = pending_frames_mod.PendingRecvDatagram;
+const PendingSendDatagram = pending_frames_mod.PendingSendDatagram;
 
 /// Distinct timers the Connection drives. The embedder only ever sees one at
 /// a time via `nextTimer` — the earliest pending — but the kind disambiguates
@@ -908,15 +887,7 @@ pub const Connection = struct {
     /// SendStream needs one global key to avoid multipath PN collisions.
     next_stream_packet_key: u64 = 0,
 
-    /// Outbound RFC 9221 DATAGRAM payloads waiting to be packed
-    /// into 1-RTT packets. Each entry is allocator-owned.
-    pending_send_datagrams: std.ArrayList(PendingSendDatagram) = .empty,
-    pending_send_datagram_bytes: usize = 0,
     next_datagram_id: u64 = 0,
-    /// Inbound DATAGRAMs received but not yet pulled by the app.
-    /// Each entry is allocator-owned.
-    pending_recv_datagrams: std.ArrayList(PendingRecvDatagram) = .empty,
-    pending_recv_datagram_bytes: usize = 0,
 
     /// DCID we put on outgoing packets (the peer chose this; client
     /// learns it from the server's first Initial SCID, or
@@ -1049,17 +1020,6 @@ pub const Connection = struct {
     /// non-null value means only the draining timer remains relevant.
     draining_deadline_us: ?u64 = null,
 
-    /// PATH_CHALLENGE token received from the peer that we still
-    /// owe a PATH_RESPONSE for. The next outgoing 1-RTT packet
-    /// will carry it.
-    pending_path_response: ?[8]u8 = null,
-    pending_path_response_path_id: u32 = 0,
-    pending_path_response_addr: ?Address = null,
-    /// PATH_CHALLENGE token we've queued for transmission to start
-    /// validating the current path.
-    pending_path_challenge: ?[8]u8 = null,
-    pending_path_challenge_path_id: u32 = 0,
-
     /// Peer-issued connection IDs we've stashed via NEW_CONNECTION_ID.
     /// Phase 9 (migration) will pull from this set; for now, the
     /// stash is just bookkeeping (and a place where a peer's
@@ -1091,20 +1051,6 @@ pub const Connection = struct {
     connection_id_event_count: usize = 0,
     datagram_send_events: [max_datagram_send_events]StoredDatagramSendEvent = undefined,
     datagram_send_event_count: usize = 0,
-    /// STOP_SENDING frames we owe the peer (one per stream id).
-    pending_stop_sending: std.ArrayList(StopSendingItem) = .empty,
-    /// MAX_STREAM_DATA frames we owe after the application drains
-    /// receive buffers. Coalesced by stream id.
-    pending_max_stream_data: std.ArrayList(MaxStreamDataItem) = .empty,
-    /// MAX_DATA value to advertise after application reads. Null
-    /// means no connection-level window update is currently queued.
-    pending_max_data: ?u64 = null,
-    pending_max_streams_bidi: ?u64 = null,
-    pending_max_streams_uni: ?u64 = null,
-    pending_data_blocked: ?u64 = null,
-    pending_stream_data_blocked: std.ArrayList(frame_types.StreamDataBlocked) = .empty,
-    pending_streams_blocked_bidi: ?u64 = null,
-    pending_streams_blocked_uni: ?u64 = null,
     local_data_blocked_at: ?u64 = null,
     local_stream_data_blocked: std.ArrayList(frame_types.StreamDataBlocked) = .empty,
     local_streams_blocked_bidi: ?u64 = null,
@@ -1115,17 +1061,14 @@ pub const Connection = struct {
     peer_streams_blocked_uni: ?u64 = null,
     /// Bytes the application has drained from all receive streams.
     recv_stream_bytes_read: u64 = 0,
-    /// Server/client-issued CIDs to advertise to the peer. This is
-    /// enough for migration and multipath probes to obtain spare CIDs.
-    pending_new_connection_ids: std.ArrayList(PendingNewConnectionId) = .empty,
-    pending_retire_connection_ids: std.ArrayList(frame_types.RetireConnectionId) = .empty,
-    pending_path_abandons: std.ArrayList(frame_types.PathAbandon) = .empty,
-    pending_path_statuses: std.ArrayList(PendingPathStatus) = .empty,
-    pending_path_new_connection_ids: std.ArrayList(frame_types.PathNewConnectionId) = .empty,
-    pending_path_retire_connection_ids: std.ArrayList(frame_types.PathRetireConnectionId) = .empty,
-    pending_max_path_id: ?u32 = null,
-    pending_paths_blocked: ?u32 = null,
-    pending_path_cids_blocked: ?frame_types.PathCidsBlocked = null,
+
+    /// All control-frame backlog the connection owes the peer at the
+    /// application encryption level — flow-control window updates,
+    /// STOP_SENDING, NEW_CONNECTION_ID/RETIRE_CONNECTION_ID, the
+    /// PATH_CHALLENGE/PATH_RESPONSE pair, multipath draft-21
+    /// bookkeeping, and queued DATAGRAMs in both directions. The
+    /// hot-path drain in `pollLevel` walks each subqueue in order.
+    pending_frames: pending_frames_mod.PendingFrameQueues = .empty,
 
     /// Build a client-side `Connection`. `tls_ctx` must be a
     /// client-mode `boringssl.tls.Context` and stays caller-owned;
@@ -1200,10 +1143,7 @@ pub const Connection = struct {
             self.allocator.destroy(s);
         }
         self.streams.deinit(self.allocator);
-        for (self.pending_send_datagrams.items) |item| self.allocator.free(item.data);
-        for (self.pending_recv_datagrams.items) |item| self.allocator.free(item.data);
-        self.pending_send_datagrams.deinit(self.allocator);
-        self.pending_recv_datagrams.deinit(self.allocator);
+        self.pending_frames.deinit(self.allocator);
         for (&self.sent) |*tracker| {
             var i: u32 = 0;
             while (i < tracker.count) : (i += 1) {
@@ -1226,17 +1166,8 @@ pub const Connection = struct {
         self.peer_cids.deinit(self.allocator);
         self.local_cids.deinit(self.allocator);
         self.retry_token.deinit(self.allocator);
-        self.pending_stop_sending.deinit(self.allocator);
-        self.pending_max_stream_data.deinit(self.allocator);
-        self.pending_stream_data_blocked.deinit(self.allocator);
         self.local_stream_data_blocked.deinit(self.allocator);
         self.peer_stream_data_blocked.deinit(self.allocator);
-        self.pending_new_connection_ids.deinit(self.allocator);
-        self.pending_retire_connection_ids.deinit(self.allocator);
-        self.pending_path_abandons.deinit(self.allocator);
-        self.pending_path_statuses.deinit(self.allocator);
-        self.pending_path_new_connection_ids.deinit(self.allocator);
-        self.pending_path_retire_connection_ids.deinit(self.allocator);
         self.inner.deinit();
         self.* = undefined;
     }
@@ -2149,26 +2080,10 @@ pub const Connection = struct {
         sequence_number: u64,
     ) void {
         if (path_id == 0) {
-            var i: usize = 0;
-            while (i < self.pending_new_connection_ids.items.len) {
-                if (self.pending_new_connection_ids.items[i].sequence_number == sequence_number) {
-                    _ = self.pending_new_connection_ids.orderedRemove(i);
-                    continue;
-                }
-                i += 1;
-            }
+            self.pending_frames.removeNewConnectionIdBySequence(sequence_number);
             return;
         }
-
-        var i: usize = 0;
-        while (i < self.pending_path_new_connection_ids.items.len) {
-            const item = self.pending_path_new_connection_ids.items[i];
-            if (item.path_id == path_id and item.sequence_number == sequence_number) {
-                _ = self.pending_path_new_connection_ids.orderedRemove(i);
-                continue;
-            }
-            i += 1;
-        }
+        self.pending_frames.removePathNewConnectionIdBySequence(path_id, sequence_number);
     }
 
     fn nextLocalCidSequence(self: *const Connection, path_id: u32) u64 {
@@ -2834,7 +2749,7 @@ pub const Connection = struct {
             stream_ptr.recv_max_data = @max(stream_ptr.recv_max_data, maximum_stream_data);
         }
         clearStreamBlocked(&self.peer_stream_data_blocked, stream_id, maximum_stream_data);
-        for (self.pending_max_stream_data.items) |*item| {
+        for (self.pending_frames.max_stream_data.items) |*item| {
             if (item.stream_id == stream_id) {
                 if (maximum_stream_data > item.maximum_stream_data) {
                     item.maximum_stream_data = maximum_stream_data;
@@ -2842,7 +2757,7 @@ pub const Connection = struct {
                 return;
             }
         }
-        try self.pending_max_stream_data.append(self.allocator, .{
+        try self.pending_frames.max_stream_data.append(self.allocator, .{
             .stream_id = stream_id,
             .maximum_stream_data = maximum_stream_data,
         });
@@ -2853,8 +2768,8 @@ pub const Connection = struct {
         if (self.peer_data_blocked_at) |limit| {
             if (maximum_data > limit) self.peer_data_blocked_at = null;
         }
-        if (self.pending_max_data == null or maximum_data > self.pending_max_data.?) {
-            self.pending_max_data = maximum_data;
+        if (self.pending_frames.max_data == null or maximum_data > self.pending_frames.max_data.?) {
+            self.pending_frames.max_data = maximum_data;
         }
     }
 
@@ -2874,16 +2789,16 @@ pub const Connection = struct {
             if (self.peer_streams_blocked_bidi) |limit| {
                 if (bounded_maximum_streams > limit) self.peer_streams_blocked_bidi = null;
             }
-            if (self.pending_max_streams_bidi == null or bounded_maximum_streams > self.pending_max_streams_bidi.?) {
-                self.pending_max_streams_bidi = bounded_maximum_streams;
+            if (self.pending_frames.max_streams_bidi == null or bounded_maximum_streams > self.pending_frames.max_streams_bidi.?) {
+                self.pending_frames.max_streams_bidi = bounded_maximum_streams;
             }
         } else {
             if (bounded_maximum_streams > self.local_max_streams_uni) self.local_max_streams_uni = bounded_maximum_streams;
             if (self.peer_streams_blocked_uni) |limit| {
                 if (bounded_maximum_streams > limit) self.peer_streams_blocked_uni = null;
             }
-            if (self.pending_max_streams_uni == null or bounded_maximum_streams > self.pending_max_streams_uni.?) {
-                self.pending_max_streams_uni = bounded_maximum_streams;
+            if (self.pending_frames.max_streams_uni == null or bounded_maximum_streams > self.pending_frames.max_streams_uni.?) {
+                self.pending_frames.max_streams_uni = bounded_maximum_streams;
             }
         }
     }
@@ -3124,7 +3039,7 @@ pub const Connection = struct {
         const changed = self.local_data_blocked_at == null or self.local_data_blocked_at.? != maximum_data;
         self.local_data_blocked_at = maximum_data;
         if (changed) {
-            self.pending_data_blocked = maximum_data;
+            self.pending_frames.data_blocked = maximum_data;
             self.recordFlowBlockedEvent(.{
                 .source = .local,
                 .kind = .data,
@@ -3139,7 +3054,7 @@ pub const Connection = struct {
         {
             return false;
         }
-        self.pending_data_blocked = maximum_data;
+        self.pending_frames.data_blocked = maximum_data;
         return true;
     }
 
@@ -3147,8 +3062,8 @@ pub const Connection = struct {
         if (self.local_data_blocked_at) |limit| {
             if (new_limit > limit) self.local_data_blocked_at = null;
         }
-        if (self.pending_data_blocked) |limit| {
-            if (new_limit > limit) self.pending_data_blocked = null;
+        if (self.pending_frames.data_blocked) |limit| {
+            if (new_limit > limit) self.pending_frames.data_blocked = null;
         }
     }
 
@@ -3163,7 +3078,7 @@ pub const Connection = struct {
         };
         const changed = try upsertStreamBlocked(&self.local_stream_data_blocked, self.allocator, item);
         if (changed) {
-            _ = try upsertStreamBlocked(&self.pending_stream_data_blocked, self.allocator, item);
+            _ = try upsertStreamBlocked(&self.pending_frames.stream_data_blocked, self.allocator, item);
             self.recordFlowBlockedEvent(.{
                 .source = .local,
                 .kind = .stream_data,
@@ -3181,7 +3096,7 @@ pub const Connection = struct {
         if (self.local_stream_data_blocked.items[idx].maximum_stream_data != item.maximum_stream_data) {
             return false;
         }
-        _ = try upsertStreamBlocked(&self.pending_stream_data_blocked, self.allocator, item);
+        _ = try upsertStreamBlocked(&self.pending_frames.stream_data_blocked, self.allocator, item);
         return true;
     }
 
@@ -3191,7 +3106,7 @@ pub const Connection = struct {
         new_limit: u64,
     ) void {
         clearStreamBlocked(&self.local_stream_data_blocked, stream_id, new_limit);
-        clearStreamBlocked(&self.pending_stream_data_blocked, stream_id, new_limit);
+        clearStreamBlocked(&self.pending_frames.stream_data_blocked, stream_id, new_limit);
     }
 
     fn noteStreamsBlocked(self: *Connection, bidi: bool, maximum_streams: u64) void {
@@ -3199,7 +3114,7 @@ pub const Connection = struct {
             const changed = self.local_streams_blocked_bidi == null or self.local_streams_blocked_bidi.? != maximum_streams;
             self.local_streams_blocked_bidi = maximum_streams;
             if (changed) {
-                self.pending_streams_blocked_bidi = maximum_streams;
+                self.pending_frames.streams_blocked_bidi = maximum_streams;
                 self.recordFlowBlockedEvent(.{
                     .source = .local,
                     .kind = .streams,
@@ -3211,7 +3126,7 @@ pub const Connection = struct {
             const changed = self.local_streams_blocked_uni == null or self.local_streams_blocked_uni.? != maximum_streams;
             self.local_streams_blocked_uni = maximum_streams;
             if (changed) {
-                self.pending_streams_blocked_uni = maximum_streams;
+                self.pending_frames.streams_blocked_uni = maximum_streams;
                 self.recordFlowBlockedEvent(.{
                     .source = .local,
                     .kind = .streams,
@@ -3229,14 +3144,14 @@ pub const Connection = struct {
             {
                 return false;
             }
-            self.pending_streams_blocked_bidi = item.maximum_streams;
+            self.pending_frames.streams_blocked_bidi = item.maximum_streams;
         } else {
             if (self.local_streams_blocked_uni == null or
                 self.local_streams_blocked_uni.? != item.maximum_streams)
             {
                 return false;
             }
-            self.pending_streams_blocked_uni = item.maximum_streams;
+            self.pending_frames.streams_blocked_uni = item.maximum_streams;
         }
         return true;
     }
@@ -3246,15 +3161,15 @@ pub const Connection = struct {
             if (self.local_streams_blocked_bidi) |limit| {
                 if (new_limit > limit) self.local_streams_blocked_bidi = null;
             }
-            if (self.pending_streams_blocked_bidi) |limit| {
-                if (new_limit > limit) self.pending_streams_blocked_bidi = null;
+            if (self.pending_frames.streams_blocked_bidi) |limit| {
+                if (new_limit > limit) self.pending_frames.streams_blocked_bidi = null;
             }
         } else {
             if (self.local_streams_blocked_uni) |limit| {
                 if (new_limit > limit) self.local_streams_blocked_uni = null;
             }
-            if (self.pending_streams_blocked_uni) |limit| {
-                if (new_limit > limit) self.pending_streams_blocked_uni = null;
+            if (self.pending_frames.streams_blocked_uni) |limit| {
+                if (new_limit > limit) self.pending_frames.streams_blocked_uni = null;
             }
         }
     }
@@ -3292,11 +3207,11 @@ pub const Connection = struct {
     pub fn sendDatagramTracked(self: *Connection, payload: []const u8) Error!u64 {
         const max_payload = try self.maxOutboundDatagramPayload();
         if (payload.len > max_payload) return Error.DatagramTooLarge;
-        if (self.pending_send_datagrams.items.len >= max_pending_datagram_count) {
+        if (self.pending_frames.send_datagrams.items.len >= max_pending_datagram_count) {
             return Error.DatagramQueueFull;
         }
         if (payload.len > max_pending_datagram_bytes or
-            self.pending_send_datagram_bytes > max_pending_datagram_bytes - payload.len)
+            self.pending_frames.send_datagram_bytes > max_pending_datagram_bytes - payload.len)
         {
             return Error.DatagramQueueFull;
         }
@@ -3306,11 +3221,11 @@ pub const Connection = struct {
         if (self.next_datagram_id == std.math.maxInt(u64)) return Error.DatagramIdExhausted;
         const id = self.next_datagram_id;
         self.next_datagram_id += 1;
-        try self.pending_send_datagrams.append(self.allocator, .{
+        try self.pending_frames.send_datagrams.append(self.allocator, .{
             .id = id,
             .data = copy,
         });
-        self.pending_send_datagram_bytes += payload.len;
+        self.pending_frames.send_datagram_bytes += payload.len;
         return id;
     }
 
@@ -3337,7 +3252,7 @@ pub const Connection = struct {
         try self.ensureCanIssueLocalCid(0, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
         try self.ensureLocalCidAvailable(0, sequence_number, local_cid);
-        for (self.pending_new_connection_ids.items) |item| {
+        for (self.pending_frames.new_connection_ids.items) |item| {
             if (item.sequence_number == sequence_number) {
                 if (!std.mem.eql(u8, item.connection_id.slice(), cid)) return Error.ConnectionIdAlreadyInUse;
                 return;
@@ -3346,7 +3261,7 @@ pub const Connection = struct {
         var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
         @memcpy(connection_id.bytes[0..cid.len], cid);
         try self.rememberLocalCid(0, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
-        try self.pending_new_connection_ids.append(self.allocator, .{
+        try self.pending_frames.new_connection_ids.append(self.allocator, .{
             .sequence_number = sequence_number,
             .retire_prior_to = retire_prior_to,
             .connection_id = connection_id,
@@ -3361,10 +3276,10 @@ pub const Connection = struct {
         self: *Connection,
         sequence_number: u64,
     ) Error!void {
-        for (self.pending_retire_connection_ids.items) |item| {
+        for (self.pending_frames.retire_connection_ids.items) |item| {
             if (item.sequence_number == sequence_number) return;
         }
-        try self.pending_retire_connection_ids.append(self.allocator, .{
+        try self.pending_frames.retire_connection_ids.append(self.allocator, .{
             .sequence_number = sequence_number,
         });
     }
@@ -3383,10 +3298,8 @@ pub const Connection = struct {
     /// in 0-RTT. The payload is dropped from the queue regardless of
     /// whether it fit.
     pub fn receiveDatagramInfo(self: *Connection, dst: []u8) ?IncomingDatagram {
-        if (self.pending_recv_datagrams.items.len == 0) return null;
-        const item = self.pending_recv_datagrams.orderedRemove(0);
+        const item = self.pending_frames.popRecvDatagram() orelse return null;
         defer self.allocator.free(item.data);
-        self.pending_recv_datagram_bytes -= item.data.len;
         const n = @min(dst.len, item.data.len);
         @memcpy(dst[0..n], item.data[0..n]);
         return .{ .len = n, .arrived_in_early_data = item.arrived_in_early_data };
@@ -3394,7 +3307,7 @@ pub const Connection = struct {
 
     /// Number of inbound DATAGRAMs queued for the app to read.
     pub fn pendingDatagrams(self: *const Connection) usize {
-        return self.pending_recv_datagrams.items.len;
+        return self.pending_frames.recv_datagrams.items.len;
     }
 
     /// Enable or disable the public multipath surface. The current
@@ -3547,13 +3460,13 @@ pub const Connection = struct {
         path_id: u32,
         error_code: u64,
     ) Error!void {
-        for (self.pending_path_abandons.items) |*item| {
+        for (self.pending_frames.path_abandons.items) |*item| {
             if (item.path_id == path_id) {
                 item.error_code = error_code;
                 return;
             }
         }
-        try self.pending_path_abandons.append(self.allocator, .{
+        try self.pending_frames.path_abandons.append(self.allocator, .{
             .path_id = path_id,
             .error_code = error_code,
         });
@@ -3569,7 +3482,7 @@ pub const Connection = struct {
         available: bool,
         sequence_number: u64,
     ) Error!void {
-        for (self.pending_path_statuses.items) |*item| {
+        for (self.pending_frames.path_statuses.items) |*item| {
             if (item.path_id == path_id) {
                 if (sequence_number >= item.sequence_number) {
                     item.sequence_number = sequence_number;
@@ -3578,7 +3491,7 @@ pub const Connection = struct {
                 return;
             }
         }
-        try self.pending_path_statuses.append(self.allocator, .{
+        try self.pending_frames.path_statuses.append(self.allocator, .{
             .path_id = path_id,
             .sequence_number = sequence_number,
             .available = available,
@@ -3602,7 +3515,7 @@ pub const Connection = struct {
         try self.ensureCanIssueLocalCid(path_id, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
         try self.ensureLocalCidAvailable(path_id, sequence_number, local_cid);
-        for (self.pending_path_new_connection_ids.items) |item| {
+        for (self.pending_frames.path_new_connection_ids.items) |item| {
             if (item.path_id == path_id and item.sequence_number == sequence_number) {
                 if (!std.mem.eql(u8, item.connection_id.slice(), cid)) return Error.ConnectionIdAlreadyInUse;
                 return;
@@ -3611,7 +3524,7 @@ pub const Connection = struct {
         var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
         @memcpy(connection_id.bytes[0..cid.len], cid);
         try self.rememberLocalCid(path_id, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
-        try self.pending_path_new_connection_ids.append(self.allocator, .{
+        try self.pending_frames.path_new_connection_ids.append(self.allocator, .{
             .path_id = path_id,
             .sequence_number = sequence_number,
             .retire_prior_to = retire_prior_to,
@@ -3629,10 +3542,10 @@ pub const Connection = struct {
         path_id: u32,
         sequence_number: u64,
     ) Error!void {
-        for (self.pending_path_retire_connection_ids.items) |item| {
+        for (self.pending_frames.path_retire_connection_ids.items) |item| {
             if (item.path_id == path_id and item.sequence_number == sequence_number) return;
         }
-        try self.pending_path_retire_connection_ids.append(self.allocator, .{
+        try self.pending_frames.path_retire_connection_ids.append(self.allocator, .{
             .path_id = path_id,
             .sequence_number = sequence_number,
         });
@@ -3646,8 +3559,8 @@ pub const Connection = struct {
         if (bounded_maximum_path_id > self.local_max_path_id) {
             self.local_max_path_id = bounded_maximum_path_id;
         }
-        if (self.pending_max_path_id == null or bounded_maximum_path_id > self.pending_max_path_id.?) {
-            self.pending_max_path_id = bounded_maximum_path_id;
+        if (self.pending_frames.max_path_id == null or bounded_maximum_path_id > self.pending_frames.max_path_id.?) {
+            self.pending_frames.max_path_id = bounded_maximum_path_id;
         }
     }
 
@@ -3655,8 +3568,8 @@ pub const Connection = struct {
     /// path-id headroom at `maximum_path_id`. Coalesces by keeping the
     /// largest pending value. draft-ietf-quic-multipath-21 §6.6.
     pub fn queuePathsBlocked(self: *Connection, maximum_path_id: u32) void {
-        if (self.pending_paths_blocked == null or maximum_path_id > self.pending_paths_blocked.?) {
-            self.pending_paths_blocked = maximum_path_id;
+        if (self.pending_frames.paths_blocked == null or maximum_path_id > self.pending_frames.paths_blocked.?) {
+            self.pending_frames.paths_blocked = maximum_path_id;
         }
     }
 
@@ -3668,7 +3581,7 @@ pub const Connection = struct {
         path_id: u32,
         next_sequence_number: u64,
     ) void {
-        self.pending_path_cids_blocked = .{
+        self.pending_frames.path_cids_blocked = .{
             .path_id = path_id,
             .next_sequence_number = next_sequence_number,
         };
@@ -3949,12 +3862,12 @@ pub const Connection = struct {
     }
 
     fn applicationPathForPoll(self: *Connection) *PathState {
-        if (self.pending_path_response != null) {
-            const p = self.pathForId(self.pending_path_response_path_id);
+        if (self.pending_frames.path_response != null) {
+            const p = self.pathForId(self.pending_frames.path_response_path_id);
             if (p.path.state != .failed and p.path.state != .retiring) return p;
         }
-        if (self.pending_path_challenge != null) {
-            const p = self.pathForId(self.pending_path_challenge_path_id);
+        if (self.pending_frames.path_challenge != null) {
+            const p = self.pathForId(self.pending_frames.path_challenge_path_id);
             if (p.path.state != .failed and p.path.state != .retiring) return p;
         }
         for (self.paths.paths.items) |*p| {
@@ -3991,10 +3904,10 @@ pub const Connection = struct {
     }
 
     fn clearQueuedPathChallengeForPath(self: *Connection, path_id: u32) void {
-        if (self.pending_path_challenge != null and
-            self.pending_path_challenge_path_id == path_id)
+        if (self.pending_frames.path_challenge != null and
+            self.pending_frames.path_challenge_path_id == path_id)
         {
-            self.pending_path_challenge = null;
+            self.pending_frames.path_challenge = null;
         }
     }
 
@@ -4004,9 +3917,9 @@ pub const Connection = struct {
         token: [8]u8,
         addr: ?Address,
     ) void {
-        self.pending_path_response = token;
-        self.pending_path_response_path_id = path_id;
-        self.pending_path_response_addr = addr;
+        self.pending_frames.path_response = token;
+        self.pending_frames.path_response_path_id = path_id;
+        self.pending_frames.path_response_addr = addr;
     }
 
     fn queuePathChallengeOnPath(
@@ -4014,8 +3927,8 @@ pub const Connection = struct {
         path_id: u32,
         token: [8]u8,
     ) void {
-        self.pending_path_challenge = token;
-        self.pending_path_challenge_path_id = path_id;
+        self.pending_frames.path_challenge = token;
+        self.pending_frames.path_challenge_path_id = path_id;
     }
 
     fn newPathChallengeToken(self: *Connection) Error![8]u8 {
@@ -4680,25 +4593,25 @@ pub const Connection = struct {
         for (&self.pn_spaces) |*space| {
             if (space.received.pending_ack) return true;
         }
-        if (self.pending_max_data != null) return true;
-        if (self.pending_max_stream_data.items.len > 0) return true;
-        if (self.pending_max_streams_bidi != null or self.pending_max_streams_uni != null) return true;
-        if (self.pending_data_blocked != null) return true;
-        if (self.pending_stream_data_blocked.items.len > 0) return true;
-        if (self.pending_streams_blocked_bidi != null or self.pending_streams_blocked_uni != null) return true;
-        if (self.pending_new_connection_ids.items.len > 0) return true;
-        if (self.pending_retire_connection_ids.items.len > 0) return true;
-        if (self.pending_stop_sending.items.len > 0) return true;
-        if (self.pending_path_response != null) return true;
-        if (self.pending_path_challenge != null) return true;
-        if (self.pending_path_abandons.items.len > 0) return true;
-        if (self.pending_path_statuses.items.len > 0) return true;
-        if (self.pending_path_new_connection_ids.items.len > 0) return true;
-        if (self.pending_path_retire_connection_ids.items.len > 0) return true;
-        if (self.pending_max_path_id != null) return true;
-        if (self.pending_paths_blocked != null) return true;
-        if (self.pending_path_cids_blocked != null) return true;
-        if (self.pending_send_datagrams.items.len > 0) return true;
+        if (self.pending_frames.max_data != null) return true;
+        if (self.pending_frames.max_stream_data.items.len > 0) return true;
+        if (self.pending_frames.max_streams_bidi != null or self.pending_frames.max_streams_uni != null) return true;
+        if (self.pending_frames.data_blocked != null) return true;
+        if (self.pending_frames.stream_data_blocked.items.len > 0) return true;
+        if (self.pending_frames.streams_blocked_bidi != null or self.pending_frames.streams_blocked_uni != null) return true;
+        if (self.pending_frames.new_connection_ids.items.len > 0) return true;
+        if (self.pending_frames.retire_connection_ids.items.len > 0) return true;
+        if (self.pending_frames.stop_sending.items.len > 0) return true;
+        if (self.pending_frames.path_response != null) return true;
+        if (self.pending_frames.path_challenge != null) return true;
+        if (self.pending_frames.path_abandons.items.len > 0) return true;
+        if (self.pending_frames.path_statuses.items.len > 0) return true;
+        if (self.pending_frames.path_new_connection_ids.items.len > 0) return true;
+        if (self.pending_frames.path_retire_connection_ids.items.len > 0) return true;
+        if (self.pending_frames.max_path_id != null) return true;
+        if (self.pending_frames.paths_blocked != null) return true;
+        if (self.pending_frames.path_cids_blocked != null) return true;
+        if (self.pending_frames.send_datagrams.items.len > 0) return true;
         var it = self.streams.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.*.send.hasPendingChunk()) return true;
@@ -4883,9 +4796,9 @@ pub const Connection = struct {
         const congestion_blocked = self.congestionBlockedOnPath(lvl, app_path);
         const path_response_addr_overrides_current = blk: {
             if (lvl != .application) break :blk false;
-            if (self.pending_path_response == null) break :blk false;
-            if (self.pending_path_response_path_id != app_path.id) break :blk false;
-            const addr = self.pending_path_response_addr orelse break :blk false;
+            if (self.pending_frames.path_response == null) break :blk false;
+            if (self.pending_frames.path_response_path_id != app_path.id) break :blk false;
+            const addr = self.pending_frames.path_response_addr orelse break :blk false;
             break :blk !Address.eql(addr, app_path.path.peer_addr);
         };
         const app_control_blocked = congestion_blocked or path_response_addr_overrides_current;
@@ -5101,8 +5014,8 @@ pub const Connection = struct {
         // 2a) MAX_DATA / MAX_STREAM_DATA (application only). We queue these
         // when the application drains receive buffers so peers can
         // continue uploads beyond their current stream window.
-        if (!app_control_blocked and lvl == .application and self.pending_max_data != null) {
-            const maximum_data = self.pending_max_data.?;
+        if (!app_control_blocked and lvl == .application and self.pending_frames.max_data != null) {
+            const maximum_data = self.pending_frames.max_data.?;
             const overhead_md: usize = 1 + varint.encodedLen(maximum_data);
             if (max_payload >= pl_pos + overhead_md) {
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
@@ -5112,12 +5025,12 @@ pub const Connection = struct {
                 try sent_packet.addRetransmitFrame(self.allocator, .{
                     .max_data = .{ .maximum_data = maximum_data },
                 });
-                self.pending_max_data = null;
+                self.pending_frames.max_data = null;
                 ack_eliciting = true;
             }
         }
-        if (!app_control_blocked and lvl == .application and self.pending_max_stream_data.items.len > 0) {
-            const item = self.pending_max_stream_data.items[0];
+        if (!app_control_blocked and lvl == .application and self.pending_frames.max_stream_data.items.len > 0) {
+            const item = self.pending_frames.max_stream_data.items[0];
             const overhead_msd: usize = 1 +
                 varint.encodedLen(item.stream_id) +
                 varint.encodedLen(item.maximum_stream_data);
@@ -5135,13 +5048,13 @@ pub const Connection = struct {
                         .maximum_stream_data = item.maximum_stream_data,
                     },
                 });
-                _ = self.pending_max_stream_data.orderedRemove(0);
+                _ = self.pending_frames.max_stream_data.orderedRemove(0);
                 ack_eliciting = true;
             }
         }
-        if (!app_control_blocked and lvl == .application and (self.pending_max_streams_bidi != null or self.pending_max_streams_uni != null)) {
-            const bidi = self.pending_max_streams_bidi != null;
-            const maximum_streams = if (bidi) self.pending_max_streams_bidi.? else self.pending_max_streams_uni.?;
+        if (!app_control_blocked and lvl == .application and (self.pending_frames.max_streams_bidi != null or self.pending_frames.max_streams_uni != null)) {
+            const bidi = self.pending_frames.max_streams_bidi != null;
+            const maximum_streams = if (bidi) self.pending_frames.max_streams_bidi.? else self.pending_frames.max_streams_uni.?;
             const overhead_ms: usize = 1 + varint.encodedLen(maximum_streams);
             if (max_payload >= pl_pos + overhead_ms) {
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
@@ -5158,15 +5071,15 @@ pub const Connection = struct {
                     },
                 });
                 if (bidi) {
-                    self.pending_max_streams_bidi = null;
+                    self.pending_frames.max_streams_bidi = null;
                 } else {
-                    self.pending_max_streams_uni = null;
+                    self.pending_frames.max_streams_uni = null;
                 }
                 ack_eliciting = true;
             }
         }
-        if (!app_control_blocked and lvl == .application and self.pending_data_blocked != null) {
-            const maximum_data = self.pending_data_blocked.?;
+        if (!app_control_blocked and lvl == .application and self.pending_frames.data_blocked != null) {
+            const maximum_data = self.pending_frames.data_blocked.?;
             const overhead_db: usize = 1 + varint.encodedLen(maximum_data);
             if (max_payload >= pl_pos + overhead_db) {
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
@@ -5176,12 +5089,12 @@ pub const Connection = struct {
                 try sent_packet.addRetransmitFrame(self.allocator, .{
                     .data_blocked = .{ .maximum_data = maximum_data },
                 });
-                self.pending_data_blocked = null;
+                self.pending_frames.data_blocked = null;
                 ack_eliciting = true;
             }
         }
-        if (!app_control_blocked and lvl == .application and self.pending_stream_data_blocked.items.len > 0) {
-            const item = self.pending_stream_data_blocked.items[0];
+        if (!app_control_blocked and lvl == .application and self.pending_frames.stream_data_blocked.items.len > 0) {
+            const item = self.pending_frames.stream_data_blocked.items[0];
             const overhead_sdb: usize = 1 +
                 varint.encodedLen(item.stream_id) +
                 varint.encodedLen(item.maximum_stream_data);
@@ -5193,13 +5106,13 @@ pub const Connection = struct {
                 try sent_packet.addRetransmitFrame(self.allocator, .{
                     .stream_data_blocked = item,
                 });
-                _ = self.pending_stream_data_blocked.orderedRemove(0);
+                _ = self.pending_frames.stream_data_blocked.orderedRemove(0);
                 ack_eliciting = true;
             }
         }
-        if (!app_control_blocked and lvl == .application and (self.pending_streams_blocked_bidi != null or self.pending_streams_blocked_uni != null)) {
-            const bidi = self.pending_streams_blocked_bidi != null;
-            const maximum_streams = if (bidi) self.pending_streams_blocked_bidi.? else self.pending_streams_blocked_uni.?;
+        if (!app_control_blocked and lvl == .application and (self.pending_frames.streams_blocked_bidi != null or self.pending_frames.streams_blocked_uni != null)) {
+            const bidi = self.pending_frames.streams_blocked_bidi != null;
+            const maximum_streams = if (bidi) self.pending_frames.streams_blocked_bidi.? else self.pending_frames.streams_blocked_uni.?;
             const overhead_sb: usize = 1 + varint.encodedLen(maximum_streams);
             if (max_payload >= pl_pos + overhead_sb) {
                 const item: frame_types.StreamsBlocked = .{
@@ -5212,9 +5125,9 @@ pub const Connection = struct {
                 pl_pos += wrote;
                 try sent_packet.addRetransmitFrame(self.allocator, .{ .streams_blocked = item });
                 if (bidi) {
-                    self.pending_streams_blocked_bidi = null;
+                    self.pending_frames.streams_blocked_bidi = null;
                 } else {
-                    self.pending_streams_blocked_uni = null;
+                    self.pending_frames.streams_blocked_uni = null;
                 }
                 ack_eliciting = true;
             }
@@ -5222,8 +5135,8 @@ pub const Connection = struct {
 
         // 2b) NEW_CONNECTION_ID (application only). Advertise spare
         // CIDs so peers can validate/migrate additional paths.
-        if (!app_control_blocked and lvl == .application and self.pending_new_connection_ids.items.len > 0) {
-            const item = self.pending_new_connection_ids.items[0];
+        if (!app_control_blocked and lvl == .application and self.pending_frames.new_connection_ids.items.len > 0) {
+            const item = self.pending_frames.new_connection_ids.items[0];
             const overhead_ncid: usize = 1 +
                 varint.encodedLen(item.sequence_number) +
                 varint.encodedLen(item.retire_prior_to) +
@@ -5246,13 +5159,13 @@ pub const Connection = struct {
                         .stateless_reset_token = item.stateless_reset_token,
                     },
                 });
-                _ = self.pending_new_connection_ids.orderedRemove(0);
+                _ = self.pending_frames.new_connection_ids.orderedRemove(0);
                 ack_eliciting = true;
             }
         }
 
-        if (!app_control_blocked and lvl == .application and self.pending_retire_connection_ids.items.len > 0) {
-            const item = self.pending_retire_connection_ids.items[0];
+        if (!app_control_blocked and lvl == .application and self.pending_frames.retire_connection_ids.items.len > 0) {
+            const item = self.pending_frames.retire_connection_ids.items[0];
             const overhead_rcid: usize = 1 + varint.encodedLen(item.sequence_number);
             if (max_payload >= pl_pos + overhead_rcid) {
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
@@ -5262,14 +5175,14 @@ pub const Connection = struct {
                 try sent_packet.addRetransmitFrame(self.allocator, .{
                     .retire_connection_id = item,
                 });
-                _ = self.pending_retire_connection_ids.orderedRemove(0);
+                _ = self.pending_frames.retire_connection_ids.orderedRemove(0);
                 ack_eliciting = true;
             }
         }
 
         // 2c) STOP_SENDING (one per packet for now — application only).
-        if (!app_control_blocked and lvl == .application and self.pending_stop_sending.items.len > 0) {
-            const item = self.pending_stop_sending.items[0];
+        if (!app_control_blocked and lvl == .application and self.pending_frames.stop_sending.items.len > 0) {
+            const item = self.pending_frames.stop_sending.items[0];
             const overhead_ss: usize = 1 + varint.encodedLen(item.stream_id) + varint.encodedLen(item.application_error_code);
             if (max_payload >= pl_pos + overhead_ss) {
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
@@ -5285,7 +5198,7 @@ pub const Connection = struct {
                         .application_error_code = item.application_error_code,
                     },
                 });
-                _ = self.pending_stop_sending.orderedRemove(0);
+                _ = self.pending_frames.stop_sending.orderedRemove(0);
                 ack_eliciting = true;
             }
         }
@@ -5295,14 +5208,14 @@ pub const Connection = struct {
         //     priority on the application path so we don't make the
         //     peer wait through a stream-data backlog.
         var path_response_used_addr_override = false;
-        if (!congestion_blocked and lvl == .application and self.pending_path_response != null and
-            self.pending_path_response_path_id == app_path.id and pl_pos + 9 <= max_payload)
+        if (!congestion_blocked and lvl == .application and self.pending_frames.path_response != null and
+            self.pending_frames.path_response_path_id == app_path.id and pl_pos + 9 <= max_payload)
         {
-            if (self.pending_path_response_addr) |addr| {
+            if (self.pending_frames.path_response_addr) |addr| {
                 path_response_used_addr_override = !Address.eql(addr, app_path.path.peer_addr);
             }
-            const tok = self.pending_path_response.?;
-            self.poll_addr_override = self.pending_path_response_addr;
+            const tok = self.pending_frames.path_response.?;
+            self.poll_addr_override = self.pending_frames.path_response_addr;
             const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                 .path_response = .{ .data = tok },
             });
@@ -5310,15 +5223,15 @@ pub const Connection = struct {
             try sent_packet.addRetransmitFrame(self.allocator, .{
                 .path_response = .{ .data = tok },
             });
-            self.pending_path_response = null;
-            self.pending_path_response_addr = null;
+            self.pending_frames.path_response = null;
+            self.pending_frames.path_response_addr = null;
             ack_eliciting = true;
         }
         if (!path_response_used_addr_override and
-            !congestion_blocked and lvl == .application and self.pending_path_challenge != null and
-            self.pending_path_challenge_path_id == app_path.id and pl_pos + 9 <= max_payload)
+            !congestion_blocked and lvl == .application and self.pending_frames.path_challenge != null and
+            self.pending_frames.path_challenge_path_id == app_path.id and pl_pos + 9 <= max_payload)
         {
-            const tok = self.pending_path_challenge.?;
+            const tok = self.pending_frames.path_challenge.?;
             const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                 .path_challenge = .{ .data = tok },
             });
@@ -5326,7 +5239,7 @@ pub const Connection = struct {
             try sent_packet.addRetransmitFrame(self.allocator, .{
                 .path_challenge = .{ .data = tok },
             });
-            self.pending_path_challenge = null;
+            self.pending_frames.path_challenge = null;
             ack_eliciting = true;
         }
 
@@ -5377,16 +5290,16 @@ pub const Connection = struct {
         // 3a) DATAGRAM frame (Application PN space). One queued
         //     payload per packet; LEN-prefixed so DATAGRAM doesn't
         //     have to be the last frame.
-        if (!path_response_used_addr_override and !congestion_blocked and (lvl == .application or lvl == .early_data) and self.pending_send_datagrams.items.len > 0) {
-            const dg = self.pending_send_datagrams.items[0];
+        if (!path_response_used_addr_override and !congestion_blocked and (lvl == .application or lvl == .early_data) and self.pending_frames.send_datagrams.items.len > 0) {
+            const dg = self.pending_frames.send_datagrams.items[0];
             const dg_overhead: usize = 1 + varint.encodedLen(dg.data.len);
             if (max_payload >= pl_pos + dg_overhead + dg.data.len) {
                 const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
                     .datagram = .{ .data = dg.data, .has_length = true },
                 });
                 pl_pos += wrote;
-                _ = self.pending_send_datagrams.orderedRemove(0);
-                self.pending_send_datagram_bytes -= dg.data.len;
+                _ = self.pending_frames.send_datagrams.orderedRemove(0);
+                self.pending_frames.send_datagram_bytes -= dg.data.len;
                 sent_datagram = .{
                     .id = dg.id,
                     .len = dg.data.len,
@@ -5560,16 +5473,16 @@ pub const Connection = struct {
         pl_pos: *usize,
         max_payload: usize,
     ) Error!bool {
-        if (self.pending_path_abandons.items.len > 0) {
-            const item = self.pending_path_abandons.items[0];
+        if (self.pending_frames.path_abandons.items.len > 0) {
+            const item = self.pending_frames.path_abandons.items[0];
             if (try encodeFrameIfFits(pl_buf, pl_pos, max_payload, .{ .path_abandon = item })) {
                 try sent_packet.addRetransmitFrame(self.allocator, .{ .path_abandon = item });
-                _ = self.pending_path_abandons.orderedRemove(0);
+                _ = self.pending_frames.path_abandons.orderedRemove(0);
                 return true;
             }
         }
-        if (self.pending_path_statuses.items.len > 0) {
-            const item = self.pending_path_statuses.items[0];
+        if (self.pending_frames.path_statuses.items.len > 0) {
+            const item = self.pending_frames.path_statuses.items[0];
             const status: frame_types.PathStatus = .{
                 .path_id = item.path_id,
                 .sequence_number = item.sequence_number,
@@ -5586,46 +5499,46 @@ pub const Connection = struct {
                     else
                         .{ .path_status_backup = status },
                 );
-                _ = self.pending_path_statuses.orderedRemove(0);
+                _ = self.pending_frames.path_statuses.orderedRemove(0);
                 return true;
             }
         }
-        if (self.pending_path_new_connection_ids.items.len > 0) {
-            const item = self.pending_path_new_connection_ids.items[0];
+        if (self.pending_frames.path_new_connection_ids.items.len > 0) {
+            const item = self.pending_frames.path_new_connection_ids.items[0];
             if (try encodeFrameIfFits(pl_buf, pl_pos, max_payload, .{ .path_new_connection_id = item })) {
                 try sent_packet.addRetransmitFrame(self.allocator, .{ .path_new_connection_id = item });
-                _ = self.pending_path_new_connection_ids.orderedRemove(0);
+                _ = self.pending_frames.path_new_connection_ids.orderedRemove(0);
                 return true;
             }
         }
-        if (self.pending_path_retire_connection_ids.items.len > 0) {
-            const item = self.pending_path_retire_connection_ids.items[0];
+        if (self.pending_frames.path_retire_connection_ids.items.len > 0) {
+            const item = self.pending_frames.path_retire_connection_ids.items[0];
             if (try encodeFrameIfFits(pl_buf, pl_pos, max_payload, .{ .path_retire_connection_id = item })) {
                 try sent_packet.addRetransmitFrame(self.allocator, .{ .path_retire_connection_id = item });
-                _ = self.pending_path_retire_connection_ids.orderedRemove(0);
+                _ = self.pending_frames.path_retire_connection_ids.orderedRemove(0);
                 return true;
             }
         }
-        if (self.pending_max_path_id) |maximum_path_id| {
+        if (self.pending_frames.max_path_id) |maximum_path_id| {
             const item: frame_types.MaxPathId = .{ .maximum_path_id = maximum_path_id };
             if (try encodeFrameIfFits(pl_buf, pl_pos, max_payload, .{ .max_path_id = item })) {
                 try sent_packet.addRetransmitFrame(self.allocator, .{ .max_path_id = item });
-                self.pending_max_path_id = null;
+                self.pending_frames.max_path_id = null;
                 return true;
             }
         }
-        if (self.pending_paths_blocked) |maximum_path_id| {
+        if (self.pending_frames.paths_blocked) |maximum_path_id| {
             const item: frame_types.PathsBlocked = .{ .maximum_path_id = maximum_path_id };
             if (try encodeFrameIfFits(pl_buf, pl_pos, max_payload, .{ .paths_blocked = item })) {
                 try sent_packet.addRetransmitFrame(self.allocator, .{ .paths_blocked = item });
-                self.pending_paths_blocked = null;
+                self.pending_frames.paths_blocked = null;
                 return true;
             }
         }
-        if (self.pending_path_cids_blocked) |item| {
+        if (self.pending_frames.path_cids_blocked) |item| {
             if (try encodeFrameIfFits(pl_buf, pl_pos, max_payload, .{ .path_cids_blocked = item })) {
                 try sent_packet.addRetransmitFrame(self.allocator, .{ .path_cids_blocked = item });
-                self.pending_path_cids_blocked = null;
+                self.pending_frames.path_cids_blocked = null;
                 return true;
             }
         }
@@ -6023,14 +5936,14 @@ pub const Connection = struct {
         self: *Connection,
         item: StopSendingItem,
     ) Error!void {
-        for (self.pending_stop_sending.items) |queued| {
+        for (self.pending_frames.stop_sending.items) |queued| {
             if (queued.stream_id == item.stream_id and
                 queued.application_error_code == item.application_error_code)
             {
                 return;
             }
         }
-        try self.pending_stop_sending.append(self.allocator, .{
+        try self.pending_frames.stop_sending.append(self.allocator, .{
             .stream_id = item.stream_id,
             .application_error_code = item.application_error_code,
         });
@@ -7004,12 +6917,12 @@ pub const Connection = struct {
             self.close(true, transport_error_protocol_violation, "datagram exceeds local limit");
             return;
         }
-        if (self.pending_recv_datagrams.items.len >= max_pending_datagram_count) {
+        if (self.pending_frames.recv_datagrams.items.len >= max_pending_datagram_count) {
             self.close(true, transport_error_protocol_violation, "datagram receive queue exhausted");
             return;
         }
         if (dg.data.len > max_pending_datagram_bytes or
-            self.pending_recv_datagram_bytes > max_pending_datagram_bytes - dg.data.len)
+            self.pending_frames.recv_datagram_bytes > max_pending_datagram_bytes - dg.data.len)
         {
             self.close(true, transport_error_protocol_violation, "datagram receive budget exhausted");
             return;
@@ -7017,11 +6930,11 @@ pub const Connection = struct {
         const copy = try self.allocator.alloc(u8, dg.data.len);
         errdefer self.allocator.free(copy);
         @memcpy(copy, dg.data);
-        try self.pending_recv_datagrams.append(self.allocator, .{
+        try self.pending_frames.recv_datagrams.append(self.allocator, .{
             .data = copy,
             .arrived_in_early_data = lvl == .early_data,
         });
-        self.pending_recv_datagram_bytes += dg.data.len;
+        self.pending_frames.recv_datagram_bytes += dg.data.len;
     }
 
     fn handleCrypto(
@@ -7591,13 +7504,13 @@ pub const Connection = struct {
                     any = true;
                 },
                 .path_response => |pr| {
-                    if (self.pending_path_response == null) {
+                    if (self.pending_frames.path_response == null) {
                         self.queuePathResponseOnPath(path_id, pr.data, null);
                     }
                     any = true;
                 },
                 .path_challenge => |pc| {
-                    if (self.pending_path_challenge == null and
+                    if (self.pending_frames.path_challenge == null and
                         self.shouldRequeuePathChallenge(path_id, pc.data))
                     {
                         self.queuePathChallengeOnPath(path_id, pc.data);
@@ -9073,7 +8986,7 @@ test "PTO requeues retransmittable control frames" {
 
     try conn.tick(conn.ptoDurationForLevel(.application));
 
-    try std.testing.expectEqual(@as(?u64, 4096), conn.pending_max_data);
+    try std.testing.expectEqual(@as(?u64, 4096), conn.pending_frames.max_data);
     try std.testing.expect(!conn.pendingPingForLevel(.application).*);
 }
 
@@ -9097,7 +9010,7 @@ test "poll helper emits one draft multipath control frame with retransmit metada
     var pos: usize = 0;
 
     try std.testing.expect(try conn.emitOnePendingMultipathFrame(&packet, &payload, &pos, default_mtu));
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_path_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.path_statuses.items.len);
     try std.testing.expectEqual(@as(usize, 1), packet.retransmit_frames.items.len);
     try std.testing.expect(packet.retransmit_frames.items[0] == .path_status_backup);
 
@@ -9130,9 +9043,9 @@ test "poll helper coalesces draft multipath control frames with retransmit metad
     var pos: usize = 0;
 
     try std.testing.expect(try conn.emitPendingMultipathFrames(&packet, &payload, &pos, default_mtu));
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_path_statuses.items.len);
-    try std.testing.expectEqual(@as(?u32, null), conn.pending_max_path_id);
-    try std.testing.expectEqual(@as(?u32, null), conn.pending_paths_blocked);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.path_statuses.items.len);
+    try std.testing.expectEqual(@as(?u32, null), conn.pending_frames.max_path_id);
+    try std.testing.expectEqual(@as(?u32, null), conn.pending_frames.paths_blocked);
     try std.testing.expectEqual(@as(usize, 3), packet.retransmit_frames.items.len);
     try std.testing.expect(packet.retransmit_frames.items[0] == .path_status_available);
     try std.testing.expect(packet.retransmit_frames.items[1] == .max_path_id);
@@ -9170,9 +9083,9 @@ test "PTO requeues retransmittable draft multipath control frames" {
 
     try conn.tick(conn.ptoDurationForLevel(.application));
 
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_path_abandons.items.len);
-    try std.testing.expectEqual(@as(u32, 3), conn.pending_path_abandons.items[0].path_id);
-    try std.testing.expectEqual(@as(u64, 99), conn.pending_path_abandons.items[0].error_code);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.path_abandons.items.len);
+    try std.testing.expectEqual(@as(u32, 3), conn.pending_frames.path_abandons.items[0].path_id);
+    try std.testing.expectEqual(@as(u64, 99), conn.pending_frames.path_abandons.items[0].error_code);
     try std.testing.expect(!conn.pendingPingForLevel(.application).*);
 }
 
@@ -9628,8 +9541,8 @@ test "PathSet API exposes path lifecycle and application recovery state" {
     try std.testing.expect(conn.markPathValidated(id));
     try std.testing.expect(conn.pathStats(id).?.validated);
     try std.testing.expect(conn.setPathBackup(id, true));
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_path_statuses.items.len);
-    try std.testing.expect(!conn.pending_path_statuses.items[0].available);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.path_statuses.items.len);
+    try std.testing.expect(!conn.pending_frames.path_statuses.items[0].available);
     conn.setScheduler(.round_robin);
     try std.testing.expect(conn.abandonPath(id));
     try std.testing.expectEqual(path_mod.State.retiring, conn.pathStats(id).?.state);
@@ -10211,10 +10124,10 @@ test "sendDatagram enforces peer support and bounded queue" {
     conn.cached_peer_transport_params = .{ .max_datagram_frame_size = 4 };
     try std.testing.expectError(Error.DatagramTooLarge, conn.sendDatagram("12345"));
     try conn.sendDatagram("1234");
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_send_datagrams.items.len);
-    try std.testing.expectEqual(@as(usize, 4), conn.pending_send_datagram_bytes);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.send_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 4), conn.pending_frames.send_datagram_bytes);
 
-    while (conn.pending_send_datagrams.items.len < max_pending_datagram_count) {
+    while (conn.pending_frames.send_datagrams.items.len < max_pending_datagram_count) {
         try conn.sendDatagram("x");
     }
     try std.testing.expectError(Error.DatagramQueueFull, conn.sendDatagram("x"));
@@ -10274,9 +10187,9 @@ test "tracked DATAGRAM emits loss event without retransmission" {
 
     var lost = conn.primaryPath().sent.removeAt(0);
     defer lost.deinit(conn.allocator);
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.send_datagrams.items.len);
     try std.testing.expect(!(try conn.requeueLostPacket(.application, &lost)));
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.send_datagrams.items.len);
 
     const event = conn.pollEvent().?;
     try std.testing.expect(event == .datagram_lost);
@@ -10296,24 +10209,24 @@ test "handleDatagram enforces local DATAGRAM limit and queue budget" {
         try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
         try std.testing.expect(conn.pending_close != null);
         try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
-        try std.testing.expectEqual(@as(usize, 0), conn.pending_recv_datagrams.items.len);
+        try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.recv_datagrams.items.len);
     }
 
     {
         var conn = try Connection.initServer(allocator, ctx);
         defer conn.deinit();
         conn.local_transport_params.max_datagram_frame_size = max_supported_udp_payload_size;
-        while (conn.pending_recv_datagrams.items.len < max_pending_datagram_count) {
+        while (conn.pending_frames.recv_datagrams.items.len < max_pending_datagram_count) {
             try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
         }
-        try std.testing.expectEqual(max_pending_datagram_count, conn.pending_recv_datagrams.items.len);
-        try std.testing.expectEqual(max_pending_datagram_count, conn.pending_recv_datagram_bytes);
+        try std.testing.expectEqual(max_pending_datagram_count, conn.pending_frames.recv_datagrams.items.len);
+        try std.testing.expectEqual(max_pending_datagram_count, conn.pending_frames.recv_datagram_bytes);
 
         var buf: [1]u8 = undefined;
         const info = conn.receiveDatagramInfo(&buf).?;
         try std.testing.expectEqual(@as(usize, 1), info.len);
-        try std.testing.expectEqual(max_pending_datagram_count - 1, conn.pending_recv_datagrams.items.len);
-        try std.testing.expectEqual(max_pending_datagram_count - 1, conn.pending_recv_datagram_bytes);
+        try std.testing.expectEqual(max_pending_datagram_count - 1, conn.pending_frames.recv_datagrams.items.len);
+        try std.testing.expectEqual(max_pending_datagram_count - 1, conn.pending_frames.recv_datagram_bytes);
 
         try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
         try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
@@ -10430,12 +10343,12 @@ test "bounded policy clamps MAX_STREAMS MAX_PATH_ID and peer CID fanout" {
     conn.queueMaxStreams(false, max_streams_per_connection + 100);
     try std.testing.expectEqual(max_streams_per_connection, conn.local_max_streams_bidi);
     try std.testing.expectEqual(max_streams_per_connection, conn.local_max_streams_uni);
-    try std.testing.expectEqual(max_streams_per_connection, conn.pending_max_streams_bidi.?);
-    try std.testing.expectEqual(max_streams_per_connection, conn.pending_max_streams_uni.?);
+    try std.testing.expectEqual(max_streams_per_connection, conn.pending_frames.max_streams_bidi.?);
+    try std.testing.expectEqual(max_streams_per_connection, conn.pending_frames.max_streams_uni.?);
 
     conn.queueMaxPathId(max_supported_path_id + 100);
     try std.testing.expectEqual(max_supported_path_id, conn.local_max_path_id);
-    try std.testing.expectEqual(max_supported_path_id, conn.pending_max_path_id.?);
+    try std.testing.expectEqual(max_supported_path_id, conn.pending_frames.max_path_id.?);
 
     conn.cached_peer_transport_params = .{
         .active_connection_id_limit = max_supported_active_connection_id_limit + 100,
@@ -10591,7 +10504,7 @@ test "send-side STREAM emission is capped by flow-control allowance" {
     try std.testing.expectEqual(@as(u64, 4), retransmit_only.length);
     try std.testing.expect(!retransmit_only.fin);
     try std.testing.expectEqual(@as(?u64, 4), conn.localDataBlockedAt());
-    try std.testing.expectEqual(@as(?u64, 4), conn.pending_data_blocked);
+    try std.testing.expectEqual(@as(?u64, 4), conn.pending_frames.data_blocked);
 
     const event = conn.pollEvent().?;
     try std.testing.expect(event == .flow_blocked);
@@ -10601,7 +10514,7 @@ test "send-side STREAM emission is capped by flow-control allowance" {
 
     conn.handleMaxData(.{ .maximum_data = 16 });
     try std.testing.expectEqual(@as(?u64, null), conn.localDataBlockedAt());
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_data_blocked);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.data_blocked);
 }
 
 test "receive flow-control MAX updates are paced by half-window" {
@@ -10646,8 +10559,8 @@ test "receive flow-control MAX updates are paced by half-window" {
 
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(0, &buf));
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_max_stream_data.items.len);
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_max_data);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.max_stream_data.items.len);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.max_data);
 }
 
 test "stream flow block queues STREAM_DATA_BLOCKED and clears on MAX_STREAM_DATA" {
@@ -10669,7 +10582,7 @@ test "stream flow block queues STREAM_DATA_BLOCKED and clears on MAX_STREAM_DATA
     _ = (try conn.limitChunkToSendFlow(s, raw)).?;
 
     try std.testing.expectEqual(@as(?u64, 4), conn.localStreamDataBlockedAt(0));
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.stream_data_blocked.items.len);
 
     const event = conn.pollEvent().?;
     try std.testing.expect(event == .flow_blocked);
@@ -10679,7 +10592,7 @@ test "stream flow block queues STREAM_DATA_BLOCKED and clears on MAX_STREAM_DATA
 
     conn.handleMaxStreamData(.{ .stream_id = 0, .maximum_stream_data = 8 });
     try std.testing.expectEqual(@as(?u64, null), conn.localStreamDataBlockedAt(0));
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.stream_data_blocked.items.len);
 }
 
 test "STREAMS_BLOCKED is queued when local stream opening hits peer limit" {
@@ -10692,7 +10605,7 @@ test "STREAMS_BLOCKED is queued when local stream opening hits peer limit" {
     conn.peer_max_streams_bidi = 0;
     try std.testing.expectError(Error.StreamLimitExceeded, conn.openBidi(0));
     try std.testing.expectEqual(@as(?u64, 0), conn.localStreamsBlockedAt(true));
-    try std.testing.expectEqual(@as(?u64, 0), conn.pending_streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, 0), conn.pending_frames.streams_blocked_bidi);
 
     const event = conn.pollEvent().?;
     try std.testing.expect(event == .flow_blocked);
@@ -10702,7 +10615,7 @@ test "STREAMS_BLOCKED is queued when local stream opening hits peer limit" {
 
     conn.handleMaxStreams(.{ .bidi = true, .maximum_streams = 1 });
     try std.testing.expectEqual(@as(?u64, null), conn.localStreamsBlockedAt(true));
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.streams_blocked_bidi);
 }
 
 test "blocked frames emit with retransmit metadata and requeue on loss" {
@@ -10726,14 +10639,14 @@ test "blocked frames emit with retransmit metadata and requeue on loss" {
     try std.testing.expect(sent.retransmit_frames.items[0] == .data_blocked);
     try std.testing.expect(sent.retransmit_frames.items[1] == .stream_data_blocked);
     try std.testing.expect(sent.retransmit_frames.items[2] == .streams_blocked);
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_data_blocked);
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_stream_data_blocked.items.len);
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.data_blocked);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.streams_blocked_bidi);
 
     _ = try conn.dispatchLostControlFrames(sent);
-    try std.testing.expectEqual(@as(?u64, 7), conn.pending_data_blocked);
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_data_blocked.items.len);
-    try std.testing.expectEqual(@as(?u64, 3), conn.pending_streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, 7), conn.pending_frames.data_blocked);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(?u64, 3), conn.pending_frames.streams_blocked_bidi);
 }
 
 test "stale blocked frames are not requeued after peer raises limits" {
@@ -10769,9 +10682,9 @@ test "stale blocked frames are not requeued after peer raises limits" {
     } });
 
     try std.testing.expect(!(try conn.dispatchLostControlFrames(&packet)));
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_data_blocked);
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_stream_data_blocked.items.len);
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.data_blocked);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.streams_blocked_bidi);
 }
 
 test "inbound blocked frames update peer state and pollable events" {
@@ -10828,7 +10741,7 @@ test "draining a peer-initiated stream returns MAX_STREAMS credit" {
 
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(0, &buf));
-    try std.testing.expectEqual(@as(?u64, 17), conn.pending_max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, 17), conn.pending_frames.max_streams_bidi);
     try std.testing.expectEqual(@as(u64, 17), conn.local_max_streams_bidi);
 }
 
@@ -10854,7 +10767,7 @@ test "draining at stream cap does not queue duplicate MAX_STREAMS" {
 
     var buf: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(0, &buf));
-    try std.testing.expectEqual(@as(?u64, null), conn.pending_max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, null), conn.pending_frames.max_streams_bidi);
     try std.testing.expectEqual(max_streams_per_connection, conn.local_max_streams_bidi);
 }
 
@@ -10921,13 +10834,13 @@ test "0-RTT rejection requeues STREAM data but not DATAGRAM payloads" {
     var out: [512]u8 = undefined;
     const n = (try conn.pollLevel(.early_data, &out, 1_000)).?;
     try std.testing.expect(n > 0);
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.send_datagrams.items.len);
     try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.early_data).count);
 
     try conn.requeueRejectedEarlyData();
 
     try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.early_data).count);
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_send_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.send_datagrams.items.len);
     const chunk = s.send.peekChunk(64).?;
     try std.testing.expectEqual(@as(u64, 0), chunk.offset);
     try std.testing.expectEqual(@as(u64, 12), chunk.length);
@@ -11324,7 +11237,7 @@ test "pollDatagram can select a non-zero application path" {
     const datagram = (try conn.pollDatagram(&packet_buf, 1_000_000)).?;
     try std.testing.expectEqual(path_id, datagram.path_id);
     try std.testing.expect(datagram.to != null);
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_path_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.path_statuses.items.len);
     try std.testing.expectEqual(@as(u32, 1), conn.paths.get(path_id).?.sent.count);
 }
 
@@ -11436,8 +11349,8 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
     try std.testing.expect(path.pending_migration_reset);
     try std.testing.expect(path.migration_rollback != null);
     try std.testing.expect(!conn.pathStats(0).?.validated);
-    try std.testing.expect(conn.pending_path_challenge != null);
-    try std.testing.expectEqual(@as(u32, 0), conn.pending_path_challenge_path_id);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expectEqual(@as(u32, 0), conn.pending_frames.path_challenge_path_id);
     try std.testing.expectEqual(@as(u64, 50_000), path.path.rtt.smoothed_rtt_us);
     try std.testing.expectEqual(@as(u64, 30_000), path.path.cc.cwnd);
 
@@ -11450,7 +11363,7 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
     try std.testing.expectEqual(@as(u64, 0), path.path.rtt.latest_rtt_us);
     const expected_cwnd = (congestion_mod.Config{ .max_datagram_size = default_mtu }).initialWindow();
     try std.testing.expectEqual(expected_cwnd, path.path.cc.cwnd);
-    try std.testing.expect(conn.pending_path_challenge == null);
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
 }
 
 test "unvalidated rebound path obeys anti-amplification before polling" {
@@ -11472,7 +11385,7 @@ test "unvalidated rebound path obeys anti-amplification before polling" {
     var packet_buf: [default_mtu]u8 = undefined;
     try std.testing.expectEqual(@as(?usize, null), try conn.pollLevel(.application, &packet_buf, 1_001_000));
     try std.testing.expect(path.pending_ping);
-    try std.testing.expect(conn.pending_path_challenge != null);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
     try std.testing.expectEqual(@as(u32, 0), path.sent.count);
     try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
 }
@@ -11571,7 +11484,7 @@ test "failed NAT rebinding validation rolls back to the previous address" {
     try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
     try std.testing.expect(path.pending_migration_reset);
     try std.testing.expectEqual(@as(u64, 40), path.path.bytes_received);
-    try std.testing.expect(conn.pending_path_challenge != null);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
     const stale_token = path.path.validator.pending_token;
 
     try conn.tick(1_000_000 + path.path.validator.timeout_us + 1);
@@ -11584,7 +11497,7 @@ test "failed NAT rebinding validation rolls back to the previous address" {
     try std.testing.expectEqual(path_mod.State.active, path.path.state);
     try std.testing.expectEqual(@as(u64, 900), path.path.bytes_received);
     try std.testing.expectEqual(@as(u64, 300), path.path.bytes_sent);
-    try std.testing.expect(conn.pending_path_challenge == null);
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
 
     var stale_packet: sent_packets_mod.SentPacket = .{
         .pn = 0,
@@ -11596,7 +11509,7 @@ test "failed NAT rebinding validation rolls back to the previous address" {
     defer stale_packet.deinit(allocator);
     try stale_packet.addRetransmitFrame(allocator, .{ .path_challenge = .{ .data = stale_token } });
     try std.testing.expect(!(try conn.dispatchLostControlFrames(&stale_packet)));
-    try std.testing.expect(conn.pending_path_challenge == null);
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
 }
 
 test "old address packets during pending rebinding do not lift new path anti-amplification" {
@@ -11649,8 +11562,8 @@ test "PATH_RESPONSE during pending rebinding is sent to the challenge address" {
     try std.testing.expect(datagram.to != null);
     try std.testing.expect(Address.eql(old_addr, datagram.to.?));
     try std.testing.expectEqual(@as(u64, 0), path.path.bytes_sent);
-    try std.testing.expect(conn.pending_path_response == null);
-    try std.testing.expect(conn.pending_path_challenge != null);
+    try std.testing.expect(conn.pending_frames.path_response == null);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
 
     var plaintext: [max_recv_plaintext]u8 = undefined;
     const keys = (try conn.packetKeys(.application, .write)).?;
@@ -11666,7 +11579,7 @@ test "PATH_RESPONSE during pending rebinding is sent to the challenge address" {
     const followup = (try conn.pollDatagram(&packet_buf, 1_000_200)).?;
     try std.testing.expect(followup.to != null);
     try std.testing.expect(Address.eql(new_addr, followup.to.?));
-    try std.testing.expect(conn.pending_path_challenge == null);
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
     try std.testing.expect(path.path.bytes_sent > 0);
 }
 
@@ -11729,7 +11642,7 @@ test "openPath respects peer MAX_PATH_ID when multipath is negotiated" {
         Error.PathLimitExceeded,
         conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc2}), ConnectionId.fromSlice(&.{0xd2})),
     );
-    try std.testing.expectEqual(@as(?u32, 1), conn.pending_paths_blocked);
+    try std.testing.expectEqual(@as(?u32, 1), conn.pending_frames.paths_blocked);
 }
 
 test "openPath requires common path id capacity and CIDs when multipath is negotiated" {
@@ -12002,9 +11915,9 @@ test "PATH_CIDS_BLOCKED can be surfaced and replenished within peer active cid l
     try std.testing.expectEqual(@as(usize, 2), queued);
     try std.testing.expectEqual(@as(?PathCidsBlockedInfo, null), conn.pendingPathCidsBlocked());
     try std.testing.expectEqual(@as(usize, 0), conn.localConnectionIdIssueBudget(path_id));
-    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
-    try std.testing.expectEqual(@as(u64, 1), conn.pending_path_new_connection_ids.items[0].sequence_number);
-    try std.testing.expectEqual(@as(u64, 2), conn.pending_path_new_connection_ids.items[1].sequence_number);
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_frames.path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 1), conn.pending_frames.path_new_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(u64, 2), conn.pending_frames.path_new_connection_ids.items[1].sequence_number);
     try std.testing.expectEqual(@as(u64, 3), conn.nextLocalConnectionIdSequence(path_id));
 
     try std.testing.expectError(
@@ -12012,7 +11925,7 @@ test "PATH_CIDS_BLOCKED can be surfaced and replenished within peer active cid l
         conn.queuePathNewConnectionId(path_id, 3, 0, &.{0xc5}, @splat(0xc5)),
     );
     try conn.queuePathNewConnectionId(path_id, 3, 1, &.{0xc5}, @splat(0xc5));
-    try std.testing.expectEqual(@as(usize, 3), conn.pending_path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 3), conn.pending_frames.path_new_connection_ids.items.len);
     try std.testing.expectEqual(@as(u64, 4), conn.nextLocalConnectionIdSequence(path_id));
 }
 
@@ -12034,10 +11947,10 @@ test "unused negotiated path ids can be pre-provisioned with PATH_NEW_CONNECTION
         .{ .connection_id = &.{0xc3}, .stateless_reset_token = @splat(0xc3) },
     });
     try std.testing.expectEqual(@as(usize, 2), queued);
-    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
-    try std.testing.expectEqual(@as(u32, 2), conn.pending_path_new_connection_ids.items[0].path_id);
-    try std.testing.expectEqual(@as(u64, 0), conn.pending_path_new_connection_ids.items[0].sequence_number);
-    try std.testing.expectEqual(@as(u64, 1), conn.pending_path_new_connection_ids.items[1].sequence_number);
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_frames.path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u32, 2), conn.pending_frames.path_new_connection_ids.items[0].path_id);
+    try std.testing.expectEqual(@as(u64, 0), conn.pending_frames.path_new_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(u64, 1), conn.pending_frames.path_new_connection_ids.items[1].sequence_number);
     try std.testing.expectEqual(@as(u64, 2), conn.nextLocalConnectionIdSequence(2));
 
     try std.testing.expectError(
@@ -12063,14 +11976,14 @@ test "PATH_RETIRE_CONNECTION_ID drops pending advertisements and allows replenis
         .{ .connection_id = &.{0xc2}, .stateless_reset_token = @splat(0xc2) },
         .{ .connection_id = &.{0xc3}, .stateless_reset_token = @splat(0xc3) },
     });
-    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_frames.path_new_connection_ids.items.len);
 
     conn.handlePathRetireConnectionId(.{
         .path_id = path_id,
         .sequence_number = 1,
     });
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_path_new_connection_ids.items.len);
-    try std.testing.expectEqual(@as(u64, 2), conn.pending_path_new_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 2), conn.pending_frames.path_new_connection_ids.items[0].sequence_number);
     try std.testing.expectEqual(@as(usize, 1), conn.localConnectionIdIssueBudget(path_id));
     const event = conn.pollEvent().?;
     try std.testing.expect(event == .connection_ids_needed);
@@ -12083,8 +11996,8 @@ test "PATH_RETIRE_CONNECTION_ID drops pending advertisements and allows replenis
         .{ .connection_id = &.{0xc4}, .stateless_reset_token = @splat(0xc4) },
     });
     try std.testing.expectEqual(@as(usize, 1), queued);
-    try std.testing.expectEqual(@as(usize, 2), conn.pending_path_new_connection_ids.items.len);
-    try std.testing.expectEqual(@as(u64, 3), conn.pending_path_new_connection_ids.items[1].sequence_number);
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_frames.path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 3), conn.pending_frames.path_new_connection_ids.items[1].sequence_number);
 }
 
 test "RETIRE_CONNECTION_ID emits with retransmit metadata and requeues on loss" {
@@ -12101,7 +12014,7 @@ test "RETIRE_CONNECTION_ID emits with retransmit metadata and requeues on loss" 
 
     var packet_buf: [default_mtu]u8 = undefined;
     const n = (try conn.pollLevel(.application, &packet_buf, 1_000_000)).?;
-    try std.testing.expectEqual(@as(usize, 0), conn.pending_retire_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.retire_connection_ids.items.len);
 
     var plaintext: [max_recv_plaintext]u8 = undefined;
     const keys = (try conn.packetKeys(.application, .write)).?;
@@ -12119,8 +12032,8 @@ test "RETIRE_CONNECTION_ID emits with retransmit metadata and requeues on loss" 
     try std.testing.expect(sent.retransmit_frames.items[0] == .retire_connection_id);
 
     _ = try conn.dispatchLostControlFrames(sent);
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_retire_connection_ids.items.len);
-    try std.testing.expectEqual(@as(u64, 7), conn.pending_retire_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.retire_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 7), conn.pending_frames.retire_connection_ids.items[0].sequence_number);
 }
 
 test "server HANDSHAKE_DONE emits with retransmit metadata and requeues on loss" {
@@ -12325,9 +12238,9 @@ test "PTO requeues retransmittable controls on non-zero application path" {
     try std.testing.expect(!path.pending_ping);
     try std.testing.expectEqual(@as(u8, 1), path.pto_probe_count);
     try std.testing.expectEqual(@as(u32, 1), path.pto_count);
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_path_abandons.items.len);
-    try std.testing.expectEqual(path_id, conn.pending_path_abandons.items[0].path_id);
-    try std.testing.expectEqual(@as(u64, 99), conn.pending_path_abandons.items[0].error_code);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.path_abandons.items.len);
+    try std.testing.expectEqual(path_id, conn.pending_frames.path_abandons.items[0].path_id);
+    try std.testing.expectEqual(@as(u64, 99), conn.pending_frames.path_abandons.items[0].error_code);
 }
 
 test "idle timer closes and enters draining" {

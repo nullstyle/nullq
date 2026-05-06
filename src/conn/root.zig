@@ -19,9 +19,15 @@
 //!  - `send_stream` / `recv_stream` — half-stream send/receive
 //!    state and reassembly.
 //!  - `retry_token` — stateless Retry token HMAC helpers.
+//!  - `pending_frames` — owns the pending control-frame queues
+//!    (MAX_DATA, MAX_STREAM_DATA, STOP_SENDING, NEW_CONNECTION_ID,
+//!    PATH_CHALLENGE/PATH_RESPONSE, multipath bookkeeping, DATAGRAMs)
+//!    that `Connection` drains in `pollLevel`.
 
 /// Connection state machine: handshake, send/receive, streams, migration, close.
 pub const state = @import("state.zig");
+/// Pending control-frame queues drained by `Connection.pollLevel`.
+pub const pending_frames = @import("pending_frames.zig");
 /// RFC 9000 §13.2 received-PN range bookkeeping for ACK frame generation.
 pub const ack_tracker = @import("ack_tracker.zig");
 /// QUIC packet number spaces (RFC 9000 §12.3): Initial / Handshake / Application.
@@ -156,4 +162,5 @@ test {
     _ = recv_stream;
     _ = path;
     _ = retry_token;
+    _ = pending_frames;
 }
