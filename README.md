@@ -315,6 +315,137 @@ fn onQlogEvent(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
 }
 ```
 
+## Production posture
+
+nullq ships secure-by-default for the `Server.Config` /
+`Client.Config` knobs the hardening guide calls out, but a handful of
+production-grade limits are off by default so dev / interop / test
+runs aren't burdened with rate-limit tuning. This section lists what's
+on without config and what you need to wire up before pointing nullq
+at the open internet.
+
+### On by default (no config required)
+
+- **0-RTT off.** `Server.Config.enable_0rtt = false` and
+  `Client.Config.session_ticket = null` (auto-built TLS context
+  follows: `early_data_enabled` is gated on these flags, never
+  unconditionally true).
+- **CONNECTION_CLOSE reason redacted.** `reveal_close_reason_on_wire
+  = false` on both `Server.Config` and `Client.Config` — the wire
+  frame carries the error code and space, but the descriptive reason
+  text is empty. Local introspection via `closeEvent()` /
+  `pollEvent()` still sees the full reason.
+- **Server SCIDs are CSPRNG draws.** Every server-issued connection
+  ID comes from `boringssl.crypto.rand.fillBytes` — no deployment
+  metadata (shard, region, tenant, timestamp) leaks on the wire.
+- **Per-stream send queue capped.** `default_max_buffered_send =
+  1 MiB` per stream (`src/conn/send_stream.zig`); `write` short-writes
+  to apply back-pressure when the cap is hit. Override per-stream via
+  `stream.send.max_buffered`.
+- **Per-Connection memory cap.** `Server.Config.max_connection_memory`
+  defaults to 32 MiB and aggregates peer-driven CRYPTO / STREAM /
+  DATAGRAM / pending-frame / ack-tracker buffers — no single peer can
+  push a Connection past this bound.
+- **Initial-too-small drop.** UDP datagrams carrying a QUIC v1
+  Initial below 1200 bytes are dropped at `Server.feed` per RFC 9000
+  §14; surfaces as `MetricsSnapshot.feeds_initial_too_small`.
+- **ACK range count cap.** Incoming ACK / PATH_ACK frames with
+  `range_count > 256` are rejected before iteration
+  (`max_incoming_ack_ranges` in `src/frame/decode.zig`); overlapping
+  ranges are also rejected.
+- **Per-datagram plaintext bound.** `max_recv_plaintext = 4096` —
+  oversized post-decryption payloads close the connection with
+  PROTOCOL_VIOLATION.
+- **Migration safety.** Address migration before handshake
+  confirmation is dropped (no anti-amp credit, no validator state).
+  PATH_CHALLENGE emission is rate-limited per path
+  (`min_path_challenge_interval_us = 100 ms`).
+- **Sensitive material zeroed on `deinit`.** Retry-token HMAC key,
+  NEW_TOKEN AEAD key, per-level traffic secrets, application
+  read/write key epochs, and stateless-reset tokens all go through
+  `std.crypto.secureZero` at struct teardown.
+
+### Off by default — opt in for production
+
+Each of these defaults to a value that's fine for `zig build test` /
+QNS interop but should be set explicitly before exposing nullq to
+arbitrary peers. All are on `Server.Config` unless noted.
+
+- `max_initials_per_source_per_window: ?u32 = null` — per-source
+  Initial-acceptance cap. Recommended ~32 for open-internet
+  deployments. Window length is `source_rate_window_us` (default 1 s).
+- `max_vn_per_source_per_window: ?u32 = 8` — per-source
+  Version-Negotiation emission cap. The default is already non-null,
+  but tune for your peer mix. Set null to disable (not recommended).
+- `max_log_events_per_source_per_window: ?u32 = 16` — per-source cap
+  on `LogEvent` deliveries to your `log_callback`. Already non-null;
+  null disables.
+- `max_datagrams_per_window: ?u32 = null` — global listener
+  packet-rate cap (no per-source bookkeeping). Pair with
+  `max_bytes_per_window: ?u64 = null` for a byte-rate cap on the same
+  window. Both share `listener_rate_window_us` (default 1 s). Scale
+  to ~2x peak observed traffic and alert on the
+  `feeds_listener_rate_limited` / `feeds_listener_byte_rate_limited`
+  metrics.
+- `retry_token_key: ?RetryTokenKey = null` — 32-byte key that enables
+  stateless Retry (RFC 9000 §8.1.2). When null, every well-formed
+  Initial earns a fresh `Connection`; when set, peers must echo a
+  valid AEAD-sealed token before slot allocation. Production
+  servers behind a CDN that already validates source addresses can
+  leave this null.
+- `new_token_key: ?NewTokenKey = null` — distinct AES-GCM-256 key
+  that enables NEW_TOKEN issuance (RFC 9000 §8.1.3). When null, no
+  NEW_TOKEN frames are emitted and returning clients always pay
+  the Retry round-trip. Intentionally separate from
+  `retry_token_key` so rotation cadences are independent.
+- `early_data_anti_replay: ?*tls.AntiReplayTracker = null` — required
+  if you flip `enable_0rtt = true` on the auto-built TLS context.
+  Wires the BoringSSL pre-accept callback so resumed sessions hash
+  to a tracker `Id` and replays return `false` (denied at the TLS
+  layer). Override-mode embedders install their own callback.
+
+### Build mode
+
+- `zig build` defaults to `Debug` — fine for development, the test
+  suite, and interop fixtures.
+- **Production deployments MUST pass `-Doptimize=ReleaseSafe`** to
+  keep Zig's runtime safety checks live (integer overflow, bounds,
+  optional unwrap, `unreachable`).
+- `ReleaseFast` and `ReleaseSmall` are forbidden for the
+  network-input parser surface — the residual `unreachable` paths in
+  `wire/`, `frame/`, and `conn/` are documented as non-peer-reachable
+  invariants but become undefined behavior under those modes. The
+  bench harness opts into `ReleaseFast` for itself only because bench
+  never touches peer input. See the policy block at the top of
+  `build.zig`.
+
+### Things you must wire yourself
+
+Defaults can't fill these in for you — they're application policy:
+
+- A `MigrationCallback` (install via
+  `Connection.setMigrationCallback`) if you want to allowlist peer
+  addresses for migration. Without one, every probe that survives
+  the pre-handshake / rate-limit gates earns a PATH_CHALLENGE.
+- An `AntiReplayTracker` (from `nullq.tls.AntiReplayTracker`) if you
+  opt into 0-RTT, threaded through
+  `Server.Config.early_data_anti_replay`.
+- A custom `boringssl.tls.Context` via
+  `Server.Config.tls_context_override` /
+  `Client.Config.tls_context_override` if you need session-ticket
+  callbacks, keylog, custom verify modes, or any other TLS-context
+  behavior the auto-built path doesn't expose.
+
+### Pointers for deeper detail
+
+- [`docs/hardening-status.md`](docs/hardening-status.md) — full
+  per-§ status against the hardening guide, with commit hashes and
+  source citations.
+- [`docs/fuzz-coverage.md`](docs/fuzz-coverage.md) — coverage-guided
+  fuzz harness inventory (§11.1).
+- `hardening-guide.md` — the canonical reference doc nullq is
+  hardened against.
+
 ## What this is
 
 - The QUIC **transport**: streams, datagrams, packet protection, loss
