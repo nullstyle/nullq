@@ -340,5 +340,5 @@ In scope for v0.1:
   published as an RFC.
 
 Out of scope: HTTP/3, QPACK, Windows, FIPS, ECN, DPLPMTUD, BBR,
-performance optimizations. See `INITIAL_PROMPT.md` for the full
-non-goals list and the historical phase plan.
+performance optimizations. See `CHANGELOG.md` for what has shipped
+and `CONTRIBUTING.md` for development workflow.

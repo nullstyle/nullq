@@ -15,7 +15,8 @@
         "interop",
         "src",
         "tools",
-        "INITIAL_PROMPT.md",
+        "CHANGELOG.md",
+        "LICENSE",
         "README.md",
     },
 }

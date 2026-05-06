@@ -5,8 +5,8 @@
 //! commonly-used types and the high-level `Server` convenience
 //! wrapper.
 //!
-//! See `INITIAL_PROMPT.md` at the project root for the architecture
-//! and phased plan, and `README.md` for an embed-as-server example.
+//! See `README.md` at the project root for an embed-as-server
+//! example and the high-level architecture overview.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
