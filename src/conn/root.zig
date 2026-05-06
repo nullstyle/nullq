@@ -28,6 +28,9 @@
 pub const state = @import("state.zig");
 /// Pending control-frame queues drained by `Connection.pollLevel`.
 pub const pending_frames = @import("pending_frames.zig");
+/// Close/draining lifecycle state extracted from `state.Connection`
+/// (RFC 9000 §10).
+pub const lifecycle = @import("lifecycle.zig");
 /// RFC 9000 §13.2 received-PN range bookkeeping for ACK frame generation.
 pub const ack_tracker = @import("ack_tracker.zig");
 /// QUIC packet number spaces (RFC 9000 §12.3): Initial / Handshake / Application.
@@ -62,13 +65,15 @@ pub const OutgoingDatagram = state.OutgoingDatagram;
 /// One UDP datagram delivered from the network with source metadata.
 pub const IncomingDatagram = state.IncomingDatagram;
 /// Which error namespace a CONNECTION_CLOSE belongs to (transport vs application).
-pub const CloseErrorSpace = state.CloseErrorSpace;
+pub const CloseErrorSpace = lifecycle.CloseErrorSpace;
 /// Connection-close event surfaced to the application.
-pub const CloseEvent = state.CloseEvent;
+pub const CloseEvent = lifecycle.CloseEvent;
 /// Origin of a CONNECTION_CLOSE (local, peer, or idle timeout).
-pub const CloseSource = state.CloseSource;
+pub const CloseSource = lifecycle.CloseSource;
 /// Phase of the close handshake (closing, draining, etc.).
-pub const CloseState = state.CloseState;
+pub const CloseState = lifecycle.CloseState;
+/// Close/draining lifecycle state stored on `Connection.lifecycle`.
+pub const LifecycleState = lifecycle.LifecycleState;
 /// Tagged event surfaced from `Connection.poll`.
 pub const ConnectionEvent = state.ConnectionEvent;
 /// Outcome of a `sendDatagram` call (queued, blocked, lost).
@@ -152,6 +157,7 @@ pub const RetryTokenValidationResult = retry_token.ValidationResult;
 
 test {
     _ = state;
+    _ = lifecycle;
     _ = ack_tracker;
     _ = pn_space;
     _ = rtt;

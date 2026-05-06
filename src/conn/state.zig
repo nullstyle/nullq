@@ -36,6 +36,7 @@ const rtt_mod = @import("rtt.zig");
 const flow_control_mod = @import("flow_control.zig");
 const event_queue_mod = @import("event_queue.zig");
 const pending_frames_mod = @import("pending_frames.zig");
+const lifecycle_mod = @import("lifecycle.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -270,53 +271,29 @@ pub const IssuedCid = struct {
 };
 
 /// Outgoing CONNECTION_CLOSE intent.
-pub const ConnectionCloseInfo = struct {
-    is_transport: bool,
-    error_code: u64,
-    frame_type: u64 = 0,
-    reason: []const u8 = &.{},
-};
+pub const ConnectionCloseInfo = lifecycle_mod.ConnectionCloseInfo;
 
 /// Origin of a connection-close event surfaced through `nextEvent`.
-pub const CloseSource = enum {
-    local,
-    peer,
-    idle_timeout,
-    stateless_reset,
-    version_negotiation,
-};
+pub const CloseSource = lifecycle_mod.CloseSource;
 
 /// QUIC distinguishes transport-level (RFC 9000 §20.1) from application-level
 /// (RFC 9000 §20.2) errors; this enum tags which space `error_code` lives in.
-pub const CloseErrorSpace = enum {
-    transport,
-    application,
-};
+pub const CloseErrorSpace = lifecycle_mod.CloseErrorSpace;
 
 /// High-level connection lifecycle state — RFC 9000 §10 (closing/draining).
-pub const CloseState = enum {
-    open,
-    closing,
-    draining,
-    closed,
-};
+pub const CloseState = lifecycle_mod.CloseState;
 
 /// Maximum length of a CONNECTION_CLOSE reason phrase we will record/emit.
-pub const max_close_reason_len: usize = 256;
+pub const max_close_reason_len: usize = lifecycle_mod.max_close_reason_len;
 
 /// Snapshot of a close event delivered to the embedder via `nextEvent`.
 /// Captures source, error space/code and (optionally) the wire-level frame
 /// type that triggered the close. RFC 9000 §10.
-pub const CloseEvent = struct {
-    source: CloseSource,
-    error_space: CloseErrorSpace,
-    error_code: u64,
-    frame_type: u64 = 0,
-    reason: []const u8 = &.{},
-    reason_truncated: bool = false,
-    at_us: ?u64 = null,
-    draining_deadline_us: ?u64 = null,
-};
+pub const CloseEvent = lifecycle_mod.CloseEvent;
+
+/// Pure close/draining state extracted from `Connection` — re-exported
+/// for tests that want to assert on it directly.
+pub const LifecycleState = lifecycle_mod.LifecycleState;
 
 /// Tagged-union of all connection-level events the embedder polls via `nextEvent`.
 /// Each variant carries enough context for the embedder to react without re-querying
@@ -354,17 +331,7 @@ pub const max_datagram_send_events: usize = event_queue_mod.max_datagram_send_ev
 
 const StoredDatagramSendEvent = event_queue_mod.StoredDatagramSendEvent;
 
-const StoredCloseEvent = struct {
-    source: CloseSource,
-    error_space: CloseErrorSpace,
-    error_code: u64,
-    frame_type: u64 = 0,
-    reason_len: usize = 0,
-    reason_truncated: bool = false,
-    at_us: ?u64 = null,
-    draining_deadline_us: ?u64 = null,
-    delivered: bool = false,
-};
+const StoredCloseEvent = lifecycle_mod.StoredCloseEvent;
 
 /// One queued STOP_SENDING frame (RFC 9000 §19.5) with its application error code.
 pub const StopSendingItem = pending_frames_mod.StopSendingItem;
@@ -975,9 +942,11 @@ pub const Connection = struct {
     /// Last send/receive activity on this connection. Zero means no
     /// packet activity has been observed yet.
     last_activity_us: u64 = 0,
-    /// Draining-state deadline. Until a richer close state lands, a
-    /// non-null value means only the draining timer remains relevant.
-    draining_deadline_us: ?u64 = null,
+
+    /// Close/draining lifecycle: pending CONNECTION_CLOSE, draining
+    /// deadline, sticky close event, and the reason-phrase buffer.
+    /// See `lifecycle.zig`.
+    lifecycle: LifecycleState = .{},
 
     /// Peer-issued connection IDs we've stashed via NEW_CONNECTION_ID.
     /// Phase 9 (migration) will pull from this set; for now, the
@@ -987,23 +956,11 @@ pub const Connection = struct {
     /// Locally-issued connection IDs, keyed by path, used to map
     /// incoming short-header DCIDs back to draft multipath path IDs.
     local_cids: std.ArrayList(IssuedCid) = .empty,
-    /// CONNECTION_CLOSE we've queued (typically from `close()`); the
-    /// next outgoing packet at the highest available encryption
-    /// level emits it.
-    pending_close: ?ConnectionCloseInfo = null,
     /// Server-only HANDSHAKE_DONE delivery. The frame is ack-eliciting
     /// and must be retransmitted on loss until the client confirms the
     /// handshake.
     pending_handshake_done: bool = false,
     handshake_done_queued_once: bool = false,
-    /// True once we've sent or received a CONNECTION_CLOSE frame, or
-    /// an idle timeout has entered draining.
-    closed: bool = false,
-    /// Sticky close/error status for embedders. The stored event keeps
-    /// offsets into `close_reason_buf` so `Connection` can be moved before
-    /// bind/init without leaving a self-referential slice behind.
-    close_event: ?StoredCloseEvent = null,
-    close_reason_buf: [max_close_reason_len]u8 = undefined,
     flow_blocked_events: event_queue_mod.EventQueue(FlowBlockedInfo, max_flow_blocked_events) = .{},
     connection_id_events: event_queue_mod.EventQueue(ConnectionIdReplenishInfo, max_connection_id_events) = .{},
     datagram_send_events: event_queue_mod.EventQueue(StoredDatagramSendEvent, max_datagram_send_events) = .{},
@@ -1214,9 +1171,9 @@ pub const Connection = struct {
             self.multipath_enabled = true;
         }
         self.validatePeerTransportLimits();
-        if (self.pending_close != null or self.closed) return params;
+        if (self.lifecycle.pending_close != null or self.lifecycle.closed) return params;
         self.validatePeerTransportRole();
-        if (self.pending_close != null or self.closed) return params;
+        if (self.lifecycle.pending_close != null or self.lifecycle.closed) return params;
         try self.installPeerTransportStatelessResetToken();
         self.validatePeerTransportConnectionIds();
         return params;
@@ -3632,12 +3589,12 @@ pub const Connection = struct {
             self.multipath_enabled = true;
         }
         self.validatePeerTransportLimits();
-        if (self.pending_close != null or self.closed) {
+        if (self.lifecycle.pending_close != null or self.lifecycle.closed) {
             self.emitConnectionStateIfChanged();
             return;
         }
         self.validatePeerTransportRole();
-        if (self.pending_close != null or self.closed) {
+        if (self.lifecycle.pending_close != null or self.lifecycle.closed) {
             self.emitConnectionStateIfChanged();
             return;
         }
@@ -4401,11 +4358,11 @@ pub const Connection = struct {
         _ = now_us;
         var best: ?TimerDeadline = null;
 
-        if (self.draining_deadline_us) |at_us| {
+        if (self.lifecycle.draining_deadline_us) |at_us| {
             considerDeadline(&best, .{ .kind = .draining, .at_us = at_us });
             return best;
         }
-        if (self.closed) return null;
+        if (self.lifecycle.closed) return null;
 
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
             const tracker = &self.pnSpaceForLevelConst(lvl).received;
@@ -4487,8 +4444,8 @@ pub const Connection = struct {
 
     /// True if `poll` would produce an outgoing packet right now.
     pub fn canSend(self: *const Connection) bool {
-        if (self.pending_close != null) return true;
-        if (self.closed) return false;
+        if (self.lifecycle.pending_close != null) return true;
+        if (self.lifecycle.closed) return false;
         if (self.anyPendingPing()) return true;
         if (self.pending_handshake_done) return true;
         inline for (level_mod.all) |lvl| {
@@ -4547,7 +4504,7 @@ pub const Connection = struct {
         dst: []u8,
         now_us: u64,
     ) Error!?OutgoingDatagram {
-        if (self.closed) return null;
+        if (self.lifecycle.closed) return null;
         self.queueHandshakeDoneIfReady();
         try self.refreshEarlyDataStatus();
         self.poll_addr_override = null;
@@ -4712,7 +4669,7 @@ pub const Connection = struct {
         // CONNECTION_CLOSE pre-empts everything: if pending, that's
         // the only frame we emit, and we mark the connection
         // closed once it goes on the wire.
-        if (self.pending_close) |info| {
+        if (self.lifecycle.pending_close) |info| {
             const close_frame = frame_types.ConnectionClose{
                 .is_transport = info.is_transport,
                 .error_code = info.error_code,
@@ -4724,8 +4681,8 @@ pub const Connection = struct {
                 .{ .connection_close = close_frame },
             );
             pl_pos += wrote;
-            self.pending_close = null;
-            self.closed = true;
+            self.lifecycle.pending_close = null;
+            self.lifecycle.closed = true;
             // No ack-eliciting flag — CONNECTION_CLOSE isn't
             // ack-eliciting per §13.2.1, but we do still want to
             // record it (it occupies a PN). Skip stream/CRYPTO/etc.
@@ -4777,8 +4734,8 @@ pub const Connection = struct {
             if (lvl == .application) self.recordApplicationPacketProtected(&close_packet);
             try sent_tracker.record(close_packet);
             const draining_deadline = now_us + self.drainingDurationUs();
-            self.draining_deadline_us = draining_deadline;
-            self.updateCloseEventDrainingDeadline(draining_deadline);
+            self.lifecycle.draining_deadline_us = draining_deadline;
+            self.lifecycle.updateDrainingDeadline(draining_deadline);
             self.qlog_packets_sent +|= 1;
             self.qlog_bytes_sent +|= n_close;
             self.emitPacketSent(lvl, pn, @intCast(n_close), 1);
@@ -5478,7 +5435,7 @@ pub const Connection = struct {
         from: ?Address,
         now_us: u64,
     ) Error!void {
-        if (self.pending_close != null or self.closed) return;
+        if (self.lifecycle.pending_close != null or self.lifecycle.closed) return;
         if (bytes.len > self.localUdpPayloadLimit()) {
             self.emitPacketDropped(null, @intCast(bytes.len), .payload_too_large);
             self.close(true, transport_error_protocol_violation, "udp payload exceeds local limit");
@@ -5522,7 +5479,7 @@ pub const Connection = struct {
                     }
                 }
             }
-            if (self.pending_close != null or self.closed) break;
+            if (self.lifecycle.pending_close != null or self.lifecycle.closed) break;
             if (!drain_tls_after_packet) break;
             // Drain CRYPTO into TLS BETWEEN packets, not just at
             // the end. A coalesced Initial+Handshake datagram
@@ -5606,55 +5563,17 @@ pub const Connection = struct {
 
     /// Current public shutdown state.
     pub fn closeState(self: *const Connection) CloseState {
-        if (self.draining_deadline_us != null) return .draining;
-        if (self.pending_close != null) return .closing;
-        if (self.closed) return .closed;
-        return .open;
+        return self.lifecycle.state();
     }
 
     /// True after we've sent or received CONNECTION_CLOSE, received a
     /// stateless reset, or timed out. Use `closeState` to distinguish
     /// closing, draining, and terminal closed states.
     pub fn isClosed(self: *const Connection) bool {
-        return self.closed;
+        return self.lifecycle.closed;
     }
 
-    fn closeErrorSpace(is_transport: bool) CloseErrorSpace {
-        return if (is_transport) .transport else .application;
-    }
-
-    fn recordCloseEvent(
-        self: *Connection,
-        source: CloseSource,
-        error_space: CloseErrorSpace,
-        error_code: u64,
-        frame_type: u64,
-        reason: []const u8,
-        at_us: ?u64,
-        draining_deadline_us: ?u64,
-    ) void {
-        if (self.close_event != null) return;
-        const reason_len = @min(reason.len, max_close_reason_len);
-        if (reason_len > 0) {
-            @memcpy(self.close_reason_buf[0..reason_len], reason[0..reason_len]);
-        }
-        self.close_event = .{
-            .source = source,
-            .error_space = error_space,
-            .error_code = error_code,
-            .frame_type = frame_type,
-            .reason_len = reason_len,
-            .reason_truncated = reason.len > reason_len,
-            .at_us = at_us,
-            .draining_deadline_us = draining_deadline_us,
-        };
-    }
-
-    fn updateCloseEventDrainingDeadline(self: *Connection, deadline_us: u64) void {
-        if (self.close_event) |*event| {
-            event.draining_deadline_us = deadline_us;
-        }
-    }
+    const closeErrorSpace = lifecycle_mod.closeErrorSpace;
 
     fn enterDraining(
         self: *Connection,
@@ -5666,7 +5585,7 @@ pub const Connection = struct {
         now_us: u64,
     ) void {
         const draining_deadline = now_us +| self.drainingDurationUs();
-        self.recordCloseEvent(
+        self.lifecycle.enterDraining(
             source,
             error_space,
             error_code,
@@ -5675,17 +5594,12 @@ pub const Connection = struct {
             now_us,
             draining_deadline,
         );
-        self.pending_close = null;
-        self.closed = true;
-        self.draining_deadline_us = draining_deadline;
         self.clearPendingPings();
         self.emitConnectionStateIfChanged();
     }
 
     fn finishDraining(self: *Connection) void {
-        self.pending_close = null;
-        self.draining_deadline_us = null;
-        self.closed = true;
+        self.lifecycle.finishDraining();
         self.clearRecoveryState();
         self.emitConnectionStateIfChanged();
     }
@@ -5699,18 +5613,14 @@ pub const Connection = struct {
         reason: []const u8,
         now_us: u64,
     ) void {
-        self.recordCloseEvent(
+        self.lifecycle.enterClosed(
             source,
             error_space,
             error_code,
             frame_type,
             reason,
             now_us,
-            null,
         );
-        self.pending_close = null;
-        self.draining_deadline_us = null;
-        self.closed = true;
         self.clearRecoveryState();
         self.emitConnectionStateIfChanged();
     }
@@ -5726,31 +5636,17 @@ pub const Connection = struct {
         );
     }
 
-    fn closeEventFromStored(self: *const Connection, event: StoredCloseEvent) CloseEvent {
-        return .{
-            .source = event.source,
-            .error_space = event.error_space,
-            .error_code = event.error_code,
-            .frame_type = event.frame_type,
-            .reason = self.close_reason_buf[0..event.reason_len],
-            .reason_truncated = event.reason_truncated,
-            .at_us = event.at_us,
-            .draining_deadline_us = event.draining_deadline_us,
-        };
-    }
-
     /// Sticky close/error status for embedders. This remains available
     /// after `pollEvent` consumes the event notification.
     pub fn closeEvent(self: *const Connection) ?CloseEvent {
-        const event = self.close_event orelse return null;
-        return self.closeEventFromStored(event);
+        return self.lifecycle.event();
     }
 
     /// Poll the next connection-level event.
     pub fn pollEvent(self: *Connection) ?ConnectionEvent {
-        if (self.close_event) |*event| {
+        if (self.lifecycle.close_event) |*event| {
             if (!event.delivered) {
-                const out = self.closeEventFromStored(event.*);
+                const out = self.lifecycle.eventFromStored(event.*);
                 event.delivered = true;
                 return .{ .close = out };
             }
@@ -5779,8 +5675,8 @@ pub const Connection = struct {
         error_code: u64,
         reason: []const u8,
     ) void {
-        if (self.pending_close != null or self.closed) return;
-        self.recordCloseEvent(
+        if (self.lifecycle.pending_close != null or self.lifecycle.closed) return;
+        self.lifecycle.record(
             .local,
             closeErrorSpace(is_transport),
             error_code,
@@ -5789,7 +5685,7 @@ pub const Connection = struct {
             null,
             null,
         );
-        self.pending_close = .{
+        self.lifecycle.pending_close = .{
             .is_transport = is_transport,
             .error_code = error_code,
             .reason = reason,
@@ -7763,16 +7659,16 @@ pub const Connection = struct {
         self.expireRetiringPaths(now_us);
         self.discardExpiredApplicationReadKeys(now_us);
 
-        if (self.draining_deadline_us) |deadline| {
+        if (self.lifecycle.draining_deadline_us) |deadline| {
             if (now_us >= deadline) {
                 self.finishDraining();
             }
             return;
         }
 
-        if (self.closed) return;
+        if (self.lifecycle.closed) return;
 
-        if (!self.closed) {
+        if (!self.lifecycle.closed) {
             if (self.idleDeadline()) |deadline| {
                 if (now_us >= deadline) {
                     self.enterDraining(
@@ -8080,7 +7976,7 @@ test "closing and draining ignore incoming datagrams" {
     });
     try peer_closed.dispatchFrames(.application, payload[0..n], 2_000_000);
     try std.testing.expectEqual(CloseState.draining, peer_closed.closeState());
-    const deadline = peer_closed.draining_deadline_us.?;
+    const deadline = peer_closed.lifecycle.draining_deadline_us.?;
     try peer_closed.handle(&random_short, null, 2_000_001);
     try std.testing.expectEqual(@as(u64, 0), peer_closed.last_activity_us);
     try peer_closed.tick(deadline);
@@ -8148,7 +8044,7 @@ test "stateless reset token closes without CONNECTION_CLOSE" {
 
     try std.testing.expect(conn.isClosed());
     try std.testing.expectEqual(CloseState.draining, conn.closeState());
-    try std.testing.expect(conn.pending_close == null);
+    try std.testing.expect(conn.lifecycle.pending_close == null);
     const close_event = conn.closeEvent().?;
     try std.testing.expectEqual(CloseSource.stateless_reset, close_event.source);
     try std.testing.expectEqual(CloseErrorSpace.transport, close_event.error_space);
@@ -8462,9 +8358,9 @@ test "Retry source CID transport parameter is validated" {
     };
     conn.validatePeerTransportConnectionIds();
 
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
-    try std.testing.expectEqualStrings("retry source cid mismatch", conn.pending_close.?.reason);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_transport_parameter, conn.lifecycle.pending_close.?.error_code);
+    try std.testing.expectEqualStrings("retry source cid mismatch", conn.lifecycle.pending_close.?.reason);
 }
 
 fn expectServerOnlyPeerTransportParamRejected(params: TransportParams, reason: []const u8) !void {
@@ -8477,9 +8373,9 @@ fn expectServerOnlyPeerTransportParamRejected(params: TransportParams, reason: [
     conn.cached_peer_transport_params = params;
     conn.validatePeerTransportRole();
 
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
-    try std.testing.expectEqualStrings(reason, conn.pending_close.?.reason);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_transport_parameter, conn.lifecycle.pending_close.?.error_code);
+    try std.testing.expectEqualStrings(reason, conn.lifecycle.pending_close.?.reason);
 }
 
 test "server rejects client-sent server-only transport parameters" {
@@ -9881,8 +9777,8 @@ test "AEAD authentication failure limit closes the connection" {
     packet_buf[n - 1] ^= 0x01;
 
     _ = try conn.handleShort(packet_buf[0..n], 1_000_000);
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_aead_limit_reached, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_aead_limit_reached, conn.lifecycle.pending_close.?.error_code);
 }
 
 fn testEarlyDataPacketKeys() !PacketKeys {
@@ -9956,9 +9852,9 @@ test "peer transport parameter limit violations use transport parameter error" {
         defer conn.deinit();
         conn.cached_peer_transport_params = .{ .max_udp_payload_size = min_quic_udp_payload_size - 1 };
         conn.validatePeerTransportLimits();
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
-        try std.testing.expectEqualStrings("peer max udp payload below minimum", conn.pending_close.?.reason);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_transport_parameter, conn.lifecycle.pending_close.?.error_code);
+        try std.testing.expectEqualStrings("peer max udp payload below minimum", conn.lifecycle.pending_close.?.reason);
     }
 
     {
@@ -9966,9 +9862,9 @@ test "peer transport parameter limit violations use transport parameter error" {
         defer conn.deinit();
         conn.cached_peer_transport_params = .{ .initial_max_streams_bidi = max_stream_count_limit + 1 };
         conn.validatePeerTransportLimits();
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_transport_parameter, conn.pending_close.?.error_code);
-        try std.testing.expectEqualStrings("peer stream count exceeds maximum", conn.pending_close.?.reason);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_transport_parameter, conn.lifecycle.pending_close.?.error_code);
+        try std.testing.expectEqualStrings("peer stream count exceeds maximum", conn.lifecycle.pending_close.?.reason);
     }
 }
 
@@ -9984,8 +9880,8 @@ test "handle rejects UDP datagrams above local payload limit before path credit"
     var bytes: [default_mtu + 1]u8 = @splat(0);
     try conn.handle(&bytes, null, 123);
 
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
     try std.testing.expectEqual(@as(u64, 0), conn.primaryPath().path.bytes_received);
     try std.testing.expectEqual(@as(u64, 0), conn.last_activity_us);
 }
@@ -10086,8 +9982,8 @@ test "handleDatagram enforces local DATAGRAM limit and queue budget" {
         var conn = try Connection.initServer(allocator, ctx);
         defer conn.deinit();
         try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
         try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.recv_datagrams.items.len);
     }
 
@@ -10109,8 +10005,8 @@ test "handleDatagram enforces local DATAGRAM limit and queue budget" {
 
         try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
         try conn.handleDatagram(.application, .{ .data = "x", .has_length = true });
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
     }
 }
 
@@ -10123,7 +10019,7 @@ test "handleCrypto bounds out-of-order reassembly" {
         var conn = try Connection.initServer(allocator, ctx);
         defer conn.deinit();
         try conn.handleCrypto(.initial, .{ .offset = max_crypto_reassembly_gap + 1, .data = "x" });
-        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
         try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending[0].items.len);
         try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending_bytes[0]);
     }
@@ -10133,7 +10029,7 @@ test "handleCrypto bounds out-of-order reassembly" {
         defer conn.deinit();
         var huge: [max_pending_crypto_bytes_per_level + 1]u8 = @splat(0);
         try conn.handleCrypto(.initial, .{ .offset = 1, .data = &huge });
-        try std.testing.expect(conn.pending_close != null);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
         try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending[0].items.len);
         try std.testing.expectEqual(@as(usize, 0), conn.crypto_pending_bytes[0]);
     }
@@ -10159,7 +10055,7 @@ test "peer-created streams respect advertised stream count" {
         .has_length = true,
     });
     try std.testing.expectEqual(@as(u64, 1), conn.peer_opened_streams_bidi);
-    try std.testing.expect(conn.pending_close == null);
+    try std.testing.expect(conn.lifecycle.pending_close == null);
 
     try conn.handleStream(.application, .{
         .stream_id = 4,
@@ -10167,8 +10063,8 @@ test "peer-created streams respect advertised stream count" {
         .data = "b",
         .has_length = true,
     });
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_stream_limit, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_stream_limit, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "local transport params reject allocation policy overflows" {
@@ -10248,12 +10144,12 @@ test "STREAM_DATA_BLOCKED tracking is bounded and validates stream space" {
         defer conn.deinit();
         try conn.setTransportParams(.{ .initial_max_streams_bidi = 1 });
         try conn.handleStreamDataBlocked(.{ .stream_id = 0, .maximum_stream_data = 7 });
-        try std.testing.expect(conn.pending_close == null);
+        try std.testing.expect(conn.lifecycle.pending_close == null);
         try std.testing.expectEqual(@as(usize, 1), conn.peer_stream_data_blocked.items.len);
 
         try conn.handleStreamDataBlocked(.{ .stream_id = 4, .maximum_stream_data = 7 });
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_stream_limit, conn.pending_close.?.error_code);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_stream_limit, conn.lifecycle.pending_close.?.error_code);
         try std.testing.expectEqual(@as(usize, 1), conn.peer_stream_data_blocked.items.len);
     }
 
@@ -10261,8 +10157,8 @@ test "STREAM_DATA_BLOCKED tracking is bounded and validates stream space" {
         var conn = try Connection.initServer(allocator, ctx);
         defer conn.deinit();
         try conn.handleStreamDataBlocked(.{ .stream_id = 3, .maximum_stream_data = 7 });
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_stream_state, conn.pending_close.?.error_code);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_stream_state, conn.lifecycle.pending_close.?.error_code);
         try std.testing.expectEqual(@as(usize, 0), conn.peer_stream_data_blocked.items.len);
     }
 
@@ -10303,8 +10199,8 @@ test "STREAM receive enforces stream and connection flow control" {
             .data = "abcd",
             .has_length = true,
         });
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_flow_control, conn.pending_close.?.error_code);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_flow_control, conn.lifecycle.pending_close.?.error_code);
         try std.testing.expectEqual(@as(u64, 0), conn.peer_sent_stream_data);
     }
 
@@ -10322,7 +10218,7 @@ test "STREAM receive enforces stream and connection flow control" {
             .data = "hello",
             .has_length = true,
         });
-        try std.testing.expect(conn.pending_close == null);
+        try std.testing.expect(conn.lifecycle.pending_close == null);
         try std.testing.expectEqual(@as(u64, 5), conn.peer_sent_stream_data);
         try conn.handleStream(.application, .{
             .stream_id = 4,
@@ -10330,8 +10226,8 @@ test "STREAM receive enforces stream and connection flow control" {
             .data = "!",
             .has_length = true,
         });
-        try std.testing.expect(conn.pending_close != null);
-        try std.testing.expectEqual(transport_error_flow_control, conn.pending_close.?.error_code);
+        try std.testing.expect(conn.lifecycle.pending_close != null);
+        try std.testing.expectEqual(transport_error_flow_control, conn.lifecycle.pending_close.?.error_code);
         try std.testing.expectEqual(@as(u64, 5), conn.peer_sent_stream_data);
     }
 }
@@ -10964,9 +10860,9 @@ test "server rejects forbidden frames in 0-RTT" {
     });
 
     _ = try conn.handleOnePacket(packet[0..packet_len], 1_000);
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
-    try std.testing.expectEqualStrings("forbidden frame in 0-RTT", conn.pending_close.?.reason);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
+    try std.testing.expectEqualStrings("forbidden frame in 0-RTT", conn.lifecycle.pending_close.?.reason);
 }
 
 test "pollLevel emits PATH_ACK for non-zero application path ACKs" {
@@ -11492,8 +11388,8 @@ test "multipath frames are rejected unless draft-21 was negotiated" {
     var payload: [16]u8 = undefined;
     const payload_len = try frame_mod.encode(payload[0..], .{ .max_path_id = .{ .maximum_path_id = 1 } });
     try conn.dispatchFrames(.application, payload[0..payload_len], 1_000_000);
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "setTransportParams advertises local multipath limit" {
@@ -11628,8 +11524,8 @@ test "RETIRE_CONNECTION_ID with sequence we never issued is a PROTOCOL_VIOLATION
     // is committing a PROTOCOL_VIOLATION. Without this gate an attacker
     // could spam fabricated retire frames to force expensive list walks.
     conn.handleRetireConnectionId(.{ .sequence_number = 99 });
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "RETIRE_CONNECTION_ID for an already-retired sequence is allowed" {
@@ -11646,13 +11542,13 @@ test "RETIRE_CONNECTION_ID for an already-retired sequence is allowed" {
 
     // First retire of seq 1: legitimate.
     conn.handleRetireConnectionId(.{ .sequence_number = 1 });
-    try std.testing.expect(conn.pending_close == null);
+    try std.testing.expect(conn.lifecycle.pending_close == null);
     // Second retire of seq 1 (could happen if we received a duplicate or
     // a delayed retransmission): still legitimate because seq 1 was issued
     // at some point. Only sequences strictly above the high watermark are
     // rejected.
     conn.handleRetireConnectionId(.{ .sequence_number = 1 });
-    try std.testing.expect(conn.pending_close == null);
+    try std.testing.expect(conn.lifecycle.pending_close == null);
 }
 
 test "retiring CID sequence 0 does not change long-header source CID" {
@@ -11710,8 +11606,8 @@ test "PATH_NEW_CONNECTION_ID rejects sequence reuse with different cid" {
         .connection_id = try frame_types.ConnId.fromSlice(&.{0x11}),
         .stateless_reset_token = @splat(0),
     });
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "PATH_NEW_CONNECTION_ID rejects path ids above local limit" {
@@ -11729,8 +11625,8 @@ test "PATH_NEW_CONNECTION_ID rejects path ids above local limit" {
         .connection_id = try frame_types.ConnId.fromSlice(&.{0x10}),
         .stateless_reset_token = @splat(0),
     });
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "MAX_PATH_ID cannot reduce the peer initial path limit" {
@@ -11742,8 +11638,8 @@ test "MAX_PATH_ID cannot reduce the peer initial path limit" {
 
     markTestMultipathNegotiated(&conn, 2);
     conn.handleMaxPathId(.{ .maximum_path_id = 1 });
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "PATH_CIDS_BLOCKED cannot skip local cid sequence numbers" {
@@ -11756,8 +11652,8 @@ test "PATH_CIDS_BLOCKED cannot skip local cid sequence numbers" {
     markTestMultipathNegotiated(&conn, 1);
     const path_id = try conn.openPath(.{}, .{}, ConnectionId.fromSlice(&.{0xc1}), ConnectionId.fromSlice(&.{0xd1}));
     conn.handlePathCidsBlocked(.{ .path_id = path_id, .next_sequence_number = 2 });
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "PATH_CIDS_BLOCKED can be surfaced and replenished within peer active cid limit" {
@@ -11995,8 +11891,8 @@ test "peer cid registration enforces active cid limit per path" {
         .connection_id = try frame_types.ConnId.fromSlice(&.{0x12}),
         .stateless_reset_token = @splat(2),
     });
-    try std.testing.expect(conn.pending_close != null);
-    try std.testing.expectEqual(transport_error_protocol_violation, conn.pending_close.?.error_code);
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    try std.testing.expectEqual(transport_error_protocol_violation, conn.lifecycle.pending_close.?.error_code);
 }
 
 test "retire_prior_to retires peer cids only on the indicated path" {
@@ -12138,14 +12034,14 @@ test "idle timer closes and enters draining" {
     try conn.tick(6_000);
     try std.testing.expect(conn.isClosed());
     try std.testing.expectEqual(CloseState.draining, conn.closeState());
-    try std.testing.expect(conn.draining_deadline_us != null);
+    try std.testing.expect(conn.lifecycle.draining_deadline_us != null);
     const close_event = conn.closeEvent().?;
     try std.testing.expectEqual(CloseSource.idle_timeout, close_event.source);
     try std.testing.expectEqual(CloseErrorSpace.transport, close_event.error_space);
     try std.testing.expectEqual(@as(u64, 0), close_event.error_code);
     try std.testing.expectEqualStrings("idle timeout", close_event.reason);
 
-    try conn.tick(conn.draining_deadline_us.?);
+    try conn.tick(conn.lifecycle.draining_deadline_us.?);
     try std.testing.expectEqual(CloseState.closed, conn.closeState());
     try std.testing.expect(conn.nextTimerDeadline(10_000) == null);
 }
