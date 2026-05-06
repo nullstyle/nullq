@@ -93,14 +93,25 @@ What's there (Retry token):
 
 What's missing:
 
-- **No NEW_TOKEN issuance.** The frame is parsed but the server side never
-  emits NEW_TOKEN, so subsequent connections from the same client always
-  pay a Retry round-trip. Search `/Users/nullstyle/prj/ai-workspace/nullq/src/`
-  for `new_token` shows the frame type only;
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/frame/types.zig` has the
-  decoder but no emitter or token policy. This is missing-feature, not
-  insecure, but means zero-RTT-reconnection guidance from §4.3 (lifetime,
-  uniqueness, no plaintext metadata) doesn't yet apply.
+- **No NEW_TOKEN issuance** — DEFERRED, tracked separately. The frame
+  type is wired through the encoder, decoder, and Connection
+  receive-side no-op; what's missing is the server-side mint policy
+  (a new token format separate from the Retry token, since NEW_TOKEN
+  binds to the *next* connection rather than this one), the
+  emit scheduling (queue a NEW_TOKEN frame after handshake
+  confirmation, possibly multiple per session), the Initial-token
+  validate path (when an Initial arrives with a token, check whether
+  it's a NEW_TOKEN rather than a Retry token and accept accordingly),
+  and the client-side storage / replay-on-next-connection plumbing.
+  This is a performance optimization that lets repeat clients skip
+  the Retry round-trip, not a security fix; the §4.3 guidance on
+  expiration / uniqueness / no-plaintext-metadata can be applied
+  cleanly at mint time when the feature is implemented. Owners
+  picking this up should mirror the `src/conn/retry_token.zig`
+  shape and add a `src/conn/new_token.zig` peer; the
+  `Server.Config.retry_token_key` is *not* reusable (NEW_TOKENs
+  must remain valid past Retry-token rotation, so they need their
+  own key with its own rotation policy).
 - The Retry token format does not include encryption — only authentication.
   The hardening guide says encryption is required only if the token carries
   address/timestamp/routing/deployment metadata; nullq's token does carry
