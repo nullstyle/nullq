@@ -31,10 +31,28 @@ const frame_type_path_cids_blocked: u64 = 0x3e7c;
 /// - `UnknownFrameType` — frame type byte/varint is not a recognized v1
 ///   or supported draft-21 multipath type.
 /// - `PathIdTooLarge` — multipath frame's path_id exceeds `u32` range.
+/// - `AckRangeCountTooLarge` — incoming ACK / PATH_ACK frame declares
+///   more ranges than `max_incoming_ack_ranges` (RFC 9000 §13.1
+///   recommends bounding ACK range processing; the hardening guide §4.7
+///   classes unbounded ACK-range loops as a DoS surface).
 pub const Error = varint.Error || wire_header.Error || error{
     UnknownFrameType,
     PathIdTooLarge,
+    AckRangeCountTooLarge,
 };
+
+/// Upper bound on the number of additional gap+length range pairs an
+/// incoming ACK or PATH_ACK frame may declare. Mirrors the local emit
+/// cap (`conn.ack_tracker.max_ranges = 255`) with one slot of margin
+/// so well-behaved peers never trip the cap. Caps both the per-frame
+/// CPU cost of the decoder loop and the downstream loss-detection
+/// walk that has to validate every range against sent-PN history.
+///
+/// The actual byte-budget cap is implicit (a 4 KiB plaintext budget
+/// limits how many varint pairs fit anyway) but we cap explicitly so
+/// the loop can't be amplified by varint lengths shorter than the
+/// 1-byte minimum we assume.
+pub const max_incoming_ack_ranges: u64 = 256;
 
 /// Result of `decode`: the parsed frame and how many input bytes it
 /// consumed. Slice fields inside `frame` borrow from the input.
@@ -112,6 +130,7 @@ fn decodeAck(src: []const u8, start: usize, with_ecn: bool) Error!Decoded {
     pos += ack_delay.bytes_read;
     const range_count = try varint.decode(src[pos..]);
     pos += range_count.bytes_read;
+    if (range_count.value > max_incoming_ack_ranges) return Error.AckRangeCountTooLarge;
     const first_range = try varint.decode(src[pos..]);
     pos += first_range.bytes_read;
 
@@ -170,6 +189,7 @@ fn decodePathAck(src: []const u8, start: usize, with_ecn: bool) Error!Decoded {
     pos += ack_delay.bytes_read;
     const range_count = try varint.decode(src[pos..]);
     pos += range_count.bytes_read;
+    if (range_count.value > max_incoming_ack_ranges) return Error.AckRangeCountTooLarge;
     const first_range = try varint.decode(src[pos..]);
     pos += first_range.bytes_read;
 
@@ -619,6 +639,54 @@ test "decode HANDSHAKE_DONE (single byte 0x1e)" {
     const d = try decode(&[_]u8{0x1e});
     try std.testing.expect(d.frame == .handshake_done);
     try std.testing.expectEqual(@as(usize, 1), d.bytes_consumed);
+}
+
+test "decode rejects ACK frames whose range_count exceeds max_incoming_ack_ranges" {
+    // range_count varint value = 1000 (well above the 256 cap). The
+    // hardening test: a peer-spammed ACK with a huge range count must
+    // be rejected *before* the decoder enters the gap+length loop, so
+    // the reject is constant-cost regardless of how many varint pairs
+    // the peer claims to be sending.
+    const bytes = [_]u8{
+        0x02, // ACK type (no ECN)
+        0x00, // largest_acked = 0
+        0x00, // ack_delay = 0
+        0x43, 0xe8, // range_count = 1000 (2-byte varint)
+        0x00, // first_range = 0
+    };
+    try std.testing.expectError(Error.AckRangeCountTooLarge, decode(&bytes));
+}
+
+test "decode accepts ACK frames whose range_count is exactly max_incoming_ack_ranges" {
+    // range_count = 256, but we don't supply 256 valid ranges — the
+    // body will fail with InsufficientBytes once the loop starts.
+    // What we're locking in: the *cap check itself* lets 256 through.
+    // Anything past the cap is AckRangeCountTooLarge; up to and
+    // including the cap goes on to consume range bytes.
+    const bytes = [_]u8{
+        0x02, // ACK type (no ECN)
+        0x00, // largest_acked = 0
+        0x00, // ack_delay = 0
+        0x41, 0x00, // range_count = 256 (2-byte varint)
+        0x00, // first_range = 0
+    };
+    // We expect InsufficientBytes (loop tries to read 256 pairs but
+    // input is exhausted), NOT AckRangeCountTooLarge.
+    try std.testing.expectError(Error.InsufficientBytes, decode(&bytes));
+}
+
+test "decode rejects PATH_ACK frames whose range_count exceeds max_incoming_ack_ranges" {
+    // PATH_ACK without ECN = 0x3e. Same shape as ACK plus a leading
+    // path_id varint.
+    const bytes = [_]u8{
+        0x3e, // PATH_ACK type (no ECN)
+        0x00, // path_id = 0
+        0x00, // largest_acked = 0
+        0x00, // ack_delay = 0
+        0x43, 0xe8, // range_count = 1000
+        0x00, // first_range = 0
+    };
+    try std.testing.expectError(Error.AckRangeCountTooLarge, decode(&bytes));
 }
 
 // -- fuzz harness --------------------------------------------------------
