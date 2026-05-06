@@ -128,14 +128,25 @@ gates every reassembly write.
   `src/server.zig:606`/`620`. Drops surface via
   `feeds_listener_rate_limited` and `feeds_listener_byte_rate_limited`
   counters. The byte-budget cap landed in commit `1dceea5`.
+  - **Per-source bandwidth shaping (token-bucket)** — commit
+    `ba46d9e`: `Server.Config.max_bytes_per_source_per_second` (null by
+    default). Each accepted datagram debits `bytes.len` against the
+    source's bucket; refills at the configured rate up to one
+    second's burst. Drops surface in
+    `feeds_source_bandwidth_limited`. Charged AFTER the global
+    listener gates so global aggregate caps still bound total
+    bandwidth even when every source has a full bucket. The shaper
+    shares the per-source rate table with `acceptSourceRate` /
+    `acceptVnRate` / `acceptLogRate` and adds two fields to
+    `SourceRateEntry`. ✅ COMPLETE.
 - Per-source rate limiting on Initials (`acceptSourceRate`); slot-table
   cap before slot allocation. Per-source VN rate limiting (commit
   `b22ebee`) — see §4.4.
 
-Note: BANDWIDTH-class shaping (token-bucket + ingress queue
-saturation) is deferred to a larger production-deployment work item.
-The current packet- and byte-window listener caps cover the threat
-class the hardening guide calls out.
+Note: ingress queue saturation (the other half of the original
+"BANDWIDTH-class shaping" deferral) remains a production-deployment
+work item; the per-source token-bucket above closes the
+shaping-on-top-of-the-sliding-window gap that motivated the deferral.
 
 ### §4.2 Anti-amplification (3× cap) — COMPLETE
 
@@ -616,11 +627,13 @@ No external review on file. This is a project-organizational item
 
 ## Currently open
 
-- **Listener BANDWIDTH-class shaping**. The packet-window
+- **Ingress queue saturation modeling**. The per-source token-bucket
+  shaper (commit `ba46d9e`) closes the shaping leg of the original
+  BANDWIDTH-class deferral on top of the existing packet-window
   (`max_datagrams_per_window`) and byte-window
-  (`max_bytes_per_window`) caps are in place (commit `1dceea5`); a
-  full token-bucket + ingress queue pressure model is deferred to a
-  larger production-deployment work item. Not a security gap on the
+  (`max_bytes_per_window`) caps. Modeling pressure on the OS-level
+  receive queue itself (e.g. `SO_RCVBUF` saturation alarms) is still
+  a production-deployment work item. Not a security gap on the
   current threat model.
 - **§13 / §15 #10 — external security review**. Organizational item.
   Tracked outside the technical hardening pass.

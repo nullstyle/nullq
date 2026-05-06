@@ -39,6 +39,13 @@ breaking changes; see notes per release.
 - §4.1 — Listener-level byte-rate limit
   (`Server.Config.max_bytes_per_window`) plus
   `feeds_listener_byte_rate_limited` counter. Commit `1dceea5`.
+- §4.1 — Per-source bandwidth shaping via token-bucket. New
+  `Server.Config.max_bytes_per_source_per_second` (null-default)
+  with one-second burst capacity; drops surface in
+  `feeds_source_bandwidth_limited`. Charged AFTER the global
+  listener gates so the aggregate ceiling still bounds total
+  bandwidth even when every source has a full bucket. Commit
+  `ba46d9e`.
 - §4.3 — Retry token format encrypt-then-authenticate with
   AES-GCM-256: 96-byte fixed wire size (12-byte nonce + 68-byte
   ciphertext + 16-byte tag); plaintext zero-padded so every minted

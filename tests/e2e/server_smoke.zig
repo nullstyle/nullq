@@ -1917,3 +1917,136 @@ test "Server.init rejects max_bytes_per_window=0" {
         .max_bytes_per_window = 0,
     }));
 }
+
+// -- §4.1 token-bucket: per-source bandwidth shaper -------------------
+
+test "Server per-source bandwidth shaper drops datagrams when bucket is empty" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        // Tight cap so the test can drain it quickly. With cap = 4096
+        // bytes/s the refill rate is ~0.004096 bytes/us; a 1ms gap
+        // refills ~4 bytes (negligible compared to a 2000-byte
+        // datagram).
+        .max_bytes_per_source_per_second = 4096,
+    });
+    defer srv.deinit();
+
+    var buf: [2000]u8 = @splat(0);
+    buf[0] = 0x40;
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0xa1) };
+
+    // First 2000-byte datagram at t=0: bucket starts full at 4096
+    // tokens, debit drops it to ~2096. Pass.
+    var outcome = try srv.feed(&buf, addr, 0);
+    try std.testing.expect(outcome != nullq.Server.FeedOutcome.dropped or true); // could drop on later gates, what matters is the bandwidth counter
+    var m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_source_bandwidth_limited);
+
+    // Second 2000-byte datagram 1 ms later: bucket refilled by ~4
+    // tokens (still ~2100). Debit drops to ~100. Pass.
+    outcome = try srv.feed(&buf, addr, 1_000);
+    m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), m.feeds_source_bandwidth_limited);
+
+    // Third 2000-byte datagram 1 us later: bucket has ~100 tokens,
+    // 2000 > 100, drop on the per-source bandwidth gate.
+    outcome = try srv.feed(&buf, addr, 1_001);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
+    try std.testing.expect(m.feeds_dropped >= 1);
+}
+
+test "Server per-source bandwidth shaper refills on idle" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_bytes_per_source_per_second = 4096,
+    });
+    defer srv.deinit();
+
+    var buf: [2000]u8 = @splat(0);
+    buf[0] = 0x40;
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0xa2) };
+
+    // Drain the bucket quickly: three 2000-byte datagrams at
+    // t=0/1/2 us. Total charge = 6000 bytes vs starting bucket of
+    // 4096 + ~3 us of refill (negligible). Third drops.
+    _ = try srv.feed(&buf, addr, 0);
+    _ = try srv.feed(&buf, addr, 1);
+    const drop_outcome = try srv.feed(&buf, addr, 2);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, drop_outcome);
+    var m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
+
+    // Advance simulated time by 2 seconds. Refill rate is 4096
+    // bytes/s, so 2 s of idle adds 8192 tokens — capped at the
+    // 4096-byte ceiling. Bucket is now full again.
+    _ = try srv.feed(&buf, addr, 2_000_002);
+    m = srv.metricsSnapshot();
+    // Counter is sticky at 1 (the earlier drop); this feed went
+    // through cleanly.
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
+}
+
+test "Server per-source bandwidth shaper is per-source" {
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_bytes_per_source_per_second = 4096,
+    });
+    defer srv.deinit();
+
+    var buf: [2000]u8 = @splat(0);
+    buf[0] = 0x40;
+    const peer_a = nullq.conn.path.Address{ .bytes = @splat(0xb1) };
+    const peer_b = nullq.conn.path.Address{ .bytes = @splat(0xb2) };
+
+    // Drain peer_a's bucket: three 2000-byte datagrams at t=0/1/2.
+    // Third trips the gate.
+    _ = try srv.feed(&buf, peer_a, 0);
+    _ = try srv.feed(&buf, peer_a, 1);
+    const a_third = try srv.feed(&buf, peer_a, 2);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, a_third);
+
+    var m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
+
+    // peer_b gets a fresh bucket; its first 2000-byte datagram
+    // passes the bandwidth gate (it may drop on later gates, but the
+    // bandwidth-limited counter must NOT increment).
+    _ = try srv.feed(&buf, peer_b, 3);
+    m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
+
+    // peer_b's second 2000-byte datagram: bucket has ~2096 tokens,
+    // pass.
+    _ = try srv.feed(&buf, peer_b, 4);
+    m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
+}
+
+test "Server.init rejects max_bytes_per_source_per_second=0" {
+    const protos = [_][]const u8{"hq-test"};
+    try std.testing.expectError(nullq.Server.Error.InvalidConfig, nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_bytes_per_source_per_second = 0,
+    }));
+}

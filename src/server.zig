@@ -253,6 +253,13 @@ const MetricsSnapshotImpl = struct {
     /// Tracks bandwidth-flavored floods that the packet-count cap
     /// would let through (few-but-large datagrams). Hardening guide §4.1.
     feeds_listener_byte_rate_limited: u64,
+    /// Datagrams dropped at the per-source bandwidth shaper
+    /// (`Config.max_bytes_per_source_per_second`). Subset of
+    /// `feeds_dropped`. Distinct from `feeds_listener_byte_rate_limited`:
+    /// the listener cap protects the aggregate firehose, this protects
+    /// against any single source consuming more than its fair share.
+    /// Hardening guide §4.1 token-bucket.
+    feeds_source_bandwidth_limited: u64,
     /// LogEvents the server dropped under the per-source log rate
     /// limit (`Config.max_log_events_per_source_per_window`).
     /// Distinct from `feeds_dropped` — feeding a datagram and emitting
@@ -352,6 +359,16 @@ const RetryStateEntry = struct {
 /// `active_connection_id_limit` toward 32 or beyond.
 const max_tracked_cids_per_slot: usize = 32;
 
+/// Idle threshold (microseconds) past which a `SourceRateEntry`
+/// whose three counter windows have all elapsed is also considered
+/// stale on the bandwidth-bucket axis and may be pruned. Five
+/// seconds is comfortably longer than the default
+/// `source_rate_window_us` (one second), so a source seen recently
+/// enough to keep its bucket warm survives `pruneSourceRate` even
+/// when its Initial / VN / log windows have aged out. Hardening
+/// guide §4.1 token-bucket.
+const bandwidth_idle_threshold_us: u64 = 5_000_000;
+
 /// Length-prefixed packed CID key used as the `cid_table` HashMap
 /// key. Byte 0 is the CID length (1..20); bytes 1..1+len are the
 /// CID material; bytes past `len` are zeroed so the key compares
@@ -402,6 +419,15 @@ const SourceRateEntry = struct {
     log_count: u32 = 0,
     /// Wall-clock microseconds when the current log window started.
     log_window_start_us: u64 = 0,
+    /// Token-bucket level (in bytes) for per-source bandwidth shaping.
+    /// Gated by `Config.max_bytes_per_source_per_second`. Refilled at
+    /// the configured rate up to a one-second burst cap; each accepted
+    /// datagram debits `bytes.len`. Hardening guide §4.1 token-bucket.
+    bandwidth_tokens: u64 = 0,
+    /// Wall-clock microseconds at the most recent token-bucket refill.
+    /// Driven by the per-feed `now_us` so the shaper reads the
+    /// embedder's monotonic clock rather than a separate timebase.
+    bandwidth_last_refill_us: u64 = 0,
 };
 
 /// Configuration handed to `Server.init`. Re-exported as
@@ -625,6 +651,21 @@ const ConfigImpl = struct {
     /// more reset jitter; larger windows smooth bursty traffic. Both
     /// listener-level caps share this single window.
     listener_rate_window_us: u64 = 1_000_000,
+
+    /// Per-source bandwidth shaping (hardening §4.1 token-bucket).
+    /// When non-null, every accepted datagram from a given source charges
+    /// `bytes.len` against a token bucket that refills at
+    /// `max_bytes_per_source_per_second` bytes per second up to the same
+    /// value as a hard cap (one second's burst). When the bucket is empty
+    /// the datagram is dropped and `feeds_source_bandwidth_limited` ticks.
+    ///
+    /// Null disables (default — production opts in). Distinct from the
+    /// global sliding-window `max_bytes_per_window` cap: this gates per
+    /// source, the global cap gates aggregate. Charging happens AFTER
+    /// the global gates approve, so the global caps still bound aggregate
+    /// bandwidth even when every individual source has full buckets.
+    /// cap=0 fails `Server.init` with `InvalidConfig`.
+    max_bytes_per_source_per_second: ?u64 = null,
 
     /// Per-source cap on `LogEvent` emissions per window (hardening
     /// guide §9.4). When the cap fires, the log is dropped silently —
@@ -952,6 +993,12 @@ pub const Server = struct {
     listener_rate_count: u32 = 0,
     bytes_in_window: u64 = 0,
     listener_rate_window_start_us: u64 = 0,
+    /// Captured `Config.max_bytes_per_source_per_second`. Null disables
+    /// the per-source bandwidth shaper; when set, every datagram that
+    /// the global listener gates approve charges `bytes.len` against
+    /// the source's token bucket (one second's burst capacity, refills
+    /// at the configured rate). Hardening guide §4.1 token-bucket.
+    max_bytes_per_source_per_second: ?u64,
 
     /// Captured `Config.max_log_events_per_source_per_window`. Null
     /// disables the per-source log rate limit. Hardening guide §9.4.
@@ -1013,6 +1060,12 @@ pub const Server = struct {
     /// (`Config.max_bytes_per_window`). Subset of `feeds_dropped`.
     /// Spiking values point at a few-but-large bandwidth flood.
     feeds_listener_byte_rate_limited: u64 = 0,
+    /// Datagrams dropped at the per-source bandwidth shaper
+    /// (`Config.max_bytes_per_source_per_second`). Subset of
+    /// `feeds_dropped`. Spiking values point at a single-source
+    /// bandwidth abuser that the global listener cap is wide enough
+    /// to let through. Hardening guide §4.1 token-bucket.
+    feeds_source_bandwidth_limited: u64 = 0,
     /// LogEvents dropped by the per-source log rate limiter
     /// (`Config.max_log_events_per_source_per_window`). NOT a subset
     /// of `feeds_dropped` — log emission is a separate side effect
@@ -1063,6 +1116,16 @@ pub const Server = struct {
         if (config.max_bytes_per_window) |cap| {
             if (cap == 0) return Error.InvalidConfig;
             if (config.listener_rate_window_us == 0) return Error.InvalidConfig;
+        }
+        // Hardening guide §4.1 token-bucket: cap=0 is meaningless —
+        // it would drop every datagram. Surface it as `InvalidConfig`
+        // instead of letting it silently DoS the server. The shaper
+        // shares the `source_rate_table` with `acceptSourceRate` /
+        // `acceptVnRate` / `acceptLogRate`, so the same capacity bound
+        // applies; explicit checks here mirror those helpers' shape.
+        if (config.max_bytes_per_source_per_second) |cap| {
+            if (cap == 0) return Error.InvalidConfig;
+            if (config.source_rate_table_capacity == 0) return Error.InvalidConfig;
         }
         if (config.max_log_events_per_source_per_window) |cap| {
             if (cap == 0) return Error.InvalidConfig;
@@ -1160,6 +1223,7 @@ pub const Server = struct {
             .max_datagrams_per_window = config.max_datagrams_per_window,
             .max_bytes_per_window = config.max_bytes_per_window,
             .listener_rate_window_us = config.listener_rate_window_us,
+            .max_bytes_per_source_per_second = config.max_bytes_per_source_per_second,
             .max_log_events_per_source = config.max_log_events_per_source_per_window,
             .stateless_responses = .empty,
         };
@@ -1290,6 +1354,32 @@ pub const Server = struct {
         if (bytes.len == 0) {
             self.feeds_dropped += 1;
             return .dropped;
+        }
+
+        // Hardening guide §4.1 token-bucket: per-source bandwidth
+        // shaper. Runs after the global listener gates (so the global
+        // aggregate ceiling still bounds total bandwidth even when
+        // every source has a full bucket) but before slot lookup (so
+        // an in-flight handshake datagram from a misbehaving source
+        // is gated too). Charge happens only when `from` is provided
+        // — null-source feeds bypass the limiter for the same reason
+        // as the per-source Initial / VN / log gates.
+        if (self.max_bytes_per_source_per_second) |cap| {
+            if (from) |addr| {
+                if (!self.acceptSourceBandwidth(addr, bytes.len, cap, now_us)) {
+                    self.feeds_source_bandwidth_limited += 1;
+                    self.feeds_dropped += 1;
+                    // Reuse `feed_rate_limited`: `recent_count` carries
+                    // the dropped datagram's byte length so embedders
+                    // can correlate the log with the bucket-empty
+                    // condition without a new variant.
+                    self.emitLog(.{ .feed_rate_limited = .{
+                        .peer = addr,
+                        .recent_count = std.math.lossyCast(u32, bytes.len),
+                    } });
+                    return .dropped;
+                }
+            }
         }
 
         // RFC 9000 §14: a server MUST discard a QUIC v1 Initial packet
@@ -2028,18 +2118,93 @@ pub const Server = struct {
         return true;
     }
 
+    /// Per-source bandwidth gate (token-bucket). Returns true when the
+    /// `bytes_charged`-byte datagram is permitted; false when the
+    /// bucket is empty. Mirrors `acceptSourceRate` / `acceptVnRate` /
+    /// `acceptLogRate` in shape (lazy eviction, OOM-fail-closed) and
+    /// shares the `source_rate_table`.
+    ///
+    /// The bucket is sized to one second of `cap_per_second`, refills
+    /// at `cap_per_second` bytes/s up to that ceiling, and debits
+    /// `bytes_charged` per accepted datagram. Hardening guide §4.1
+    /// token-bucket: this is the per-source companion to the global
+    /// sliding-window byte-rate cap. The shaper sits AFTER the global
+    /// listener gates so the global aggregate ceiling still bounds
+    /// total bandwidth even with every source's bucket full.
+    fn acceptSourceBandwidth(
+        self: *Server,
+        addr: Address,
+        bytes_charged: u64,
+        cap_per_second: u64,
+        now_us: u64,
+    ) bool {
+        // Lazy eviction shared with the rest of the per-source helpers.
+        if (self.source_rate_table.count() >= self.source_rate_table_capacity) {
+            self.pruneSourceRate(now_us);
+            if (self.source_rate_table.count() >= self.source_rate_table_capacity) {
+                self.evictOldestSourceRate();
+            }
+        }
+
+        const gop = self.source_rate_table.getOrPut(self.allocator, addr) catch {
+            // OOM on the rate table: deny the datagram rather than
+            // continue unprotected. Mirrors `acceptSourceRate` policy.
+            return false;
+        };
+        if (!gop.found_existing) {
+            // Bootstrap: full bucket, charge immediately. A first
+            // datagram larger than one full second's burst is dropped
+            // here (the bucket starts at `cap_per_second`, not at
+            // `cap_per_second + bytes_charged`).
+            const tokens_after_charge: u64 = if (cap_per_second >= bytes_charged)
+                cap_per_second - bytes_charged
+            else
+                0;
+            gop.value_ptr.* = .{
+                .count = 0,
+                .window_start_us = 0,
+                .vn_count = 0,
+                .vn_window_start_us = 0,
+                .log_count = 0,
+                .log_window_start_us = 0,
+                .bandwidth_tokens = tokens_after_charge,
+                .bandwidth_last_refill_us = now_us,
+            };
+            return cap_per_second >= bytes_charged;
+        }
+
+        // Refill: tokens += elapsed_us * cap / 1_000_000, capped at cap.
+        // `mulWide` keeps the intermediate product in u128 so a long
+        // idle gap on a high cap can't overflow u64 mid-divide.
+        const elapsed = now_us -% gop.value_ptr.bandwidth_last_refill_us;
+        const refill: u64 = @intCast(std.math.mulWide(u64, elapsed, cap_per_second) / std.time.us_per_s);
+        const refilled = std.math.add(u64, gop.value_ptr.bandwidth_tokens, refill) catch cap_per_second;
+        gop.value_ptr.bandwidth_tokens = @min(refilled, cap_per_second);
+        gop.value_ptr.bandwidth_last_refill_us = now_us;
+
+        if (gop.value_ptr.bandwidth_tokens < bytes_charged) return false;
+        gop.value_ptr.bandwidth_tokens -= bytes_charged;
+        return true;
+    }
+
     fn pruneSourceRate(self: *Server, now_us: u64) void {
         var it = self.source_rate_table.iterator();
         while (it.next()) |entry| {
             const init_elapsed = now_us -% entry.value_ptr.window_start_us;
             const vn_elapsed = now_us -% entry.value_ptr.vn_window_start_us;
             const log_elapsed = now_us -% entry.value_ptr.log_window_start_us;
-            // Only prune when *all three* per-counter windows have
-            // elapsed — otherwise an entry that's only stale on one
-            // axis would lose its still-active counters on the others.
+            const bandwidth_elapsed = now_us -% entry.value_ptr.bandwidth_last_refill_us;
+            // Only prune when *all four* per-counter / per-bucket axes
+            // have gone idle — otherwise an entry that's only stale on
+            // one axis would lose its still-active counters on the
+            // others. The bandwidth-bucket survival threshold is held
+            // separately so a long-idle source still pays the
+            // refill-from-empty bootstrap rather than getting a free
+            // full-bucket reset on its next packet.
             if (init_elapsed >= self.source_rate_window_us and
                 vn_elapsed >= self.source_rate_window_us and
-                log_elapsed >= self.source_rate_window_us)
+                log_elapsed >= self.source_rate_window_us and
+                bandwidth_elapsed >= bandwidth_idle_threshold_us)
             {
                 _ = self.source_rate_table.remove(entry.key_ptr.*);
             }
@@ -2480,6 +2645,7 @@ pub const Server = struct {
             .feeds_vn_rate_limited = self.feeds_vn_rate_limited,
             .feeds_listener_rate_limited = self.feeds_listener_rate_limited,
             .feeds_listener_byte_rate_limited = self.feeds_listener_byte_rate_limited,
+            .feeds_source_bandwidth_limited = self.feeds_source_bandwidth_limited,
             .feeds_log_rate_limited = self.feeds_log_rate_limited,
             .retries_validated = self.retries_validated,
             .stateless_responses_evicted = self.stateless_responses_evicted,
