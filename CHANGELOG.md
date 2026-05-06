@@ -35,6 +35,22 @@ breaking changes; see notes per release.
   the embedder attaches via the new `Slot.setTraceContext(trace_id,
   parent_span_id)` method. nullq treats both as opaque metadata —
   they are never read or forwarded into qlog or onto the wire.
+- `nullq.Server.replaceTlsContext` — graceful, hot-swappable TLS
+  context reload. Accepts either fresh PEM bytes (rebuilt with the
+  Server's existing ALPN preference list and TLS-1.3 defaults) or a
+  caller-built `boringssl.tls.Context` via the new `Server.TlsReload`
+  union. The pre-swap context is moved into a draining list with a
+  refcount equal to the live slots that opened against it; existing
+  slots keep their per-connection SSL handle (BoringSSL's `SSL_new`
+  up-ref keeps the underlying `SSL_CTX` alive across the swap). On
+  each successful `Server.reap`, draining contexts whose refcount
+  hits zero are torn down. `Server.deinit` cleans up any still-live
+  draining entries. Resumption note: tickets minted under the old
+  context cannot decrypt under the new one (different key material);
+  embedders that need cross-reload resumption must manage ticket
+  keys themselves and pass the rebuilt context via the `.override`
+  variant. See `src/server.zig` and the tests in
+  `tests/e2e/server_smoke.zig`.
 
 ## [0.1.0-pre.1] - 2026-05-05
 

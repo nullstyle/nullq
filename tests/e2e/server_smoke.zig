@@ -7,11 +7,30 @@
 
 const std = @import("std");
 const nullq = @import("nullq");
+const boringssl = @import("boringssl");
 const common = @import("common.zig");
 
 const test_cert_pem = common.test_cert_pem;
 const test_key_pem = common.test_key_pem;
 const defaultParams = common.defaultParams;
+
+/// Build a fresh server-mode TLS context wired identically to the
+/// one `Server.init` constructs internally — TLS-1.3 only,
+/// `verify=.none`, ALPN preloaded, early data enabled, and the test
+/// cert/key loaded. Helper for the TLS-reload tests so each test
+/// can hand the Server an `.override` and compare `inner` pointers.
+fn buildOverrideTlsCtx(alpn: []const []const u8) !boringssl.tls.Context {
+    var ctx = try boringssl.tls.Context.initServer(.{
+        .verify = .none,
+        .min_version = boringssl.raw.TLS1_3_VERSION,
+        .max_version = boringssl.raw.TLS1_3_VERSION,
+        .alpn = alpn,
+        .early_data_enabled = true,
+    });
+    errdefer ctx.deinit();
+    try ctx.loadCertChainAndKey(test_cert_pem, test_key_pem);
+    return ctx;
+}
 
 test "Server.init + deinit on a real cert/key pair" {
     const protos = [_][]const u8{"hq-test"};
@@ -678,4 +697,236 @@ test "Slot.setTraceContext round-trips and defaults are null" {
     try std.testing.expect(slot.parent_span_id != null);
     try std.testing.expectEqualSlices(u8, &trace_id, &slot.trace_id.?);
     try std.testing.expectEqualSlices(u8, &parent_span_id, &slot.parent_span_id.?);
+}
+
+test "Server.replaceTlsContext on an empty server swaps the current context and tears down the old one" {
+    // No live slots → the swap has no draining entry to record.
+    // `current_generation` still bumps; the new context becomes
+    // current; the previous Server-owned context is freed in place
+    // (the leak detector catches the failure mode).
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), srv.current_generation);
+    try std.testing.expect(srv.owns_tls);
+    const old_inner = srv.tls_ctx.inner;
+
+    // Hand the Server a fresh override built outside its API so we
+    // can compare `inner` pointers afterward.
+    const new_ctx = try buildOverrideTlsCtx(&protos);
+    const new_inner = new_ctx.inner;
+    try srv.replaceTlsContext(.{ .override = new_ctx });
+
+    // The current context now points at the new SSL_CTX, the old
+    // one was torn down (no live slot to keep it draining), and the
+    // generation rolled over to 1.
+    try std.testing.expectEqual(new_inner, srv.tls_ctx.inner);
+    try std.testing.expect(srv.owns_tls);
+    try std.testing.expectEqual(@as(u32, 1), srv.current_generation);
+    try std.testing.expectEqual(@as(usize, 0), srv.draining_tls_contexts.items.len);
+    try std.testing.expect(old_inner != new_inner);
+
+    // PEM-variant reload also works on an empty server.
+    try srv.replaceTlsContext(.{ .pem = .{
+        .cert_pem = test_cert_pem,
+        .key_pem = test_key_pem,
+    } });
+    try std.testing.expectEqual(@as(u32, 2), srv.current_generation);
+    try std.testing.expect(srv.tls_ctx.inner != new_inner);
+    try std.testing.expectEqual(@as(usize, 0), srv.draining_tls_contexts.items.len);
+}
+
+test "Server.replaceTlsContext while a slot is live drains the old context and routes new connections through the new one" {
+    // 1. Drive a real client to deposit an Initial → slot opens at
+    //    generation 0, against the original Server-built context.
+    // 2. Replace the TLS context with an `.override` whose `inner`
+    //    we captured up-front. Verify the old context migrates into
+    //    `draining_tls_contexts` with refcount=1, the new context
+    //    becomes current, and `current_generation` bumps to 1.
+    // 3. Drive a second client. Its Initial accepts into a fresh
+    //    slot stamped with generation=1 (i.e. the new context).
+    // 4. Close + reap each slot in turn, verifying the draining
+    //    entry's refcount decrements when the gen-0 slot is reaped
+    //    and the entry is removed entirely on the same reap.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    const old_inner = srv.tls_ctx.inner;
+
+    // -- step 1: open slot #1 against the original context --
+    var client1 = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client1.deinit();
+    try client1.conn.advance();
+
+    var initial_buf1: [2048]u8 = undefined;
+    const n1 = (try client1.conn.poll(&initial_buf1, 1_000)) orelse
+        return error.NoInitialEmitted;
+
+    const addr1 = nullq.conn.path.Address{ .bytes = @splat(0x11) };
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.accepted,
+        try srv.feed(initial_buf1[0..n1], addr1, 1_000),
+    );
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+    try std.testing.expectEqual(@as(u32, 0), srv.slots.items[0].tls_generation);
+
+    // -- step 2: hot-swap the context --
+    const new_ctx = try buildOverrideTlsCtx(&protos);
+    const new_inner = new_ctx.inner;
+    try srv.replaceTlsContext(.{ .override = new_ctx });
+
+    try std.testing.expectEqual(new_inner, srv.tls_ctx.inner);
+    try std.testing.expectEqual(@as(u32, 1), srv.current_generation);
+    try std.testing.expectEqual(@as(usize, 1), srv.draining_tls_contexts.items.len);
+    try std.testing.expectEqual(old_inner, srv.draining_tls_contexts.items[0].ctx.inner);
+    try std.testing.expectEqual(@as(u32, 0), srv.draining_tls_contexts.items[0].generation);
+    try std.testing.expectEqual(@as(usize, 1), srv.draining_tls_contexts.items[0].refcount);
+    // The original slot still talks to the old context — its
+    // generation tag did not change.
+    try std.testing.expectEqual(@as(u32, 0), srv.slots.items[0].tls_generation);
+
+    // -- step 3: open slot #2 against the new context --
+    var client2 = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client2.deinit();
+    try client2.conn.advance();
+
+    var initial_buf2: [2048]u8 = undefined;
+    const n2 = (try client2.conn.poll(&initial_buf2, 2_000)) orelse
+        return error.NoInitialEmitted;
+
+    const addr2 = nullq.conn.path.Address{ .bytes = @splat(0x22) };
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.accepted,
+        try srv.feed(initial_buf2[0..n2], addr2, 2_000),
+    );
+    try std.testing.expectEqual(@as(usize, 2), srv.connectionCount());
+
+    // The new slot is at gen=1 (matches `current_generation`); the
+    // old slot is still at gen=0. The draining refcount didn't
+    // change — only reap touches it.
+    var found_gen_0 = false;
+    var found_gen_1 = false;
+    for (srv.slots.items) |slot| {
+        if (slot.tls_generation == 0) found_gen_0 = true;
+        if (slot.tls_generation == 1) found_gen_1 = true;
+    }
+    try std.testing.expect(found_gen_0);
+    try std.testing.expect(found_gen_1);
+    try std.testing.expectEqual(@as(usize, 1), srv.draining_tls_contexts.items[0].refcount);
+
+    // -- step 4: close both slots and reap --
+    // Close the gen-1 slot first so we can confirm that reaping it
+    // does NOT touch the draining entry (current generation).
+    var gen_0_slot: *nullq.Server.Slot = undefined;
+    var gen_1_slot: *nullq.Server.Slot = undefined;
+    for (srv.slots.items) |slot| {
+        if (slot.tls_generation == 0) gen_0_slot = slot;
+        if (slot.tls_generation == 1) gen_1_slot = slot;
+    }
+    gen_1_slot.conn.close(true, 0x00, "test");
+    // `close()` only sets pending_close; we have to drive a `poll`
+    // for the CONNECTION_CLOSE frame to be emitted and the
+    // connection to flip to `lifecycle.closed = true`. The poll
+    // output goes nowhere — this is just a state-pumping call.
+    var drain_buf: [2048]u8 = undefined;
+    _ = try gen_1_slot.conn.poll(&drain_buf, 3_000);
+    try std.testing.expect(gen_1_slot.conn.isClosed());
+    try std.testing.expectEqual(@as(usize, 1), srv.reap());
+    // Draining entry untouched — current-gen slot reaping is a no-op
+    // for the refcount path.
+    try std.testing.expectEqual(@as(usize, 1), srv.draining_tls_contexts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), srv.draining_tls_contexts.items[0].refcount);
+
+    // Close the gen-0 slot. Reaping it should drop the refcount to
+    // zero, deinit the draining context, and remove the entry.
+    gen_0_slot.conn.close(true, 0x00, "test");
+    _ = try gen_0_slot.conn.poll(&drain_buf, 4_000);
+    try std.testing.expect(gen_0_slot.conn.isClosed());
+    try std.testing.expectEqual(@as(usize, 1), srv.reap());
+    try std.testing.expectEqual(@as(usize, 0), srv.draining_tls_contexts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+}
+
+test "Server.deinit after replaceTlsContext cleans up unreaped draining contexts" {
+    // The leak detector is the actual oracle here: build a Server,
+    // open a slot, swap the TLS context (so the old one moves into
+    // `draining_tls_contexts` with refcount=1), then call
+    // `srv.deinit` *without* reaping the gen-0 slot. The deinit
+    // path must tear down both the current and the draining
+    // context, plus the slot's Connection. Any leak fails the test.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+
+    var client = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "example.com",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer client.deinit();
+    try client.conn.advance();
+
+    var initial_buf: [2048]u8 = undefined;
+    const n = (try client.conn.poll(&initial_buf, 1_000)) orelse
+        return error.NoInitialEmitted;
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.accepted,
+        try srv.feed(initial_buf[0..n], addr, 1_000),
+    );
+
+    // Two swaps in a row → two draining entries (refcount=1 on the
+    // first, refcount=0 path on the second since slot count at
+    // gen=1 is zero, so the second pre-swap context is freed
+    // in-place rather than draining).
+    const new_ctx_a = try buildOverrideTlsCtx(&protos);
+    try srv.replaceTlsContext(.{ .override = new_ctx_a });
+    try std.testing.expectEqual(@as(usize, 1), srv.draining_tls_contexts.items.len);
+
+    // Second swap: the post-swap-1 context has zero gen-1 slots, so
+    // it is `deinit`-ed in place and never enters the draining list.
+    try srv.replaceTlsContext(.{ .pem = .{
+        .cert_pem = test_cert_pem,
+        .key_pem = test_key_pem,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), srv.draining_tls_contexts.items.len);
+    try std.testing.expectEqual(@as(u32, 2), srv.current_generation);
+
+    // No reap; jump straight to deinit. Leak detector validates.
+    srv.deinit();
 }
