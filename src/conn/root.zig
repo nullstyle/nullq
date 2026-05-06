@@ -46,6 +46,8 @@ pub const recv_stream = @import("recv_stream.zig");
 pub const path = @import("path.zig");
 /// RFC 9000 §8.1.2 stateless Retry token mint/validate.
 pub const retry_token = @import("retry_token.zig");
+/// Per-connection embedder-event surfacing buffers (flow-blocked, CID-replenish, DATAGRAM ack/loss).
+pub const event_queue = @import("event_queue.zig");
 
 /// Top-level QUIC connection state machine (RFC 9000).
 pub const Connection = state.Connection;
@@ -156,4 +158,5 @@ test {
     _ = recv_stream;
     _ = path;
     _ = retry_token;
+    _ = event_queue;
 }

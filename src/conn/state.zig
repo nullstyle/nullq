@@ -34,6 +34,7 @@ const path_mod = @import("path.zig");
 const congestion_mod = @import("congestion.zig");
 const rtt_mod = @import("rtt.zig");
 const flow_control_mod = @import("flow_control.zig");
+const event_queue_mod = @import("event_queue.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -328,71 +329,29 @@ pub const ConnectionEvent = union(enum) {
 };
 
 /// Whether a flow-control block was hit on the local side or reported by the peer.
-pub const FlowBlockedSource = enum {
-    local,
-    peer,
-};
-
+pub const FlowBlockedSource = event_queue_mod.FlowBlockedSource;
 /// Which flow-control axis ran out of credit — connection data, per-stream data,
 /// or stream-count (RFC 9000 §4 / §19.12-§19.14).
-pub const FlowBlockedKind = enum {
-    data,
-    stream_data,
-    streams,
-};
-
+pub const FlowBlockedKind = event_queue_mod.FlowBlockedKind;
 /// One flow-control block event delivered to the embedder via `nextEvent`. Carries
 /// the limit that was hit and (for stream-data) which stream tripped it.
-pub const FlowBlockedInfo = struct {
-    source: FlowBlockedSource,
-    kind: FlowBlockedKind,
-    limit: u64,
-    stream_id: ?u64 = null,
-    bidi: ?bool = null,
-};
-
+pub const FlowBlockedInfo = event_queue_mod.FlowBlockedInfo;
 /// Maximum buffered FlowBlockedInfo events before older entries are dropped.
-pub const max_flow_blocked_events: usize = 16;
-
+pub const max_flow_blocked_events: usize = event_queue_mod.max_flow_blocked_events;
 /// Why the connection is asking the embedder to issue more local connection IDs.
-pub const ConnectionIdReplenishReason = enum {
-    retired,
-    path_cids_blocked,
-};
-
+pub const ConnectionIdReplenishReason = event_queue_mod.ConnectionIdReplenishReason;
 /// Embedder-visible snapshot of CID-issuance state when the active count drops
 /// below the peer's `active_connection_id_limit` (RFC 9000 §5.1.1).
-pub const ConnectionIdReplenishInfo = struct {
-    path_id: u32,
-    reason: ConnectionIdReplenishReason,
-    active_count: usize,
-    active_limit: usize,
-    issue_budget: usize,
-    next_sequence_number: u64,
-    blocked_next_sequence_number: ?u64 = null,
-};
-
+pub const ConnectionIdReplenishInfo = event_queue_mod.ConnectionIdReplenishInfo;
 /// Maximum buffered CID replenish events before older entries are dropped.
-pub const max_connection_id_events: usize = 16;
-
+pub const max_connection_id_events: usize = event_queue_mod.max_connection_id_events;
 /// One ACK or loss event for a previously-sent RFC 9221 DATAGRAM frame, returned
 /// to the embedder so it can reconcile its outbound queue.
-pub const DatagramSendEvent = struct {
-    id: u64,
-    len: usize,
-    path_id: u32 = 0,
-    packet_number: u64 = 0,
-    sent_time_us: u64 = 0,
-    arrived_in_early_data: bool = false,
-};
-
+pub const DatagramSendEvent = event_queue_mod.DatagramSendEvent;
 /// Maximum buffered datagram ack/loss events before older entries are dropped.
-pub const max_datagram_send_events: usize = 64;
+pub const max_datagram_send_events: usize = event_queue_mod.max_datagram_send_events;
 
-const StoredDatagramSendEvent = union(enum) {
-    acked: DatagramSendEvent,
-    lost: DatagramSendEvent,
-};
+const StoredDatagramSendEvent = event_queue_mod.StoredDatagramSendEvent;
 
 const StoredCloseEvent = struct {
     source: CloseSource,
@@ -1085,12 +1044,9 @@ pub const Connection = struct {
     /// bind/init without leaving a self-referential slice behind.
     close_event: ?StoredCloseEvent = null,
     close_reason_buf: [max_close_reason_len]u8 = undefined,
-    flow_blocked_events: [max_flow_blocked_events]FlowBlockedInfo = undefined,
-    flow_blocked_event_count: usize = 0,
-    connection_id_events: [max_connection_id_events]ConnectionIdReplenishInfo = undefined,
-    connection_id_event_count: usize = 0,
-    datagram_send_events: [max_datagram_send_events]StoredDatagramSendEvent = undefined,
-    datagram_send_event_count: usize = 0,
+    flow_blocked_events: event_queue_mod.EventQueue(FlowBlockedInfo, max_flow_blocked_events) = .{},
+    connection_id_events: event_queue_mod.EventQueue(ConnectionIdReplenishInfo, max_connection_id_events) = .{},
+    datagram_send_events: event_queue_mod.EventQueue(StoredDatagramSendEvent, max_datagram_send_events) = .{},
     /// STOP_SENDING frames we owe the peer (one per stream id).
     pending_stop_sending: std.ArrayList(StopSendingItem) = .empty,
     /// MAX_STREAM_DATA frames we owe after the application drains
@@ -2924,9 +2880,7 @@ pub const Connection = struct {
     }
 
     fn recordFlowBlockedEvent(self: *Connection, info: FlowBlockedInfo) void {
-        var i: usize = 0;
-        while (i < self.flow_blocked_event_count) : (i += 1) {
-            const existing = self.flow_blocked_events[i];
+        for (self.flow_blocked_events.constSlice()) |existing| {
             if (existing.source == info.source and
                 existing.kind == info.kind and
                 existing.limit == info.limit and
@@ -2936,16 +2890,7 @@ pub const Connection = struct {
                 return;
             }
         }
-        if (self.flow_blocked_event_count == max_flow_blocked_events) {
-            std.mem.copyForwards(
-                FlowBlockedInfo,
-                self.flow_blocked_events[0 .. max_flow_blocked_events - 1],
-                self.flow_blocked_events[1..max_flow_blocked_events],
-            );
-            self.flow_blocked_event_count -= 1;
-        }
-        self.flow_blocked_events[self.flow_blocked_event_count] = info;
-        self.flow_blocked_event_count += 1;
+        self.flow_blocked_events.push(info);
     }
 
     fn cidPathCanBeManaged(self: *const Connection, path_id: u32) bool {
@@ -2992,25 +2937,13 @@ pub const Connection = struct {
         if (!self.cidPathCanBeManaged(path_id)) return;
         const info = self.connectionIdReplenishInfoFor(path_id, reason, blocked_next_sequence_number);
         if (info.issue_budget == 0 and info.blocked_next_sequence_number == null) return;
-        var i: usize = 0;
-        while (i < self.connection_id_event_count) : (i += 1) {
-            if (self.connection_id_events[i].path_id == path_id and
-                self.connection_id_events[i].reason == reason)
-            {
-                self.connection_id_events[i] = info;
+        for (self.connection_id_events.slice()) |*existing| {
+            if (existing.path_id == path_id and existing.reason == reason) {
+                existing.* = info;
                 return;
             }
         }
-        if (self.connection_id_event_count == max_connection_id_events) {
-            std.mem.copyForwards(
-                ConnectionIdReplenishInfo,
-                self.connection_id_events[0 .. max_connection_id_events - 1],
-                self.connection_id_events[1..max_connection_id_events],
-            );
-            self.connection_id_event_count -= 1;
-        }
-        self.connection_id_events[self.connection_id_event_count] = info;
-        self.connection_id_event_count += 1;
+        self.connection_id_events.push(info);
     }
 
     fn connectionIdEventStillNeeded(self: *const Connection, path_id: u32) bool {
@@ -3023,24 +2956,18 @@ pub const Connection = struct {
 
     fn refreshConnectionIdEventsForPath(self: *Connection, path_id: u32) void {
         var i: usize = 0;
-        while (i < self.connection_id_event_count) {
-            if (self.connection_id_events[i].path_id != path_id) {
+        while (i < self.connection_id_events.len) {
+            const slice = self.connection_id_events.slice();
+            if (slice[i].path_id != path_id) {
                 i += 1;
                 continue;
             }
             if (!self.connectionIdEventStillNeeded(path_id)) {
-                if (i + 1 < self.connection_id_event_count) {
-                    std.mem.copyForwards(
-                        ConnectionIdReplenishInfo,
-                        self.connection_id_events[i .. self.connection_id_event_count - 1],
-                        self.connection_id_events[i + 1 .. self.connection_id_event_count],
-                    );
-                }
-                self.connection_id_event_count -= 1;
+                self.connection_id_events.removeAt(i);
                 continue;
             }
-            const event = self.connection_id_events[i];
-            self.connection_id_events[i] = self.connectionIdReplenishInfoFor(
+            const event = slice[i];
+            self.connection_id_events.slice()[i] = self.connectionIdReplenishInfoFor(
                 path_id,
                 event.reason,
                 event.blocked_next_sequence_number,
@@ -3050,37 +2977,16 @@ pub const Connection = struct {
     }
 
     fn recordDatagramSendEvent(self: *Connection, event: StoredDatagramSendEvent) void {
-        if (self.datagram_send_event_count == max_datagram_send_events) {
-            std.mem.copyForwards(
-                StoredDatagramSendEvent,
-                self.datagram_send_events[0 .. max_datagram_send_events - 1],
-                self.datagram_send_events[1..max_datagram_send_events],
-            );
-            self.datagram_send_event_count -= 1;
-        }
-        self.datagram_send_events[self.datagram_send_event_count] = event;
-        self.datagram_send_event_count += 1;
-    }
-
-    fn datagramEventFromPacket(packet: *const sent_packets_mod.SentPacket) ?DatagramSendEvent {
-        const dg = packet.datagram orelse return null;
-        return .{
-            .id = dg.id,
-            .len = dg.len,
-            .path_id = dg.path_id,
-            .packet_number = packet.pn,
-            .sent_time_us = packet.sent_time_us,
-            .arrived_in_early_data = packet.is_early_data,
-        };
+        self.datagram_send_events.push(event);
     }
 
     fn recordDatagramAcked(self: *Connection, packet: *const sent_packets_mod.SentPacket) void {
-        const event = datagramEventFromPacket(packet) orelse return;
+        const event = event_queue_mod.datagramEventFromPacket(packet) orelse return;
         self.recordDatagramSendEvent(.{ .acked = event });
     }
 
     fn recordDatagramLost(self: *Connection, packet: *const sent_packets_mod.SentPacket) void {
-        const event = datagramEventFromPacket(packet) orelse return;
+        const event = event_queue_mod.datagramEventFromPacket(packet) orelse return;
         self.recordDatagramSendEvent(.{ .lost = event });
     }
 
@@ -5936,40 +5842,13 @@ pub const Connection = struct {
                 return .{ .close = out };
             }
         }
-        if (self.flow_blocked_event_count > 0) {
-            const out = self.flow_blocked_events[0];
-            if (self.flow_blocked_event_count > 1) {
-                std.mem.copyForwards(
-                    FlowBlockedInfo,
-                    self.flow_blocked_events[0 .. self.flow_blocked_event_count - 1],
-                    self.flow_blocked_events[1..self.flow_blocked_event_count],
-                );
-            }
-            self.flow_blocked_event_count -= 1;
+        if (self.flow_blocked_events.pop()) |out| {
             return .{ .flow_blocked = out };
         }
-        if (self.connection_id_event_count > 0) {
-            const out = self.connection_id_events[0];
-            if (self.connection_id_event_count > 1) {
-                std.mem.copyForwards(
-                    ConnectionIdReplenishInfo,
-                    self.connection_id_events[0 .. self.connection_id_event_count - 1],
-                    self.connection_id_events[1..self.connection_id_event_count],
-                );
-            }
-            self.connection_id_event_count -= 1;
+        if (self.connection_id_events.pop()) |out| {
             return .{ .connection_ids_needed = out };
         }
-        if (self.datagram_send_event_count > 0) {
-            const out = self.datagram_send_events[0];
-            if (self.datagram_send_event_count > 1) {
-                std.mem.copyForwards(
-                    StoredDatagramSendEvent,
-                    self.datagram_send_events[0 .. self.datagram_send_event_count - 1],
-                    self.datagram_send_events[1..self.datagram_send_event_count],
-                );
-            }
-            self.datagram_send_event_count -= 1;
+        if (self.datagram_send_events.pop()) |out| {
             return switch (out) {
                 .acked => |event| .{ .datagram_acked = event },
                 .lost => |event| .{ .datagram_lost = event },
