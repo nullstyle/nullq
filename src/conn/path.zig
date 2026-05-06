@@ -139,6 +139,13 @@ pub const Path = struct {
 
     state: State = .fresh,
 
+    /// Microseconds-clock when we most recently emitted a
+    /// PATH_CHALLENGE for this path. Drives the rate-limit gate in
+    /// `Connection.recordAuthenticatedDatagramAddress` (hardening
+    /// guide §4.8: "rate-limit path probes"). Null until the first
+    /// challenge.
+    last_path_challenge_at_us: ?u64 = null,
+
     /// Construct a fresh `Path` with the given 4-tuple/CID pair and
     /// a NewReno controller seeded from `cc_cfg`. The path starts
     /// `fresh` and unvalidated.

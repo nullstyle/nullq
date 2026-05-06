@@ -219,6 +219,16 @@ pub const min_stream_credit_return_batch: u64 = 16;
 /// Divisor controlling the watermark at which MAX_STREAMS replenishment fires.
 pub const stream_credit_return_divisor: u64 = 1;
 
+/// Minimum interval between path-validation probes (PATH_CHALLENGE
+/// emissions) for the same path. Hardens against a peer that
+/// repeatedly switches source addresses to force fresh validator
+/// state and burn server CPU minting tokens. 100 ms is short enough
+/// that a real NAT rebinding-then-immediate-keepalive sequence still
+/// validates within one RTT, and long enough to stop any
+/// adversarial probe-flood. Surfaced in qlog as
+/// `migration_fail_reason = .rate_limited`.
+pub const min_path_challenge_interval_us: u64 = 100_000;
+
 /// Implementation allocation policy. QUIC's wire limits are intentionally
 /// enormous; nullq caps the resources it advertises and tracks so peer input
 /// cannot force unbounded stream/path/CID state.
@@ -611,6 +621,16 @@ pub const QlogMigrationFailReason = enum {
     /// A `MigrationCallback` returned `.deny`, so PATH_CHALLENGE was
     /// never queued and the candidate 4-tuple was abandoned.
     policy_denied,
+    /// RFC 9000 §9.6 / hardening guide §4.8 — peer attempted to
+    /// migrate before the handshake was confirmed. The triggering
+    /// authenticated datagram is dropped (no anti-amp credit, no
+    /// PATH_CHALLENGE emitted) so the connection state stays
+    /// anchored to the original 4-tuple.
+    pre_handshake,
+    /// A new PATH_CHALLENGE for this path arrived too soon after the
+    /// last one (per `min_path_challenge_interval_us`). Path probe
+    /// rate-limit fired; the peer's address change was not honored.
+    rate_limited,
 };
 
 /// Optional qlog event payload. Existing variants only populate the
@@ -808,6 +828,14 @@ pub const Connection = struct {
     /// Last alert byte received via the `send_alert` callback, if
     /// any. Non-null = handshake should be torn down.
     alert: ?u8 = null,
+
+    /// **Test-only.** When set, the migration gate in
+    /// `recordAuthenticatedDatagramAddress` bypasses its
+    /// `handshakeDone()` check so peer-address-change tests can fire
+    /// migration without driving a full TLS handshake. Production
+    /// code MUST NOT set this — it disables RFC 9000 §9.6 / hardening
+    /// guide §4.8 enforcement.
+    test_only_force_handshake_for_migration: bool = false,
 
     /// Pending hostname for client connections; applied during
     /// `bind` because we can't safely call `setHostname` before
@@ -3971,6 +3999,10 @@ pub const Connection = struct {
         const token = try self.newPathChallengeToken();
         const timeout_us = saturatingMul(self.ptoDurationForApplicationPath(path), 3);
         path.path.validator.beginChallenge(token, now_us, timeout_us);
+        // Stamp the path's last-challenge clock so the rate limiter
+        // in `recordAuthenticatedDatagramAddress` can throttle
+        // subsequent peer-initiated migration attempts.
+        path.path.last_path_challenge_at_us = now_us;
         self.queuePathChallengeOnPath(path.id, token);
     }
 
@@ -3992,6 +4024,43 @@ pub const Connection = struct {
             return;
         }
         if (path.matchesMigrationRollbackAddress(addr)) return;
+
+        // RFC 9000 §9.6 / hardening guide §4.8: peer-initiated
+        // migration is forbidden before the handshake is confirmed.
+        // The triggering datagram authenticated under existing keys,
+        // so we know the peer holds them — but pre-handshake an
+        // address swap is more likely to be a probe than legitimate
+        // NAT churn, and the cost of being wrong is allowing the
+        // peer to anchor connection state to a half-handshaked
+        // 4-tuple. Drop the datagram (no anti-amp credit, no
+        // PATH_CHALLENGE) and surface the event in qlog.
+        if (!self.handshakeDone() and !self.test_only_force_handshake_for_migration) {
+            self.emitQlog(.{
+                .name = .migration_path_failed,
+                .path_id = path_id,
+                .migration_fail_reason = .pre_handshake,
+            });
+            return;
+        }
+
+        // Per-path PATH_CHALLENGE rate limit (hardening guide §4.8:
+        // "rate-limit path probes"). Caps how fast a peer can force
+        // us to mint fresh challenge tokens and validator state. A
+        // legitimate NAT rebinding + retry sequence completes inside
+        // one RTT, so 100 ms between probes is well above the
+        // legitimate floor; an adversarial probe flood is throttled
+        // to one challenge per `min_path_challenge_interval_us`.
+        if (path.path.last_path_challenge_at_us) |last_us| {
+            if (now_us -| last_us < min_path_challenge_interval_us) {
+                self.emitQlog(.{
+                    .name = .migration_path_failed,
+                    .path_id = path_id,
+                    .migration_fail_reason = .rate_limited,
+                });
+                return;
+            }
+        }
+
         if (self.migration_callback) |callback| {
             const current = path.peerAddress();
             const verdict = callback(self.migration_user_data, self, addr, current);
@@ -11220,6 +11289,11 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
     defer conn.deinit();
 
     try installTestApplicationReadSecret(&conn);
+    // The migration gate enforces handshakeDone() before honoring a
+    // peer-address change. This test exercises post-handshake NAT
+    // rebinding without driving an actual TLS handshake; opt out of
+    // the gate so the test stays focused on the validation flow.
+    conn.test_only_force_handshake_for_migration = true;
     try conn.setLocalScid(&.{0xa0});
     const old_addr = Address{ .bytes = .{ 1, 2, 3, 4 } ++ @as([18]u8, @splat(0)) };
     const new_addr = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
@@ -12414,6 +12488,10 @@ test "migration callback: allow lets path validation start as usual" {
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
+    // Bypass the handshake-done migration gate; this test verifies
+    // post-handshake migration-callback behavior without driving TLS.
+    conn.test_only_force_handshake_for_migration = true;
+
     var policy: TestMigrationPolicy = .{ .decision = .allow };
     conn.setMigrationCallback(TestMigrationPolicy.callback, &policy);
 
@@ -12457,6 +12535,10 @@ test "migration callback: deny skips PATH_CHALLENGE and keeps the old 4-tuple li
     defer ctx.deinit();
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
+
+    // Bypass the handshake-done migration gate (post-handshake-only
+    // behavior is exercised here without driving the actual TLS).
+    conn.test_only_force_handshake_for_migration = true;
 
     var policy: TestMigrationPolicy = .{ .decision = .deny };
     conn.setMigrationCallback(TestMigrationPolicy.callback, &policy);
@@ -12515,6 +12597,10 @@ test "migration callback: no callback installed preserves prior migration behavi
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
+    // Bypass the handshake-done migration gate; the post-handshake
+    // no-callback path is what's under test here.
+    conn.test_only_force_handshake_for_migration = true;
+
     // Explicitly leave the callback unset — this is the pre-existing
     // behavior path. The same setup that drives an allow-with-callback
     // succeeds without one, identically.
@@ -12533,6 +12619,104 @@ test "migration callback: no callback installed preserves prior migration behavi
     try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
     try std.testing.expect(path.pending_migration_reset);
     try std.testing.expectEqual(.pending, path.path.validator.status);
+}
+
+test "pre-handshake migration: peer-address change is dropped, no PATH_CHALLENGE" {
+    // Hardening guide §4.8 / RFC 9000 §9.6: an authenticated peer-
+    // address change before handshake confirmation is not legitimate
+    // migration. The gate must drop the datagram (no anti-amp credit,
+    // no validator state, no PATH_CHALLENGE) and emit
+    // `migration_path_failed` with reason `pre_handshake`.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Note: NOT setting test_only_force_handshake_for_migration here
+    // — the gate is what we're testing.
+    try std.testing.expect(!conn.handshakeDone());
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    const old_addr = Address{ .bytes = .{ 1, 1, 1, 1 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 2, 2, 2, 2 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    const orig_bytes_received = path.path.bytes_received;
+
+    try conn.recordAuthenticatedDatagramAddress(0, new_addr, 1200, 1_000_000);
+
+    // Drop semantics: peer_addr unchanged, no anti-amp credit, no
+    // PATH_CHALLENGE, no validator state mutation, last-challenge
+    // clock not stamped.
+    try std.testing.expect(Address.eql(old_addr, path.path.peer_addr));
+    try std.testing.expectEqual(orig_bytes_received, path.path.bytes_received);
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+    try std.testing.expectEqual(@as(?u64, null), path.path.last_path_challenge_at_us);
+
+    // qlog event: migration_path_failed / pre_handshake.
+    try std.testing.expect(recorder.contains(.migration_path_failed));
+    const evt = recorder.first(.migration_path_failed).?;
+    try std.testing.expectEqual(
+        @as(?QlogMigrationFailReason, .pre_handshake),
+        evt.migration_fail_reason,
+    );
+    try std.testing.expectEqual(@as(?u32, 0), evt.path_id);
+}
+
+test "post-handshake migration: PATH_CHALLENGE rate-limit blocks rapid-fire probes" {
+    // Hardening guide §4.8: per-path PATH_CHALLENGE rate limit
+    // (`min_path_challenge_interval_us`). The first migration after
+    // handshake fires a challenge; a second migration arriving
+    // sooner than the interval is rate-limited (no second challenge).
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.test_only_force_handshake_for_migration = true;
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    const addr_a = Address{ .bytes = .{ 10, 0, 0, 1 } ++ @as([18]u8, @splat(0)) };
+    const addr_b = Address{ .bytes = .{ 10, 0, 0, 2 } ++ @as([18]u8, @splat(0)) };
+    const addr_c = Address{ .bytes = .{ 10, 0, 0, 3 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(addr_a);
+    path.path.markValidated();
+
+    // First migration: challenge fires, last_path_challenge_at_us stamped.
+    const t0: u64 = 1_000_000;
+    try conn.recordAuthenticatedDatagramAddress(0, addr_b, 1200, t0);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expectEqual(@as(?u64, t0), path.path.last_path_challenge_at_us);
+
+    // Drain the queued challenge so the next migration tries a fresh
+    // queue, otherwise the queue-already-set assertion would mask the
+    // rate-limit verdict.
+    conn.pending_frames.path_challenge = null;
+
+    // Second migration arrives 50 ms later — well inside the 100 ms
+    // rate limit. Must be rejected with `rate_limited`.
+    const t1: u64 = t0 + 50_000;
+    try conn.recordAuthenticatedDatagramAddress(0, addr_c, 1200, t1);
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+
+    const fail_evt = recorder.first(.migration_path_failed).?;
+    try std.testing.expectEqual(
+        @as(?QlogMigrationFailReason, .rate_limited),
+        fail_evt.migration_fail_reason,
+    );
+
+    // Third migration after the interval elapses: clears the gate.
+    const t2: u64 = t0 + min_path_challenge_interval_us + 1;
+    try conn.recordAuthenticatedDatagramAddress(0, addr_c, 1200, t2);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expectEqual(@as(?u64, t2), path.path.last_path_challenge_at_us);
 }
 
 test "migration callback: setMigrationCallback installs and clears the hook" {
