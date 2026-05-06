@@ -55,6 +55,9 @@ pub const recv_stream = @import("recv_stream.zig");
 pub const path = @import("path.zig");
 /// RFC 9000 §8.1.2 stateless Retry token mint/validate.
 pub const retry_token = @import("retry_token.zig");
+/// RFC 9000 §10.3 stateless-reset token derivation
+/// (default-safe HMAC-SHA256 over CID).
+pub const stateless_reset = @import("stateless_reset.zig");
 /// Per-connection embedder-event surfacing buffers (flow-blocked, CID-replenish, DATAGRAM ack/loss).
 pub const event_queue = @import("event_queue.zig");
 
@@ -176,6 +179,7 @@ test {
     _ = recv_stream;
     _ = path;
     _ = retry_token;
+    _ = stateless_reset;
     _ = event_queue;
     _ = pending_frames;
 }
