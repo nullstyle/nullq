@@ -9,6 +9,22 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+(no changes since v0.2.0)
+
+## [0.2.0] - 2026-05-06
+
+A production-posture release. Substantial pass against
+`hardening-guide.md` §3 (Zig safety), §4 (QUIC transport), §5 (TLS /
+0-RTT), §8 (resource exhaustion), §9 (info disclosure), §11 (fuzz
+coverage), §12 (defaults). Twenty-plus commits closed the bulk of
+the original audit's open items; defaults are now secure-out-of-box;
+opt-in production knobs are documented in `README.md`'s "Production
+posture" section.
+
+See also `docs/hardening-status.md` for the per-§ COMPLETE / PARTIAL /
+DEFERRED scorecard, and `docs/fuzz-coverage.md` for the fuzz-target
+inventory (now 19 coverage-guided harnesses).
+
 ### Hardening (security-relevant)
 
 - §3.1 — Build-mode policy as a top-of-file comment block in
@@ -45,7 +61,7 @@ breaking changes; see notes per release.
   `feeds_source_bandwidth_limited`. Charged AFTER the global
   listener gates so the aggregate ceiling still bounds total
   bandwidth even when every source has a full bucket. Commit
-  `ba46d9e`.
+  `0b12ad7`.
 - §4.3 — Retry token format encrypt-then-authenticate with
   AES-GCM-256: 96-byte fixed wire size (12-byte nonce + 68-byte
   ciphertext + 16-byte tag); plaintext zero-padded so every minted
@@ -216,6 +232,19 @@ breaking changes; see notes per release.
   65th source triggers first eviction). Commit `512d1c3`.
 - Adapt v1-byte-shape assertions to the new v2 (96-byte) AES-GCM-256
   Retry-token format. Commit `c2c0c90`.
+- §11.1 #19 — `fuzz: Connection NEW_CONNECTION_ID /
+  RETIRE_CONNECTION_ID lifecycle invariants` at
+  `src/conn/state.zig:13548`. Drives smith-chosen interleavings of
+  `handleNewConnectionId` / `handleRetireConnectionId` /
+  `handlePathNewConnectionId`; asserts `peer_cids` count ≤
+  `active_connection_id_limit`, sequence numbers unique, retired
+  sequences gone, active path CID always one of the live entries.
+  Commit `889b70b`.
+- §11.2 #14 — `tests/e2e/unknown_frames_smoke.zig` regression test
+  pumping a 1000-byte all-unknown-frame-type payload through a
+  fully-authenticated 1-RTT packet; asserts `Connection.handle`
+  surfaces `error.UnknownFrameType` without auto-closing or
+  spinning. Commit `889b70b`.
 
 ### Docs
 
@@ -226,10 +255,14 @@ breaking changes; see notes per release.
 - `docs/hardening-status.md` rewritten as the post-hardening status
   doc; the original 2026-05-06 audit body archived at
   `docs/archive/hardening-audit-2026-05-06.md`.
-- `docs/fuzz-coverage.md` refreshed to reflect the 18 fuzz harness
-  sites now in tree; only §11.1 #19 (CID-lifecycle interleavings)
-  and §11.2 #14 (named all-unknown-frames regression) remain
-  formally open.
+- `docs/fuzz-coverage.md` refreshed to reflect the 19 fuzz harness
+  sites now in tree; all in-scope §11.1 / §11.2 rows COVERED after
+  the §4.1 bandwidth shaper, the CID-lifecycle harness, and the
+  all-unknown-frames regression landed.
+- `README.md` — new "Production posture" section listing
+  default-safe knobs, opt-in production caps, build-mode policy,
+  and the embedder-must-wire-yourself items (`MigrationCallback`,
+  `AntiReplayTracker`, custom `tls.Context`). Commit `054c668`.
 
 ### Build / dependencies
 

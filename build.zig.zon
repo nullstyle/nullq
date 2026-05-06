@@ -1,6 +1,6 @@
 .{
     .name = .nullq,
-    .version = "0.1.0-pre.1",
+    .version = "0.2.0",
     .fingerprint = 0x134639da49b66715,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
