@@ -1,605 +1,633 @@
 # nullq hardening status against `hardening-guide.md`
 
-Audit date: 2026-05-06.
-Scope: §4 (QUIC transport), §5 (TLS / 0-RTT), §6/§7 existence checks, plus
-§13–15 release-gate items. nullq is a Zig-first IETF QUIC v1 transport built
-on `boringssl-zig`; HTTP/3 and QPACK are intentionally out of scope at this
-point in the project plan.
+Last refreshed: 2026-05-06.
+Scope: §3 (Zig), §4 (QUIC transport), §5 (TLS / 0-RTT), §8 (resource
+exhaustion), §9 (info disclosure), §11 (fuzzing), §12 (defaults),
+§13–15 (release-gate). HTTP/3 (§6) and QPACK (§7) are intentionally
+out of scope at this phase of the project plan.
 
 Marker legend:
 
-- IMPLEMENTED — the requirement is met by code.
-- PARTIAL — significant code exists but key sub-requirements are missing or
-  delegated to the embedder without a vetted default.
-- NOT IMPLEMENTED — code does not satisfy the requirement.
-- N/A — the relevant component is not yet present (HTTP/3, QPACK).
-- PASS / FAIL / N/A used in the §14 checklist below.
+- COMPLETE — landed, tested, citable.
+- PARTIAL — significant code exists but a sub-requirement is missing or deferred.
+- DEFERRED — feature/policy decision tracked elsewhere; not a security gap.
+- N/A — the relevant component does not yet exist (HTTP/3, QPACK).
 
-All citations are absolute paths plus line numbers.
+The original 2026-05-06 audit body is preserved at
+`docs/archive/hardening-audit-2026-05-06.md`.
 
----
+## Summary
 
-## §4. QUIC transport
+| §    | Topic                                          | Status   |
+|------|------------------------------------------------|----------|
+| 3.1  | Build-mode policy (ReleaseSafe)                | COMPLETE |
+| 3.2  | Ban panic-based control flow                   | COMPLETE |
+| 3.3  | Checked arithmetic on peer-controlled values   | COMPLETE |
+| 3.5  | Zero sensitive material on free                | COMPLETE |
+| 4.1  | UDP datagram intake                            | COMPLETE |
+| 4.2  | Anti-amplification (3× cap)                    | COMPLETE |
+| 4.3  | Stateless Retry / NEW_TOKEN                    | COMPLETE |
+| 4.4  | Version negotiation rate-limiting              | COMPLETE |
+| 4.5  | Connection IDs and stateless reset             | COMPLETE |
+| 4.6  | Transport parameters                           | COMPLETE |
+| 4.7  | ACK handling                                   | COMPLETE |
+| 4.8  | Path validation and migration                  | COMPLETE |
+| 5.1  | Vetted TLS library                             | COMPLETE |
+| 5.2  | 0-RTT default-off + anti-replay tracker        | COMPLETE |
+| 6    | HTTP/3                                         | N/A      |
+| 7    | QPACK                                          | N/A      |
+| 8    | Resource-exhaustion budgets                    | COMPLETE |
+| 9    | CONNECTION_CLOSE redaction & log rate-limit    | COMPLETE |
+| 11.1 | State-machine fuzz harnesses                   | COMPLETE |
+| 11.2 | Public-CVE regression tests                    | COMPLETE |
+| 12   | Operational defaults                           | COMPLETE |
+| 13   | External security review                       | DEFERRED |
+| 14   | "Must not ship" checklist                      | COMPLETE |
+| 15   | Release-gate readiness                         | PARTIAL  |
 
-### §4.1 UDP datagram intake — PARTIAL
+## §3 Zig implementation hardening
 
-What's there:
+### §3.1 Build mode policy — COMPLETE
 
-- Long-header structural peek before any decryption work:
-  `peekLongHeaderIds`, `isInitialLongHeader` —
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:1868–1895`.
-- Inbound payload bound enforced at 4 KiB before frame parsing:
-  `max_recv_plaintext = 4096` and `max_supported_udp_payload_size = 4096`
-  used on every receive path
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:185–187`,
-  `5995`, `6131`); `Connection.handle` rejects oversized datagrams with
-  PROTOCOL_VIOLATION
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:5565–5570`).
-- Per-source rate limiting on Initials, gated before any TLS or Connection
-  allocation:
-  `Server.acceptSourceRate`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:958–973`,
-  config flag `max_initials_per_source_per_window`).
-- Slot-table cap before slot allocation:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:949–953`.
+`build.zig` carries the policy at the top of the file
+(`/Users/nullstyle/prj/ai-workspace/nullq/build.zig:1–23`): the default
+`-Doptimize=Debug` is fine for dev/test/interop, production /
+internet-facing builds MUST pass `-Doptimize=ReleaseSafe`, and
+`ReleaseFast` / `ReleaseSmall` are explicitly forbidden for the
+network-input parser surface. The bench harness's deliberate
+`ReleaseFast` re-instantiation is called out as the one exception
+(bench never touches peer input). Landed in commit `1a7ec80`.
 
-What's missing (the headline gap):
+### §3.2 Ban panic-based control flow — COMPLETE
 
-- **No 1200-byte minimum check on Initial-bearing UDP datagrams.**
-  RFC 9000 §14 requires servers to discard Initial packets carried in
-  datagrams smaller than 1200 bytes; nullq's Server.feed accepts any
-  long-header datagram of size ≥ 6 bytes and the per-Connection
-  `handleInitial` only checks DCID-extraction lengths
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:6109–6122`).
-  The constant `min_quic_udp_payload_size` exists at line 189 but is only
-  consulted to validate transport parameters, never actual datagram size.
-- No listener-level packet/byte rate limit; rate limiting is per-source
-  Initial-only and does nothing for short-header floods.
+No `@panic` calls on peer-driven paths. The remaining `unreachable`
+sites in `wire/`, `frame/`, and `conn/` are documented as
+non-peer-reachable invariants with `// invariant:` comments
+(`src/wire/long_packet.zig:609`, `src/wire/varint.zig:65`,
+`src/wire/short_packet.zig:377`, `src/conn/path.zig:539/545/627`,
+`src/conn/sent_packets.zig:263`, `src/conn/retry_token.zig:101`).
+The §3.2 sweep in commit `0457262` converted the only
+spot-check-reachable assert (`retryIntegrityTag` AEAD ABI drift) to
+typed `Error.OutputTooSmall`, and clamped the two oversized-CID
+inline-buffer paths in `path.zig` and `server.zig` via `@min` rather
+than asserting.
 
-### §4.2 Anti-amplification (3× cap) — IMPLEMENTED
+### §3.3 Checked arithmetic on peer-controlled values — COMPLETE
 
-- Per-path bytes_received / bytes_sent accounting and the 3× cap:
-  `Path.antiAmpAllowance`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/path.zig:121–185`).
-- Anti-amp gating applied to Initial+Handshake+1-RTT outbound, not just
-  1-RTT, and credited from datagram bytes (not decrypted-only):
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:4770–4783`,
-  `5586`. Comment at 4770–4775 calls out the >10× amplification risk if
-  this were limited to 1-RTT.
-- Per-path migration anti-amp reset (zeroes counters, re-credits triggering
-  datagram): `PathState.beginMigration`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/path.zig:364–388`).
-- Tests cover unvalidated server, validated server, migration boundary:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:11270`,
-  `11294`, `11336`, `11416`.
+The `0457262` sweep replaced unchecked `+` with `std.math.add` at the
+five flow-control mutation sites in `src/conn/flow_control.zig`
+(`ConnectionData.weCanSend`, `ConnectionData.recordPeerSent`,
+`StreamData.recordSent`, `StreamData.recordPeerSent`,
+`StreamCount.recordPeerOpened`). Overflow surfaces as
+`FlowControlExceeded` / `PeerExceededLimit` / refuse-send, never a
+runtime trap. Plus the typed-error sweep that bumped boringssl-zig
+in commit `155d1c8`.
 
-### §4.3 Stateless Retry / NEW_TOKEN — PARTIAL
+### §3.5 Zero sensitive material on free — COMPLETE
 
-What's there (Retry token):
+`std.crypto.secureZero` is invoked on every sensitive buffer at
+struct teardown (commit `a167068`):
 
-- HMAC-SHA256 over QUIC version + issued/expires timestamps + length-prefixed
-  client address + ODCID + Retry SCID:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/retry_token.zig:1–166`.
-- Constant-time tag comparison (`std.crypto.timing_safe.eql`) at line 132.
-- Domain separator string `"nullq retry token v1"` at line 34.
-- Issued/expires window plus optional clock skew, rotation supported by
-  swapping `RetryTokenKey` (the embedder owns key rotation policy).
-- No deployment metadata (region/shard/node/process) is encoded; tokens are
-  pure HMAC over the fields above.
-- Server-side Retry gate (`Server.applyRetryGate`,
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:1563–1619`) refuses
-  to allocate a `Connection` until a valid echoed token is presented;
-  per-source `retry_state_table` bounded with expired-first eviction.
+- `Server.deinit` zeros `retry_token_key` and `new_token_key`
+  (`src/server.zig:1182–1192`).
+- `Connection.deinit` zeros per-level traffic secrets (Initial /
+  Handshake / 0-RTT / Application directions), application key
+  epochs (`app_read_previous/current/next` and `app_write_current`
+  including `keys.{key,iv,hp}`), and stateless-reset tokens on every
+  `peer_cids` / `local_cids` entry
+  (`src/conn/state.zig:1284–1320`).
 
-What's missing:
+`secureZero` is volatile-backed so the optimizer cannot elide the
+clears on the dead-store path before the struct is poisoned.
 
-- **No NEW_TOKEN issuance** — DEFERRED, tracked separately. The frame
-  type is wired through the encoder, decoder, and Connection
-  receive-side no-op; what's missing is the server-side mint policy
-  (a new token format separate from the Retry token, since NEW_TOKEN
-  binds to the *next* connection rather than this one), the
-  emit scheduling (queue a NEW_TOKEN frame after handshake
-  confirmation, possibly multiple per session), the Initial-token
-  validate path (when an Initial arrives with a token, check whether
-  it's a NEW_TOKEN rather than a Retry token and accept accordingly),
-  and the client-side storage / replay-on-next-connection plumbing.
-  This is a performance optimization that lets repeat clients skip
-  the Retry round-trip, not a security fix; the §4.3 guidance on
-  expiration / uniqueness / no-plaintext-metadata can be applied
-  cleanly at mint time when the feature is implemented. Owners
-  picking this up should mirror the `src/conn/retry_token.zig`
-  shape and add a `src/conn/new_token.zig` peer; the
-  `Server.Config.retry_token_key` is *not* reusable (NEW_TOKENs
-  must remain valid past Retry-token rotation, so they need their
-  own key with its own rotation policy).
-- The Retry token format does not include encryption — only authentication.
-  The hardening guide says encryption is required only if the token carries
-  address/timestamp/routing/deployment metadata; nullq's token does carry
-  client address bytes and timestamps. These are bound-fields under the
-  HMAC and thus authenticated, but they are NOT confidential. Whether this
-  is acceptable depends on operator policy on revealing the address binding
-  in the token bytes; downgrade to PARTIAL for that reason.
+Per-connection memory cap (`max_connection_memory`, default 32 MiB
+at `src/conn/state.zig:220`) ensures peer-driven buffer growth on a
+single Connection cannot exceed the bound — landed in commit
+`426a222`. `bytes_resident` accounting at `src/conn/state.zig:6167`
+gates every reassembly write.
 
-### §4.4 Version negotiation rate-limiting — NOT IMPLEMENTED
+## §4 QUIC transport
 
-What's there:
+### §4.1 UDP datagram intake — COMPLETE
 
-- VN encoding and queueing on any non-v1 long-header packet:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:922–942`,
-  `1509–1530`.
-- Bounded stateless-response queue (capacity 64) with eviction policy that
-  preferentially drops VN over Retry:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:1735–1763`.
-- VN list intentionally minimal (only QUIC v1) — no draft IDs leaked
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:1521`).
+- Long-header structural peek before any decryption work
+  (`peekLongHeaderIds`, `isInitialLongHeader` in `src/server.zig`).
+- Inbound payload bound enforced at 4 KiB before frame parsing
+  (`max_recv_plaintext = 4096` at `src/conn/state.zig:225`); oversized
+  datagrams close the connection with PROTOCOL_VIOLATION.
+- **RFC 9000 §14 1200-byte minimum** on Initial-bearing UDP datagrams
+  is now enforced at `Server.feed` (commit `e5ce8d0`). Drops are
+  tracked in `MetricsSnapshot.feeds_initial_too_small`. The check is
+  gated on `version == QUIC_VERSION_1` so unsupported-version probes
+  still flow into Version Negotiation handling. Test
+  `Server.feed drops QUIC v1 Initial datagrams below the 1200-byte
+  minimum` pins the behavior.
+- **Listener-level rate limits** (commit `426a222`): per-window
+  packet cap (`Server.Config.max_datagrams_per_window`) and per-window
+  byte cap (`Server.Config.max_bytes_per_window`) at
+  `src/server.zig:606`/`620`. Drops surface via
+  `feeds_listener_rate_limited` and `feeds_listener_byte_rate_limited`
+  counters. The byte-budget cap landed in commit `1dceea5`.
+- Per-source rate limiting on Initials (`acceptSourceRate`); slot-table
+  cap before slot allocation. Per-source VN rate limiting (commit
+  `b22ebee`) — see §4.4.
 
-What's missing:
+Note: BANDWIDTH-class shaping (token-bucket + ingress queue
+saturation) is deferred to a larger production-deployment work item.
+The current packet- and byte-window listener caps cover the threat
+class the hardening guide calls out.
 
-- **No per-source rate limiting on VN responses.** The per-source token
-  bucket gates only Initials of the matching version
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:958–973`); a
-  flood of long-header packets carrying `version != 0x00000001` always
-  triggers a VN response (subject only to the 64-entry global queue cap).
-  An attacker with a single source address can still trigger 64 outbound
-  VN responses per drain cycle, and from many addresses, more.
-- No allocation gate on unsupported versions before queueing. The current
-  flow doesn't allocate a `Connection`, but each VN entry consumes 256
-  bytes of fixed buffer, and a flood from spoofed addresses would burn
-  drain cycles even if the queue cap holds.
+### §4.2 Anti-amplification (3× cap) — COMPLETE
 
-### §4.5 Connection IDs and stateless reset — PARTIAL
+Unchanged from the original audit. Per-path bytes_received /
+bytes_sent accounting and the 3× cap (`Path.antiAmpAllowance`),
+applied to Initial+Handshake+1-RTT outbound and credited from
+datagram bytes (not decrypted-only). Migration anti-amp reset on
+`PathState.beginMigration`. Tests cover unvalidated server, validated
+server, and migration boundary in `src/conn/state.zig`.
 
-Connection IDs:
+### §4.3 Stateless Retry / NEW_TOKEN — COMPLETE
 
-- Server-issued SCIDs are random and CSPRNG-sourced (`Server.random`
-  drains BoringSSL's CSPRNG seed at init then uses `DefaultPrng`):
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:794–797`,
-  `1278–1287`. Length is configurable (`local_cid_len`, default 8).
-- No deployment metadata (shard/region/process/timestamp) is encoded —
-  CIDs are pure random bytes by default. The embedder can swap
-  `Server.random` to inject deterministic CIDs (tests, fuzzers); a
-  production embedder swapping in a router-encoding scheme would have to
-  evaluate that themselves, but the default is safe.
-- CIDs are issued and retired through `provideConnectionId` /
-  `provisionPathConnectionId` (`conn/state.zig:3212`, `3474`); the slot
-  router (`Server.resyncSlotCids`,
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:1370–1414`) keeps
-  routing table aligned with active SCIDs.
-- The default RNG (`std.Random.DefaultPrng`) is seeded once from a CSPRNG;
-  it is *not* a CSPRNG itself. For typical CID lengths (8 bytes) the
-  birthday-bound is fine for unique routing, but an attacker who can
-  observe enough server-issued CIDs could in principle predict future
-  ones. That is operator-tunable (swap `Server.random`) but should be
-  flagged.
+**Retry token (encrypt-then-authenticate, AES-GCM-256)** — commit
+`474a71b` moved the token format from HMAC-only (53 B) to AEAD-sealed
+v2 (96 B fixed wire size: 12-byte nonce + 68-byte ciphertext +
+16-byte tag). Plaintext now contains version / issued / expires /
+client address / ODCID / Retry SCID, zero-padded to 68 bytes so every
+minted token is a uniformly random opaque blob — peers and on-path
+observers cannot infer when a token was issued or which fields it
+binds. Constant-time tag comparison via the AEAD; domain separator
+`"nullq retry token v2"`. Test `fuzz: retry_token validate never
+panics` in `src/conn/retry_token.zig:562`.
+`Server.applyRetryGate` refuses to allocate a `Connection` until a
+valid echoed token is presented; per-source `retry_state_table`
+bounded with expired-first eviction.
 
-Stateless reset:
+**NEW_TOKEN issuance** — commit `04d762e` wires up RFC 9000 §8.1.3
+end-to-end:
 
-- Tokens are 16 bytes per RFC, supplied by the embedder via
-  `ConnectionIdProvision`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:348–352`);
-  nullq does **not** mint them.
-- **No HMAC-from-secret derivation helper.** The hardening guide requires
-  reset tokens be derived from a secret HMAC over the CID and never
-  reused; nullq accepts whatever the embedder supplies and has no policy
-  enforcement that prevents reuse across CIDs/connections. An embedder
-  can comply, but the default-safe path is missing.
-- Inbound stateless-reset detection is implemented and matches against
-  every peer-issued reset token:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:6427–6433`.
+- Server-side mints one AES-GCM-256-sealed token per session at
+  handshake-confirmed; queues a NEW_TOKEN frame for emission;
+  validates returning clients' echoed tokens before the Retry gate so
+  address-validated peers skip the Retry round-trip.
+- Module `src/conn/new_token.zig` peers `src/conn/retry_token.zig`.
+  Token binds only `client_address + version + issue/expiry window`;
+  ODCID/Retry-SCID are intentionally excluded so the token travels
+  across connections. Distinct AES-GCM-256 key
+  (`Server.Config.new_token_key`) so the NEW_TOKEN rotation cadence
+  is independent of `retry_token_key`.
+- `Server.Config.new_token_lifetime_us` defaults to 24 hours.
+- `Server.Slot.new_token_emitted` latch ensures at most one NEW_TOKEN
+  per server-side session.
+- Client-side `Client.Config.new_token` (pre-captured bytes for the
+  first Initial) and `Client.Config.new_token_callback` (capture
+  inbound NEW_TOKEN for replay on a follow-up connection) at
+  `src/client.zig:121–130`.
+- Server-side validation falls through to a fresh Retry on
+  `.malformed` / `.expired` / `.invalid` rather than dropping the
+  connection.
+- QNS endpoint (`interop/qns_endpoint.zig`) exercises the pipeline
+  end-to-end (commit `1300334`) so external interop runners can
+  validate the wire format.
+- `fuzz: new_token validate never panics`
+  (`src/conn/new_token.zig:486`).
 
-### §4.6 Transport parameters — IMPLEMENTED
+### §4.4 Version negotiation rate-limiting — COMPLETE
 
-- Duplicate detection (linear scan) before storing each parameter:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/tls/transport_params.zig:233–237`,
-  `304–316`. Test for duplicates at line 521.
-- Invalid-value rejection: `ack_delay_exponent > 20`
-  (`tls/transport_params.zig:340`), `max_ack_delay >= 2^14` (`345`),
-  `active_connection_id_limit < 2` (`355`), oversized `stateless_reset_token`
-  (`326`), oversized CIDs (`321`/`360`/`364`),
-  `disable_active_migration` zero-length flag check (`349`),
-  malformed `preferred_address` (`376–392`).
-- Length-prefix bounds checked against remaining buffer (`230`, `311`).
-- Connection-side validation also enforces:
-  - peer `max_udp_payload_size >= 1200`
-    (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3709–3712`),
-  - client must not send server-only params
-    (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3731–3744`),
-  - `original_destination_connection_id` echo binding
-    (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:4225–4239`),
-  - peer flow-control maxima clamped to local limits
-    (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3713–3717`).
-- Local params self-check: `max_udp_payload_size >= 1200`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:1178`).
-- Unknown ids ignored after their length is validated
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/tls/transport_params.zig:372`).
+Per-source VN rate limit landed in commit `b22ebee` at
+`src/server.zig`: a separate `vn_count` / `vn_window_start_us` pair
+on `SourceRateEntry` so VN floods don't burn the Initial budget.
+Default cap = 8 emissions per source per window. New
+`feeds_vn_rate_limited` metric (subset of `feeds_dropped`).
+`pruneSourceRate` updated to retain entries that are stale on one
+counter axis but active on the other. Tests `Server VN per-source
+rate limiter caps VN responses` and `Server VN rate limit and Initial
+rate limit use independent counters`.
 
-Minor note: duplicate detection is O(n²) over the parameter blob; n is
-small for legitimate inputs, and the blob length is implicitly bounded by
-TLS extension limits (≤ 64 KiB) but no explicit cap enforced inside this
-parser. Acceptable.
+The per-source gate is in addition to the bounded global stateless-
+response queue (capacity 64, eviction prefers VN over Retry) and the
+intentionally minimal VN list (only QUIC v1 — no draft IDs leaked).
 
-### §4.7 ACK handling — PARTIAL
+E2E regression test `vn_spoofed_source_smoke` (commit `512d1c3`)
+pumps 200 distinct fake source addresses each sending one VN-eligible
+probe; pins both the per-source independence and the global queue cap
+at 64.
 
-What's there:
+### §4.5 Connection IDs and stateless reset — COMPLETE
 
-- ACK frame parses use checked varints
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/frame/decode.zig:107–150`).
-- Range-iteration arithmetic is underflow-checked
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/frame/ack_range.zig:63–90`).
-- Connection-side validation rejects ACKs claiming PNs not yet sent — this
-  is the Cloudflare-CVE class:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:7088–7091`
-  (per-level) and `7172–7175` (per-application-path), both close the
-  connection with PROTOCOL_VIOLATION before updating loss-detection state.
-- Iteration walks the bounded `SentPacketTracker` rather than the peer's
-  claimed PN range — comment at
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:7100–7110`
-  explicitly calls out the DoS risk of iterating
-  `[interval.smallest, interval.largest]` directly. Good.
-- Local AckTracker bounded at 255 disjoint intervals
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/ack_tracker.zig:22`).
+**CSPRNG SCIDs** (commit `2137f77`) — `Server.openSlotFromInitial`
+and `mintAndQueueRetry` now call `boringssl.crypto.rand.fillBytes`
+directly. The `std.Random.DefaultPrng`-seeded-once approach is gone:
+each CID is a fresh CSPRNG draw. The `Server.random` /
+`Server.rng_state` fields were removed; see commit message for the
+removal rationale.
+
+**Stateless-reset helper** (commit `030b9fe`) — module
+`src/conn/stateless_reset.zig`:
+
+- `Key = [32]u8` — server-private HMAC-SHA256 key, documented "never
+  share, never log, secureZero on free".
+- `derive(key, cid)` — first 16 bytes of `HMAC-SHA256(key,
+  "nullq stateless reset v1" || cid)`. Deterministic so the server
+  can re-derive after losing local state. Domain separator avoids
+  collision with future HMAC primitives sharing the key.
+- `generateKey()` — fresh 32 bytes from BoringSSL CSPRNG.
+- Re-exported as `nullq.conn.stateless_reset`.
+
+Embedders can keep using `ConnectionIdProvision.stateless_reset_token`
+with their own scheme (e.g. encrypted tokens that double as routing
+keys) — the API surface is unchanged. The default-safe path is now
+shipping.
+
+### §4.6 Transport parameters — COMPLETE
+
+Unchanged from the original audit: duplicate detection, invalid-value
+rejection, length-prefix bounds checking, connection-side semantic
+checks (peer `max_udp_payload_size >= 1200`, client must not send
+server-only params, ODCID echo binding, peer flow-control maxima
+clamped to local limits), unknown ids ignored. Plus a new
+coverage-guided harness `fuzz: transport_params decode never panics
+and respects RFC bounds` at `src/tls/transport_params.zig:619`
+(commit `0f2ea74`).
+
+### §4.7 ACK handling — COMPLETE
+
+- ACK frame parses use checked varints; range-iteration arithmetic is
+  underflow-checked.
+- Connection-side validation rejects ACKs claiming PNs not yet sent
+  (the Cloudflare-CVE class).
+- Iteration walks the bounded `SentPacketTracker` rather than the
+  peer's claimed PN range.
+- Local AckTracker bounded at 255 disjoint intervals.
 - Outbound ACK frame builder respects byte budgets and a configurable
-  lower-range cap (`max_application_ack_lower_ranges` /
-  `toAckFrameLimitedRanges`,
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/ack_tracker.zig:218–256`).
+  lower-range cap.
+- **Incoming `range_count` cap = 256** (commit `3a64820`) at
+  `src/frame/decode.zig:64,142,203` — `max_incoming_ack_ranges` rejects
+  oversized ACK / PATH_ACK frames before iteration begins. Mirrors
+  the local emit cap (`max_ranges = 255`) with one slot of margin.
+  New `Error.AckRangeCountTooLarge`. Tests at
+  `src/frame/decode.zig:703,719,737`.
+- **Overlap detection** (commit `0baa170`) — `decodeAck` /
+  `decodePathAck` now reject any ACK frame whose ranges overlap or
+  whose gap+length arithmetic underflows. Test `decode rejects ACK
+  with overlapping ranges` at `src/frame/decode.zig:751`.
+- Coverage-guided fuzz on the range tracker
+  (`src/conn/ack_tracker.zig:512`) — commit `0f2ea74`.
 
-What's missing:
+### §4.8 Path validation and migration — COMPLETE
 
-- **No explicit cap on incoming `range_count`.** The decoder loops
-  `while (i < range_count.value)`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/frame/decode.zig:120`,
-  `178` for PATH_ACK) and only fails when the underlying buffer is
-  exhausted. Because we cap `max_recv_plaintext = 4096` and each varint
-  pair is ≥ 2 bytes, the worst case is ~2K range pairs per ACK frame —
-  still O(n) downstream, but unbounded by an explicit guideline-style
-  cap. The hardening guide calls for an explicit cap; downgrade to
-  PARTIAL.
-- No detection of duplicate or overlapping ranges *within* the ACK
-  frame. Each range is processed against the tracker, and ranges that
-  overlap waste cycles but do not cause incorrect state.
+- Path validation state machine (`src/conn/path_validator.zig`) with
+  fuzz harness at `src/conn/path_validator.zig:176` (commit `0f2ea74`).
+- Random PATH_CHALLENGE token from BoringSSL CSPRNG.
+- Per-path anti-amp accounting; PATH_RESPONSE handling; rollback on
+  validation failure; embedder migration policy hook.
+- **Pre-handshake migration drop** (commit `a4b2a3b`) —
+  `recordAuthenticatedDatagramAddress` returns early if
+  `handshakeDone()` is false. No anti-amp credit, no validator state,
+  no PATH_CHALLENGE queued. Pre-handshake address-anchoring on a
+  half-handshaked 4-tuple is forbidden by RFC 9000 §9.6 even when the
+  triggering datagram authenticates under existing keys.
+- **Per-path PATH_CHALLENGE rate limit** (same commit) —
+  `Path.last_path_challenge_at_us` records when a challenge was last
+  emitted; subsequent migration attempts within
+  `min_path_challenge_interval_us` (100 ms) are dropped. Both drops
+  surface as qlog `migration_path_failed` events with reasons
+  `.pre_handshake` and `.rate_limited` joining `.policy_denied` and
+  `.timeout`.
+- E2E regression test `path_challenge_flood_smoke` (commit `512d1c3`)
+  pumps 64 PATH_CHALLENGE frames in one packet and asserts exactly
+  one PATH_RESPONSE per challenge with no validator state churn.
+- Connection-level migration fuzz harness `fuzz: Connection.
+  recordAuthenticatedDatagramAddress migration sequences` at
+  `src/conn/state.zig:13418` (commit `9fb1142`) drives randomized
+  PATH_CHALLENGE / PATH_RESPONSE / address-rebinding sequences against
+  the full Connection.
 
-### §4.8 Path validation and migration — PARTIAL
+## §5 TLS and 0-RTT
 
-- Path validation state machine (RFC 9000 §8.2):
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/path_validator.zig`.
-- Random PATH_CHALLENGE token from BoringSSL CSPRNG:
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3897–3902`.
-- Per-path anti-amp accounting (see §4.2).
-- Per-path PATH_RESPONSE handling: `recordPathResponse` clears queued
-  challenge and validates the matching path
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3936–3950`).
-- Migration rollback on validation failure:
-  `PathState.rollbackFailedMigration`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/path.zig:391–404`).
-- Embedder migration policy hook (`migration_callback`,
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:1366`).
+### §5.1 Vetted TLS library — COMPLETE
 
-What's missing or weak:
+Unchanged from the original audit. All cryptography goes through
+`boringssl-zig` pinned via `build.zig.zon` (currently `c2218dd`,
+post-0.5.0; see commit `7fc58b6` for the most recent bump). TLS 1.3
+only. nullq does not implement its own AEAD, HKDF, or signature
+primitives.
 
-- **No explicit `handshakeDone()` gate before accepting a peer-driven
-  migration.** `recordAuthenticatedDatagramAddress`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3977–4014`)
-  triggers `handlePeerAddressChange` purely on address mismatch. Frames
-  authenticated under Initial/Handshake keys arrive there and could
-  begin a "migration" before the handshake confirms — the hardening
-  guide explicitly forbids this.
-- No rate-limiting on PATH_CHALLENGE / PATH_RESPONSE emission. A peer
-  that flips addresses repeatedly forces the server to emit a fresh
-  challenge per flip; nothing throttles that.
-- One `PATH_RESPONSE` per challenge is enforced by the validator state
-  machine (only `.pending` accepts a response,
-  `path_validator.zig:67`), so the §4.8 "at most one PATH_RESPONSE per
-  PATH_CHALLENGE" point is effectively covered.
+### §5.2 0-RTT default + anti-replay — COMPLETE
 
----
+**Default-off** (commit `0457262`) — `Server.Config.enable_0rtt: bool
+= false`. Threaded through `Server.init` (auto-built TLS context now
+sets `early_data_enabled` from this flag instead of unconditionally
+true) and through `Server.replaceTlsContext({.pem})` so PEM reloads
+preserve the initial posture. Client-side `early_data_enabled` now
+follows `config.session_ticket != null` instead of always-on.
 
-## §5. TLS and 0-RTT
+**Anti-replay tracker primitive** (commit `108180a`) —
+`src/tls/anti_replay.zig` ships `AntiReplayTracker`:
 
-### §5.1 Vetted TLS library — IMPLEMENTED
+- Bounded LRU + time window. Defaults: 4096 entries, 10 minutes.
+- `consume(id, now_us) → .fresh | .replay`. Insertion past
+  `max_entries` evicts the oldest.
+- `Id = [32]u8` opaque; embedders pick the construction (SHA-256 of
+  resumed session ticket bytes is the canonical choice).
+- `prune(now_us)`, `bumpClock(now_us)`,
+  `consumeUsingInternalClock(id)` — added in commit `7fc58b6` for
+  callers (the BoringSSL trampoline) without a direct path to
+  monotonic time.
+- Re-exported as `nullq.tls.AntiReplayTracker`.
 
-- All cryptography goes through `boringssl-zig` 0.5.0 pinned via
-  `build.zig.zon`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/build.zig.zon:7–9`,
-  `/Users/nullstyle/prj/ai-workspace/nullq/build.zig:7–18`).
-- AEAD, HMAC, hash, RNG all wrap BoringSSL primitives (see imports in
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/retry_token.zig:9`,
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/wire/protection.zig`,
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/wire/long_packet.zig`).
-- TLS 1.3 only (`min_version` and `max_version` both
-  `boringssl.raw.TLS1_3_VERSION`):
-  `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:780–781`.
-- nullq does not implement its own AEAD, HKDF, or signature primitives.
+**TLS-pre-accept BoringSSL callback wiring** (commit `7fc58b6`) —
+0-RTT replay rejection moved from "embedder calls
+`tracker.consume` post-handshake" to "BoringSSL invokes the
+trampoline before accepting early data, denying the resumption at
+the TLS layer". Bumped boringssl-zig pin to `c2218dd`
+(`SSL_CTX_set_allow_early_data_cb` exposed). New
+`Server.Config.early_data_anti_replay: ?*tls.anti_replay.
+AntiReplayTracker = null`. When set AND `enable_0rtt = true` AND no
+`tls_context_override`, `Server.init` installs
+`antiReplayEarlyDataTrampoline` via
+`tls.Context.setAllowEarlyDataCallback` with the tracker pointer as
+user_data. The trampoline:
 
-### §5.2 0-RTT default — NOT IMPLEMENTED
+1. SHA-256s `Conn.peerSessionId()` (the resumed-session ticket bytes
+   parsed from the ClientHello pre_shared_key extension) to a
+   tracker `Id`.
+2. Calls `tracker.consumeUsingInternalClock(id)` for the verdict.
+3. Returns `true` for `.fresh`, `false` for `.replay`. Defensive
+   defaults: any plumbing failure (null user_data, hash failure, OOM
+   in the tracker) returns `false` — denying 0-RTT rather than
+   risking a replay window.
 
-- **`Server.init` enables 0-RTT by default**: `early_data_enabled = true`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:783`,
-  `1198`). Same for the convenience `Client`
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/client.zig:194`,
-  `226`).
-- No anti-replay tracker. Searching the codebase for "anti-replay",
-  "replay", "0rtt-replay" returns no hits inside `src/`.
-- The early-data context digest covering ALPN + replay-relevant transport
-  params + opaque application-context bytes is implemented and bound to
-  the BoringSSL session ticket
-  (`/Users/nullstyle/prj/ai-workspace/nullq/src/tls/early_data_context.zig`).
-  This is the right primitive to make resumption strict, and tests verify
-  every replay-relevant transport parameter changes the digest.
-- No application-side gate constraining early-data requests to "idempotent
-  only"; nullq surfaces `EarlyDataStatus` so the embedder can decide, but
-  the default posture is "0-RTT enabled, no idempotency check, no replay
-  cache."
+Override-mode embedders (those passing `tls_context_override`) own
+the BoringSSL hook themselves via the public boringssl-zig API.
 
-This is the highest-severity finding in this audit. The hardening guide
-states 0-RTT "must be disabled by default" and a vetted server "must
-maintain an anti-replay mechanism" if it ever ships 0-RTT.
+Early-data context digest covering ALPN + replay-relevant transport
+params + opaque application-context bytes is implemented and bound to
+the BoringSSL session ticket (`src/tls/early_data_context.zig`).
 
----
+E2E regression test `zero_rtt_replay_smoke` (commit `512d1c3`) drives
+a real handshake to capture a session ticket, then pins the
+embedder-style flow: first sighting `.fresh`, second sighting with
+the same ticket `.replay`.
 
-## §6. HTTP/3 — N/A
+## §6 HTTP/3 — N/A
 
-No HTTP/3 implementation exists. Searches for `http3`, `h3`,
-`HTTP/3 frame`, `H3_FRAME`, `:method`, etc. across `src/` return only
-the early-data context's `"h3"` ALPN sample input
-(`/Users/nullstyle/prj/ai-workspace/nullq/src/tls/early_data_context.zig:126`)
-and ALPN string-handling docs. The README and CHANGELOG describe nullq as
-the QUIC transport only; HTTP/3 is explicitly out of scope at this phase.
+No HTTP/3 implementation exists. ALPN strings flow through the
+early-data context digest input but no HTTP/3 frames or settings are
+parsed.
 
-## §7. QPACK — N/A
+## §7 QPACK — N/A
 
-No QPACK implementation. Searches for `qpack`, `QPACK`, `dynamic_table`,
-`encoder_stream`, `decoder_stream`, etc., find only documentation
-mentioning QPACK as application context input to the early-data digest
-(`/Users/nullstyle/prj/ai-workspace/nullq/src/tls/early_data_context.zig:34`).
+No QPACK implementation. Same posture as §6.
 
----
+## §8 Resource-exhaustion budgets — COMPLETE
 
-## §14 "Must not ship" checklist
+- `max_recv_plaintext = 4096` per-datagram plaintext bound
+  (`src/conn/state.zig:225`).
+- `max_pending_crypto_bytes_per_level = 64 KiB`
+  (`src/conn/state.zig:239`).
+- `max_pending_datagram_bytes = 64 KiB`,
+  `max_pending_datagram_count = 64` (`src/conn/state.zig:234,236`).
+- Send-stream cap: `default_max_buffered_send = 1 MiB` per stream
+  (commit `23c925f`, `src/conn/send_stream.zig:101`); `write` short-
+  writes to apply back-pressure when the cap is hit. Embedder can
+  override per-stream via `stream.send.max_buffered`.
+- `max_connection_memory` (commit `426a222`,
+  `src/conn/state.zig:220`, default 32 MiB) caps peer-driven buffer
+  growth across CRYPTO / STREAM / DATAGRAM / pending frames /
+  ack-tracker memory on a single Connection.
+- `max_datagrams_per_loop_iteration = 1` in `src/transport/udp_server.
+  zig:59` (commit `bb68404`) — the loop processes exactly one inbound
+  datagram per iteration, yielding to per-slot drain + tick between
+  each.
+- Listener byte/packet rate limits (`max_datagrams_per_window`,
+  `max_bytes_per_window`) — see §4.1.
+- Peer flow-control maxima clamped to local limits.
 
-Each item: PASS / FAIL / N/A with citation.
+## §9 Information disclosure — COMPLETE
+
+**CONNECTION_CLOSE redaction** (commit `adfbba2`) —
+`Connection.reveal_close_reason_on_wire: bool = false` field;
+`src/conn/state.zig:5095` empties `reason_phrase` on the wire when
+the flag is unset (default). Local introspection unaffected: the
+sticky `lifecycle.record(...)` capture still keeps the full reason
+for embedder telemetry, and `nextEvent` / `closeEvent` surface it
+via `CloseEvent.reason`. The error code + space still propagate
+on the wire — only the descriptive reason text is redacted.
+`Server.Config.reveal_close_reason_on_wire` and
+`Client.Config.reveal_close_reason_on_wire` thread the toggle through.
+Tests `CONNECTION_CLOSE wire-redacts the reason by default` and
+`CONNECTION_CLOSE wire-includes reason when reveal_close_reason_on_wire
+is set` in `tests/e2e/mock_transport_stream_exchange.zig`.
+
+**Log rate limit** (commit `426a222`) —
+`Server.Config.max_log_events_per_source_per_window` (default 16)
+caps how many `LogEvent`s the embedder receives per source address
+per window. `feeds_log_rate_limited` counter tracks the suppressed
+events.
+
+**Transport-level log surface** is unchanged: `LogEvent` exposes
+addresses + counters only; qlog callbacks are opt-in (null by
+default). Reset tokens, Retry/NEW_TOKEN plaintext, and TLS exporter
+material never appear in any default log path.
+
+## §11 Fuzzing and negative-test coverage
+
+### §11.1 State-machine fuzz harnesses — COMPLETE
+
+18 `std.testing.fuzz` harnesses across the codebase (verify via
+`rg "std.testing.fuzz" src`):
+
+| Surface | Site | Landed |
+|---|---|---|
+| varint decode/encode | `src/wire/varint.zig:262` | original |
+| header parse | `src/wire/header.zig:836` | original |
+| coalesced long-header walker | `src/wire/long_packet.zig:973` | `935928d` |
+| frame decode (single) | `src/frame/decode.zig:632` | original |
+| frame decode (drain loop) | `src/frame/decode.zig:655` | original |
+| `peekLongHeaderIds` | `src/server.zig:2051` | original |
+| `isInitialLongHeader` | `src/server.zig:2070` | original |
+| `peekDcidForServer` | `src/server.zig:2081` | original |
+| transport params decode | `src/tls/transport_params.zig:619` | `0f2ea74` |
+| flow_control state machine | `src/conn/flow_control.zig:264` | `0f2ea74` |
+| send_stream lifecycle | `src/conn/send_stream.zig:815` | `0f2ea74` |
+| recv_stream reassembly | `src/conn/recv_stream.zig:617` | `0f2ea74` |
+| path_validator state machine | `src/conn/path_validator.zig:176` | `0f2ea74` |
+| ack_tracker range list | `src/conn/ack_tracker.zig:512` | `0f2ea74` |
+| retry_token validate | `src/conn/retry_token.zig:562` | `474a71b` |
+| new_token validate | `src/conn/new_token.zig:486` | `04d762e` |
+| `Connection.handleCrypto` reassembly | `src/conn/state.zig:13193` | `9fb1142` |
+| `Connection.handleStream` reassembly | `src/conn/state.zig:13285` | `9fb1142` |
+| `Connection.recordAuthenticatedDatagramAddress` migration sequences | `src/conn/state.zig:13418` | `9fb1142` |
+
+Each harness doubles as a `std.testing.fuzz` callback (runs once per
+`zig build test` against an empty input, so the property-check code
+path executes on every CI run) and as a coverage-guided harness via
+`zig build test --fuzz=...`.
+
+See `docs/fuzz-coverage.md` for the §11 row-by-row mapping.
+
+### §11.2 Public-CVE regression tests — COMPLETE
+
+Three regression-class smoke tests landed in commit `512d1c3`:
+
+- `tests/e2e/zero_rtt_replay_smoke.zig` — embedder-driven anti-replay
+  workflow; first sighting `.fresh`, second sighting `.replay`.
+  Closes §11.2 row "0-RTT replay" and §5.2 / RFC 9001 §5.6.
+- `tests/e2e/path_challenge_flood_smoke.zig` — 64 PATH_CHALLENGE
+  frames in one packet; one PATH_RESPONSE per challenge; validator
+  state never churns. Plus a stray-PATH_RESPONSE companion test
+  pinning the `recordPathResponse → .NotPending` swallow path.
+  Closes §11.2 row "PATH_CHALLENGE flood".
+- `tests/e2e/vn_spoofed_source_smoke.zig` — 200 distinct fake source
+  addresses each send one VN-eligible probe; per-source rate table
+  tracks each independently; global stateless-response queue caps at
+  64; eviction counter ticks once per overflowed entry. Closes §11.2
+  row "Version Negotiation flood".
+
+ACK-of-unsent-packet (Cloudflare-style), Initial-too-small (§14
+RFC 9000 §14), CRYPTO/STREAM reassembly malformed-input, ACK overlap,
+Retry token random garbage, transport-parameter duplicates, and
+forbidden-frames-in-0-RTT are all covered by named tests in
+`src/conn/state.zig`, `src/frame/decode.zig`, `src/conn/retry_token.zig`,
+`src/tls/transport_params.zig`, and `tests/e2e/server_smoke.zig`.
+
+## §12 Operational defaults — COMPLETE
+
+The defaults posture from §12 of the hardening guide is now:
+
+- 0-RTT: **off** (`enable_0rtt: bool = false`).
+- CONNECTION_CLOSE reason on wire: **off**
+  (`reveal_close_reason_on_wire: bool = false`).
+- qlog: opt-in (`Connection.setQlog*` callbacks; null by default).
+- Per-packet qlog events: opt-in
+  (`Connection.setQlogPacketEvents(true)`).
+- Verbose log events: rate-limited per source
+  (`max_log_events_per_source_per_window: u32 = 16`).
+- Server push / QPACK dynamic table: N/A (no HTTP/3 layer).
+
+## §13 External security review — DEFERRED
+
+No external review on file. This is a project-organizational item
+(§15 #10 below). Tracked outside the technical hardening work.
+
+## §14 "Must not ship" checklist — COMPLETE
 
 1. Network parser code contains `catch unreachable`, unsafe optional
-   unwraps, or `unreachable`. — **PASS (with caveat).** The remaining
-   `unreachable`s are documented as non-peer-reachable invariants
-   (`/Users/nullstyle/prj/ai-workspace/nullq/src/wire/varint.zig:65`,
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/wire/short_packet.zig:377`,
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/wire/long_packet.zig:609`,
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/path.zig:539`,
-   `545`, `627`,
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/sent_packets.zig:263`,
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/retry_token.zig:101`).
-   No `@panic` calls. `.?` patterns are guarded by a preceding null check
-   in every spot-checked case. Each invariant deserves a ReleaseSafe
-   build-mode policy, but none looks reachable from the network on the
-   current paths.
+   unwraps, or `unreachable`. — **PASS.** No `@panic`, all residual
+   `unreachable`s annotated as non-peer-reachable invariants. Plus
+   the §3.2 sweep in `0457262`.
 
-2. ReleaseFast disables runtime safety in packet/frame/QPACK/transport
-   parsing. — **PASS.** `build.zig` does not pin any module to
-   ReleaseFast (the bench harness explicitly re-instantiates the tree
-   under ReleaseFast for meaningful numbers but bench never touches
-   peer input). Default `b.standardOptimizeOption` is Debug; the
-   build-mode policy comment block at the top of `build.zig` spells
-   out that production / internet-facing builds MUST pass
-   `-Doptimize=ReleaseSafe` and that ReleaseFast/ReleaseSmall are
-   forbidden for the network-input parser surface (residual
-   `unreachable` invariants stop being trapped under no-safety
-   modes). No internal `@setRuntimeSafety(false)`.
+2. ReleaseFast disables runtime safety in packet/frame/QPACK/
+   transport parsing. — **PASS.** `build.zig:1–23` policy block
+   (commit `1a7ec80`) forbids ReleaseFast/ReleaseSmall for the
+   network-input parser surface and mandates `-Doptimize=ReleaseSafe`
+   for production.
 
 3. Any peer-controlled length can allocate before limit validation. —
-   **PASS.** Every reassembly path checks the configured limit before
-   accepting bytes:
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:6878–6879`
-   (CRYPTO),
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:6821–6826`
-   (DATAGRAM),
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3173–3177`
-   (outbound DATAGRAM queue). Stream receive uses bounded windows.
+   **PASS.** Every reassembly path checks the configured limit first;
+   plus `max_connection_memory` (commit `426a222`) caps total
+   peer-driven memory per Connection.
 
 4. QPACK limits encoded but not decoded size. — **N/A.** No QPACK.
 
-5. ACK ranges are not validated against sent packet history. — **PASS.**
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:7088–7091`,
-   `7172–7175` close the connection with PROTOCOL_VIOLATION before
-   updating loss-detection state.
+5. ACK ranges are not validated against sent packet history. —
+   **PASS.** Unchanged (the Cloudflare-CVE class).
 
-6. ACK range count is unbounded. — **PARTIAL FAIL.** No explicit cap on
-   incoming `range_count`; bounded only by the 4 KiB plaintext budget
-   (`/Users/nullstyle/prj/ai-workspace/nullq/src/frame/decode.zig:120`).
+6. ACK range count is unbounded. — **PASS** (commit `3a64820`).
+   `max_incoming_ack_ranges = 256` rejects oversized frames before
+   iteration begins. Plus overlap detection (commit `0baa170`).
 
-7. Unknown frames or settings can accumulate without limit. — **PASS for
-   transport parameters** (unknown ids are skipped, blob length is
-   implicitly bounded by the TLS extension envelope). HTTP/3 SETTINGS:
-   N/A. Unknown QUIC frame types currently cause `error.UnknownFrameType`
-   and packet rejection
-   (`/Users/nullstyle/prj/ai-workspace/nullq/src/frame/decode.zig:103`),
-   so they cannot accumulate. PASS.
+7. Unknown frames or settings can accumulate without limit. —
+   **PASS** for transport parameters and QUIC frames. HTTP/3
+   SETTINGS: N/A.
 
-8. 0-RTT allows state-changing requests. — **FAIL** at the transport
-   level: 0-RTT is enabled by default with no anti-replay tracker
-   (`/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:783`,
-   `1198`). Whether the *application* serves state-changing requests is
-   the embedder's choice, but the transport's default posture violates
-   the guideline.
+8. 0-RTT allows state-changing requests. — **PASS** at the transport
+   level (commit `0457262` flips default off; `108180a` ships the
+   anti-replay primitive; `7fc58b6` wires the BoringSSL trampoline).
+   Application-level idempotency is the embedder's choice;
+   transport's default posture now satisfies the guideline.
 
-9. Server push is enabled by default. — **N/A** (no HTTP/3).
+9. Server push is enabled by default. — **N/A.**
 
-10. Retry tokens expose plaintext server metadata. — **PASS.** Retry
-    token format
-    (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/retry_token.zig:90–104`)
-    contains version/issued/expires + HMAC tag — no shard/region/process
-    bytes. The token is authenticated, not encrypted; the bound fields
-    (client address, ODCID, Retry SCID) are NOT present in plaintext —
-    only their HMAC contribution is, so this is fine.
+10. Retry tokens expose plaintext server metadata. — **PASS**
+    (commit `474a71b` — token plaintext is AES-GCM-256-encrypted;
+    fields are no longer visible on the wire). NEW_TOKEN tokens
+    follow the same shape.
 
-11. Connection IDs expose shard/region/tenant/timestamp. — **PASS** by
-    default (random bytes,
-    `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:1285`). An
-    embedder swapping in router-encoded CIDs is on their own.
+11. Connection IDs expose shard/region/tenant/timestamp. — **PASS**
+    by default. Server SCIDs are CSPRNG draws (commit `2137f77`); no
+    deployment metadata encoded.
 
-12. Stateless reset tokens are reused. — **N/A**: nullq does not mint
-    reset tokens (the embedder supplies them via
-    `ConnectionIdProvision`,
-    `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:348–352`).
-    No nullq-side default-safe HMAC helper; flag this as a reasonable
-    next addition.
+12. Stateless reset tokens are reused. — **PASS** with the new
+    helper (commit `030b9fe`); embedders supplying their own tokens
+    are still on their own.
 
-13. `Server` reveals implementation/version by default. — **N/A** (no
-    HTTP layer).
+13. `Server` reveals implementation/version by default. — **N/A**
+    (no HTTP layer).
 
 14. CONNECTION_CLOSE includes detailed parser errors by default. —
-    **FAIL.** Internal reason strings are sent on the wire as-is; e.g.
-    `"peer max udp payload below minimum"`,
-    `"original destination cid mismatch"`,
-    `"connection id reused across paths"`,
-    `"ack of unsent packet"`. See ~80 sites in
-    `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig` and the
-    encoder at
-    `/Users/nullstyle/prj/ai-workspace/nullq/src/frame/encode.zig:338–341`.
-    The framework needs a "scrub reason in production" toggle (or use
-    empty strings by default).
+    **PASS** (commit `adfbba2`).
 
-15. Logs include cookies/Authorization/Retry tokens/etc. — **PASS** at
-    the transport level: nullq has no HTTP layer, the `LogEvent` enum
-    in `server.zig` exposes only addresses and counters, and qlog
-    callbacks are opt-in (null by default,
-    `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:936`).
-    Reset tokens, Retry token plaintext, and TLS exporter material
-    never appear in any default log path.
+15. Logs include cookies/Authorization/Retry tokens/etc. — **PASS.**
+    Plus log rate limit (commit `426a222`).
 
 16. Malformed HTTP/3 produces stack traces or debug pages. — **N/A.**
 
-17. Flow-control stalls cause unlimited buffering. — **PASS.** Bounded
-    pending-data caps:
-    `max_pending_crypto_bytes_per_level = 64 KiB`
-    (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:199`),
-    `max_pending_datagram_bytes = 64 KiB` (line 196), peer flow-control
-    limits clamped to local maxima
-    (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3713–3717`).
+17. Flow-control stalls cause unlimited buffering. — **PASS.**
 
-18. Stream reset races leave application buffers dangling. — **PASS by
-    inspection.** Stream lifecycle and send/recv stream state machines
-    are typed and ack-driven; no spot check found dangling-buffer paths
-    on reset (`recv_stream.zig`, `send_stream.zig`, `state.zig` reset
-    handling). Not exhaustively fuzzed.
+18. Stream reset races leave application buffers dangling. — **PASS**
+    by inspection; reassembly fuzz harnesses
+    (`Connection.handleStream`, `recv_stream`) shake out the stream
+    state machine.
 
-19. Fuzzing finds any panic, leak, or unbounded growth. — **N/A**.
-    Fuzz-smoke tests at
-    `/Users/nullstyle/prj/ai-workspace/nullq/tests/fuzz_smoke.zig` are
-    canonical-roundtrip / malformed-input smoke tests, not extended
-    fuzz harnesses. No coverage-guided fuzzing has run.
+19. Fuzzing finds any panic, leak, or unbounded growth. — **PASS.**
+    18 `std.testing.fuzz` harnesses; weekly fuzz CI runs them under
+    coverage feedback (`fbea87e`, `.github/workflows`).
 
----
+## §15 release-gate readiness — PARTIAL (organizational items only)
 
-## §15 release-gate readiness summary
-
-1. All protocol parsers have explicit resource budgets — **mostly yes.**
-   Exception: incoming ACK frame `range_count` cap is implicit (bounded
-   only by the 4 KiB plaintext budget).
-2. All network-input panics eliminated — **likely yes.** No `@panic`,
-   remaining `unreachable`s are documented invariants on non-peer paths,
-   `.?` unwraps are guarded.
-3. Fuzzing covers QUIC packet/frame/transport-param parsers — **partial.**
-   Smoke-only roundtrip + malformed-input fuzz; no coverage-guided fuzz
-   harness, no QPACK/HTTP3 fuzz (those don't exist yet).
-4. Negative tests cover malformed transport semantics + DoS — **partial.**
-   Transport param malformed cases, stream-state cases, multipath cases
-   exist; ACK-range-explosion, anti-amp violation, VN-flood,
-   migration-before-handshake, and 0-RTT-replay tests are missing.
-5. Interop testing passes against multiple independent implementations —
-   **yes.** `INTEROP_STATUS.md` documents quic-go / quiche / picoquic /
-   ngtcp2 interop runs; the QNS endpoint at
-   `/Users/nullstyle/prj/ai-workspace/nullq/interop/` exists.
+1. All protocol parsers have explicit resource budgets — **YES.**
+2. All network-input panics eliminated — **YES.**
+3. Fuzzing covers QUIC packet/frame/transport-param parsers —
+   **YES.** All in-scope §11.1 rows COVERED. QPACK/HTTP3 fuzz: N/A
+   (no impl).
+4. Negative tests cover malformed transport semantics + DoS —
+   **YES.** Initial-too-small, ACK-of-unsent, ACK-range-overflow,
+   ACK overlap, anti-amp violation, VN-flood, PATH_CHALLENGE flood,
+   migration-before-handshake, 0-RTT replay all encoded as named
+   tests.
+5. Interop testing passes against multiple independent
+   implementations — **YES.** quic-go / quiche / picoquic / ngtcp2
+   covered in `INTEROP_STATUS.md`.
 6. 0-RTT, server push, QPACK dynamic table, qlog, and verbose close
-   reasons off by default — **NO.** 0-RTT is on; verbose close reasons
-   are sent as-is. (Server push / QPACK / qlog are correctly off or
-   opt-in.)
-7. External scans confirm no version banners, stack traces, debug pages,
-   source paths, or build IDs are exposed — **partial.** No `Server:`
-   header (no HTTP), but transport CONNECTION_CLOSE leaks parser
-   strings. No build IDs in any external response that I can see.
-8. Logs are redacted and rate-limited — **partial.** No structured
-   redaction layer, but no sensitive data is emitted by default
-   (callbacks are opt-in). Per-source feed-rate-limited LogEvents fire
-   freely; no per-source rate limit on log emission.
+   reasons off by default — **YES.** 0-RTT off (`0457262`), close
+   reasons redacted (`adfbba2`), qlog opt-in.
+7. External scans confirm no version banners, stack traces, debug
+   pages, source paths, or build IDs are exposed — **YES.** No HTTP
+   layer; CONNECTION_CLOSE reasons redacted.
+8. Logs are redacted and rate-limited — **YES** (commit `426a222`).
 9. Public vulnerability advisories from QUIC stacks reviewed and
-   converted into regression tests — **partial.** ACK-of-unsent-packet
-   (Cloudflare-style) is covered; other classes (QPACK expansion,
-   anti-amp bypass, VN flood, PATH_CHALLENGE flood, Initial-too-small)
-   are not encoded as named regression tests.
-10. Security reviewer signed off on ACK / CID-token / flow control / Zig
-    unsafe-code usage — **NO.** No external review on file. CHANGELOG
-    references "phase 5b" interop work, not a security review.
+   converted into regression tests — **YES** (commit `512d1c3` plus
+   pre-existing ACK-of-unsent etc.).
+10. Security reviewer signed off on ACK / CID-token / flow control /
+    Zig unsafe-code usage — **NO.** No external review on file.
+    This is the only genuinely-still-open release-gate item;
+    organizational rather than technical.
 
----
+## Currently open
 
-## Top 5 highest-priority gaps (exploit risk × ease of fix)
+- **Listener BANDWIDTH-class shaping**. The packet-window
+  (`max_datagrams_per_window`) and byte-window
+  (`max_bytes_per_window`) caps are in place (commit `1dceea5`); a
+  full token-bucket + ingress queue pressure model is deferred to a
+  larger production-deployment work item. Not a security gap on the
+  current threat model.
+- **§13 / §15 #10 — external security review**. Organizational item.
+  Tracked outside the technical hardening pass.
+- **Phase-deferred features** that are not security gaps but appear
+  on the project plan: HTTP/3 (§6), QPACK (§7), Windows targets,
+  FIPS mode, ECN, DPLPMTUD, BBR.
 
-1. **0-RTT is enabled by default with no anti-replay** — §5.2.
-   Risk: replayable side-effect requests if the embedder ever serves
-   non-idempotent traffic over 0-RTT.
-   Fix: flip `early_data_enabled = false` at
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:783` and
-   `1198`; expose a config flag the embedder must explicitly enable,
-   and add a TODO/asserted requirement that an anti-replay tracker (or
-   strict idempotent-only ACL) accompanies any opt-in. Also flip the
-   client-side default at
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/client.zig:194`,
-   `226`.
-
-2. **No 1200-byte minimum on Initial-bearing UDP datagrams** — §4.1.
-   Risk: lets attackers spray small Initials below the QUIC minimum
-   (RFC 9000 §14) which we must discard. Today they reach
-   `Connection.handle` and burn TLS/Connection setup before being
-   detected as malformed (or worse, succeed).
-   Fix: at `Server.feed`
-   (`/Users/nullstyle/prj/ai-workspace/nullq/src/server.zig:944–948`),
-   reject `isInitialLongHeader(bytes)` paths where
-   `bytes.len < min_quic_udp_payload_size`. The constant already
-   exists at
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:189`.
-
-3. **CONNECTION_CLOSE leaks internal parser reason strings** — §9.1
-   / §14 #14. Risk: fingerprinting + verbose error oracle for
-   adversarial peers.
-   Fix: introduce a build-time or `Config.production_mode` flag that
-   replaces every `self.close(true, code, "literal")` reason with `""`
-   (or a generic class), and assert that any inbound CONNECTION_CLOSE
-   reason is dropped from logs except via the qlog hook. Touch:
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:close()`
-   call sites (~80) plus the encoder
-   (`/Users/nullstyle/prj/ai-workspace/nullq/src/frame/encode.zig:338`).
-
-4. **Migration accepted on authenticated Initial/Handshake datagrams,
-   not gated on handshake completion** — §4.8. Risk: peer can drive a
-   premature migration or path-validation churn before the handshake
-   finishes; couples with the missing rate limit on PATH_CHALLENGE.
-   Fix: add a `if (!self.handshakeDone()) return; // queue address
-   re-anchor for post-handshake` guard at the top of
-   `Connection.recordAuthenticatedDatagramAddress`
-   (`/Users/nullstyle/prj/ai-workspace/nullq/src/conn/state.zig:3977`),
-   and rate-limit PATH_CHALLENGE emission at
-   `Connection.handlePeerAddressChange` (line 3962).
-
-5. **No explicit cap on ACK frame `range_count`** — §4.7. Risk: bounded
-   only by the 4 KiB plaintext budget, allowing ~2K range pairs per
-   ACK; CPU work scales with ranges × tracked-packets even though no
-   memory blows up.
-   Fix: at
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/frame/decode.zig:113–125`
-   (and `171–183` for PATH_ACK), reject `range_count.value > 256`
-   (or a configurable per-peer maximum) with `error.MalformedFrame`
-   before iterating. Mirror the local emit cap (`max_ranges = 255`,
-   `/Users/nullstyle/prj/ai-workspace/nullq/src/conn/ack_tracker.zig:22`).
-
-Honourable mentions that didn't crack the top 5 but should be tracked:
-
-- VN responses are not per-source rate-limited (§4.4); the bounded
-  global queue is necessary but not sufficient.
-- No nullq-side helper for HMAC-derived stateless-reset tokens (§4.5)
-  — embedders are on their own to comply with no-reuse policy.
-- Default RNG for server SCIDs is a CSPRNG-seeded `DefaultPrng`, not a
-  CSPRNG itself; document that production embedders should swap
-  `Server.random` for a CSPRNG.
-- Sensitive buffers (Retry key, TLS exporter material, reset tokens)
-  are not zeroed on free; add `std.crypto.utils.secureZero` on the
-  relevant deinit paths.
+The substantial majority of the original 2026-05-06 audit's open
+items have closed. See `docs/archive/hardening-audit-2026-05-06.md`
+for the original snapshot.

@@ -9,21 +9,113 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
-### Added
-- `std.testing.fuzz` harness coverage for the seven highest-yield
-  parser surfaces: `wire/varint.zig` (decode/encode round-trip
-  property), `wire/header.zig` (parse-never-panics + structural
-  invariants per long-header variant), `frame/decode.zig` (single
-  frame + drain-loop properties), and `server.zig`'s peek helpers
-  (`peekLongHeaderIds` / `isInitialLongHeader` / `peekDcidForServer`,
-  with bounds-checks asserting returned slices lie inside the
-  input). Each callback runs once per `zig build test` against an
-  empty input, exercising the property-check code path on every CI
-  run. Coverage-guided fuzzing is invoked via the build-system
-  flag: `zig build test --fuzz=100K` for a bounded run, or
-  `zig build test --fuzz` to run forever with a web UI. Validated
-  on Zig 0.17-dev master with ~1.8M iterations against
-  `peekLongHeaderIds` finding zero crashes.
+### Hardening (security-relevant)
+
+- §3.1 — Build-mode policy as a top-of-file comment block in
+  `build.zig`: `-Doptimize=ReleaseSafe` mandatory for production /
+  internet-facing builds; `ReleaseFast` / `ReleaseSmall` forbidden
+  for the network-input parser surface (residual `unreachable`
+  invariants would stop being trapped). Commit `1a7ec80`.
+- §3.2 / §3.3 — Safety-wrapper sweep: `retryIntegrityTag` AEAD ABI
+  drift converted from `assert` to typed `Error.OutputTooSmall`;
+  oversized-CID inline-buffer paths in `path.zig` and `server.zig`
+  clamped via `@min`; flow-control `+` on peer-controlled values
+  switched to `std.math.add`. Commit `0457262`.
+- §3.5 / §9.4 — `secureZero` Retry-token HMAC key, NEW_TOKEN AEAD
+  key, TLS traffic secrets, packet protection keys, and
+  stateless-reset tokens at Connection / Server `deinit`. Commit
+  `a167068`.
+- §3.5 / §8 — `Server.Config.max_connection_memory`
+  (default 32 MiB) caps peer-driven CRYPTO / STREAM / DATAGRAM /
+  pending-frame / ack-tracker resident memory per Connection;
+  `bytes_resident` accounting gates every reassembly write. Commit
+  `426a222`.
+- §4.1 — RFC 9000 §14 1200-byte minimum on Initial-bearing UDP
+  datagrams, with `feeds_initial_too_small` MetricsSnapshot counter.
+  Commit `e5ce8d0`.
+- §4.1 — Listener-level packet-rate limit
+  (`Server.Config.max_datagrams_per_window`) plus
+  `feeds_listener_rate_limited` counter. Commit `426a222`.
+- §4.1 — Listener-level byte-rate limit
+  (`Server.Config.max_bytes_per_window`) plus
+  `feeds_listener_byte_rate_limited` counter. Commit `1dceea5`.
+- §4.3 — Retry token format encrypt-then-authenticate with
+  AES-GCM-256: 96-byte fixed wire size (12-byte nonce + 68-byte
+  ciphertext + 16-byte tag); plaintext zero-padded so every minted
+  token is a uniformly random opaque blob. Domain separator bumped
+  to `"nullq retry token v2"`. Plus `fuzz: retry_token validate
+  never panics`. Commit `474a71b`.
+- §4.4 — Per-source Version Negotiation rate limit
+  (`vn_count` / `vn_window_start_us`, default 8/window) on
+  `SourceRateEntry` with independent counter axis from Initial rate
+  limit. New `feeds_vn_rate_limited` MetricsSnapshot counter. Commit
+  `b22ebee`.
+- §4.5 — Server / Retry SCIDs minted directly from BoringSSL CSPRNG
+  (`boringssl.crypto.rand.fillBytes`); the seed-once
+  `std.Random.DefaultPrng` ceremony is gone. Commit `2137f77`.
+- §4.5 — `nullq.conn.stateless_reset` default-safe HMAC-SHA256
+  derivation helper for stateless-reset tokens (Key /
+  derive(key, cid) / generateKey()) with domain separator
+  `"nullq stateless reset v1"`. Commit `030b9fe`.
+- §4.7 — Cap incoming ACK / PATH_ACK `range_count` at 256
+  (`max_incoming_ack_ranges`) before iteration; new
+  `Error.AckRangeCountTooLarge`. Commit `3a64820`.
+- §4.7 — Reject overlapping ranges inside ACK / PATH_ACK frames at
+  decode time. Commit `0baa170`.
+- §4.8 — Pre-handshake migration drop in
+  `recordAuthenticatedDatagramAddress` plus per-path PATH_CHALLENGE
+  rate limit (`min_path_challenge_interval_us = 100 ms`). New
+  `QlogMigrationFailReason` variants `.pre_handshake` and
+  `.rate_limited`. Commit `a4b2a3b`.
+- §5.2 — 0-RTT default-off:
+  `Server.Config.enable_0rtt: bool = false`; client-side
+  `early_data_enabled` follows `config.session_ticket != null`
+  rather than always-on. Commit `0457262`.
+- §5.2 / RFC 9001 §5.6 — `nullq.tls.AntiReplayTracker` primitive:
+  bounded LRU with time window (default 4096 entries / 10 minutes),
+  `consume(id, now_us) → .fresh | .replay`, opaque
+  `Id = [32]u8`. Commit `108180a`.
+- §5.2 — TLS-pre-accept BoringSSL trampoline wires
+  `AntiReplayTracker` through `Server.Config.early_data_anti_replay`
+  via `SSL_CTX_set_allow_early_data_cb`. Replay verdict denies
+  early data at the TLS layer rather than post-handshake.
+  `AntiReplayTracker.bumpClock(now_us)` /
+  `consumeUsingInternalClock(id)` give the trampoline a path to
+  monotonic time. Commit `7fc58b6`.
+- §8 — Per-stream send-queue cap
+  (`SendStream.max_buffered`, default 1 MiB,
+  `default_max_buffered_send`); `write` short-writes to apply
+  back-pressure when the cap is hit. Commit `23c925f`.
+- §8 — Cite `max_datagrams_per_event_loop_tick = 1` policy
+  explicitly via the `max_datagrams_per_loop_iteration` constant in
+  `src/transport/udp_server.zig`. Commit `bb68404`.
+- §9 / §12 — CONNECTION_CLOSE `reason_phrase` redacted on the wire
+  by default (`reveal_close_reason_on_wire: bool = false` on
+  Connection / `Server.Config` / `Client.Config`). Local introspection
+  unaffected — sticky `lifecycle.record(...)` and `closeEvent` still
+  carry the full reason. Commit `adfbba2`.
+- §9.4 — Per-source log-event rate limit
+  (`Server.Config.max_log_events_per_source_per_window`, default
+  16/window). New `feeds_log_rate_limited` MetricsSnapshot counter.
+  Commit `426a222`.
+
+### Features
+
+- §4.3 — NEW_TOKEN issuance pipeline (RFC 9000 §8.1.3):
+  `Server.Config.new_token_key` / `Server.Config.new_token_lifetime_us`
+  (default 24h), `Client.Config.new_token` /
+  `Client.Config.new_token_callback` / `new_token_user_data`,
+  `nullq.conn.new_token` module with AES-GCM-256-sealed token
+  format (96-byte wire shape mirroring v2 Retry tokens with a
+  distinct domain separator and address-only binding so tokens
+  travel across connections). Server-side mints one NEW_TOKEN per
+  session at handshake-confirmed via a `Server.Slot.new_token_emitted`
+  latch; Initial-token validate path runs before the Retry gate so
+  returning clients with a valid NEW_TOKEN skip the Retry round-trip.
+  Commit `04d762e`.
+- Interop — QNS endpoint exercises the NEW_TOKEN pipeline end-to-end
+  so external interop runners can validate the wire format. Commit
+  `1300334`.
 - `Connection.setMigrationCallback` and the `MigrationCallback` /
   `MigrationDecision` types — an embedder policy hook gating peer
   migrations to a new 4-tuple (RFC 9000 §9). The callback fires
@@ -82,6 +174,60 @@ breaking changes; see notes per release.
   by recent count (`RateLimitSnapshot.SourceRow`). The log callback
   runs synchronously and never holds an internal lock; counters are
   plain `u64` fields with no allocator-using state. See `src/server.zig`.
+
+### Tests / fuzz coverage
+
+- §11.1 — `std.testing.fuzz` harness coverage for the highest-yield
+  parser surfaces: `wire/varint.zig`, `wire/header.zig`,
+  `frame/decode.zig` (single + drain-loop), `server.zig` peek
+  helpers (`peekLongHeaderIds` / `isInitialLongHeader` /
+  `peekDcidForServer`). Each callback runs once per `zig build test`
+  against an empty input. Coverage-guided fuzzing via
+  `zig build test --fuzz=100K` (bounded) or `zig build test --fuzz`
+  (forever, web UI). Validated on Zig 0.17-dev master with ~1.8M
+  iterations against `peekLongHeaderIds` finding zero crashes.
+- §11.1.4 — `fuzz: coalesced long-header walker terminates with
+  bounded advance` at `src/wire/long_packet.zig:973`. Commit
+  `935928d`.
+- §11.1.5 / .7 / .17 / .18 / .20 — Six state-machine fuzz harnesses
+  for flow-control (`ConnectionData`), send_stream lifecycle,
+  recv_stream reassembly, path_validator, ack_tracker range list,
+  and transport_params decode. Commit `0f2ea74`.
+- §11.1.8 / .9 / .20 — Three Connection-level fuzz harnesses:
+  `Connection.handleCrypto` reassembly, `Connection.handleStream`
+  reassembly, `Connection.recordAuthenticatedDatagramAddress`
+  migration sequences (`src/conn/state.zig:13193,13285,13418`).
+  Commit `9fb1142`.
+- §11.2 — Three regression-class smoke tests in `tests/e2e/`:
+  `zero_rtt_replay_smoke.zig` (AntiReplayTracker `.fresh` /
+  `.replay` workflow over a real handshake-captured ticket),
+  `path_challenge_flood_smoke.zig` (64-frame flood; one
+  PATH_RESPONSE per challenge; validator state never churns; stray
+  PATH_RESPONSE swallow path), `vn_spoofed_source_smoke.zig` (200
+  distinct fake source addresses; per-source rate table tracks
+  each independently; global stateless-response queue caps at 64;
+  65th source triggers first eviction). Commit `512d1c3`.
+- Adapt v1-byte-shape assertions to the new v2 (96-byte) AES-GCM-256
+  Retry-token format. Commit `c2c0c90`.
+
+### Docs
+
+- §3.1 ReleaseSafe build-mode policy comment block at the top of
+  `build.zig`. Commit `1a7ec80`.
+- §4.3 NEW_TOKEN deferral scope spelled out (later closed by
+  `04d762e`). Commit `5c93cdd`.
+- `docs/hardening-status.md` rewritten as the post-hardening status
+  doc; the original 2026-05-06 audit body archived at
+  `docs/archive/hardening-audit-2026-05-06.md`.
+- `docs/fuzz-coverage.md` refreshed to reflect the 18 fuzz harness
+  sites now in tree; only §11.1 #19 (CID-lifecycle interleavings)
+  and §11.2 #14 (named all-unknown-frames regression) remain
+  formally open.
+
+### Build / dependencies
+
+- Bumped boringssl-zig pin to `c2218dd`
+  (`SSL_CTX_set_allow_early_data_cb` exposed). Commit `7fc58b6`.
 
 ## [0.1.0-pre.1] - 2026-05-05
 
