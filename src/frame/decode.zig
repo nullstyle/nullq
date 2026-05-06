@@ -35,10 +35,19 @@ const frame_type_path_cids_blocked: u64 = 0x3e7c;
 ///   more ranges than `max_incoming_ack_ranges` (RFC 9000 §13.1
 ///   recommends bounding ACK range processing; the hardening guide §4.7
 ///   classes unbounded ACK-range loops as a DoS surface).
+/// - `OverlappingAckRanges` — incoming ACK / PATH_ACK frame's range
+///   list contains ranges that overlap or whose gap+length arithmetic
+///   underflows the descending PN cursor. Per RFC 9000 §19.3.1, ranges
+///   are encoded strictly descending from `largest_acked`; any
+///   redundancy is malformed and a peer that emits it is wasting
+///   decoder cycles. Hardening guide §4.7 calls for fail-fast at
+///   decode rather than letting downstream loss-detection see ranges
+///   that overlap each other.
 pub const Error = varint.Error || wire_header.Error || error{
     UnknownFrameType,
     PathIdTooLarge,
     AckRangeCountTooLarge,
+    OverlappingAckRanges,
 };
 
 /// Upper bound on the number of additional gap+length range pairs an
@@ -144,6 +153,8 @@ fn decodeAck(src: []const u8, start: usize, with_ecn: bool) Error!Decoded {
     }
     const ranges_bytes = src[ranges_start..pos];
 
+    try validateAckRanges(largest.value, first_range.value, range_count.value, ranges_bytes);
+
     var ecn: ?types.EcnCounts = null;
     if (with_ecn) {
         const ect0 = try varint.decode(src[pos..]);
@@ -203,6 +214,8 @@ fn decodePathAck(src: []const u8, start: usize, with_ecn: bool) Error!Decoded {
     }
     const ranges_bytes = src[ranges_start..pos];
 
+    try validateAckRanges(largest.value, first_range.value, range_count.value, ranges_bytes);
+
     var ecn: ?types.EcnCounts = null;
     if (with_ecn) {
         const ect0 = try varint.decode(src[pos..]);
@@ -226,6 +239,52 @@ fn decodePathAck(src: []const u8, start: usize, with_ecn: bool) Error!Decoded {
         } },
         .bytes_consumed = pos,
     };
+}
+
+/// Walk an ACK / PATH_ACK frame's range list and reject any list where
+/// the gap+length arithmetic underflows the descending PN cursor.
+///
+/// Wire format (RFC 9000 §19.3.1): the First ACK Range covers
+/// `[largest_acked - first_range, largest_acked]`. Each subsequent
+/// `(gap, length)` pair walks down strictly:
+///
+///     new_largest  = prev_smallest - gap - 2
+///     new_smallest = new_largest - length
+///
+/// A peer that violates the descent — either by encoding a first_range
+/// larger than `largest_acked`, or by emitting a gap+length pair whose
+/// subtraction would dip below zero — is malformed. There is no valid
+/// way for two ranges in a single ACK frame to overlap or duplicate
+/// each other; an "overlapping" encoding manifests as one of these
+/// underflows because PN-space is unsigned. Hardening guide §4.7.
+///
+/// `ranges_bytes` is the slice the decode loop above already
+/// successfully parsed, so varint.decode here cannot fail
+/// (InsufficientBytes was rejected in the parse loop). We re-decode
+/// rather than threading the parsed values through the parse loop so
+/// the parse loop stays a single pass with no allocation.
+fn validateAckRanges(
+    largest_acked: u64,
+    first_range: u64,
+    range_count: u64,
+    ranges_bytes: []const u8,
+) Error!void {
+    if (first_range > largest_acked) return Error.OverlappingAckRanges;
+    var cursor: u64 = largest_acked - first_range; // smallest of the prior range
+    var pos: usize = 0;
+    var i: u64 = 0;
+    while (i < range_count) : (i += 1) {
+        const gap = try varint.decode(ranges_bytes[pos..]);
+        pos += gap.bytes_read;
+        const length = try varint.decode(ranges_bytes[pos..]);
+        pos += length.bytes_read;
+
+        // new_largest = cursor - gap - 2; underflow ⇒ overlap/malformed.
+        if (cursor < gap.value + 2) return Error.OverlappingAckRanges;
+        const new_largest = cursor - gap.value - 2;
+        if (new_largest < length.value) return Error.OverlappingAckRanges;
+        cursor = new_largest - length.value; // smallest of the new range
+    }
 }
 
 fn decodeStream(src: []const u8, start: usize, type_byte: u8) Error!Decoded {
@@ -687,6 +746,108 @@ test "decode rejects PATH_ACK frames whose range_count exceeds max_incoming_ack_
         0x00, // first_range = 0
     };
     try std.testing.expectError(Error.AckRangeCountTooLarge, decode(&bytes));
+}
+
+test "decode rejects ACK with overlapping ranges" {
+    // largest_acked = 100, first_range = 5 → first interval [95..100].
+    // A well-formed second range with gap=0 would land at
+    // new_largest = 95 - 0 - 2 = 93 → interval [93 - length .. 93].
+    // To force overlap into the *first* range we'd need new_largest
+    // ≥ 95, i.e. cursor=95, gap=0 and 95 - 0 - 2 = 93 — never reaches
+    // back into the prior interval.
+    //
+    // Overlap in PN-space is therefore expressible only by
+    // arithmetic underflow: e.g. cursor = 95, but gap is encoded so
+    // that gap + 2 > 95. With first_range = 5 and largest_acked = 5
+    // the first interval is [0..5], and a gap=10 makes
+    // new_largest = 0 - 10 - 2 → underflow. That underflow IS the
+    // overlap signature for a peer that tried to claim a range
+    // already covered by the descending walk.
+    const bytes = [_]u8{
+        0x02, // ACK (no ECN)
+        0x05, // largest_acked = 5
+        0x00, // ack_delay = 0
+        0x01, // range_count = 1
+        0x05, // first_range = 5 → covers [0..5]
+        0x0a, // gap = 10 → would underflow
+        0x00, // length = 0
+    };
+    try std.testing.expectError(Error.OverlappingAckRanges, decode(&bytes));
+}
+
+test "decode rejects ACK with underflowing range arithmetic" {
+    // first_range = 200 with largest_acked = 100 → the first interval
+    // would span [-100..100], i.e. underflow. Reject before any
+    // subsequent range is even consulted.
+    const bytes = [_]u8{
+        0x02, // ACK (no ECN)
+        0x40, 0x64, // largest_acked = 100 (2-byte varint)
+        0x00, // ack_delay = 0
+        0x00, // range_count = 0
+        0x40, 0xc8, // first_range = 200 (2-byte varint)
+    };
+    try std.testing.expectError(Error.OverlappingAckRanges, decode(&bytes));
+}
+
+test "decode accepts ACK with adjacent ranges (gap=0)" {
+    // gap=0 in the QUIC encoding does NOT mean ranges share a PN —
+    // §19.3.1 makes new_largest = prev_smallest - 2. So with cursor=20
+    // (smallest of [20..30]) the next range's largest = 18. Adjacent
+    // here means "minimum legal gap"; the single PN 19 is unacked.
+    //
+    // Acked: [20..30], [10..18]. Encoded:
+    //   largest_acked = 30, first_range = 10 (covers 20..30)
+    //   gap = 0 → new_largest = 20 - 0 - 2 = 18
+    //   length = 8 → new_smallest = 18 - 8 = 10
+    const bytes = [_]u8{
+        0x02, // ACK (no ECN)
+        0x1e, // largest_acked = 30
+        0x00, // ack_delay = 0
+        0x01, // range_count = 1
+        0x0a, // first_range = 10
+        0x00, // gap = 0
+        0x08, // length = 8
+    };
+    const d = try decode(&bytes);
+    try std.testing.expect(d.frame == .ack);
+    try std.testing.expectEqual(@as(u64, 30), d.frame.ack.largest_acked);
+    try std.testing.expectEqual(@as(u64, 10), d.frame.ack.first_range);
+    try std.testing.expectEqual(@as(u64, 1), d.frame.ack.range_count);
+}
+
+test "decode accepts ACK with ranges at the boundary" {
+    // Boundary: descending walk reaches PN 0 with no slack, but does
+    // not underflow. Setup: largest_acked = 5, first_range = 3 →
+    // first interval [2..5] (smallest = 2). Then gap=0, length=0:
+    //   new_largest = 2 - 0 - 2 = 0
+    //   new_smallest = 0 - 0     = 0
+    // Second interval is exactly [0..0]. Anything tighter (gap=1, or
+    // length=1) would underflow and trip OverlappingAckRanges.
+    const bytes = [_]u8{
+        0x02, // ACK (no ECN)
+        0x05, // largest_acked = 5
+        0x00, // ack_delay = 0
+        0x01, // range_count = 1
+        0x03, // first_range = 3 → [2..5]
+        0x00, // gap = 0
+        0x00, // length = 0 → [0..0]
+    };
+    const d = try decode(&bytes);
+    try std.testing.expect(d.frame == .ack);
+    try std.testing.expectEqual(@as(u64, 5), d.frame.ack.largest_acked);
+    try std.testing.expectEqual(@as(u64, 1), d.frame.ack.range_count);
+
+    // Sanity: nudge length up by 1, the same descent now underflows.
+    const bytes_bad = [_]u8{
+        0x02,
+        0x05,
+        0x00,
+        0x01,
+        0x03,
+        0x00,
+        0x01, // length = 1 → new_smallest = 0 - 1 → underflow
+    };
+    try std.testing.expectError(Error.OverlappingAckRanges, decode(&bytes_bad));
 }
 
 // -- fuzz harness --------------------------------------------------------
