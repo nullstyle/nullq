@@ -17,9 +17,9 @@
 //!   wire bytes (the inverse of what `decode` populates as
 //!   `ranges_bytes`).
 //!
-//! A higher-level "interval list builder" — given a sorted list of
-//! acknowledged PNs, produce the optimal `(first_range, ranges)` —
-//! is Phase 5's concern; it'll live with the ACK tracker.
+//! The higher-level "interval list builder" — given a sorted list
+//! of acknowledged PNs, produce the optimal `(first_range, ranges)`
+//! — lives with the ACK tracker (`conn/ack_tracker.zig`).
 
 const std = @import("std");
 const types = @import("types.zig");

@@ -1,10 +1,11 @@
 //! NewReno congestion control (RFC 9002 §7 + Appendix B).
 //!
-//! Single-controller-per-path; multipath connections will have one
-//! per active path (Phase 10). The controller works in
-//! `bytes_in_flight` units the connection state machine maintains
-//! externally (in `SentPacketTracker`), but the controller itself
-//! tracks `cwnd` and `ssthresh` as authoritative per-path limits.
+//! One controller per Path: the single-path connection has one,
+//! multipath connections have one per active path. The controller
+//! works in `bytes_in_flight` units the connection state machine
+//! maintains externally (in `SentPacketTracker`), but the controller
+//! itself tracks `cwnd` and `ssthresh` as authoritative per-path
+//! limits.
 
 const std = @import("std");
 

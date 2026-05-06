@@ -3,10 +3,10 @@
 //! This module deals with the *unprotected* wire format. RFC 9001 §5
 //! header protection masks the low bits of the first byte and the
 //! Packet Number bytes; that is the responsibility of
-//! `wire/protection.zig` (Phase 3). Until then, callers passing
-//! protected bytes through `parse` will get nonsensical reserved bits
-//! and PN values — which is fine, because Phase-1 tests synthesize
-//! packets in their plaintext form.
+//! `wire/protection.zig`. Callers parsing live datagrams must remove
+//! header protection before passing bytes here; the unit tests in
+//! this file synthesize headers in their plaintext form for KAT
+//! coverage.
 //!
 //! Connection IDs are capped at 20 bytes here (the QUIC v1 limit per
 //! RFC 9000 §17.2). RFC 8999 invariants allow up to 255-byte CIDs in

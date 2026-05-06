@@ -1,15 +1,13 @@
 //! nullq.Connection — per-connection state machine root.
 //!
-//! Phase 4 scope: TLS handshake glue. The Connection wraps a
-//! `boringssl.tls.Conn` (the SSL object), installs nullq's
-//! `tls.quic.Method` callbacks, and exposes a deterministic
-//! `advance` driver that pulls peer-provided CRYPTO bytes through
-//! `provideQuicData` + `SSL_do_handshake` until the handshake
-//! completes.
-//!
-//! The packet number space, ACK tracker, congestion controller,
-//! flow control, and stream layer all land in Phase 5; their
-//! placeholders are noted here.
+//! The Connection wraps a `boringssl.tls.Conn` (the SSL object),
+//! installs nullq's `tls.quic.Method` callbacks, and exposes a
+//! deterministic `advance` driver that pulls peer-provided CRYPTO
+//! bytes through `provideQuicData` + `SSL_do_handshake` until the
+//! handshake completes. Once handshake is done it owns packet number
+//! spaces, ACK tracking, congestion control, flow control, the
+//! stream layer, the multipath `PathSet`, key updates, and the
+//! close/draining lifecycle.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
