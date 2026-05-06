@@ -105,6 +105,13 @@ const ConfigImpl = struct {
     /// embedders without a ticket get `early_data_enabled = false`
     /// per the §5.2 / §12 hardening posture.
     session_ticket: ?[]const u8 = null,
+
+    /// Whether to encode the locally-recorded close-reason string into
+    /// outgoing CONNECTION_CLOSE frames. Default `false` (redact) per
+    /// hardening guide §9 / §12 — internal parser-error strings reveal
+    /// implementation detail to the peer. Local introspection via
+    /// close events is unaffected.
+    reveal_close_reason_on_wire: bool = false,
 };
 
 /// Errors produced by `Client.connect`. Distinct from
@@ -223,6 +230,7 @@ pub const Client = struct {
 
         conn_ptr.* = try Connection.initClient(config.allocator, tls_ctx, server_name_z);
         errdefer conn_ptr.deinit();
+        conn_ptr.reveal_close_reason_on_wire = config.reveal_close_reason_on_wire;
 
         if (config.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, config.qlog_user_data);
 

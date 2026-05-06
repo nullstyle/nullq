@@ -477,6 +477,18 @@ const ConfigImpl = struct {
     /// supplying their own `boringssl.tls.Context` are responsible for
     /// configuring its early-data posture themselves.
     enable_0rtt: bool = false,
+
+    /// Whether to encode the locally-recorded close-reason string into
+    /// outgoing CONNECTION_CLOSE frames. Default `false` (redact) per
+    /// hardening guide §9 / §12: internal parser-error strings reveal
+    /// implementation detail to the peer (parser fingerprinting,
+    /// internal state names). Local introspection is unaffected; the
+    /// embedder still sees the reason via close events.
+    ///
+    /// Threaded onto every Connection the Server creates. Embedders
+    /// can also set `Connection.reveal_close_reason_on_wire` directly
+    /// for finer-grained control (e.g. dev/debug builds).
+    reveal_close_reason_on_wire: bool = false,
 };
 
 /// Argument to `Server.replaceTlsContext`. Either fresh PEM bytes
@@ -737,6 +749,11 @@ pub const Server = struct {
     /// it again.
     enable_0rtt: bool,
 
+    /// Captured `Config.reveal_close_reason_on_wire` — applied to
+    /// every Connection the Server creates so the close-reason
+    /// redaction posture matches the embedder's choice.
+    reveal_close_reason_on_wire: bool,
+
     /// Bounded FIFO of stateless responses (VN, Retry) queued for
     /// the embedder to drain via `drainStatelessResponse`. Bounded
     /// at `stateless_response_queue_capacity`; on overflow the
@@ -875,6 +892,7 @@ pub const Server = struct {
             .retry_token_lifetime_us = config.retry_token_lifetime_us,
             .retry_state_table_capacity = config.retry_state_table_capacity,
             .enable_0rtt = config.enable_0rtt,
+            .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .stateless_responses = .empty,
             .random = prng.random(),
             .rng_state = prng,
@@ -1330,6 +1348,7 @@ pub const Server = struct {
 
         conn_ptr.* = try Connection.initServer(self.allocator, self.tls_ctx);
         errdefer conn_ptr.deinit();
+        conn_ptr.reveal_close_reason_on_wire = self.reveal_close_reason_on_wire;
 
         try conn_ptr.bind();
         if (self.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, self.qlog_user_data);

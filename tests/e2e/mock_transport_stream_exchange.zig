@@ -512,6 +512,126 @@ test "DATAGRAM round-trips through the 1-RTT path" {
     try std.testing.expectEqualStrings("hello-from-client", rx_s[0..sn]);
 }
 
+test "CONNECTION_CLOSE wire-redacts the reason by default (hardening §9 / §12)" {
+    const allocator = std.testing.allocator;
+
+    var server_tls: boringssl.tls.Context = undefined;
+    var client_tls: boringssl.tls.Context = undefined;
+    try buildContexts(&server_tls, &client_tls);
+    defer server_tls.deinit();
+    defer client_tls.deinit();
+
+    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    defer client.deinit();
+    var server = try nullq.Connection.initServer(allocator, server_tls);
+    defer server.deinit();
+
+    try client.bind();
+    try server.bind();
+    client.peer = &server;
+    server.peer = &client;
+
+    const tp: nullq.tls.TransportParams = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
+        .initial_max_streams_bidi = 16,
+    };
+    try client.setTransportParams(tp);
+    try server.setTransportParams(tp);
+    try handshake(allocator, &client, &server);
+
+    try client.setPeerDcid(&ServerCid);
+    try client.setLocalScid(&ClientCid);
+    try server.setPeerDcid(&ClientCid);
+    try server.setLocalScid(&ServerCid);
+
+    // Default posture: redact close reason on wire. Local sticky
+    // event keeps the full reason for the closing endpoint's
+    // observability; the wire-encoded frame the peer decodes carries
+    // an empty reason_phrase.
+    try std.testing.expect(!client.reveal_close_reason_on_wire);
+    client.close(true, 0x0a, "ack of unsent packet");
+
+    // Local sender keeps the reason locally — the redaction is only
+    // for what the peer sees.
+    try std.testing.expectEqualStrings("ack of unsent packet", client.closeEvent().?.reason);
+
+    var pkt: [2048]u8 = undefined;
+    var iters: u32 = 0;
+    while (iters < 10 and !server.isClosed()) : (iters += 1) {
+        if (try client.poll(&pkt, 1_000_000)) |n| {
+            try server.handle(pkt[0..n], null, 1_000_000);
+        }
+        if (try server.poll(&pkt, 1_000_000)) |n| {
+            try client.handle(pkt[0..n], null, 1_000_000);
+        }
+    }
+    try std.testing.expect(server.isClosed());
+
+    // The receiver's sticky close event reflects what came over the
+    // wire — empty reason, but the error code and space still carry
+    // operational signal.
+    const peer_close = server.closeEvent().?;
+    try std.testing.expectEqual(@as(usize, 0), peer_close.reason.len);
+    try std.testing.expectEqual(@as(u64, 0x0a), peer_close.error_code);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, peer_close.error_space);
+}
+
+test "CONNECTION_CLOSE wire-includes reason when reveal_close_reason_on_wire is set" {
+    const allocator = std.testing.allocator;
+
+    var server_tls: boringssl.tls.Context = undefined;
+    var client_tls: boringssl.tls.Context = undefined;
+    try buildContexts(&server_tls, &client_tls);
+    defer server_tls.deinit();
+    defer client_tls.deinit();
+
+    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    defer client.deinit();
+    var server = try nullq.Connection.initServer(allocator, server_tls);
+    defer server.deinit();
+
+    // Embedder opt-in: dev/debug builds want the reason on the wire
+    // for cross-side diagnostics.
+    client.reveal_close_reason_on_wire = true;
+
+    try client.bind();
+    try server.bind();
+    client.peer = &server;
+    server.peer = &client;
+
+    const tp: nullq.tls.TransportParams = .{
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 20,
+        .initial_max_stream_data_bidi_remote = 1 << 20,
+        .initial_max_streams_bidi = 16,
+    };
+    try client.setTransportParams(tp);
+    try server.setTransportParams(tp);
+    try handshake(allocator, &client, &server);
+
+    try client.setPeerDcid(&ServerCid);
+    try client.setLocalScid(&ClientCid);
+    try server.setPeerDcid(&ClientCid);
+    try server.setLocalScid(&ServerCid);
+
+    client.close(true, 0x0a, "diagnostic reason");
+
+    var pkt: [2048]u8 = undefined;
+    var iters: u32 = 0;
+    while (iters < 10 and !server.isClosed()) : (iters += 1) {
+        if (try client.poll(&pkt, 1_000_000)) |n| {
+            try server.handle(pkt[0..n], null, 1_000_000);
+        }
+        if (try server.poll(&pkt, 1_000_000)) |n| {
+            try client.handle(pkt[0..n], null, 1_000_000);
+        }
+    }
+    try std.testing.expect(server.isClosed());
+    try std.testing.expectEqualStrings("diagnostic reason", server.closeEvent().?.reason);
+}
+
 test "CONNECTION_CLOSE propagates from sender to receiver" {
     const allocator = std.testing.allocator;
 

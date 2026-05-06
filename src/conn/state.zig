@@ -837,6 +837,20 @@ pub const Connection = struct {
     /// guide §4.8 enforcement.
     test_only_force_handshake_for_migration: bool = false,
 
+    /// Whether to encode the locally-recorded close-reason string into
+    /// outgoing CONNECTION_CLOSE frames. Default `false` (redact) per
+    /// hardening guide §9 / §12: internal parser-error strings like
+    /// "ack of unsent packet" or "connection id reused across paths"
+    /// are useful telemetry for the embedder but reveal implementation
+    /// detail to the peer (parser fingerprinting, internal state
+    /// names). Local introspection is unaffected — `lifecycle.record`
+    /// always captures the reason for embedder-side observability,
+    /// and `nextEvent` surfaces it via `CloseEvent.reason`.
+    ///
+    /// Embedders that want the reason on the wire (debug builds,
+    /// internal load tests, etc.) can flip this to `true`.
+    reveal_close_reason_on_wire: bool = false,
+
     /// Pending hostname for client connections; applied during
     /// `bind` because we can't safely call `setHostname` before
     /// the Connection has a stable address.
@@ -4865,11 +4879,20 @@ pub const Connection = struct {
         // the only frame we emit, and we mark the connection
         // closed once it goes on the wire.
         if (self.lifecycle.pending_close) |info| {
+            // Hardening guide §9 / §12: redact the reason on the wire
+            // by default. Embedders can opt in to wire-visible reasons
+            // via `reveal_close_reason_on_wire = true`. Local sticky
+            // reason (`lifecycle.record(...)` above the close path) is
+            // always retained for embedder telemetry.
+            const wire_reason: []const u8 = if (self.reveal_close_reason_on_wire)
+                info.reason
+            else
+                &[_]u8{};
             const close_frame = frame_types.ConnectionClose{
                 .is_transport = info.is_transport,
                 .error_code = info.error_code,
                 .frame_type = info.frame_type,
-                .reason_phrase = info.reason,
+                .reason_phrase = wire_reason,
             };
             const wrote = try frame_mod.encode(
                 pl_buf[0..max_payload],
