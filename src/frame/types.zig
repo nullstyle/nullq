@@ -4,7 +4,6 @@
 //! plus ACK (with range encoding) and STREAM (with FIN/LEN/OFF flags
 //! in the type byte).
 
-const std = @import("std");
 const wire_header = @import("../wire/header.zig");
 
 /// Connection ID type, shared with `wire/header.zig`. NEW_CONNECTION_ID
