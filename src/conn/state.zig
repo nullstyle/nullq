@@ -1338,7 +1338,7 @@ pub const Connection = struct {
         alpn: []const u8,
         application_context: []const u8,
     ) !early_data_context_mod.Digest {
-        const digest = early_data_context_mod.build(.{
+        const digest = try early_data_context_mod.build(.{
             .transport_params = params,
             .alpn = alpn,
             .application_context = application_context,

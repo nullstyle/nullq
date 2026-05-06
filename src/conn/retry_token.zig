@@ -41,7 +41,7 @@ pub const Error = error{
     ContextTooLong,
     /// A Connection ID exceeded `path.max_cid_len`.
     DcidTooLong,
-};
+} || boringssl.crypto.hmac.Error;
 
 /// Inputs to `mint`. The HMAC binds `client_address`, `original_dcid`,
 /// `retry_scid`, `quic_version`, `now_us`, and the expiry derived from
@@ -146,22 +146,22 @@ fn authTag(
     original_dcid: []const u8,
     retry_scid: []const u8,
 ) Error![tag_len]u8 {
-    var h = HmacSha256.init(key);
+    var h = try HmacSha256.init(key);
     defer h.deinit();
-    h.update(domain_separator);
-    h.update(header);
+    try h.update(domain_separator);
+    try h.update(header);
     try updateBound(&h, client_address);
     try updateBound(&h, original_dcid);
     try updateBound(&h, retry_scid);
-    return h.finalDigest();
+    return try h.finalDigest();
 }
 
 fn updateBound(h: *HmacSha256, bytes: []const u8) Error!void {
     if (bytes.len > max_bound_value_len) return Error.ContextTooLong;
     var len: [2]u8 = undefined;
     std.mem.writeInt(u16, &len, @intCast(bytes.len), .big);
-    h.update(&len);
-    h.update(bytes);
+    try h.update(&len);
+    try h.update(bytes);
 }
 
 fn addSat(a: u64, b: u64) u64 {

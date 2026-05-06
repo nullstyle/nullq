@@ -53,7 +53,7 @@ pub const Error = error{
     LabelTooLong,
     ContextTooLong,
     OutputTooLong,
-};
+} || boringssl.crypto.kdf.Error;
 
 /// HKDF-Expand-Label per RFC 8446 §7.1, with the TLS 1.3 prefix
 /// `"tls13 "` baked in. Writes `dst.len` bytes into `dst`.
@@ -111,8 +111,8 @@ pub fn hkdfExpandLabelWithHash(
     pos += context.len;
 
     switch (hash) {
-        .sha256 => HkdfSha256.expand(secret, info_buf[0..pos], dst),
-        .sha384 => HkdfSha384.expand(secret, info_buf[0..pos], dst),
+        .sha256 => try HkdfSha256.expand(secret, info_buf[0..pos], dst),
+        .sha384 => try HkdfSha384.expand(secret, info_buf[0..pos], dst),
     }
 }
 
@@ -123,7 +123,7 @@ pub fn hkdfExpandLabelWithHash(
 /// §5.2). `is_server = false` produces client-side keys; `true`
 /// produces server-side keys.
 pub fn deriveInitialKeys(dcid: []const u8, is_server: bool) Error!Keys {
-    const initial_secret = HkdfSha256.extract(&initial_salt_v1, dcid);
+    const initial_secret = try HkdfSha256.extract(&initial_salt_v1, dcid);
 
     var keys: Keys = undefined;
     const role_label: []const u8 = if (is_server) "server in" else "client in";
@@ -203,7 +203,7 @@ test "hkdfExpandLabel matches the same shape boringssl-zig already KATs" {
     // (boringssl-zig's QUIC v1 initial_secret KAT covers the extract
     // step; we cover the full chain in the §A.1 tests above).
     const dcid = fromHex("8394c8f03e515708");
-    const initial_secret = HkdfSha256.extract(&initial_salt_v1, &dcid);
+    const initial_secret = try HkdfSha256.extract(&initial_salt_v1, &dcid);
 
     var client_secret: [32]u8 = undefined;
     try hkdfExpandLabel(&client_secret, &initial_secret, "client in", "");

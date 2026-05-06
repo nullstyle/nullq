@@ -203,7 +203,7 @@ pub fn sealInitial(dst: []u8, opts: InitialSealOptions) Error!usize {
 
     // Header-protect.
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const mask = short_packet.headerProtectionMask(opts.keys, &sample);
+    const mask = try short_packet.headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .long, pn_offset, pn_len, mask);
 
     return total_len;
@@ -311,7 +311,7 @@ pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
     const total_len = hdr_len + ct_len;
 
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const mask = short_packet.headerProtectionMask(opts.keys, &sample);
+    const mask = try short_packet.headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .long, pn_offset, pn_len, mask);
 
     return total_len;
@@ -389,7 +389,7 @@ pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
     const total_len = hdr_len + ct_len;
 
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const mask = short_packet.headerProtectionMask(opts.keys, &sample);
+    const mask = try short_packet.headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .long, pn_offset, pn_len, mask);
 
     return total_len;
@@ -532,7 +532,7 @@ fn openLongHeader(
     // Sample for HP.
     if (src.len < pn_offset + 4 + protection.sample_len) return Error.InsufficientCiphertext;
     const sample = try protection.sampleAt(src, pn_offset);
-    const mask = short_packet.headerProtectionMask(keys, &sample);
+    const mask = try short_packet.headerProtectionMask(keys, &sample);
 
     // Strip HP from byte 0 (low 4 bits) and PN bytes.
     src[0] ^= mask[0] & 0x0f;

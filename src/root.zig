@@ -194,7 +194,7 @@ test {
 
 test "phase 0: builds and links against boringssl-zig" {
     // Touch boringssl so the link path is exercised.
-    const digest = boringssl.crypto.hash.Sha256.hash("nullq");
+    const digest = try boringssl.crypto.hash.Sha256.hash("nullq");
     try std.testing.expectEqual(@as(usize, 32), digest.len);
 
     try std.testing.expectEqualStrings("0.0.0", version());

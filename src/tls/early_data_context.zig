@@ -35,19 +35,24 @@ pub const Options = struct {
     application_context: []const u8 = &.{},
 };
 
+/// Errors raised by the SHA-256 builder. These propagate from the
+/// boringssl-zig crypto wrapper, which surfaces BoringSSL non-success
+/// returns as typed errors instead of panicking.
+pub const Error = boringssl.crypto.hash.Error;
+
 /// Build the SHA-256 0-RTT context digest for `opts`. The output is
 /// what nullq passes to `SSL_set_quic_early_data_context` so
 /// resumption only accepts early data when the same QUIC version,
 /// ALPN, replay-relevant transport params, and application context
 /// (e.g. HTTP/3 SETTINGS) are all in effect.
-pub fn build(opts: Options) Digest {
-    var h = boringssl.crypto.hash.Sha256.init();
-    h.update("nullq quic 0-rtt context v1");
-    updateU32(&h, opts.quic_version);
-    updateBytes(&h, opts.alpn);
-    updateTransportParams(&h, opts.transport_params);
-    updateBytes(&h, opts.application_context);
-    return h.finalDigest();
+pub fn build(opts: Options) Error!Digest {
+    var h = try boringssl.crypto.hash.Sha256.init();
+    try h.update("nullq quic 0-rtt context v1");
+    try updateU32(&h, opts.quic_version);
+    try updateBytes(&h, opts.alpn);
+    try updateTransportParams(&h, opts.transport_params);
+    try updateBytes(&h, opts.application_context);
+    return try h.finalDigest();
 }
 
 /// Convenience wrapper around `build` for the common call shape:
@@ -57,7 +62,7 @@ pub fn buildForTransportParams(
     transport_params: Params,
     alpn: []const u8,
     application_context: []const u8,
-) Digest {
+) Error!Digest {
     return build(.{
         .transport_params = transport_params,
         .alpn = alpn,
@@ -65,7 +70,7 @@ pub fn buildForTransportParams(
     });
 }
 
-fn updateTransportParams(h: *boringssl.crypto.hash.Sha256, p: Params) void {
+fn updateTransportParams(h: *boringssl.crypto.hash.Sha256, p: Params) Error!void {
     // Deliberately exclude connection-instance identifiers and tokens
     // such as original_destination_connection_id, stateless_reset_token,
     // preferred_address, initial_source_connection_id, and
@@ -73,56 +78,56 @@ fn updateTransportParams(h: *boringssl.crypto.hash.Sha256, p: Params) void {
     // migration hint and would make otherwise valid resumption reject
     // 0-RTT. The context below covers the transport and application
     // settings that constrain early bytes.
-    updateU64(h, p.max_idle_timeout_ms);
-    updateU64(h, p.max_udp_payload_size);
-    updateU64(h, p.initial_max_data);
-    updateU64(h, p.initial_max_stream_data_bidi_local);
-    updateU64(h, p.initial_max_stream_data_bidi_remote);
-    updateU64(h, p.initial_max_stream_data_uni);
-    updateU64(h, p.initial_max_streams_bidi);
-    updateU64(h, p.initial_max_streams_uni);
-    updateU64(h, p.ack_delay_exponent);
-    updateU64(h, p.max_ack_delay_ms);
-    updateBool(h, p.disable_active_migration);
-    updateU64(h, p.active_connection_id_limit);
-    updateU64(h, p.max_datagram_frame_size);
+    try updateU64(h, p.max_idle_timeout_ms);
+    try updateU64(h, p.max_udp_payload_size);
+    try updateU64(h, p.initial_max_data);
+    try updateU64(h, p.initial_max_stream_data_bidi_local);
+    try updateU64(h, p.initial_max_stream_data_bidi_remote);
+    try updateU64(h, p.initial_max_stream_data_uni);
+    try updateU64(h, p.initial_max_streams_bidi);
+    try updateU64(h, p.initial_max_streams_uni);
+    try updateU64(h, p.ack_delay_exponent);
+    try updateU64(h, p.max_ack_delay_ms);
+    try updateBool(h, p.disable_active_migration);
+    try updateU64(h, p.active_connection_id_limit);
+    try updateU64(h, p.max_datagram_frame_size);
     if (p.initial_max_path_id) |max_path_id| {
-        h.update(&.{1});
-        updateU32(h, max_path_id);
+        try h.update(&.{1});
+        try updateU32(h, max_path_id);
     } else {
-        h.update(&.{0});
+        try h.update(&.{0});
     }
 }
 
-fn updateBytes(h: *boringssl.crypto.hash.Sha256, bytes: []const u8) void {
-    updateU64(h, bytes.len);
-    h.update(bytes);
+fn updateBytes(h: *boringssl.crypto.hash.Sha256, bytes: []const u8) Error!void {
+    try updateU64(h, bytes.len);
+    try h.update(bytes);
 }
 
-fn updateBool(h: *boringssl.crypto.hash.Sha256, value: bool) void {
-    h.update(if (value) &.{1} else &.{0});
+fn updateBool(h: *boringssl.crypto.hash.Sha256, value: bool) Error!void {
+    try h.update(if (value) &.{1} else &.{0});
 }
 
-fn updateU32(h: *boringssl.crypto.hash.Sha256, value: u32) void {
+fn updateU32(h: *boringssl.crypto.hash.Sha256, value: u32) Error!void {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], value, .big);
-    h.update(&buf);
+    try h.update(&buf);
 }
 
-fn updateU64(h: *boringssl.crypto.hash.Sha256, value: u64) void {
+fn updateU64(h: *boringssl.crypto.hash.Sha256, value: u64) Error!void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, buf[0..8], value, .big);
-    h.update(&buf);
+    try h.update(&buf);
 }
 
 fn expectContextDiffers(base: Options, changed: Options) !void {
-    const base_digest = build(base);
-    const changed_digest = build(changed);
+    const base_digest = try build(base);
+    const changed_digest = try build(changed);
     try std.testing.expect(!std.mem.eql(u8, &base_digest, &changed_digest));
 }
 
 test "context is stable and sensitive to transport and app settings" {
-    const base = build(.{
+    const base = try build(.{
         .alpn = "h3",
         .transport_params = .{
             .initial_max_data = 1024,
@@ -130,7 +135,7 @@ test "context is stable and sensitive to transport and app settings" {
         },
         .application_context = "settings-v1",
     });
-    const same = build(.{
+    const same = try build(.{
         .alpn = "h3",
         .transport_params = .{
             .initial_max_data = 1024,
@@ -138,7 +143,7 @@ test "context is stable and sensitive to transport and app settings" {
         },
         .application_context = "settings-v1",
     });
-    const changed_tp = build(.{
+    const changed_tp = try build(.{
         .alpn = "h3",
         .transport_params = .{
             .initial_max_data = 2048,
@@ -146,7 +151,7 @@ test "context is stable and sensitive to transport and app settings" {
         },
         .application_context = "settings-v1",
     });
-    const changed_app = build(.{
+    const changed_app = try build(.{
         .alpn = "h3",
         .transport_params = .{
             .initial_max_data = 1024,
@@ -258,7 +263,7 @@ test "context changes for every 0-RTT replay-relevant transport parameter" {
 
 test "context ignores connection-instance identifiers" {
     const path = @import("../conn/path.zig");
-    const base = build(.{
+    const base = try build(.{
         .transport_params = .{
             .original_destination_connection_id = path.ConnectionId.fromSlice(&.{ 1, 2, 3, 4 }),
             .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 5, 6, 7, 8 }),
@@ -275,7 +280,7 @@ test "context ignores connection-instance identifiers" {
             .initial_max_data = 1024,
         },
     });
-    const changed_ids = build(.{
+    const changed_ids = try build(.{
         .transport_params = .{
             .original_destination_connection_id = path.ConnectionId.fromSlice(&.{ 0xaa, 0xbb }),
             .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 0xcc, 0xdd }),
@@ -292,7 +297,7 @@ test "context ignores connection-instance identifiers" {
             .initial_max_data = 1024,
         },
     });
-    const changed_limit = build(.{
+    const changed_limit = try build(.{
         .transport_params = .{
             .original_destination_connection_id = path.ConnectionId.fromSlice(&.{ 1, 2, 3, 4 }),
             .initial_source_connection_id = path.ConnectionId.fromSlice(&.{ 5, 6, 7, 8 }),

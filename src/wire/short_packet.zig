@@ -179,10 +179,10 @@ pub fn deriveNextTrafficSecret(suite: Suite, secret: []const u8) Error!TrafficSe
 
 /// Compute the 5-byte header-protection mask using the suite-specific
 /// algorithm (RFC 9001 §5.4.3 / §5.4.4).
-pub fn headerProtectionMask(keys: *const PacketKeys, sample: *const [protection.sample_len]u8) [protection.mask_len]u8 {
+pub fn headerProtectionMask(keys: *const PacketKeys, sample: *const [protection.sample_len]u8) protection.Error![protection.mask_len]u8 {
     return switch (keys.suite) {
-        .aes128_gcm_sha256 => protection.aesHpMask(@ptrCast(keys.hp[0..16]), sample),
-        .aes256_gcm_sha384 => protection.aes256HpMask(@ptrCast(keys.hp[0..32]), sample),
+        .aes128_gcm_sha256 => try protection.aesHpMask(@ptrCast(keys.hp[0..16]), sample),
+        .aes256_gcm_sha384 => try protection.aes256HpMask(@ptrCast(keys.hp[0..32]), sample),
         .chacha20_poly1305_sha256 => protection.chacha20HpMask(@ptrCast(keys.hp[0..32]), sample),
     };
 }
@@ -413,7 +413,7 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
     const total_len = hdr_len + ct_len;
     const pn_offset = hdr_len - pn_len;
     const sample = try protection.sampleAt(dst[0..total_len], pn_offset);
-    const mask = headerProtectionMask(opts.keys, &sample);
+    const mask = try headerProtectionMask(opts.keys, &sample);
     try protection.applyHpMask(dst[0..total_len], .short, pn_offset, pn_len, mask);
 
     return total_len;
@@ -463,7 +463,7 @@ pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult
     if (src.len < pn_offset + 4 + protection.sample_len) return Error.InsufficientCiphertext;
 
     const sample = try protection.sampleAt(src, pn_offset);
-    const mask = headerProtectionMask(opts.keys, &sample);
+    const mask = try headerProtectionMask(opts.keys, &sample);
 
     // Strip HP into local copies. The source datagram stays intact
     // so callers can retry with updated packet-protection keys.

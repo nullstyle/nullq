@@ -36,7 +36,7 @@ pub const Error = error{
     InvalidPnLength,
     InvalidPnOffset,
     OutputTooSmall,
-} || boringssl.crypto.aead.Error;
+} || boringssl.crypto.aead.Error || boringssl.crypto.aes.Error;
 
 /// Construct the per-packet AEAD nonce by XORing the 62-bit packet
 /// number (left-padded with zeros to 12 bytes, big-endian) into the
@@ -72,8 +72,8 @@ pub fn aeadNonceForPath(iv: *const [12]u8, path_id: u32, pn: u64) [12]u8 {
 /// Compute the 5-byte header-protection mask from a 16-byte ciphertext
 /// sample using AES-128 single-block encryption. The mask is the first
 /// 5 bytes of `AES_encrypt(hp_key, sample)`. RFC 9001 §5.4.3.
-pub fn aesHpMask(hp_key: *const [16]u8, sample: *const [sample_len]u8) [mask_len]u8 {
-    const aes = Aes128.init(hp_key);
+pub fn aesHpMask(hp_key: *const [16]u8, sample: *const [sample_len]u8) Error![mask_len]u8 {
+    const aes = try Aes128.init(hp_key);
     var block: [16]u8 = undefined;
     aes.encryptBlock(sample, &block);
     var mask: [mask_len]u8 = undefined;
@@ -82,8 +82,8 @@ pub fn aesHpMask(hp_key: *const [16]u8, sample: *const [sample_len]u8) [mask_len
 }
 
 /// AES-256-GCM uses AES-256 for QUIC header protection.
-pub fn aes256HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) [mask_len]u8 {
-    const aes = Aes256.init(hp_key);
+pub fn aes256HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) Error![mask_len]u8 {
+    const aes = try Aes256.init(hp_key);
     var block: [16]u8 = undefined;
     aes.encryptBlock(sample, &block);
     var mask: [mask_len]u8 = undefined;
@@ -343,7 +343,7 @@ test "full pipeline: protect then unprotect a synthetic Initial" {
 
     // Header-protect: sample is 16 bytes starting at pn_offset+4.
     const sample = try sampleAt(packet[0 .. ct_start + ct_len], pn_offset);
-    const mask = aesHpMask(&keys.hp, &sample);
+    const mask = try aesHpMask(&keys.hp, &sample);
     try applyHpMask(&packet, .long, pn_offset, pn_length, mask);
 
     // ── receiver flow ──
@@ -351,7 +351,7 @@ test "full pipeline: protect then unprotect a synthetic Initial" {
     const rx_sample = try sampleAt(packet[0 .. ct_start + ct_len], pn_offset);
     try std.testing.expectEqualSlices(u8, &sample, &rx_sample);
 
-    const rx_mask = aesHpMask(&keys.hp, &rx_sample);
+    const rx_mask = try aesHpMask(&keys.hp, &rx_sample);
     try applyHpMask(&packet, .long, pn_offset, pn_length, rx_mask);
 
     // After unmasking, the header bytes should be byte-equal to the
@@ -381,7 +381,7 @@ test "RFC 9001 §A.2 — header-protection mask matches spec" {
     const keys = try initial.deriveInitialKeys(&dcid, false);
 
     const sample = fromHex("d1b1c98dd7689fb8ec11d242b123dc9b");
-    const mask = aesHpMask(&keys.hp, &sample);
+    const mask = try aesHpMask(&keys.hp, &sample);
     try std.testing.expectEqualSlices(u8, &fromHex("437b9aec36"), &mask);
 }
 
