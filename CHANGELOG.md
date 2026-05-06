@@ -9,6 +9,24 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Added
+- `Connection.setMigrationCallback` and the `MigrationCallback` /
+  `MigrationDecision` types — an embedder policy hook gating peer
+  migrations to a new 4-tuple (RFC 9000 §9). The callback fires
+  synchronously on the existing path's auth context **before**
+  PATH_CHALLENGE / PATH_RESPONSE so that pure address-allowlist
+  policies don't pay for a validation round-trip. Returning `.deny`
+  drops the migration attempt, credits the triggering datagram
+  against the existing path's anti-amp, and emits a
+  `migration_path_failed` qlog event with reason `policy_denied`;
+  the connection stays open on the original 4-tuple. Re-exported as
+  `nullq.MigrationCallback` / `nullq.MigrationDecision`.
+- `QlogMigrationFailReason` enum (`timeout`, `policy_denied`) and
+  matching optional `migration_fail_reason` field on `QlogEvent`.
+  Existing `migration_path_failed` emit sites now populate
+  `.timeout`; the new `policy_denied` value comes from the
+  migration-callback deny path.
+
 ## [0.1.0-pre.1] - 2026-05-05
 
 First tagged pre-release. The transport passes the full quic-go

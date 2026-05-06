@@ -121,6 +121,13 @@ pub const QlogStreamState = conn.QlogStreamState;
 pub const QlogCongestionState = conn.QlogCongestionState;
 /// Loss-detection reason classification for qlog `loss_detected` events.
 pub const QlogLossReason = conn.QlogLossReason;
+/// Why a candidate migration path failed (timeout, policy denial).
+pub const QlogMigrationFailReason = conn.QlogMigrationFailReason;
+/// Embedder policy hook gating peer migrations to a new 4-tuple
+/// (RFC 9000 §9). Install via `Connection.setMigrationCallback`.
+pub const MigrationCallback = conn.MigrationCallback;
+/// Allow / deny verdict returned by a `MigrationCallback`.
+pub const MigrationDecision = conn.MigrationDecision;
 /// Per-path congestion controller state, exposed via `PathStats`.
 pub const CongestionState = conn.CongestionState;
 

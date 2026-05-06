@@ -106,6 +106,12 @@ pub const QlogStreamState = state.QlogStreamState;
 pub const QlogCongestionState = state.QlogCongestionState;
 /// qlog reason a packet was declared lost.
 pub const QlogLossReason = state.QlogLossReason;
+/// qlog reason a candidate migration path failed (timeout / policy).
+pub const QlogMigrationFailReason = state.QlogMigrationFailReason;
+/// Embedder policy hook for gating peer migrations to a new 4-tuple.
+pub const MigrationCallback = state.MigrationCallback;
+/// Allow / deny verdict returned by `MigrationCallback`.
+pub const MigrationDecision = state.MigrationDecision;
 /// Phase of the per-path congestion controller (slow-start, recovery, etc.).
 pub const CongestionState = path.CongestionState;
 /// How a new connection ID was provisioned (initial, server-assigned, user-assigned).
