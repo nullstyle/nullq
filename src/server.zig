@@ -550,6 +550,21 @@ const ConfigImpl = struct {
     /// configuring its early-data posture themselves.
     enable_0rtt: bool = false,
 
+    /// Anti-replay tracker for 0-RTT early-data (hardening §5.2 /
+    /// RFC 9001 §5.6). When `enable_0rtt` is true and this is non-null,
+    /// the Server installs a BoringSSL `allow_early_data` callback
+    /// that hashes the resumed-session ticket bytes
+    /// (`Conn.peerSessionId`) to the tracker's 32-byte `Id` and calls
+    /// `tracker.consume(id, now)`. Verdict `.fresh` lets BoringSSL
+    /// accept 0-RTT; `.replay` toggles `early_data_enabled` off for
+    /// that handshake (the connection then completes as 1-RTT).
+    ///
+    /// The tracker is owned by the embedder and must outlive the
+    /// `Server`. Only consulted when `tls_context_override` is null —
+    /// override-mode embedders install their own callback via
+    /// `boringssl.tls.Context.setAllowEarlyDataCallback`.
+    early_data_anti_replay: ?*tls_mod.anti_replay.AntiReplayTracker = null,
+
     /// Whether to encode the locally-recorded close-reason string into
     /// outgoing CONNECTION_CLOSE frames. Default `false` (redact) per
     /// hardening guide §9 / §12: internal parser-error strings reveal
@@ -880,6 +895,12 @@ pub const Server = struct {
     /// it again.
     enable_0rtt: bool,
 
+    /// Captured `Config.early_data_anti_replay`. Drives the
+    /// `bumpClock` call in `feed` so the BoringSSL trampoline has
+    /// the latest `now_us` to consult in its
+    /// `consumeUsingInternalClock` call.
+    early_data_anti_replay: ?*tls_mod.anti_replay.AntiReplayTracker,
+
     /// Captured `Config.reveal_close_reason_on_wire` — applied to
     /// every Connection the Server creates so the close-reason
     /// redaction posture matches the embedder's choice.
@@ -1027,6 +1048,19 @@ pub const Server = struct {
             });
             errdefer tls_ctx.deinit();
             try tls_ctx.loadCertChainAndKey(config.tls_cert_pem, config.tls_key_pem);
+            // Hardening §5.2 / RFC 9001 §5.6: when the embedder
+            // installs an `AntiReplayTracker`, hook BoringSSL's
+            // pre-resumption early-data callback so duplicate 0-RTT
+            // attempts are rejected at the TLS layer (not just at
+            // application post-handshake). Only fires on the
+            // auto-built path; override-mode embedders own the hook
+            // themselves.
+            if (config.enable_0rtt and config.early_data_anti_replay != null) {
+                try tls_ctx.setAllowEarlyDataCallback(
+                    antiReplayEarlyDataTrampoline,
+                    @ptrCast(config.early_data_anti_replay.?),
+                );
+            }
             owns_tls = true;
         }
 
@@ -1084,6 +1118,7 @@ pub const Server = struct {
             .new_token_key = config.new_token_key,
             .new_token_lifetime_us = config.new_token_lifetime_us,
             .enable_0rtt = config.enable_0rtt,
+            .early_data_anti_replay = config.early_data_anti_replay,
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .max_connection_memory = config.max_connection_memory,
             .max_datagrams_per_window = config.max_datagrams_per_window,
@@ -1166,6 +1201,12 @@ pub const Server = struct {
         // log rate limit against in-feed time without taking a separate
         // clock argument.
         self.last_feed_now_us = now_us;
+        // Push the same `now_us` to the anti-replay tracker so its
+        // BoringSSL `allow_early_data` trampoline (which has no other
+        // path to a monotonic clock) ages entries against
+        // Server-driven time. No-op when 0-RTT or anti-replay isn't
+        // configured.
+        if (self.early_data_anti_replay) |tracker| tracker.bumpClock(now_us);
         // Hardening guide §4.1: listener-level packet rate limit. Runs
         // *before* the empty-bytes check, before the 1200-byte Initial
         // size gate, before slot lookup — every datagram entering the
@@ -2527,6 +2568,50 @@ fn peekInitialToken(bytes: []const u8) ?[]const u8 {
     return switch (parsed.header) {
         .initial => |initial| initial.token,
         else => null,
+    };
+}
+
+/// BoringSSL `allow_early_data` callback installed by `Server.init`
+/// when an `AntiReplayTracker` is supplied via Config. Hashes the
+/// resumed-session ticket bytes (`Conn.peerSessionId`) to a 32-byte
+/// tracker `Id` and consults `tracker.consume` for a verdict.
+///
+/// Return contract (mirrors `boringssl.tls.AllowEarlyDataCallback`):
+///   - `true`  → BoringSSL proceeds with 0-RTT for this handshake.
+///   - `false` → BoringSSL toggles `early_data_enabled = false` on
+///               this `SSL` so the handshake completes as 1-RTT.
+///
+/// Defensive defaults: any plumbing failure (null user_data, hash
+/// failure, OOM in the tracker) returns `false` — denying 0-RTT
+/// rather than risking a replay window where the tracker can't see
+/// the attempt. Hash failures are not peer-reachable in practice.
+fn antiReplayEarlyDataTrampoline(
+    user_data: ?*anyopaque,
+    ssl: *boringssl.tls.Conn,
+) bool {
+    const raw_ptr = user_data orelse return false;
+    const tracker: *tls_mod.anti_replay.AntiReplayTracker =
+        @ptrCast(@alignCast(raw_ptr));
+
+    // No resumed session attached → no replay risk to gate on. Return
+    // true; BoringSSL will refuse 0-RTT anyway because there's no
+    // ticket to bind it to.
+    const ticket = ssl.peerSessionId() orelse return true;
+
+    const id_full = boringssl.crypto.hash.Sha256.hash(ticket) catch return false;
+    var id: tls_mod.anti_replay.Id = undefined;
+    @memcpy(&id, id_full[0..tls_mod.anti_replay.id_len]);
+
+    // The tracker exposes an internal-clock variant of `consume` so
+    // this callback (which has no path to the Server's monotonic
+    // clock) can defer to the most recent `now_us` that
+    // `Server.feed` cached via `bumpClock`. The age-out window then
+    // tracks Server-driven time exactly the way the application-
+    // layer `consume(id, now_us)` callers see.
+    const verdict = tracker.consumeUsingInternalClock(id) catch return false;
+    return switch (verdict) {
+        .fresh => true,
+        .replay => false,
     };
 }
 

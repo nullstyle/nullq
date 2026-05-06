@@ -134,6 +134,13 @@ pub const AntiReplayTracker = struct {
     /// timestamp here too so `consume` can verify a hit isn't stale
     /// without scanning `entries`.
     seen: std.AutoHashMapUnmanaged(Id, u64) = .empty,
+    /// Monotonic-non-decreasing clock cache, set via `bumpClock`.
+    /// Used by `consumeUsingInternalClock` so callers without an
+    /// explicit `now_us` (such as the BoringSSL `allow_early_data`
+    /// callback hook) can still drive the tracker. The application-
+    /// layer `consume(id, now_us)` API is unchanged and ignores this
+    /// field.
+    last_observed_now_us: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !AntiReplayTracker {
         if (options.max_entries == 0) return error.InvalidOptions;
@@ -193,6 +200,27 @@ pub const AntiReplayTracker = struct {
     /// idle ticks if they want to keep memory tighter.
     pub fn prune(self: *AntiReplayTracker, now_us: u64) void {
         self.pruneStale(now_us);
+    }
+
+    /// Update the cached internal clock. Called by `Server.feed` so
+    /// the BoringSSL `allow_early_data` trampoline (which has no
+    /// other path to a monotonic clock) has a sensible `now_us` to
+    /// pass into `consumeUsingInternalClock`. Monotonic-non-decreasing
+    /// — older `now_us` values are clamped up to the cached value.
+    pub fn bumpClock(self: *AntiReplayTracker, now_us: u64) void {
+        if (now_us > self.last_observed_now_us) {
+            self.last_observed_now_us = now_us;
+        }
+    }
+
+    /// `consume` variant for callers that can't pipe in `now_us`
+    /// directly — uses the cached clock from `bumpClock`. Returns
+    /// the same `.fresh`/`.replay` verdicts.
+    pub fn consumeUsingInternalClock(
+        self: *AntiReplayTracker,
+        id: Id,
+    ) error{OutOfMemory}!Verdict {
+        return self.consume(id, self.last_observed_now_us);
     }
 
     /// How many entries the tracker currently holds. Useful for
