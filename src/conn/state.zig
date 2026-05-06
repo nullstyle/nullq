@@ -13508,3 +13508,206 @@ fn fuzzConnMigrationImpl(_: void, smith: *std.testing.Smith) anyerror!void {
         }
     }
 }
+
+// Connection-ID lifecycle fuzz harness — drives smith-chosen
+// interleavings of `handleNewConnectionId` / `handleRetireConnectionId`
+// / `handlePathNewConnectionId` against a fully-authenticated
+// `Connection` and asserts:
+//
+// - No panic / overflow trap on any sequence.
+// - `peer_cids.items.len` for path 0 never exceeds the local-side
+//   `active_connection_id_limit` cap that gates `registerPeerCid`
+//   (set tight at 4 here so the cap path is reachable in 0..32 ops).
+// - Every `peer_cids` entry has a unique (path_id, sequence_number)
+//   pair — `registerPeerCid` rejects sequence reuse with a different
+//   cid/token, so duplicates surface as a close rather than a stored
+//   collision.
+// - After `handleRetireConnectionId(seq=N)` returns without closing
+//   the connection, sequence N is no longer present in `local_cids`
+//   for path 0 (we pre-populate `local_cids` with seq 0/1/2 so the
+//   retire path has something to remove).
+// - `path.path.peer_cid` (the active CID for path 0) always matches
+//   one of the entries in `peer_cids` — or is empty (initial state)
+//   or the connection has closed.
+// - If the connection closed during the run, the close error code is
+//   one of {`transport_error_protocol_violation`,
+//   `transport_error_frame_encoding`,
+//   `transport_error_excessive_load`}. In practice
+//   `registerPeerCid` / `handleRetireConnectionId` only emit
+//   `protocol_violation` (retire-not-yet-issued, sequence-reuse,
+//   cid-reuse-across-paths, retire_prior_to-too-large, active-cid
+//   limit), but the broader set is documented for forward-compat.
+//
+// Multipath scope reduction: we hold path_id at 0 for the
+// `handlePathNewConnectionId` op so the harness does not need to
+// negotiate multipath transport parameters and stand up secondary
+// paths — both `handleNewConnectionId` and the path_id=0 form of
+// `handlePathNewConnectionId` converge on `registerPeerCid`, so the
+// fuzzer-chosen interleaving of the two entry points still exercises
+// the same state-machine surface that §11.1 #19 calls out.
+test "fuzz: Connection NEW_CONNECTION_ID / RETIRE_CONNECTION_ID lifecycle invariants" {
+    try std.testing.fuzz({}, fuzzCidLifecycle, .{});
+}
+
+fn fuzzCidLifecycle(_: void, smith: *std.testing.Smith) anyerror!void {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Tight `active_connection_id_limit` so the
+    // "peer_cids exceeds limit" close path is reachable in a 32-op
+    // budget. The cap on `peer_cids` per path comes from the local
+    // side's transport params (it bounds how many of the peer's CIDs
+    // we are willing to hold). 4 is small enough that the fuzzer
+    // routinely walks past it.
+    conn.local_transport_params.active_connection_id_limit = 4;
+    const peer_cid_cap = conn.local_transport_params.active_connection_id_limit;
+
+    // Plant a few `local_cids` entries so `handleRetireConnectionId`
+    // has something to remove (otherwise it always no-ops on the
+    // local-side list). The peer's `active_connection_id_limit`
+    // governs how many of OUR CIDs we may issue, so set the peer's
+    // cached transport params to allow the seeds.
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 8 };
+    try conn.setLocalScid(&.{0xa0});
+    try conn.queueNewConnectionId(1, 0, &.{0xa1}, @splat(0xa1));
+    try conn.queueNewConnectionId(2, 0, &.{0xa2}, @splat(0xa2));
+    // After this, `local_cids` holds seqs 0, 1, 2 on path 0 and the
+    // recorded high-watermark `next_local_cid_seq` is 3. RETIRE
+    // frames with seq < 3 are legal (well-formed); seq >= 3 is a
+    // PROTOCOL_VIOLATION the fuzz harness must ride out as a close.
+
+    const num_ops = smith.valueRangeAtMost(u8, 0, 32);
+    var op_i: u8 = 0;
+    while (op_i < num_ops) : (op_i += 1) {
+        const op_kind = smith.valueRangeAtMost(u8, 0, 2);
+        const seq = smith.valueRangeAtMost(u64, 0, 16);
+        const cid_len = smith.valueRangeAtMost(u8, 0, 20);
+        // Bail out of obviously-invalid input the parser would reject
+        // before the handler sees it. `wire_header.ConnId.fromSlice`
+        // errors on len > 20, but we already cap above; this is
+        // belt-and-braces for forward-compat.
+        if (cid_len > 20) return;
+
+        var cid_bytes: [20]u8 = undefined;
+        smith.bytes(cid_bytes[0..cid_len]);
+        var token: [16]u8 = undefined;
+        smith.bytes(&token);
+
+        // Pick a `retire_prior_to` <= seq sometimes, > seq sometimes
+        // (the latter triggers the PROTOCOL_VIOLATION close path).
+        const rpt_kind = smith.valueRangeAtMost(u8, 0, 3);
+        const retire_prior_to: u64 = switch (rpt_kind) {
+            0 => 0,
+            1 => seq,
+            2 => if (seq > 0) seq - 1 else 0,
+            else => seq +| 1, // forces invalid-rpt close
+        };
+
+        switch (op_kind) {
+            0 => {
+                // NEW_CONNECTION_ID — register a peer-issued CID at
+                // path 0.
+                const conn_id = frame_types.ConnId.fromSlice(cid_bytes[0..cid_len]) catch return;
+                conn.handleNewConnectionId(.{
+                    .sequence_number = seq,
+                    .retire_prior_to = retire_prior_to,
+                    .connection_id = conn_id,
+                    .stateless_reset_token = token,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {},
+                };
+            },
+            1 => {
+                // RETIRE_CONNECTION_ID — peer asks us to retire one
+                // of OUR (local) CIDs at the named sequence.
+                conn.handleRetireConnectionId(.{ .sequence_number = seq });
+            },
+            else => {
+                // PATH_NEW_CONNECTION_ID — same shape as NEW with
+                // path_id=0. Doc'd above: keeping path_id at 0 means
+                // we don't have to negotiate multipath, but the call
+                // still exercises the second entry point into
+                // `registerPeerCid`.
+                const conn_id = frame_types.ConnId.fromSlice(cid_bytes[0..cid_len]) catch return;
+                conn.handlePathNewConnectionId(.{
+                    .path_id = 0,
+                    .sequence_number = seq,
+                    .retire_prior_to = retire_prior_to,
+                    .connection_id = conn_id,
+                    .stateless_reset_token = token,
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {},
+                };
+            },
+        }
+
+        // Invariant 1: peer_cids count for path 0 stays inside cap.
+        // (`registerPeerCid` closes with PROTOCOL_VIOLATION rather
+        // than overshoot the cap, so the cap holds even on
+        // adversarial input.)
+        const path0_count: u64 = @intCast(conn.peerCidActiveCountForPath(0));
+        try std.testing.expect(path0_count <= peer_cid_cap);
+
+        // Invariant 2: sequence_number is unique per path within
+        // peer_cids. Walk the list O(n^2) — we cap at 4 entries.
+        for (conn.peer_cids.items, 0..) |a, ai| {
+            for (conn.peer_cids.items[ai + 1 ..]) |b| {
+                if (a.path_id == b.path_id) {
+                    try std.testing.expect(a.sequence_number != b.sequence_number);
+                }
+            }
+        }
+
+        // Invariant 3 (RETIRE consequence): the named sequence was
+        // removed from `local_cids` on path 0 if it was present and
+        // the call did not close. We can't know which op fired this
+        // iteration without re-checking `op_kind`, so guard on it.
+        if (op_kind == 1 and conn.lifecycle.pending_close == null) {
+            // After a successful retire, no `local_cids` entry on
+            // path 0 with that sequence remains.
+            for (conn.local_cids.items) |item| {
+                if (item.path_id == 0) {
+                    try std.testing.expect(item.sequence_number != seq);
+                }
+            }
+        }
+
+        // Invariant 4: path 0's active peer_cid matches one of the
+        // peer_cids entries on path 0, OR the field is empty (no
+        // peer-issued CID promoted yet), OR the connection has
+        // closed.
+        if (conn.lifecycle.pending_close == null) {
+            const path = conn.paths.get(0).?;
+            const active = path.path.peer_cid;
+            if (active.len != 0) {
+                var matched = false;
+                for (conn.peer_cids.items) |item| {
+                    if (item.path_id == 0 and ConnectionId.eql(item.cid, active)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                try std.testing.expect(matched);
+            }
+        }
+
+        // Invariant 5 (close-code coherence): if the run produced a
+        // close, the error code lives in the documented set. Stop
+        // feeding ops once closed — the handlers no-op anyway, but
+        // the asserts above grow stale on a zombie state machine.
+        if (conn.lifecycle.pending_close) |info| {
+            const code = info.error_code;
+            try std.testing.expect(
+                code == transport_error_protocol_violation or
+                    code == transport_error_frame_encoding or
+                    code == transport_error_excessive_load,
+            );
+            break;
+        }
+    }
+}

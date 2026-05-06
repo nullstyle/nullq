@@ -6,7 +6,7 @@ required fuzz targets and §11.2 regression classes onto the codebase,
 and records the gaps that remain (very few, after the recent hardening
 pass).
 
-Last refreshed: 2026-05-06.
+Last refreshed: 2026-05-06 (CID lifecycle fuzz + all-unknown-frames regression).
 
 Scope notes:
 
@@ -27,7 +27,7 @@ Scope notes:
 ## 1. Inventory of `std.testing.fuzz` sites
 
 Verified via `rg "std.testing.fuzz" /Users/nullstyle/prj/ai-workspace/nullq/src`.
-Eighteen harnesses across thirteen files:
+Nineteen harnesses across thirteen files:
 
 | # | File | Test name | Target |
 |---|---|---|---|
@@ -50,9 +50,10 @@ Eighteen harnesses across thirteen files:
 | 17 | `src/conn/state.zig:13193` | `fuzz: Connection.handleCrypto reassembly invariants` | Drives `Connection.handleCrypto` via `dispatchFrames` with fuzzer-chosen offsets, lengths, and PN-spaces; asserts no panic/overflow, `bytes_resident <= max_connection_memory`, monotonic `crypto_recv_offset[idx]` per level, duplicate offsets do not push residency higher (commit `9fb1142`) |
 | 18 | `src/conn/state.zig:13285` | `fuzz: Connection.handleStream reassembly invariants` | Drives `Connection.handleStream` with fuzzer-chosen stream IDs / offsets / lengths / FIN flag; asserts `bytes_resident` cap, monotonic `read_offset`, well-formed send-side state after RESET_STREAM, `final_size` invariants once a FIN is observed (commit `9fb1142`) |
 | 19 | `src/conn/state.zig:13418` | `fuzz: Connection.recordAuthenticatedDatagramAddress migration sequences` | Drives randomized address-rebinding sequences against `Connection.recordAuthenticatedDatagramAddress` plus PATH_CHALLENGE / PATH_RESPONSE flows; asserts `peer_addr` always equals one of the candidate addresses fed in, `path.validator.status` always one of {idle, pending, validated, failed}, every `migration_path_failed` qlog event carries a documented `migration_fail_reason` (timeout / policy_denied / pre_handshake / rate_limited) (commit `9fb1142`) |
+| 20 | `src/conn/state.zig:13548` | `fuzz: Connection NEW_CONNECTION_ID / RETIRE_CONNECTION_ID lifecycle invariants` | Drives smith-chosen interleavings of `handleNewConnectionId` / `handleRetireConnectionId` / `handlePathNewConnectionId` (path_id=0) with fuzzer-chosen sequence numbers, retire_prior_to, CID bytes (len 0..20), and stateless-reset tokens; asserts `peer_cids` per-path count never exceeds the local `active_connection_id_limit` cap, sequence numbers within `peer_cids` are unique per path, RETIRE_CONNECTION_ID drops the named sequence from `local_cids` when not closing, the active `path.peer_cid` always matches an entry in `peer_cids`, and any close error code is one of `{protocol_violation, frame_encoding, excessive_load}` |
 
-(Eighteen harness sites — `src/conn/state.zig` contributes three;
-the row count above is 19 because we list each by its line number.)
+(Nineteen harness sites — `src/conn/state.zig` contributes four;
+the row count above is 20 because we list each by its line number.)
 
 The `tests/fuzz_smoke.zig` harness adds nine deterministic randomized
 round-trip tests covering varint, frame, transport-parameter, packet
@@ -92,7 +93,7 @@ Status legend:
 | 16 | QPACK field section decoder | MISSING (no impl) | nullq has no QPACK layer. |
 | 17 | Flow-control state machine | COVERED | `src/conn/flow_control.zig:264` `fuzz: flow_control ConnectionData state-machine invariants` — drives `recordSent` / `recordPeerSent` / `weCanSend` / `onMaxData` / `raiseLocalMax` with arbitrary u64s; asserts no overflow trap, monotonic limits, post-state invariants. Plus the deterministic `src/conn/flow_control.zig:198–246` happy-path tests and the connection-level integration coverage at `src/conn/state.zig:10309–10523`. |
 | 18 | Stream lifecycle state machine | COVERED | `src/conn/send_stream.zig:815` `fuzz: send_stream lifecycle invariants` and `src/conn/recv_stream.zig:617` `fuzz: recv_stream reassembly invariants` drive randomized op sequences across the full per-stream state machine and assert structural invariants (offset monotonicity, range-list bounds, terminal-state coherence). Connection-level reassembly fuzz adds end-to-end coverage at `src/conn/state.zig:13285`. Deterministic happy-path coverage retained at `src/conn/recv_stream.zig:379–599` and `src/conn/send_stream.zig:441–797`. |
-| 19 | Connection ID lifecycle | PARTIAL | `src/conn/state.zig:11487–11904` covers issuance, retirement, retire-prior-to per path, sequence-reuse rejection. No fuzzer drives random `NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID` / `PATH_NEW_CONNECTION_ID` interleavings, but the operation set is small enough that the deterministic suite is high coverage. |
+| 19 | Connection ID lifecycle | COVERED | `src/conn/state.zig:13548` `fuzz: Connection NEW_CONNECTION_ID / RETIRE_CONNECTION_ID lifecycle invariants` drives smith-chosen interleavings of `handleNewConnectionId` / `handleRetireConnectionId` / `handlePathNewConnectionId` (path_id=0) with fuzzer-chosen sequence numbers, retire_prior_to, CID bytes (len 0..20), and stateless-reset tokens; asserts the `peer_cids` cap, per-path sequence-number uniqueness, post-RETIRE removal from `local_cids`, active-CID coherence with `peer_cids`, and that any close code is one of `{protocol_violation, frame_encoding, excessive_load}`. Deterministic coverage retained at `src/conn/state.zig:11487–11904`. |
 | 20 | Path migration state machine | COVERED | `src/conn/path_validator.zig:176` `fuzz: path_validator state-machine invariants` covers the validator state machine. `src/conn/state.zig:13418` `fuzz: Connection.recordAuthenticatedDatagramAddress migration sequences` (commit `9fb1142`) drives full Connection-level migration sequences with fuzzer-chosen address rebinds and challenge/response flows; asserts `peer_addr` membership, `path.validator.status` legality, and `migration_fail_reason` enumeration coverage. Deterministic coverage retained at `src/conn/path_validator.zig:92–158` and `src/conn/path.zig:674–750`. Migration callback variants tested at `src/conn/state.zig:12410–12538`. |
 
 ## 3. §11.2 regression classes
@@ -114,7 +115,7 @@ Status legend matches §2.
 | 11 | Uppercase field names | MISSING (no impl) | No HTTP/3 in nullq. |
 | 12 | Forbidden `Connection` header | MISSING (no impl) | No HTTP/3 in nullq. |
 | 13 | Invalid `Content-Length` | MISSING (no impl) | No HTTP/3 in nullq. |
-| 14 | Excessive unknown frames | PARTIAL | At the QUIC-frame layer, `src/frame/decode.zig:600 decode rejects unknown frame type` covers single-byte rejection; the drain-loop fuzz at `:655` caps iterations at 16k. The Connection-level CRYPTO/STREAM reassembly fuzzes (`src/conn/state.zig:13193,13285`) drive randomized frame sequences through `dispatchFrames`. No regression test specifically pumps an all-unknown-frames payload to confirm the connection closes with `FRAME_ENCODING_ERROR`, but the fuzz harness reaches that path. |
+| 14 | Excessive unknown frames | COVERED | `tests/e2e/unknown_frames_smoke.zig` drives a real handshake to completion, then hand-seals a 1-RTT packet whose decrypted payload is ~1000 single-byte unknown-type varints (`0x21`); `Connection.handle` returns `error.UnknownFrameType` (surfaced from `frame.decode` on the very first byte), the server's PN tracker advanced (so the error is at the frame layer, not AEAD/PN), and the connection is *not* pushed into a zombie state — the next `poll` succeeds. Plus the original frame-level coverage: `src/frame/decode.zig:679 decode rejects unknown frame type` and the drain-loop fuzz at `:655` capping iterations at 16k. The Connection-level CRYPTO/STREAM reassembly fuzzes (`src/conn/state.zig:13193,13285`) also drive randomized frame sequences through `dispatchFrames`. |
 | 15 | Excessive unknown settings | MISSING (no impl) | HTTP/3 layer absent; transport-parameter unknowns are silently skipped as required (`src/tls/transport_params.zig:563 decode skips unknown ids`). |
 | 16 | Excessive blocked QPACK streams | MISSING (no impl) | No QPACK in nullq. |
 | 17 | Dynamic table refs beyond known insert count | MISSING (no impl) | No QPACK in nullq. |
@@ -126,27 +127,9 @@ Status legend matches §2.
 
 ## 4. Remaining gaps
 
-Two §11.1 / §11.2 rows are the only items not flipped to COVERED:
-
-- **§11.1 #19 (Connection ID lifecycle).** Issuance / retirement /
-  retire-prior-to / sequence-reuse rejection are covered by
-  deterministic tests at `src/conn/state.zig:11487–11904`. No
-  coverage-guided fuzzer drives random
-  `NEW_CONNECTION_ID` / `RETIRE_CONNECTION_ID` /
-  `PATH_NEW_CONNECTION_ID` interleavings. The op set is small and the
-  deterministic suite hits the corner cases the hardening guide calls
-  out, so this is a low-priority addition.
-- **§11.2 #14 (Excessive unknown frames).** The frame-level decoder
-  rejects unknown types and the drain-loop fuzz caps iterations.
-  Connection-level reassembly fuzz exercises `dispatchFrames`. A
-  dedicated regression test that pumps an all-unknown-frames payload
-  through `handleAtLevel` to confirm the connection closes with
-  `FRAME_ENCODING_ERROR` rather than CPU-spinning would close this
-  cleanly.
-
-All other in-scope rows are COVERED. Out-of-scope rows (HTTP/3,
-QPACK) are tracked for when those layers are added — see the
-appendix.
+Every §11.1 / §11.2 row that has a corresponding nullq implementation
+is now flipped to COVERED. Out-of-scope rows (HTTP/3, QPACK) are
+tracked for when those layers are added — see the appendix.
 
 ## Appendix: out-of-scope rows
 
