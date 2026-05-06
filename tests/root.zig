@@ -7,4 +7,5 @@ test {
     _ = @import("e2e/server_smoke.zig");
     _ = @import("e2e/server_loop_smoke.zig");
     _ = @import("e2e/client_smoke.zig");
+    _ = @import("e2e/server_client_handshake.zig");
 }
