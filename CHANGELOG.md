@@ -9,6 +9,12 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+## [0.1.0-pre.1] - 2026-05-05
+
+First tagged pre-release. The transport passes the full quic-go
+interop matrix (`H, DC, C20, S, R, Z, M`); public Zig API is still
+expected to churn before `0.1.0` final.
+
 ### Added
 - `nullq.Server` production-grade convenience wrapper for embedding
   nullq as a UDP server. Owns the TLS context and a CID-to-slot
