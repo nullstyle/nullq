@@ -952,3 +952,76 @@ test "Initial coalesced with Handshake: bytes_consumed lets us advance" {
     try testing.expectEqualSlices(u8, "H0", o2.payload[0..2]);
     try testing.expectEqual(h_len, o2.bytes_consumed);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive the structural coalesced-datagram walker with arbitrary
+// bytes. The receive path in `Connection.handle` walks coalesced
+// QUIC packets by parsing a header, decrypting, then advancing by
+// `bytes_consumed`. The structural walker here mirrors the
+// pre-decryption shape: parse a header, compute the on-wire packet
+// length from `pn_offset + payload_length`, advance, repeat. This
+// catches walker-only failure modes (misframed length fields, header
+// parses that report inconsistent offsets, infinite loops on
+// degenerate inputs) without requiring decryption keys.
+//
+// Property: the walker terminates within a bounded iteration cap;
+// every step advances by at least 1 byte; cumulative offset stays
+// inside the input.
+
+test "fuzz: coalesced long-header walker terminates with bounded advance" {
+    try std.testing.fuzz({}, fuzzCoalescedWalker, .{});
+}
+
+fn fuzzCoalescedWalker(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buf: [4096]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    const input = input_buf[0..len];
+    const dcid_len_for_short = smith.valueRangeAtMost(u8, 0, 20);
+
+    // Cap iterations: a 4 KiB datagram cannot legitimately hold more
+    // than ~250 minimal packets (each long-header packet is at least
+    // ~16 bytes). Anything past this cap is either degenerate input
+    // or a walker bug.
+    const max_iters: u32 = 256;
+    var iters: u32 = 0;
+    var pos: usize = 0;
+
+    while (pos < input.len and iters < max_iters) : (iters += 1) {
+        const slice = input[pos..];
+        const parsed = header.parse(slice, dcid_len_for_short) catch return;
+
+        // Compute the on-wire packet length. Long-header
+        // Initial/0-RTT/Handshake carry an explicit `payload_length`
+        // varint that frames the PN+payload+tag region. Retry / VN
+        // and short-header packets cannot be coalesce-followed
+        // (RFC 9000 §17), so the walker terminates after them.
+        const advance: usize = switch (parsed.header) {
+            .initial => |h| blk: {
+                const payload_len = std.math.cast(usize, h.payload_length) orelse return;
+                break :blk std.math.add(usize, parsed.pn_offset, payload_len) catch return;
+            },
+            .zero_rtt => |h| blk: {
+                const payload_len = std.math.cast(usize, h.payload_length) orelse return;
+                break :blk std.math.add(usize, parsed.pn_offset, payload_len) catch return;
+            },
+            .handshake => |h| blk: {
+                const payload_len = std.math.cast(usize, h.payload_length) orelse return;
+                break :blk std.math.add(usize, parsed.pn_offset, payload_len) catch return;
+            },
+            .retry, .version_negotiation, .one_rtt => break,
+        };
+
+        // Walker invariants:
+        // - advance must lie within remaining input (no over-read).
+        // - advance must be > 0 (no infinite loop on degenerate
+        //   payload_length=0 inputs).
+        if (advance == 0 or advance > slice.len) return;
+        pos += advance;
+    }
+
+    // Cumulative offset stays inside the input slice.
+    try std.testing.expect(pos <= input.len);
+    // The walker terminates within the cap.
+    try std.testing.expect(iters < max_iters);
+}

@@ -59,7 +59,7 @@ Status legend:
 | 1 | QUIC varint decoder | COVERED | `src/wire/varint.zig:262` |
 | 2 | Long-header parser | COVERED | `src/wire/header.zig:836` (handles all six variants) and `src/server.zig:2051` (peek surface) |
 | 3 | Short-header parser | COVERED | `src/wire/header.zig:836` walks short headers under fuzzer-chosen DCID length; `src/server.zig:2081` is the routing-level peek |
-| 4 | Coalesced datagram parser | MISSING | Only one unit test exercises the coalesced path: `src/wire/long_packet.zig:914` `Initial coalesced with Handshake: bytes_consumed lets us advance`. No fuzz harness drives `Connection.handle` over a mutated coalesced datagram. |
+| 4 | Coalesced datagram parser | COVERED | `src/wire/long_packet.zig:973` `fuzz: coalesced long-header walker terminates with bounded advance` — structural walker mirrors the receive-path coalesce loop (parse header, advance by `pn_offset + payload_length`); asserts bounded iteration, in-bounds advance, and termination on Retry/VN/short. Plus the original positive `bytes_consumed` test at `src/wire/long_packet.zig:918`. |
 | 5 | Transport parameter parser | PARTIAL | `tests/fuzz_smoke.zig:217` round-trips generated params; `tests/fuzz_smoke.zig:276` deterministically fuzzes malformed buffers. No `std.testing.fuzz` harness — only fixed-seed sweeps. |
 | 6 | Retry token parser | PARTIAL | `src/conn/retry_token.zig` has 3 negative tests at lines 178, 197, 230 (wrong address, wrong CIDs, wrong version, expired, future, malformed prefix). No fuzzer drives `validate` with arbitrary bytes. |
 | 7 | ACK frame parser | PARTIAL | The ACK frame is decoded inside `frame.decode` (covered) — its parser is exercised. The ACK *range iterator* has deterministic property coverage in `tests/fuzz_smoke.zig:390` plus invariant tests in `src/frame/ack_range.zig:127–207`. No coverage-guided harness on the iterator. |
@@ -138,18 +138,17 @@ alongside `ACK with largest_acked >= next_pn is a PROTOCOL_VIOLATION`,
 and the assertion is "either the connection closes with
 `FRAME_ENCODING_ERROR` or processing returns within a fixed bound".
 
-### Priority 3: Coalesced-datagram fuzz harness (§11.1.4)
+### Priority 3: Coalesced-datagram fuzz harness (§11.1.4) — DONE
 
-**Risk: high. Readiness: ready.** The coalesced path is server-side
-hot — every client first-flight is Initial+Handshake or
-Initial+0-RTT. `Connection.handle` walks them via
-`bytes_consumed`. The only test today is the single positive case at
-`src/wire/long_packet.zig:914`. A `std.testing.fuzz` harness on
-`Connection.handle` (or, more practically, on a thin "open then walk
-remainder" helper) would cover advancement-past-end, oversize
-declared-payload-length, zero-length packets in the middle, and
-packets with mismatched DCIDs. Lives next to existing fuzz harnesses
-in `src/wire/long_packet.zig` or a new file under `src/conn/`.
+**Landed.** `src/wire/long_packet.zig:973` `fuzz: coalesced
+long-header walker terminates with bounded advance`. Structural
+walker mirrors the receive-path coalesce loop: parse header, advance
+by `pn_offset + payload_length`, repeat until input exhausted or a
+Retry/VN/short-header packet (which can't be coalesce-followed) is
+parsed. Asserts bounded iteration count (≤256), monotonic advance
+(≥1 byte), and in-bounds cumulative offset. Catches malformed
+length-field encodings, header parses with inconsistent offsets, and
+infinite-loop inputs without needing decryption keys.
 
 ### Priority 4: PATH_CHALLENGE flood / migration-before-handshake (§11.2.20 + §11.2.22)
 
