@@ -10,24 +10,6 @@ breaking changes; see notes per release.
 ## [Unreleased]
 
 ### Added
-- `nullq.transport.runUdpServer` — opinionated `std.Io`-based UDP
-  server loop that binds the socket, applies `SO_RCVBUF` / `SO_SNDBUF`
-  tuning, drives the `feed` / `pollDatagram` / `tick` / `reap`
-  cadence on a 5 ms heartbeat, and shuts down cleanly when a
-  caller-supplied `std.atomic.Value(bool)` flag flips. Intended as
-  the fastest path from `nullq.Server.init` to a working QUIC
-  endpoint. The QNS endpoint and other embedders that need full
-  control (Retry, version negotiation, deterministic CIDs) keep
-  driving the I/O-agnostic Server interface directly. See
-  `src/transport/udp_server.zig` and the README "Embed nullq as a
-  server" section.
-- `.github/workflows/test.yml`: matrix build/test on ubuntu-latest and
-  macos-latest with Zig 0.16.0.
-- `.github/workflows/interop.yml`: weekly QNS interop run against the
-  official `quic-interop/quic-interop-runner` (server role, `H,DC,M`
-  against quic-go, quiche, ngtcp2). Marked `continue-on-error` since
-  interop is environment-sensitive and not a hard merge gate.
-- This `CHANGELOG.md`.
 - `nullq.Server` production-grade convenience wrapper for embedding
   nullq as a UDP server. Owns the TLS context and a CID-to-slot
   routing table; the embedder owns the socket and clock. Config /
@@ -39,15 +21,6 @@ breaking changes; see notes per release.
   `Config.max_initials_per_source_per_window` and surfaces a
   distinct `FeedOutcome.rate_limited` variant. See `src/server.zig`
   and the `README.md` "Embed nullq as a server" section.
-- `nullq.Client` convenience wrapper for embedding nullq as a QUIC
-  client. Mirror to `nullq.Server`: builds a client-mode TLS
-  context, generates the per-connection random initial DCID and
-  SCID (RFC 9000 §7.2), and runs `bind` / `setLocalScid` /
-  `setInitialDcid` / `setPeerDcid` / `setTransportParams` in the
-  right order, returning a heap-allocated `*Connection` ready for
-  the first `advance` / `poll`. Optional `Config.session_ticket`
-  wires up resumption + 0-RTT in one step. See `src/client.zig` and
-  the `README.md` "Embed nullq as a client" section.
 - `nullq.Server` Version Negotiation and stateless Retry gates,
   surfaced through new `FeedOutcome.version_negotiated` /
   `FeedOutcome.retry_sent` variants and a new
@@ -66,6 +39,26 @@ breaking changes; see notes per release.
   legacy QNS endpoint loop at `interop/qns_endpoint.zig` retains
   its bespoke version of these flows for interop fixtures, but new
   embedders can rely on `Server` for both.
+- `nullq.Client` convenience wrapper for embedding nullq as a QUIC
+  client. Mirror to `nullq.Server`: builds a client-mode TLS
+  context, generates the per-connection random initial DCID and
+  SCID (RFC 9000 §7.2), and runs `bind` / `setLocalScid` /
+  `setInitialDcid` / `setPeerDcid` / `setTransportParams` in the
+  right order, returning a heap-allocated `*Connection` ready for
+  the first `advance` / `poll`. Optional `Config.session_ticket`
+  wires up resumption + 0-RTT in one step. See `src/client.zig` and
+  the `README.md` "Embed nullq as a client" section.
+- `nullq.transport.runUdpServer` — opinionated `std.Io`-based UDP
+  server loop that binds the socket, applies `SO_RCVBUF` / `SO_SNDBUF`
+  tuning, drives the `feed` / `pollDatagram` / `tick` / `reap`
+  cadence on a 5 ms heartbeat, and shuts down cleanly when a
+  caller-supplied `std.atomic.Value(bool)` flag flips. Intended as
+  the fastest path from `nullq.Server.init` to a working QUIC
+  endpoint. The QNS endpoint and other embedders that need full
+  control (Retry, version negotiation, deterministic CIDs) keep
+  driving the I/O-agnostic Server interface directly. See
+  `src/transport/udp_server.zig` and the README "Embed nullq as a
+  server" section.
 - `Connection.localScidCount`, `Connection.localScids`, and
   `Connection.ownsLocalCid` for embedders that maintain a
   CID-to-connection routing table outside the connection
@@ -90,6 +83,12 @@ breaking changes; see notes per release.
 - `zig build bench` step with 9 ReleaseFast wire/frame microbenchmarks
   (varint enc/dec, STREAM enc/dec, ACK enc/dec, short-header enc/dec,
   CID generation). See `bench/main.zig` and `bench/README.md`.
+- `.github/workflows/test.yml`: matrix build/test on ubuntu-latest and
+  macos-latest with Zig 0.16.0.
+- `.github/workflows/interop.yml`: weekly QNS interop run against the
+  official `quic-interop/quic-interop-runner` (server role, `H,DC,M`
+  against quic-go, quiche, ngtcp2). Marked `continue-on-error` since
+  interop is environment-sensitive and not a hard merge gate.
 
 ### Changed
 - `boringssl-zig` is now a URL+hash dep pinned to a specific upstream
@@ -99,17 +98,17 @@ breaking changes; see notes per release.
 - Stateless reset token comparison uses
   `std.crypto.timing_safe.eql` instead of `std.mem.eql`, closing
   the timing side-channel called out in RFC 9000 §10.3.
-- The 9 internal `unreachable` arms in `src/wire`, `src/conn/path`,
-  and `src/conn/retry_token` are now annotated with `// invariant:`
+- All 15 `unreachable` / `@panic` sites in `src/` were audited; the
+  9 reachable-from-input arms in `src/wire`, `src/conn/path`, and
+  `src/conn/retry_token` are now annotated with `// invariant:`
   comments documenting why each is unreachable from peer input.
-  All 15 `unreachable`/`@panic` sites in `src/` were audited; none
-  are peer-reachable.
+  None are peer-reachable.
 
 ### Notes
 - nullq remains pre-1.0 (`0.0.0` in `build.zig.zon`). The transport is
-  feature-rich and passes a substantial QNS interop matrix, but the
-  public Zig API is still expected to churn before the first tagged
-  release.
+  feature-rich and passes a substantial QNS interop matrix (see
+  `INTEROP_STATUS.md`), but the public Zig API is still expected to
+  churn before the first tagged release.
 
 ## [0.0.0] - pre-release development
 
