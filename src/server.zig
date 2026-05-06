@@ -791,11 +791,6 @@ pub const Server = struct {
     /// oldest entry is evicted to keep ingest latency bounded.
     stateless_responses: std.ArrayList(StatelessResponse) = .empty,
 
-    /// Random source used to mint server SCIDs. Embedders that need
-    /// deterministic CIDs (interop fixtures, fuzzers) can swap this.
-    random: std.Random,
-    rng_state: std.Random.DefaultPrng,
-
     /// Monotonic, server-local slot id. Bumped on every accepted
     /// slot; stable for the slot's lifetime. NOT a CID — it's purely
     /// a routing key for embedder logs/tracing.
@@ -876,14 +871,12 @@ pub const Server = struct {
             owns_tls = true;
         }
 
-        // Cheap default RNG seed taken from BoringSSL's CSPRNG.
-        // The PRNG itself is just `DefaultPrng` because all we need
-        // is unique server SCIDs — embedders that want full crypto
-        // randomness on every CID can post-init swap `Server.random`.
-        var seed_bytes: [8]u8 = undefined;
-        try boringssl.crypto.rand.fillBytes(&seed_bytes);
-        const seed = std.mem.readInt(u64, &seed_bytes, .little);
-        var prng = std.Random.DefaultPrng.init(seed);
+        // SCIDs and Retry SCIDs are minted directly from BoringSSL's
+        // CSPRNG — see `mintLocalCid` / `mintAndQueueRetry`. There is
+        // no PRNG-from-seed cache: each ID is a fresh
+        // `crypto.rand.fillBytes` call so an attacker observing
+        // server-issued CIDs can't predict future ones from a finite
+        // PRNG state. (Hardening guide §4.5.)
 
         const slots_initial_capacity: usize = @min(config.max_concurrent_connections, 64);
         var slots: std.ArrayList(*Slot) = .empty;
@@ -932,8 +925,6 @@ pub const Server = struct {
             .enable_0rtt = config.enable_0rtt,
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .stateless_responses = .empty,
-            .random = prng.random(),
-            .rng_state = prng,
         };
     }
 
@@ -1428,7 +1419,7 @@ pub const Server = struct {
             @memcpy(server_scid[0..echo.retry_scid_len], local_scid);
             local_scid = server_scid[0..echo.retry_scid_len];
         } else {
-            self.random.bytes(server_scid[0..self.local_cid_len]);
+            try boringssl.crypto.rand.fillBytes(server_scid[0..self.local_cid_len]);
             local_scid = server_scid[0..self.local_cid_len];
         }
         try conn_ptr.setLocalScid(local_scid);
@@ -1849,7 +1840,7 @@ pub const Server = struct {
         // a different connection.
         var retry_scid: [20]u8 = @splat(0);
         const retry_scid_len = self.local_cid_len;
-        self.random.bytes(retry_scid[0..retry_scid_len]);
+        try boringssl.crypto.rand.fillBytes(retry_scid[0..retry_scid_len]);
 
         var addr_buf: [22]u8 = undefined;
         const ctx = addressContext(&addr_buf, addr);
