@@ -284,6 +284,37 @@ const ConfigImpl = struct {
     retry_state_table_capacity: u32 = 4096,
 };
 
+/// Argument to `Server.replaceTlsContext`. Either fresh PEM bytes
+/// (the server rebuilds an internally-owned context with the same
+/// shape `Server.init` produces) or a caller-built context the
+/// embedder hands over wholesale. Re-exported as `Server.TlsReload`.
+const TlsReloadImpl = union(enum) {
+    /// Rebuild a fresh server context from PEM-encoded cert chain
+    /// and private key. The new context is configured identically to
+    /// `Server.init`'s default path: TLS-1.3 only, `verify=.none`,
+    /// `early_data_enabled = true`, and the server's currently-cached
+    /// ALPN list. The Server takes ownership of the resulting context
+    /// and `deinit`s it (after refcounted draining) on `Server.deinit`
+    /// or on a subsequent `replaceTlsContext`.
+    pem: struct {
+        /// PEM-encoded certificate chain (leaf first, then any
+        /// intermediates). Must outlive only this call — the new
+        /// `boringssl.tls.Context` parses the bytes during construction
+        /// and copies what it needs.
+        cert_pem: []const u8,
+        /// PEM-encoded private key matching the leaf in `cert_pem`.
+        /// Same lifetime constraint as `cert_pem`.
+        key_pem: []const u8,
+    },
+    /// A caller-built context the Server should adopt as the new
+    /// current context. Use this to wire up bespoke options the
+    /// `pem` variant doesn't expose (custom verify modes, session
+    /// ticket callbacks, ALPN protocols different from the
+    /// init-time list, etc.). The Server takes ownership and will
+    /// `deinit` the override when it eventually drains.
+    override: boringssl.tls.Context,
+};
+
 /// One slot in the server's per-connection table. The `Connection`
 /// is heap-allocated so the embedder can hold stable pointers across
 /// `Server.feed` / `Server.poll` calls. Re-exported as `Server.Slot`.
@@ -311,6 +342,35 @@ const SlotImpl = struct {
     /// can use this to enforce idle timeouts beyond what QUIC's own
     /// idle timer covers.
     last_activity_us: u64 = 0,
+    /// TLS-context generation this slot was opened against. Set to
+    /// `Server.current_generation` at `openSlotFromInitial` time and
+    /// never mutated afterward. Drives draining-context refcount
+    /// bookkeeping in `Server.reap`: when a slot is reaped, its
+    /// generation tells us which draining context (if any) loses a
+    /// reference.
+    tls_generation: u32 = 0,
+};
+
+/// Bookkeeping for one TLS context that has been swapped out by
+/// `Server.replaceTlsContext` but still has live slots referencing it
+/// via per-connection SSL handles. The entry is `deinit`-ed and
+/// dropped when `refcount` hits zero on reap.
+const DrainingTlsEntry = struct {
+    /// The swapped-out context. Owned — `refcount==0` deinit calls
+    /// `Context.deinit` on this. Per-connection SSL handles created
+    /// against this context already hold their own up-ref via
+    /// `SSL_new`, so deiniting here only drops the Server's reference;
+    /// the underlying SSL_CTX stays alive until every per-connection
+    /// SSL handle is freed.
+    ctx: boringssl.tls.Context,
+    /// Generation tag. Slots opened against this context recorded the
+    /// same value in their `tls_generation` field; reap matches on it.
+    generation: u32,
+    /// Number of live slots still associated with this context. Set
+    /// at swap-time (= count of pre-swap slots whose generation was
+    /// `current_generation`); decremented in `reap` when one of those
+    /// slots is reclaimed.
+    refcount: usize,
 };
 
 /// Outcome of feeding a single datagram to the server. Re-exported
@@ -383,20 +443,35 @@ const ErrorImpl = error{
 pub const Server = struct {
     /// Re-exports of the helper types so `Server.Config`,
     /// `Server.Slot`, `Server.FeedOutcome`, `Server.StatelessResponse`,
-    /// and `Server.Error` all resolve from the public API surface.
-    /// The top-level definitions remain authoritative.
+    /// `Server.TlsReload`, and `Server.Error` all resolve from the
+    /// public API surface. The top-level definitions remain
+    /// authoritative.
     pub const Config = ConfigImpl;
     pub const Slot = SlotImpl;
     pub const FeedOutcome = FeedOutcomeImpl;
     pub const StatelessResponse = StatelessResponseImpl;
+    pub const TlsReload = TlsReloadImpl;
     pub const Error = ErrorImpl;
 
     allocator: std.mem.Allocator,
     tls_ctx: boringssl.tls.Context,
     /// True if the TLS context was built by `Server.init` and must
     /// be torn down on `deinit`. False if the embedder supplied
-    /// `tls_context_override`.
+    /// `tls_context_override`. `replaceTlsContext` updates this in
+    /// step with the swap: a `.pem` reload produces an owned new
+    /// context (`owns_tls = true`), an `.override` reload adopts the
+    /// caller-supplied context as owned (`owns_tls = true`) — once
+    /// the caller hands the context to the Server, the Server is
+    /// responsible for the eventual `deinit`. The pre-swap context's
+    /// owned/borrowed status is preserved by only moving it into
+    /// `draining_tls_contexts` when it was previously owned.
     owns_tls: bool,
+    /// Borrowed ALPN list captured from `Config.alpn_protocols` at
+    /// `init` time. Used by `replaceTlsContext({.pem = ...})` to
+    /// reconstruct the new context with the same ALPN preference
+    /// order. Embedders that need to change the ALPN list across a
+    /// reload must use the `.override` variant.
+    alpn_protocols: []const []const u8,
     transport_params: TransportParams,
     max_concurrent_connections: u32,
     local_cid_len: u8,
@@ -438,6 +513,21 @@ pub const Server = struct {
     /// deterministic CIDs (interop fixtures, fuzzers) can swap this.
     random: std.Random,
     rng_state: std.Random.DefaultPrng,
+
+    /// Monotonic counter stamping every newly-opened slot's
+    /// `tls_generation`. Starts at 0 and bumps on each
+    /// `replaceTlsContext` call. Slots opened against `tls_ctx` carry
+    /// this exact value; slots opened before a swap retain whatever
+    /// generation was current when they were created.
+    current_generation: u32 = 0,
+    /// Pre-swap TLS contexts that were owned by the Server and still
+    /// have at least one live slot referencing them via a
+    /// per-connection SSL handle. Each entry is `deinit`-ed and
+    /// removed in `reap` once its `refcount` reaches zero. Pre-swap
+    /// contexts that the embedder originally supplied via
+    /// `tls_context_override` are NOT inserted here — the embedder
+    /// retains ownership of those.
+    draining_tls_contexts: std.ArrayListUnmanaged(DrainingTlsEntry) = .empty,
 
     pub fn init(config: Config) Error!Server {
         if (config.alpn_protocols.len == 0) return Error.InvalidConfig;
@@ -504,6 +594,7 @@ pub const Server = struct {
             .allocator = config.allocator,
             .tls_ctx = tls_ctx,
             .owns_tls = owns_tls,
+            .alpn_protocols = config.alpn_protocols,
             .transport_params = config.transport_params,
             .max_concurrent_connections = config.max_concurrent_connections,
             .local_cid_len = config.local_cid_len,
@@ -536,6 +627,12 @@ pub const Server = struct {
         self.source_rate_table.deinit(self.allocator);
         self.retry_state_table.deinit(self.allocator);
         self.stateless_responses.deinit(self.allocator);
+        // Draining contexts always represent ownership the Server
+        // took on at swap-time, so they're unconditionally deinit-ed
+        // here regardless of `owns_tls` (which only describes the
+        // *current* context).
+        for (self.draining_tls_contexts.items) |*entry| entry.ctx.deinit();
+        self.draining_tls_contexts.deinit(self.allocator);
         if (self.owns_tls) self.tls_ctx.deinit();
         self.* = undefined;
     }
@@ -699,6 +796,10 @@ pub const Server = struct {
     /// slots reclaimed. Iterates back-to-front and uses
     /// `swapRemove`, so reaping N closed slots is O(N), not O(N²).
     /// Each reaped slot drops every CID it owned from `cid_table`.
+    /// If a reaped slot was opened against a draining TLS context,
+    /// its draining-entry refcount is decremented; when the count
+    /// reaches zero the draining context is `deinit`-ed and removed
+    /// from `draining_tls_contexts`.
     pub fn reap(self: *Server) usize {
         var reaped: usize = 0;
         var i: usize = self.slots.items.len;
@@ -707,13 +808,40 @@ pub const Server = struct {
             const slot = self.slots.items[i];
             if (!slot.conn.isClosed()) continue;
             self.dropAllCidsFromTable(slot);
+            const generation = slot.tls_generation;
             slot.conn.deinit();
             self.allocator.destroy(slot.conn);
             self.allocator.destroy(slot);
             _ = self.slots.swapRemove(i);
             reaped += 1;
+            self.releaseGeneration(generation);
         }
         return reaped;
+    }
+
+    /// Decrement the refcount on the draining entry for `generation`,
+    /// if any. When the refcount hits zero, the entry's context is
+    /// torn down and the entry is dropped from
+    /// `draining_tls_contexts`. A `generation` matching
+    /// `current_generation` is a no-op (the current context isn't a
+    /// draining entry until the next `replaceTlsContext`).
+    fn releaseGeneration(self: *Server, generation: u32) void {
+        if (generation == self.current_generation) return;
+        var idx: usize = 0;
+        while (idx < self.draining_tls_contexts.items.len) : (idx += 1) {
+            const entry = &self.draining_tls_contexts.items[idx];
+            if (entry.generation != generation) continue;
+            // invariant: refcount > 0 — every live slot at this
+            // generation contributed exactly one. Reaping a slot
+            // can't drop to zero before all its refs are accounted.
+            std.debug.assert(entry.refcount > 0);
+            entry.refcount -= 1;
+            if (entry.refcount == 0) {
+                entry.ctx.deinit();
+                _ = self.draining_tls_contexts.swapRemove(idx);
+            }
+            return;
+        }
     }
 
     /// Queue `CONNECTION_CLOSE` on every live slot. Embedders should
@@ -723,6 +851,98 @@ pub const Server = struct {
         for (self.slots.items) |slot| {
             slot.conn.close(true, error_code, reason);
         }
+    }
+
+    /// Hot-swap the TLS context used for new connections. Existing
+    /// slots keep talking to their original context via the
+    /// per-connection SSL handle (BoringSSL up-refs `SSL_CTX` on
+    /// `SSL_new`, so the slot's TLS state survives the swap); only
+    /// future `acceptInitial` calls — i.e. brand-new slots created
+    /// after this returns — see the new context.
+    ///
+    /// The pre-swap context, if it was Server-owned, is moved into
+    /// `draining_tls_contexts` with a refcount equal to the number of
+    /// live slots that were opened against it. As those slots reach
+    /// `.closed` and get reaped, the refcount decrements; the
+    /// draining context is torn down on the reap that drops the last
+    /// reference. If the pre-swap context was caller-supplied (via
+    /// `Config.tls_context_override`), the embedder retains
+    /// ownership: the swap simply forgets the borrowed pointer here
+    /// and stops handing it to new slots. The draining list is
+    /// always purely Server-owned.
+    ///
+    /// **Resumption note**: BoringSSL mints session tickets under
+    /// the SSL_CTX's per-context ticket key, so a ticket issued
+    /// before this swap cannot be decrypted under the new context
+    /// (different key material). Embedders that need cross-reload
+    /// resumption — for example to keep 0-RTT working across a hot
+    /// cert rotation — must manage ticket key material themselves
+    /// (`SSL_CTX_set_tlsext_ticket_keys` or its callback variants)
+    /// and feed the rebuilt context in via the `.override` variant
+    /// after configuring the keys explicitly. This call deliberately
+    /// does not bridge ticket keys for you.
+    ///
+    /// Errors:
+    ///   - `OutOfMemory`: appending to `draining_tls_contexts`.
+    ///   - `boringssl.tls.Error.*` / `InvalidConfig`: only the
+    ///     `.pem` variant — propagated from
+    ///     `Context.initServer`/`loadCertChainAndKey`. The Server is
+    ///     left untouched on error: the current context, slot table,
+    ///     and draining list are all unchanged.
+    pub fn replaceTlsContext(self: *Server, reload: TlsReload) Error!void {
+        var new_ctx: boringssl.tls.Context = switch (reload) {
+            .pem => |pem| blk: {
+                if (pem.cert_pem.len == 0 or pem.key_pem.len == 0) return Error.InvalidConfig;
+                var ctx = try boringssl.tls.Context.initServer(.{
+                    .verify = .none,
+                    .min_version = boringssl.raw.TLS1_3_VERSION,
+                    .max_version = boringssl.raw.TLS1_3_VERSION,
+                    .alpn = self.alpn_protocols,
+                    .early_data_enabled = true,
+                });
+                errdefer ctx.deinit();
+                try ctx.loadCertChainAndKey(pem.cert_pem, pem.key_pem);
+                break :blk ctx;
+            },
+            .override => |ctx| ctx,
+        };
+        // From this point on the new context is logically the
+        // Server's. If the bookkeeping below fails we have to deinit
+        // it ourselves to avoid leaking — the caller already
+        // surrendered ownership of an `.override`, and the `.pem`
+        // branch built it locally.
+        errdefer new_ctx.deinit();
+
+        // Count live slots at the current generation so we know how
+        // many references the about-to-drain context still holds.
+        var refs: usize = 0;
+        const gen_to_drain = self.current_generation;
+        for (self.slots.items) |slot| {
+            if (slot.tls_generation == gen_to_drain) refs += 1;
+        }
+
+        // Reserve a draining slot up-front when the pre-swap context
+        // is owned and still referenced — `appendBounded`-style call
+        // would also work, but doing it now means an OOM here leaves
+        // both the old context and the slot table untouched.
+        if (self.owns_tls and refs > 0) {
+            try self.draining_tls_contexts.append(self.allocator, .{
+                .ctx = self.tls_ctx,
+                .generation = gen_to_drain,
+                .refcount = refs,
+            });
+        } else if (self.owns_tls and refs == 0) {
+            // Owned but no live slots reference it — drop immediately.
+            self.tls_ctx.deinit();
+        }
+        // If !owns_tls, the embedder retains ownership of the
+        // pre-swap context — we just forget the pointer.
+
+        self.tls_ctx = new_ctx;
+        self.owns_tls = true;
+        self.current_generation +%= 1;
+        // `errdefer new_ctx.deinit()` no longer applies after the
+        // assignment above; everything that could fail has run.
     }
 
     // -- internals ------------------------------------------------------
@@ -794,6 +1014,7 @@ pub const Server = struct {
             .initial_dcid = initial_dcid,
             .peer_addr = from,
             .last_activity_us = now_us,
+            .tls_generation = self.current_generation,
         };
 
         // Reserve a slot in the CID table for the initial DCID. If
