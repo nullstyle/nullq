@@ -272,6 +272,145 @@ test "Server.feed with unsupported version queues a Version Negotiation packet" 
     try std.testing.expectEqual(@as(?nullq.Server.StatelessResponse, null), srv.drainStatelessResponse());
 }
 
+test "Server VN per-source rate limiter caps VN responses (hardening guide §4.4)" {
+    // Per-source VN-emission cap. After `max_vn_per_source_per_window`
+    // VN responses to a given source within `source_rate_window_us`,
+    // further non-v1 long-header probes from that source are dropped
+    // (no VN emitted, queue not bumped). Independent from the Initial
+    // budget — a peer that floods VN probes shouldn't burn the same
+    // counter that gates Initial slot creation.
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_vn_per_source_per_window = 3,
+        .source_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    // 19-byte non-v1 long-header packet (same shape the existing VN
+    // test uses). Version 0xdeadbeef — well below 1200 bytes, but
+    // VN handling is governed by §6 not §14 so the size gate doesn't
+    // fire here.
+    var probe = [_]u8{
+        0xc0,
+        0xde, 0xad, 0xbe, 0xef,
+        0x04,
+        0xa0, 0xa1, 0xa2, 0xa3,
+        0x04,
+        0xb0, 0xb1, 0xb2, 0xb3,
+        0x00, 0x00, 0x00,
+    };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+
+    // First three probes from this source: each earns a VN response.
+    for (0..3) |i| {
+        try std.testing.expectEqual(
+            nullq.Server.FeedOutcome.version_negotiated,
+            try srv.feed(&probe, addr, @intCast(i)),
+        );
+    }
+
+    // Fourth probe: rate-limited, no VN queued.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.dropped,
+        try srv.feed(&probe, addr, 4),
+    );
+
+    // Different source from cleared address space: gets its own budget.
+    const other_addr = nullq.conn.path.Address{ .bytes = @splat(0x88) };
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.version_negotiated,
+        try srv.feed(&probe, other_addr, 5),
+    );
+
+    // After the window elapses, the original source's VN budget resets.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.version_negotiated,
+        try srv.feed(&probe, addr, 1_500_000),
+    );
+
+    // Counters reflect the gate firings exactly.
+    const m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 5), m.feeds_version_negotiated);
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_vn_rate_limited);
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_dropped);
+}
+
+test "Server VN rate limit and Initial rate limit use independent counters" {
+    // A peer that spams VN probes shouldn't burn the per-source
+    // Initial budget, and vice versa. Each (source, kind) gets its
+    // own count + window inside `SourceRateEntry`.
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .max_initials_per_source_per_window = 2,
+        .max_vn_per_source_per_window = 2,
+        .source_rate_window_us = 1_000_000,
+    });
+    defer srv.deinit();
+
+    var vn_probe = [_]u8{
+        0xc0,
+        0xde, 0xad, 0xbe, 0xef,
+        0x04,
+        0xa0, 0xa1, 0xa2, 0xa3,
+        0x04,
+        0xb0, 0xb1, 0xb2, 0xb3,
+        0x00, 0x00, 0x00,
+    };
+    var v1_initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
+
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x99) };
+
+    // Two VN probes — both earn responses, VN budget consumed.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.version_negotiated,
+        try srv.feed(&vn_probe, addr, 0),
+    );
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.version_negotiated,
+        try srv.feed(&vn_probe, addr, 1),
+    );
+
+    // Now Initial probes from the same address — Initial budget is
+    // STILL FULL despite VN budget being exhausted. First two pass,
+    // third rate-limits on the Initial side.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.dropped, // openSlot fails (DCID len 21), but rate-limit not yet hit
+        try srv.feed(&v1_initial, addr, 2),
+    );
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.dropped,
+        try srv.feed(&v1_initial, addr, 3),
+    );
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.rate_limited,
+        try srv.feed(&v1_initial, addr, 4),
+    );
+
+    // VN budget on this address still empty: a third VN probe
+    // rate-limits on the VN side, independently.
+    try std.testing.expectEqual(
+        nullq.Server.FeedOutcome.dropped,
+        try srv.feed(&vn_probe, addr, 5),
+    );
+
+    const m = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 2), m.feeds_version_negotiated);
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_vn_rate_limited);
+    try std.testing.expectEqual(@as(u64, 1), m.feeds_rate_limited);
+}
+
 test "Server.feed without `from` drops unsupported-version packets" {
     const protos = [_][]const u8{"hq-test"};
 

@@ -237,6 +237,12 @@ const MetricsSnapshotImpl = struct {
     /// bytes). A subset of `feeds_dropped` — incremented in addition
     /// to it. Spiking values point at amplification probes.
     feeds_initial_too_small: u64,
+    /// Non-v1 long-header datagrams that would have triggered a
+    /// Version Negotiation response but were dropped because the
+    /// per-source VN rate limit (`max_vn_per_source_per_window`)
+    /// fired. A subset of `feeds_dropped`. Spiking values point at
+    /// VN-flood probes.
+    feeds_vn_rate_limited: u64,
     /// Echoed Retry tokens that successfully validated and led to a
     /// post-Retry `.accepted`. Always less than or equal to
     /// `feeds_retry_sent`.
@@ -355,13 +361,22 @@ fn cidKeyFromConnectionId(cid: ConnectionId) CidKey {
 
 /// Per-source rate-limit bookkeeping. One entry per active source
 /// address; entries older than `source_rate_window_us` are pruned
-/// lazily on each `feed`.
+/// lazily on each `feed`. Two independent (count, window_start) pairs
+/// track Initial-eligible and Version-Negotiation-eligible traffic
+/// separately — a peer that spams VN probes shouldn't burn the
+/// per-source Initial budget, and vice versa.
 const SourceRateEntry = struct {
     /// Initial-driven slot creations attributed to this source
     /// within the current window.
     count: u32,
-    /// Wall-clock microseconds when the current window started.
+    /// Wall-clock microseconds when the current Initial window started.
     window_start_us: u64,
+    /// Version-Negotiation responses attributed to this source within
+    /// the current VN window. Gated by
+    /// `Config.max_vn_per_source_per_window`.
+    vn_count: u32 = 0,
+    /// Wall-clock microseconds when the current VN window started.
+    vn_window_start_us: u64 = 0,
 };
 
 /// Configuration handed to `Server.init`. Re-exported as
@@ -432,13 +447,25 @@ const ConfigImpl = struct {
     max_initials_per_source_per_window: ?u32 = null,
 
     /// Sliding-window size for `max_initials_per_source_per_window`,
-    /// in microseconds. Default is one second.
+    /// in microseconds. Default is one second. Shared by the VN
+    /// rate-limit window (`max_vn_per_source_per_window`).
     source_rate_window_us: u64 = 1_000_000,
 
     /// Maximum number of distinct source addresses the rate limiter
     /// tracks at once. Excess sources rotate out the oldest entry.
     /// Only consulted when the limiter is enabled.
     source_rate_table_capacity: u32 = 4096,
+
+    /// Per-source-address Version-Negotiation-emission cap. Null
+    /// disables the limiter (every non-v1 long-header packet earns a
+    /// VN response, subject only to the bounded global stateless
+    /// queue). Hardening guide §4.4: a peer flooding non-v1
+    /// long-header probes from a single address can otherwise force
+    /// up to `stateless_response_queue_capacity` outbound bytes per
+    /// drain cycle. Recommended: 8 for open-internet deployments —
+    /// legitimate clients fix their version after one VN response and
+    /// retry with v1.
+    max_vn_per_source_per_window: ?u32 = 8,
 
     /// 32-byte HMAC key used to mint and validate stateless Retry
     /// tokens (RFC 9000 §8.1.2). When null, Retry is disabled and
@@ -731,6 +758,10 @@ pub const Server = struct {
     max_initials_per_source: ?u32,
     source_rate_window_us: u64,
     source_rate_table_capacity: u32,
+    /// Captured `Config.max_vn_per_source_per_window`. Null disables
+    /// the per-source VN rate limit; otherwise gates VN emission via
+    /// the same `source_rate_table` (separate counter pair).
+    max_vn_per_source: ?u32,
 
     /// Per-source Retry bookkeeping. Empty when Retry is disabled.
     /// One entry per peer that earned a Retry packet, dropped once
@@ -799,6 +830,7 @@ pub const Server = struct {
     feeds_version_negotiated: u64 = 0,
     feeds_retry_sent: u64 = 0,
     feeds_initial_too_small: u64 = 0,
+    feeds_vn_rate_limited: u64 = 0,
     retries_validated: u64 = 0,
     stateless_responses_evicted: u64 = 0,
     slots_reaped: u64 = 0,
@@ -813,6 +845,11 @@ pub const Server = struct {
         if (config.local_cid_len == 0 or config.local_cid_len > 20) return Error.InvalidConfig;
         if (config.tls_cert_pem.len == 0 or config.tls_key_pem.len == 0) return Error.InvalidConfig;
         if (config.max_initials_per_source_per_window) |cap| {
+            if (cap == 0) return Error.InvalidConfig;
+            if (config.source_rate_window_us == 0) return Error.InvalidConfig;
+            if (config.source_rate_table_capacity == 0) return Error.InvalidConfig;
+        }
+        if (config.max_vn_per_source_per_window) |cap| {
             if (cap == 0) return Error.InvalidConfig;
             if (config.source_rate_window_us == 0) return Error.InvalidConfig;
             if (config.source_rate_table_capacity == 0) return Error.InvalidConfig;
@@ -885,6 +922,7 @@ pub const Server = struct {
             .cid_table = cid_table,
             .source_rate_table = .empty,
             .max_initials_per_source = config.max_initials_per_source_per_window,
+            .max_vn_per_source = config.max_vn_per_source_per_window,
             .source_rate_window_us = config.source_rate_window_us,
             .source_rate_table_capacity = config.source_rate_table_capacity,
             .retry_state_table = .empty,
@@ -1003,6 +1041,23 @@ pub const Server = struct {
         if (peekLongHeaderIds(bytes)) |ids| {
             if (ids.version != QUIC_VERSION_1) {
                 if (from) |addr| {
+                    // Per-source VN-rate gate (hardening guide §4.4):
+                    // legitimate clients fix their version and retry
+                    // with QUIC v1 after one VN response, so even a
+                    // small cap is non-disruptive. This blunts the
+                    // VN-flood amplification surface where one source
+                    // fills the global stateless-response queue.
+                    if (self.max_vn_per_source) |cap| {
+                        if (!self.acceptVnRate(addr, cap, now_us)) {
+                            self.feeds_vn_rate_limited += 1;
+                            self.feeds_dropped += 1;
+                            self.emitLog(.{ .feed_rate_limited = .{
+                                .peer = addr,
+                                .recent_count = if (self.source_rate_table.get(addr)) |e| e.vn_count else cap,
+                            } });
+                            return .dropped;
+                        }
+                    }
                     self.queueVersionNegotiation(addr, bytes) catch {
                         self.feeds_dropped += 1;
                         return .dropped;
@@ -1555,11 +1610,62 @@ pub const Server = struct {
         return true;
     }
 
+    /// Per-source VN-emission rate gate. Mirrors `acceptSourceRate`
+    /// but uses the entry's secondary `vn_count` / `vn_window_start_us`
+    /// pair so VN floods don't burn the per-source Initial budget
+    /// (and vice versa). Returns `true` when emission is permitted.
+    fn acceptVnRate(
+        self: *Server,
+        addr: Address,
+        cap: u32,
+        now_us: u64,
+    ) bool {
+        // Lazy eviction shared with `acceptSourceRate`.
+        if (self.source_rate_table.count() >= self.source_rate_table_capacity) {
+            self.pruneSourceRate(now_us);
+            if (self.source_rate_table.count() >= self.source_rate_table_capacity) {
+                self.evictOldestSourceRate();
+            }
+        }
+
+        const gop = self.source_rate_table.getOrPut(self.allocator, addr) catch {
+            // OOM on the rate table: deny the VN rather than continue
+            // unprotected. Mirrors `acceptSourceRate` policy.
+            return false;
+        };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{
+                .count = 0,
+                .window_start_us = 0,
+                .vn_count = 1,
+                .vn_window_start_us = now_us,
+            };
+            return true;
+        }
+
+        const elapsed = now_us -% gop.value_ptr.vn_window_start_us;
+        if (elapsed >= self.source_rate_window_us) {
+            gop.value_ptr.vn_count = 1;
+            gop.value_ptr.vn_window_start_us = now_us;
+            return true;
+        }
+
+        if (gop.value_ptr.vn_count >= cap) return false;
+        gop.value_ptr.vn_count += 1;
+        return true;
+    }
+
     fn pruneSourceRate(self: *Server, now_us: u64) void {
         var it = self.source_rate_table.iterator();
         while (it.next()) |entry| {
-            const elapsed = now_us -% entry.value_ptr.window_start_us;
-            if (elapsed >= self.source_rate_window_us) {
+            const init_elapsed = now_us -% entry.value_ptr.window_start_us;
+            const vn_elapsed = now_us -% entry.value_ptr.vn_window_start_us;
+            // Only prune when both per-counter windows have elapsed —
+            // otherwise an entry that's only stale on one axis would
+            // lose its still-active counter on the other.
+            if (init_elapsed >= self.source_rate_window_us and
+                vn_elapsed >= self.source_rate_window_us)
+            {
                 _ = self.source_rate_table.remove(entry.key_ptr.*);
             }
         }
@@ -1875,6 +1981,7 @@ pub const Server = struct {
             .feeds_version_negotiated = self.feeds_version_negotiated,
             .feeds_retry_sent = self.feeds_retry_sent,
             .feeds_initial_too_small = self.feeds_initial_too_small,
+            .feeds_vn_rate_limited = self.feeds_vn_rate_limited,
             .retries_validated = self.retries_validated,
             .stateless_responses_evicted = self.stateless_responses_evicted,
             .slots_reaped = self.slots_reaped,
