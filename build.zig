@@ -58,6 +58,46 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     test_step.dependOn(&run_integration_tests.step);
 
+    // RFC-traceable conformance suites under tests/conformance/. Each
+    // file mirrors a section of an RFC and uses BCP 14 keywords plus
+    // `[RFC#### §X.Y ¶N]` citations in test names so failures point an
+    // auditor straight at the offending requirement. See
+    // `tests/conformance/README.md` for the full grammar.
+    //
+    // The conformance binary is its own `addTest` invocation so we can
+    // expose a narrower `zig build conformance` entry point and so a
+    // `-Dconformance-filter='RFC9000 §17'` invocation only walks the
+    // conformance corpus. It uses the default Zig test runner so we
+    // don't take on a third-party runner dependency.
+    //
+    // The Zig default runner doesn't accept `--test-filter` at runtime
+    // — filtering is a compile-time `--test-filter` flag wired via
+    // `TestOptions.filters`. That is fine for our use case (auditors
+    // run `zig build conformance` against a fresh tree).
+    const conformance_filter = b.option(
+        []const u8,
+        "conformance-filter",
+        "Substring filter for the RFC conformance suite (e.g. 'RFC9000 §17')",
+    );
+    const conformance_filters: []const []const u8 =
+        if (conformance_filter) |f| &.{f} else &.{};
+    const conformance_mod = b.createModule(.{
+        .root_source_file = b.path("tests/conformance/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    conformance_mod.addImport("nullq", nullq_mod);
+    conformance_mod.addImport("boringssl", boringssl_mod);
+    const conformance_tests = b.addTest(.{
+        .root_module = conformance_mod,
+        .filters = conformance_filters,
+    });
+    const run_conformance_tests = b.addRunArtifact(conformance_tests);
+    test_step.dependOn(&run_conformance_tests.step);
+
+    const conformance_step = b.step("conformance", "Run nullq RFC-traceable conformance suites");
+    conformance_step.dependOn(&run_conformance_tests.step);
+
     const qns_mod = b.createModule(.{
         .root_source_file = b.path("interop/qns_endpoint.zig"),
         .target = target,
