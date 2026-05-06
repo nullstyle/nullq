@@ -600,6 +600,19 @@ pub const QlogLossReason = enum {
     pto_probe,
 };
 
+/// Why a candidate path failed to validate — populates the qlog
+/// `migration_path_failed` event. `timeout` is the RFC 9000 §8.2.4
+/// 3 * PTO expiry; `policy_denied` is an embedder-installed
+/// `MigrationCallback` returning `.deny` before validation began.
+pub const QlogMigrationFailReason = enum {
+    /// PATH_CHALLENGE went unanswered for 3 * PTO and the validator
+    /// transitioned to `.failed`.
+    timeout,
+    /// A `MigrationCallback` returned `.deny`, so PATH_CHALLENGE was
+    /// never queued and the candidate 4-tuple was abandoned.
+    policy_denied,
+};
+
 /// Optional qlog event payload. Existing variants only populate the
 /// previous fields; new variants additionally fill the per-event
 /// fields below. Callers should branch on `name` and read only the
@@ -634,6 +647,10 @@ pub const QlogEvent = struct {
     loss_reason: ?QlogLossReason = null,
     /// Path-validation outcome (migration_path_*) and stream lifecycle.
     path_id: ?u32 = null,
+    /// Why a `migration_path_failed` event fired. `null` for the
+    /// `migration_path_validated` variant or when the embedder hasn't
+    /// observed the new field yet (existing emit sites set this).
+    migration_fail_reason: ?QlogMigrationFailReason = null,
     stream_id: ?u64 = null,
     stream_state: ?QlogStreamState = null,
     /// Congestion / RTT snapshot — congestion_state_updated + metrics_updated.
@@ -662,6 +679,53 @@ pub const QlogEvent = struct {
 /// each emitted `QlogEvent`; the callback must not call back into the same
 /// Connection.
 pub const QlogCallback = *const fn (user_data: ?*anyopaque, event: QlogEvent) void;
+
+/// Allow / deny verdict returned by a `MigrationCallback`. The
+/// callback is consulted before nullq starts path validation on a
+/// candidate 4-tuple (RFC 9000 §9). `.allow` proceeds with
+/// PATH_CHALLENGE; `.deny` skips validation entirely and keeps the
+/// existing path live.
+pub const MigrationDecision = enum {
+    /// Proceed with path validation on the candidate addresss.
+    allow,
+    /// Refuse the migration. PATH_CHALLENGE is not queued, the
+    /// peer's existing 4-tuple stays in use, and a
+    /// `migration_path_failed` qlog event with reason
+    /// `policy_denied` is emitted.
+    deny,
+};
+
+/// Embedder policy hook consulted when nullq detects a peer migration
+/// candidate (RFC 9000 §9). Fires synchronously, **before** the
+/// PATH_CHALLENGE / PATH_RESPONSE round-trip — this lets the embedder
+/// short-circuit purely-address-based allowlists ("only accept
+/// migrations from corporate IPs") without paying for a probe. The
+/// callback runs after the triggering datagram has decrypted cleanly
+/// under the existing path's keys, so its frames are trustworthy.
+///
+/// Arguments:
+/// - `user_data` — opaque pointer registered via
+///   `Connection.setMigrationCallback`.
+/// - `conn` — the live Connection, passed by const-pointer so the
+///   callback can read state (e.g. role, peer SCID, scheduling
+///   policy) but cannot mutate it. nullq is single-threaded
+///   internally; the callback must not call back into this
+///   Connection.
+/// - `candidate_addr` — the new peer 4-tuple address the datagram
+///   arrived on.
+/// - `current_addr` — the existing peer address on the affected
+///   path, or `null` if the path had no peer address recorded yet
+///   (in which case the callback is not consulted).
+///
+/// Return `.allow` to start path validation as usual, or `.deny` to
+/// drop the migration attempt while keeping the connection alive on
+/// the existing path.
+pub const MigrationCallback = *const fn (
+    user_data: ?*anyopaque,
+    conn: *const Connection,
+    candidate_addr: Address,
+    current_addr: ?Address,
+) MigrationDecision;
 
 const ApplicationKeyEpoch = struct {
     material: SecretMaterial,
@@ -871,6 +935,12 @@ pub const Connection = struct {
     app_key_update_limits: ApplicationKeyUpdateLimits = .{},
     qlog_callback: ?QlogCallback = null,
     qlog_user_data: ?*anyopaque = null,
+    /// Optional embedder policy that gates peer migrations to a new
+    /// 4-tuple (RFC 9000 §9). When `null`, every authenticated
+    /// migration candidate is accepted and validated. See
+    /// `setMigrationCallback`.
+    migration_callback: ?MigrationCallback = null,
+    migration_user_data: ?*anyopaque = null,
     /// Opt-in for high-volume per-packet qlog events
     /// (`packet_sent`, `packet_received`, `packet_lost`). Disabled by
     /// default so production callers don't pay for every packet
@@ -1268,6 +1338,33 @@ pub const Connection = struct {
     ) void {
         self.qlog_callback = callback;
         self.qlog_user_data = user_data;
+    }
+
+    /// Install an embedder-policy hook that gates peer migrations to
+    /// a new 4-tuple (RFC 9000 §9). The callback fires synchronously
+    /// **before** PATH_CHALLENGE / PATH_RESPONSE — i.e. as soon as the
+    /// triggering datagram authenticates on the existing path's keys
+    /// and we identify a different peer address. Most embedders only
+    /// want an IP allowlist, which doesn't justify paying for a
+    /// validation round-trip.
+    ///
+    /// Returning `.deny` from the callback drops the migration
+    /// attempt: PATH_CHALLENGE is not queued, the existing path keeps
+    /// its address (and its anti-amp credit grows from the triggering
+    /// datagram), and the connection stays open. A
+    /// `migration_path_failed` qlog event with reason `policy_denied`
+    /// is emitted for observability.
+    ///
+    /// The callback receives `*const Connection` so it can read state
+    /// but not mutate it. Pass `null` (with any user data) to remove
+    /// a previously-installed callback.
+    pub fn setMigrationCallback(
+        self: *Connection,
+        callback: ?MigrationCallback,
+        user_data: ?*anyopaque,
+    ) void {
+        self.migration_callback = callback;
+        self.migration_user_data = user_data;
     }
 
     /// Enable or disable per-packet qlog events
@@ -3818,14 +3915,22 @@ pub const Connection = struct {
         const path_id = path.id;
         if (path.pending_migration_reset and path.rollbackFailedMigration()) {
             self.clearQueuedPathChallengeForPath(path_id);
-            self.emitQlog(.{ .name = .migration_path_failed, .path_id = path_id });
+            self.emitQlog(.{
+                .name = .migration_path_failed,
+                .path_id = path_id,
+                .migration_fail_reason = .timeout,
+            });
             return;
         }
         path.path.fail();
         path.pending_migration_reset = false;
         path.migration_rollback = null;
         self.clearQueuedPathChallengeForPath(path_id);
-        self.emitQlog(.{ .name = .migration_path_failed, .path_id = path_id });
+        self.emitQlog(.{
+            .name = .migration_path_failed,
+            .path_id = path_id,
+            .migration_fail_reason = .timeout,
+        });
     }
 
     fn recordPathResponse(
@@ -3887,6 +3992,24 @@ pub const Connection = struct {
             return;
         }
         if (path.matchesMigrationRollbackAddress(addr)) return;
+        if (self.migration_callback) |callback| {
+            const current = path.peerAddress();
+            const verdict = callback(self.migration_user_data, self, addr, current);
+            if (verdict == .deny) {
+                // RFC 9000 §9 / design note: the triggering datagram
+                // already decrypted cleanly under the existing path's
+                // keys, so its frames are safe to credit against the
+                // existing 4-tuple. Don't migrate; let the peer keep
+                // using the old address.
+                path.path.onDatagramReceived(datagram_len);
+                self.emitQlog(.{
+                    .name = .migration_path_failed,
+                    .path_id = path_id,
+                    .migration_fail_reason = .policy_denied,
+                });
+                return;
+            }
+        }
         try self.handlePeerAddressChange(path, addr, datagram_len, now_us);
     }
 
@@ -12260,4 +12383,171 @@ test "qlog: pathStats exposes the new connection-level counters" {
     try std.testing.expectEqual(stats.rttvar_us, stats.srtt_us / 2);
     // Slow start phase before any loss.
     try std.testing.expectEqual(path_mod.CongestionState.slow_start, stats.congestion_window_state);
+}
+
+const TestMigrationPolicy = struct {
+    decision: MigrationDecision,
+    invocations: u32 = 0,
+    last_candidate: ?Address = null,
+    last_current: ?Address = null,
+    last_role: ?Role = null,
+
+    fn callback(
+        user_data: ?*anyopaque,
+        conn: *const Connection,
+        candidate_addr: Address,
+        current_addr: ?Address,
+    ) MigrationDecision {
+        const self: *TestMigrationPolicy = @ptrCast(@alignCast(user_data.?));
+        self.invocations += 1;
+        self.last_candidate = candidate_addr;
+        self.last_current = current_addr;
+        self.last_role = conn.role;
+        return self.decision;
+    }
+};
+
+test "migration callback: allow lets path validation start as usual" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var policy: TestMigrationPolicy = .{ .decision = .allow };
+    conn.setMigrationCallback(TestMigrationPolicy.callback, &policy);
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    const old_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 10, 0, 0, 2 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.markValidated();
+
+    try conn.recordAuthenticatedDatagramAddress(0, new_addr, 1200, 1_000_000);
+
+    // The callback was consulted once with the right addresses.
+    try std.testing.expectEqual(@as(u32, 1), policy.invocations);
+    try std.testing.expect(policy.last_candidate != null);
+    try std.testing.expect(Address.eql(new_addr, policy.last_candidate.?));
+    try std.testing.expect(policy.last_current != null);
+    try std.testing.expect(Address.eql(old_addr, policy.last_current.?));
+    try std.testing.expectEqual(@as(?Role, .client), policy.last_role);
+
+    // Allow path: PATH_CHALLENGE was queued and migration began.
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expectEqual(@as(u32, 0), conn.pending_frames.path_challenge_path_id);
+    try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+
+    // Drive validation to completion and confirm the path validates.
+    conn.recordPathResponse(0, path.path.validator.pending_token);
+    try std.testing.expect(path.path.isValidated());
+    try std.testing.expect(recorder.contains(.migration_path_validated));
+    // No policy_denied event was emitted on the allow path.
+    try std.testing.expect(!recorder.contains(.migration_path_failed));
+}
+
+test "migration callback: deny skips PATH_CHALLENGE and keeps the old 4-tuple live" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var policy: TestMigrationPolicy = .{ .decision = .deny };
+    conn.setMigrationCallback(TestMigrationPolicy.callback, &policy);
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    const old_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 192, 168, 9, 9 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.markValidated();
+    const orig_bytes_received = path.path.bytes_received;
+
+    try conn.recordAuthenticatedDatagramAddress(0, new_addr, 1200, 1_000_000);
+
+    // Callback was consulted exactly once.
+    try std.testing.expectEqual(@as(u32, 1), policy.invocations);
+
+    // Deny: no PATH_CHALLENGE, no rollback snapshot, peer_addr unchanged.
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+    try std.testing.expect(Address.eql(old_addr, path.path.peer_addr));
+    try std.testing.expect(!path.pending_migration_reset);
+    try std.testing.expect(path.migration_rollback == null);
+    try std.testing.expect(path.path.isValidated());
+    // markValidated set the validator to .validated; deny path must
+    // not perturb that — it should leave the existing validator state
+    // alone (no new challenge, no transition to pending/idle/failed).
+    try std.testing.expectEqual(.validated, path.path.validator.status);
+
+    // The triggering datagram's bytes credited the existing path's
+    // anti-amp rather than vanishing.
+    try std.testing.expectEqual(orig_bytes_received + 1200, path.path.bytes_received);
+
+    // qlog observability: migration_path_failed with policy_denied.
+    try std.testing.expect(recorder.contains(.migration_path_failed));
+    const fail_event = recorder.first(.migration_path_failed).?;
+    try std.testing.expectEqual(
+        @as(?QlogMigrationFailReason, .policy_denied),
+        fail_event.migration_fail_reason,
+    );
+    try std.testing.expectEqual(@as(?u32, 0), fail_event.path_id);
+
+    // The peer can keep talking on the old 4-tuple — confirm a
+    // subsequent same-address datagram is still credited cleanly.
+    try conn.recordAuthenticatedDatagramAddress(0, old_addr, 800, 1_000_500);
+    try std.testing.expectEqual(orig_bytes_received + 1200 + 800, path.path.bytes_received);
+    // Callback is not consulted for same-address traffic.
+    try std.testing.expectEqual(@as(u32, 1), policy.invocations);
+}
+
+test "migration callback: no callback installed preserves prior migration behavior" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Explicitly leave the callback unset — this is the pre-existing
+    // behavior path. The same setup that drives an allow-with-callback
+    // succeeds without one, identically.
+    try std.testing.expect(conn.migration_callback == null);
+
+    const old_addr = Address{ .bytes = .{ 7, 7, 7, 7 } ++ .{0} ** 18 };
+    const new_addr = Address{ .bytes = .{ 8, 8, 8, 8 } ++ .{0} ** 18 };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.markValidated();
+
+    try conn.recordAuthenticatedDatagramAddress(0, new_addr, 1200, 1_000_000);
+
+    // PATH_CHALLENGE queued, migration in progress — same as before.
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+}
+
+test "migration callback: setMigrationCallback installs and clears the hook" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var policy: TestMigrationPolicy = .{ .decision = .deny };
+    conn.setMigrationCallback(TestMigrationPolicy.callback, &policy);
+    try std.testing.expect(conn.migration_callback != null);
+    try std.testing.expect(conn.migration_user_data == @as(?*anyopaque, &policy));
+
+    conn.setMigrationCallback(null, null);
+    try std.testing.expect(conn.migration_callback == null);
+    try std.testing.expect(conn.migration_user_data == null);
 }
