@@ -232,6 +232,11 @@ const MetricsSnapshotImpl = struct {
     feeds_version_negotiated: u64,
     /// Initials that triggered a Retry packet (`.retry_sent`).
     feeds_retry_sent: u64,
+    /// Initial-bearing UDP datagrams discarded because the datagram
+    /// payload was smaller than the RFC 9000 §14 minimum (1200
+    /// bytes). A subset of `feeds_dropped` — incremented in addition
+    /// to it. Spiking values point at amplification probes.
+    feeds_initial_too_small: u64,
     /// Echoed Retry tokens that successfully validated and led to a
     /// post-Retry `.accepted`. Always less than or equal to
     /// `feeds_retry_sent`.
@@ -776,6 +781,7 @@ pub const Server = struct {
     feeds_table_full: u64 = 0,
     feeds_version_negotiated: u64 = 0,
     feeds_retry_sent: u64 = 0,
+    feeds_initial_too_small: u64 = 0,
     retries_validated: u64 = 0,
     stateless_responses_evicted: u64 = 0,
     slots_reaped: u64 = 0,
@@ -932,6 +938,33 @@ pub const Server = struct {
         if (bytes.len == 0) {
             self.feeds_dropped += 1;
             return .dropped;
+        }
+
+        // RFC 9000 §14: a server MUST discard a QUIC v1 Initial packet
+        // carried in a UDP datagram with a payload smaller than 1200
+        // bytes. Enforced *before* slot lookup so the rule applies
+        // both to new-connection-creating Initials and to in-flight
+        // handshake Initials that would otherwise route to an existing
+        // slot.
+        //
+        // Gated on `version == QUIC_VERSION_1` so unsupported-version
+        // probes still flow into the Version Negotiation path below
+        // (whose response is governed by RFC 9000 §6, not §14). The
+        // size check keys off the leading packet's long-header type
+        // bits — coalesced datagrams whose first packet is Initial
+        // are the typical adversarial pattern (single short Initial
+        // used to mint server state cheaply); a pathological
+        // inner-Initial would still ride a leading packet large
+        // enough to push the datagram past 1200, so this covers the
+        // practical attack surface.
+        if (isInitialLongHeader(bytes) and bytes.len < conn_mod.state.min_quic_udp_payload_size) {
+            if (peekLongHeaderIds(bytes)) |ids| {
+                if (ids.version == QUIC_VERSION_1) {
+                    self.feeds_initial_too_small += 1;
+                    self.feeds_dropped += 1;
+                    return .dropped;
+                }
+            }
         }
 
         // Existing connection? Hash table lookup, O(1).
@@ -1822,6 +1855,7 @@ pub const Server = struct {
             .feeds_table_full = self.feeds_table_full,
             .feeds_version_negotiated = self.feeds_version_negotiated,
             .feeds_retry_sent = self.feeds_retry_sent,
+            .feeds_initial_too_small = self.feeds_initial_too_small,
             .retries_validated = self.retries_validated,
             .stateless_responses_evicted = self.stateless_responses_evicted,
             .slots_reaped = self.slots_reaped,

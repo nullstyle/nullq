@@ -14,6 +14,19 @@ const test_cert_pem = common.test_cert_pem;
 const test_key_pem = common.test_key_pem;
 const defaultParams = common.defaultParams;
 
+/// Pad a short long-header Initial fixture out to RFC 9000 §14's
+/// 1200-byte UDP-payload minimum so `Server.feed` doesn't drop it
+/// on the size gate before reaching the test's actual assertion
+/// surface (table-full / rate-limit / Retry / log_callback / metrics).
+/// Trailing bytes are zero — these fixtures all hit gates that fire
+/// before payload-decode, so post-prefix content is irrelevant.
+fn padInitial(prefix: []const u8) [1200]u8 {
+    std.debug.assert(prefix.len <= 1200);
+    var out: [1200]u8 = @splat(0);
+    @memcpy(out[0..prefix.len], prefix);
+    return out;
+}
+
 /// Build a fresh server-mode TLS context wired identically to the
 /// one `Server.init` constructs internally — TLS-1.3 only,
 /// `verify=.none`, ALPN preloaded, early data enabled, and the test
@@ -74,6 +87,45 @@ test "Server.feed drops non-Initial bytes silently" {
     try std.testing.expectEqual(@as(usize, 0), srv.reap());
 }
 
+test "Server.feed drops QUIC v1 Initial datagrams below the 1200-byte minimum (RFC 9000 §14)" {
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer srv.deinit();
+
+    // Long-header Initial with QUIC v1 version, but the UDP datagram
+    // payload is 7 bytes — way below the 1200-byte floor. Per RFC
+    // 9000 §14 the server MUST discard it. The drop fires *before*
+    // any Connection state is allocated, so no slot is created.
+    var tiny_v1_initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x01) };
+    const outcome = try srv.feed(&tiny_v1_initial, addr, 1_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+
+    // The drop is counted distinctly so ops can grep amplification
+    // probes without conflating with generic malformed-packet drops.
+    const metrics = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), metrics.feeds_initial_too_small);
+    try std.testing.expectEqual(@as(u64, 1), metrics.feeds_dropped);
+
+    // Same fixture but with a non-v1 version: must NOT take the
+    // §14 path — version-negotiation handling owns unsupported
+    // versions, regardless of datagram size (RFC 9000 §6 governs
+    // VN, not §14). Also asserted: the size counter doesn't move.
+    var tiny_unsupported_version = [_]u8{ 0xc0, 0xde, 0xad, 0xbe, 0xef, 4, 0xa, 0xb, 0xc, 0xd, 4, 0x1, 0x2, 0x3, 0x4 };
+    const outcome2 = try srv.feed(&tiny_unsupported_version, addr, 2_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.version_negotiated, outcome2);
+    const metrics2 = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 1), metrics2.feeds_initial_too_small);
+}
+
 test "Server.feed rejects long-header packets when the table is full" {
     const protos = [_][]const u8{"hq-test"};
 
@@ -89,7 +141,7 @@ test "Server.feed rejects long-header packets when the table is full" {
 
     // A syntactically plausible long-header byte still gets
     // rejected because the cap is 0.
-    var bytes = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
+    var bytes = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 });
     const outcome = try srv.feed(&bytes, null, 0);
     try std.testing.expectEqual(nullq.Server.FeedOutcome.table_full, outcome);
 }
@@ -113,7 +165,7 @@ test "Server source rate limiter trips after the configured cap" {
     // inside `openSlotFromInitial` because the declared DCID length
     // (21) exceeds the QUIC max of 20. The rate limiter still ticks
     // for each call.
-    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
     const addr = nullq.conn.path.Address{ .bytes = @splat(0xab) };
 
     // First three from this source: each consumes a token, openSlot
@@ -281,8 +333,11 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
 
     // Hand-roll an Initial header (token-len=0, payload-len=1,
     // pn-bits=00 i.e. 1-byte PN). The cell after the PN doesn't
-    // matter — Retry never inspects the payload.
-    var initial: [256]u8 = @splat(0);
+    // matter — Retry never inspects the payload. The buffer is
+    // 1200 bytes so the datagram clears the RFC 9000 §14 minimum;
+    // trailing zeros are ignored by the Retry-gate parser, which
+    // only reads up through token_length + token.
+    var initial: [1200]u8 = @splat(0);
     initial[0] = 0xc0; // long header, type=Initial, PN-len bits=00
     std.mem.writeInt(u32, initial[1..5], nullq.QUIC_VERSION_1, .big);
     initial[5] = odcid.len;
@@ -299,10 +354,9 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     initial[pos] = 0x00; // PN
     pos += 1;
     initial[pos] = 0xff; // payload byte (irrelevant)
-    const initial_len = pos + 1;
 
     const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
-    const outcome1 = try srv.feed(initial[0..initial_len], addr, 1_000);
+    const outcome1 = try srv.feed(&initial, addr, 1_000);
     try std.testing.expectEqual(nullq.Server.FeedOutcome.retry_sent, outcome1);
     try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
@@ -319,7 +373,9 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     // retry SCID we just minted, but the token won't validate, so
     // the datagram drops and no Connection is created.
     const retry_scid_bytes = retry_parsed.header.retry.scid.slice();
-    var bad_initial: [256]u8 = @splat(0);
+    // Same 1200-byte trick: the Retry validator reads up through
+    // token_length + token only; trailing zeros are ignored.
+    var bad_initial: [1200]u8 = @splat(0);
     bad_initial[0] = 0xc0;
     std.mem.writeInt(u32, bad_initial[1..5], nullq.QUIC_VERSION_1, .big);
     bad_initial[5] = @intCast(retry_scid_bytes.len);
@@ -339,9 +395,8 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     bad_initial[bp] = 0x00;
     bp += 1;
     bad_initial[bp] = 0xff;
-    const bad_len = bp + 1;
 
-    const outcome2 = try srv.feed(bad_initial[0..bad_len], addr, 2_000);
+    const outcome2 = try srv.feed(&bad_initial, addr, 2_000);
     try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome2);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     // Crucially: a malformed echo does NOT mint a fresh Retry
@@ -967,7 +1022,7 @@ test "Server log_callback fires for table_full" {
     });
     defer srv.deinit();
 
-    var bytes = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
+    var bytes = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 });
     const peer = nullq.conn.path.Address{ .bytes = @splat(0x55) };
     try std.testing.expectEqual(
         nullq.Server.FeedOutcome.table_full,
@@ -1013,7 +1068,7 @@ test "Server log_callback fires for rate_limited and version_negotiated" {
     // ticks the rate limiter. The DCID length 21 makes openSlotFromInitial
     // return InvalidConfig (DCID > 20). The first two attempts get .dropped
     // (each consuming a token); the third is rate-limited.
-    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
     const rl_peer = nullq.conn.path.Address{ .bytes = @splat(0xab) };
     _ = try srv.feed(&initial, rl_peer, 0);
     _ = try srv.feed(&initial, rl_peer, 1);
@@ -1079,7 +1134,7 @@ test "Server metricsSnapshot tracks counters across feed outcomes" {
     _ = try srv.feed(&vn_bytes, vn_peer, 100);
 
     // Rate-limit hit. Two attempts at the cap, then over.
-    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
     const rl_peer = nullq.conn.path.Address{ .bytes = @splat(0xab) };
     _ = try srv.feed(&initial, rl_peer, 0);
     _ = try srv.feed(&initial, rl_peer, 1);
@@ -1108,7 +1163,7 @@ test "Server rateLimitSnapshot reports top offender after cap is hit" {
     });
     defer srv.deinit();
 
-    var initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 };
+    var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
     const heavy_peer = nullq.conn.path.Address{ .bytes = @splat(0xaa) };
     const light_peer = nullq.conn.path.Address{ .bytes = @splat(0x11) };
 
