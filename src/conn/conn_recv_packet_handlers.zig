@@ -365,6 +365,14 @@ pub fn handleHandshake(
     }
 
     self.last_authenticated_path_id = self.current_incoming_path_id;
+    // RFC 9000 §8.1: a successfully decrypted Handshake packet from the
+    // peer authenticates the source address (only the genuine peer holds
+    // Handshake-level keys). For servers, this lifts the 3x
+    // anti-amplification cap on the path. Idempotent if already
+    // validated (e.g. via PATH_RESPONSE during migration).
+    if (self.role == .server) {
+        self.pathForId(self.current_incoming_path_id).path.markValidated();
+    }
     if (self.closingAttributionOnly()) {
         // RFC 9000 §10.2.1 ¶3 attribution path. See `handleShort`.
         self.closing_state_attribution_observed = true;

@@ -3583,10 +3583,11 @@ test "validated path is not constrained by anti-amplification" {
     var conn = try Connection.initServer(allocator, ctx);
     defer conn.deinit();
 
-    // Default primary path is born validated, so even a tiny
-    // bytes_received does not gate Initial sends — keep the existing
-    // behavior intact for the validated case.
+    // Server primary starts unvalidated (RFC 9000 §8.1). Force-validate
+    // it so we can exercise the "validated path bypasses anti-amp"
+    // branch directly without driving a Handshake exchange.
     const path = conn.primaryPath();
+    path.path.markValidated();
     try std.testing.expect(path.path.isValidated());
     path.path.bytes_received = 50;
     path.path.bytes_sent = 0;
@@ -3926,6 +3927,11 @@ test "retiring CID sequence 0 does not change long-header source CID" {
     defer ctx.deinit();
     var conn = try Connection.initServer(allocator, ctx);
     defer conn.deinit();
+
+    // Server primary starts unvalidated (RFC 9000 §8.1). This test
+    // exercises long-header SCID selection on a late Initial; not the
+    // anti-amp path. Force-validate so pollLevel isn't gated.
+    conn.primaryPath().path.markValidated();
 
     const initial_dcid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 };
     const initial_scid = [_]u8{0xa0};
@@ -4544,6 +4550,10 @@ test "qlog: packet_sent / packet_received are gated by setQlogPacketEvents" {
     try installTestApplicationReadSecret(&conn);
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{});
+    // Server primary starts unvalidated (RFC 9000 §8.1). This test
+    // exercises the qlog gating, not the anti-amp path; force-validate
+    // so pollLevel returns a packet.
+    conn.primaryPath().path.markValidated();
 
     var recorder: TestQlogRecorder = .{};
     conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
@@ -4656,6 +4666,10 @@ test "qlog: pathStats exposes the new connection-level counters" {
     try installTestApplicationReadSecret(&conn);
     try installTestApplicationWriteSecret(&conn);
     try conn.setPeerDcid(&.{});
+    // Server primary starts unvalidated (RFC 9000 §8.1). This test
+    // exercises pathStats counters, not the anti-amp path; force-validate
+    // so pollLevel returns a packet.
+    conn.primaryPath().path.markValidated();
 
     // Drive a single send to bump counters.
     var buf: [default_mtu]u8 = undefined;

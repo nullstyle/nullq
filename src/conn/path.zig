@@ -506,6 +506,19 @@ pub const PathSet = struct {
 
     /// Lazily install the primary path (id 0) on first use. No-op if
     /// the set already has paths.
+    ///
+    /// The primary starts in the **unvalidated** state. Each role decides
+    /// when to flip it (`Path.markValidated`):
+    ///
+    /// - **Client**: validated immediately after `ensurePrimary` returns.
+    ///   The client picked the destination address itself; there is no
+    ///   spoofing risk for its own outbound, so the §8.1 3x cap doesn't
+    ///   apply.
+    /// - **Server**: validated when a Handshake-level packet from the
+    ///   peer decrypts successfully (RFC 9000 §8.1). Only the genuine
+    ///   peer holds Handshake keys, so a successful open proves the
+    ///   source address. Until then the §8.1 anti-amplification cap
+    ///   throttles outbound bytes to `3 * bytes_received`.
     pub fn ensurePrimary(
         self: *PathSet,
         allocator: std.mem.Allocator,
@@ -513,7 +526,6 @@ pub const PathSet = struct {
     ) !void {
         if (self.paths.items.len != 0) return;
         var p = PathState.init(0, .{}, .{}, .{}, .{}, cc_cfg);
-        p.path.markValidated();
         p.path.state = .active;
         try self.paths.append(allocator, p);
     }
@@ -747,14 +759,18 @@ test "retire and fail transitions" {
     try testing.expectEqual(State.failed, p.state);
 }
 
-test "PathSet starts with validated path 0" {
+test "PathSet starts with active, unvalidated path 0" {
     var set: PathSet = .{};
     defer set.deinit(testing.allocator);
     try set.ensurePrimary(testing.allocator, .{ .max_datagram_size = 1200 });
 
     try testing.expectEqual(@as(usize, 1), set.paths.items.len);
     try testing.expectEqual(@as(u32, 0), set.primary().id);
-    try testing.expect(set.primary().path.isValidated());
+    try testing.expectEqual(State.active, set.primary().path.state);
+    // ensurePrimary leaves the path unvalidated; each role decides when to
+    // flip it (see PathSet.ensurePrimary docs and Connection.initClient /
+    // handleHandshake for the matching policies).
+    try testing.expect(!set.primary().path.isValidated());
     try testing.expectEqual(@as(u32, 0), set.selectForSending().id);
 }
 

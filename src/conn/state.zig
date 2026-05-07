@@ -1305,6 +1305,12 @@ pub const Connection = struct {
         };
         errdefer conn.inner.deinit();
         try conn.paths.ensurePrimary(allocator, .{ .max_datagram_size = default_mtu });
+        // Client picked the destination address itself, so the §8.1
+        // anti-amplification cap doesn't apply on its outbound. Primary
+        // path starts validated. (See `PathSet.ensurePrimary` for the
+        // matching server policy: the server leaves it unvalidated and
+        // flips it on the first authenticated Handshake from peer.)
+        conn.primaryPath().path.markValidated();
         return conn;
     }
 
