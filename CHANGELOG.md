@@ -9,7 +9,48 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
-(no changes since v0.2.0)
+### Tests
+
+- **RFC-traceable conformance suite under `tests/conformance/`.** 11
+  files (one per RFC area), 297 tests + 44 visible-debt skips = 341
+  total tests. Every test name pairs a BCP 14 keyword (MUST / MUST
+  NOT / SHOULD / MAY / NORMATIVE) with a precise `[RFC#### §X.Y ¶N]`
+  citation per the `zspec-rfc-testing.md` grammar. Coverage matrix:
+
+      rfc8999_invariants.zig                 14 tests   (RFC 8999 §4-§6)
+      rfc9000_varint.zig                     21 tests   (§16)
+      rfc9000_packet_headers.zig             38 tests   (§17, all 5 packet types)
+      rfc9000_transport_params.zig           36 tests   (§18, every defined TP)
+      rfc9000_frames.zig                     58 tests   (§19, all 18 frame types)
+      rfc9000_streams_flow.zig               37 tests   (§3-§5, §10, §10.3 stateless reset)
+      rfc9000_negotiation_validation.zig     33 tests   (§6 VN, §8 address validation, §9 migration)
+      rfc9000_packetization.zig              21 tests   (§12.3 PN spaces, §13 ACKs, §14 size, §20 errors)
+      rfc9001_tls.zig                        36 tests   (§5 keys/HP/AEAD, §5.6 anti-replay, §5.8 retry, §6 KU, §8 ALPN)
+      rfc9002_loss_recovery.zig              29 tests   (§5 RTT, §6 loss, §7 cwnd, §B.5/B.6/§7.6.1 NewReno)
+      rfc9221_datagram.zig                   18 tests   (§3 TP 0x20, §4 frame types 0x30/0x31)
+
+  Wired as its own `zig build conformance` step using the default Zig
+  test runner (no third-party runner dependency). Compile-time filter
+  via `-Dconformance-filter='RFC9000 §17'` etc. — Zig's default runner
+  has no runtime filter, so the build option participates in the
+  compile cache key for fast incremental rebuilds.
+
+  Full test count is now 879 pass + 44 skip across 5 binaries (was
+  596 + 10 stub skips). The 44 skips are visible conformance debt,
+  each with an inline TODO; most depend on a Connection-level
+  conformance fixture that drives `dispatchFrames` without a full TLS
+  handshake.
+
+  Real implementation gaps surfaced by the suite (carried forward as
+  visible debt rather than fixed in this commit):
+
+  - **§17.2.1 / §17.3 Reserved Bits** — emitted as zero (covered),
+    but `Connection` does not yet treat non-zero received Reserved
+    Bits as PROTOCOL_VIOLATION.
+  - **RFC 9221 §4 ¶3** — DATAGRAM in non-1-RTT/0-RTT packet MUST
+    close with PROTOCOL_VIOLATION; `Connection.dispatchFrames` lacks
+    a per-encryption-level allowed-frames table for Initial /
+    Handshake (broader RFC 9000 §12.4 / §17.2 work).
 
 ## [0.2.0] - 2026-05-06
 

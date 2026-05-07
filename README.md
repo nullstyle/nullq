@@ -443,6 +443,11 @@ Defaults can't fill these in for you — they're application policy:
   source citations.
 - [`docs/fuzz-coverage.md`](docs/fuzz-coverage.md) — coverage-guided
   fuzz harness inventory (§11.1).
+- [`tests/conformance/README.md`](tests/conformance/README.md) —
+  RFC-traceable conformance suite (BCP 14 keywords, `[RFC#### §X.Y]`
+  citations). Run with `zig build conformance` or filter via
+  `-Dconformance-filter='RFC9000 §17'`. 297 active tests + 44
+  visible-debt skips across RFCs 8999 / 9000 / 9001 / 9002 / 9221.
 - `hardening-guide.md` — the canonical reference doc nullq is
   hardened against.
 
