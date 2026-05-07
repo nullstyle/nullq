@@ -38,6 +38,7 @@ const event_queue_mod = @import("event_queue.zig");
 const pending_frames_mod = @import("pending_frames.zig");
 const lifecycle_mod = @import("lifecycle.zig");
 const stateless_reset_mod = @import("stateless_reset.zig");
+const path_frame_queue = @import("path_frame_queue.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -2325,7 +2326,7 @@ pub const Connection = struct {
         return if (self.initial_source_cid_set) self.initial_source_cid else self.local_scid;
     }
 
-    fn rememberLocalCid(
+    pub fn rememberLocalCid(
         self: *Connection,
         path_id: u32,
         sequence_number: u64,
@@ -2437,7 +2438,7 @@ pub const Connection = struct {
         self.pending_frames.removePathNewConnectionIdBySequence(path_id, sequence_number);
     }
 
-    fn nextLocalCidSequence(self: *const Connection, path_id: u32) u64 {
+    pub fn nextLocalCidSequence(self: *const Connection, path_id: u32) u64 {
         var next: u64 = 0;
         for (self.local_cids.items) |item| {
             if (item.path_id == path_id and item.sequence_number >= next) {
@@ -2549,7 +2550,7 @@ pub const Connection = struct {
         return false;
     }
 
-    fn ensureLocalCidAvailable(
+    pub fn ensureLocalCidAvailable(
         self: *const Connection,
         path_id: u32,
         sequence_number: u64,
@@ -2635,7 +2636,7 @@ pub const Connection = struct {
         return @intCast(remaining);
     }
 
-    fn ensureCanIssueLocalCid(
+    pub fn ensureCanIssueLocalCid(
         self: *Connection,
         path_id: u32,
         sequence_number: u64,
@@ -3373,7 +3374,7 @@ pub const Connection = struct {
         return false;
     }
 
-    fn refreshConnectionIdEventsForPath(self: *Connection, path_id: u32) void {
+    pub fn refreshConnectionIdEventsForPath(self: *Connection, path_id: u32) void {
         var i: usize = 0;
         while (i < self.connection_id_events.len) {
             const slice = self.connection_id_events.slice();
@@ -3867,56 +3868,14 @@ pub const Connection = struct {
         return st;
     }
 
-    /// Queue a PATH_ABANDON frame for the given multipath path. Coalesces
-    /// repeated calls for the same `path_id` (last `error_code` wins).
-    /// draft-ietf-quic-multipath-21 §6.1.
-    pub fn queuePathAbandon(
-        self: *Connection,
-        path_id: u32,
-        error_code: u64,
-    ) Error!void {
-        for (self.pending_frames.path_abandons.items) |*item| {
-            if (item.path_id == path_id) {
-                item.error_code = error_code;
-                return;
-            }
-        }
-        try self.pending_frames.path_abandons.append(self.allocator, .{
-            .path_id = path_id,
-            .error_code = error_code,
-        });
+    pub fn queuePathAbandon(self: *Connection, path_id: u32, error_code: u64) Error!void {
+        return path_frame_queue.queuePathAbandon(self, path_id, error_code);
     }
 
-    /// Queue a PATH_AVAILABLE / PATH_BACKUP frame announcing a status
-    /// change for `path_id`. Coalesces with any existing entry for the
-    /// same path, preferring the higher sequence number.
-    /// draft-ietf-quic-multipath-21 §6.2.
-    pub fn queuePathStatus(
-        self: *Connection,
-        path_id: u32,
-        available: bool,
-        sequence_number: u64,
-    ) Error!void {
-        for (self.pending_frames.path_statuses.items) |*item| {
-            if (item.path_id == path_id) {
-                if (sequence_number >= item.sequence_number) {
-                    item.sequence_number = sequence_number;
-                    item.available = available;
-                }
-                return;
-            }
-        }
-        try self.pending_frames.path_statuses.append(self.allocator, .{
-            .path_id = path_id,
-            .sequence_number = sequence_number,
-            .available = available,
-        });
+    pub fn queuePathStatus(self: *Connection, path_id: u32, available: bool, sequence_number: u64) Error!void {
+        return path_frame_queue.queuePathStatus(self, path_id, available, sequence_number);
     }
 
-    /// Queue a PATH_NEW_CONNECTION_ID frame for the multipath path-scoped
-    /// CID issuance flow. Validates `cid` length, issuance budget, and
-    /// uniqueness; remembers the local CID so packets bearing it can be
-    /// authenticated. draft-ietf-quic-multipath-21 §6.3.
     pub fn queuePathNewConnectionId(
         self: *Connection,
         path_id: u32,
@@ -3925,116 +3884,31 @@ pub const Connection = struct {
         cid: []const u8,
         stateless_reset_token: [16]u8,
     ) Error!void {
-        if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
-        try self.ensureCanIssueCidForPathId(path_id);
-        try self.ensureCanIssueLocalCid(path_id, sequence_number, retire_prior_to, cid.len);
-        const local_cid = ConnectionId.fromSlice(cid);
-        try self.ensureLocalCidAvailable(path_id, sequence_number, local_cid);
-        for (self.pending_frames.path_new_connection_ids.items) |item| {
-            if (item.path_id == path_id and item.sequence_number == sequence_number) {
-                if (!std.mem.eql(u8, item.connection_id.slice(), cid)) return Error.ConnectionIdAlreadyInUse;
-                return;
-            }
-        }
-        var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
-        @memcpy(connection_id.bytes[0..cid.len], cid);
-        try self.rememberLocalCid(path_id, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
-        try self.pending_frames.path_new_connection_ids.append(self.allocator, .{
-            .path_id = path_id,
-            .sequence_number = sequence_number,
-            .retire_prior_to = retire_prior_to,
-            .connection_id = connection_id,
-            .stateless_reset_token = stateless_reset_token,
-        });
-        self.refreshConnectionIdEventsForPath(path_id);
+        return path_frame_queue.queuePathNewConnectionId(self, path_id, sequence_number, retire_prior_to, cid, stateless_reset_token);
     }
 
-    /// Queue a PATH_RETIRE_CONNECTION_ID frame asking the peer to drop the
-    /// `(path_id, sequence_number)` CID. Idempotent — duplicate retires for
-    /// the same pair are coalesced. draft-ietf-quic-multipath-21 §6.4.
-    pub fn queuePathRetireConnectionId(
-        self: *Connection,
-        path_id: u32,
-        sequence_number: u64,
-    ) Error!void {
-        for (self.pending_frames.path_retire_connection_ids.items) |item| {
-            if (item.path_id == path_id and item.sequence_number == sequence_number) return;
-        }
-        try self.pending_frames.path_retire_connection_ids.append(self.allocator, .{
-            .path_id = path_id,
-            .sequence_number = sequence_number,
-        });
+    pub fn queuePathRetireConnectionId(self: *Connection, path_id: u32, sequence_number: u64) Error!void {
+        return path_frame_queue.queuePathRetireConnectionId(self, path_id, sequence_number);
     }
 
-    /// Queue a MAX_PATH_ID frame raising our advertised path-id ceiling.
-    /// `maximum_path_id` is clamped to `max_supported_path_id`; lower values
-    /// than the current limit are ignored. draft-ietf-quic-multipath-21 §6.5.
     pub fn queueMaxPathId(self: *Connection, maximum_path_id: u32) void {
-        const bounded_maximum_path_id = @min(maximum_path_id, max_supported_path_id);
-        if (bounded_maximum_path_id > self.local_max_path_id) {
-            self.local_max_path_id = bounded_maximum_path_id;
-        }
-        if (self.pending_frames.max_path_id == null or bounded_maximum_path_id > self.pending_frames.max_path_id.?) {
-            self.pending_frames.max_path_id = bounded_maximum_path_id;
-        }
+        return path_frame_queue.queueMaxPathId(self, maximum_path_id);
     }
 
-    /// Queue a PATHS_BLOCKED frame telling the peer we have run out of
-    /// path-id headroom at `maximum_path_id`. Coalesces by keeping the
-    /// largest pending value. draft-ietf-quic-multipath-21 §6.6.
     pub fn queuePathsBlocked(self: *Connection, maximum_path_id: u32) void {
-        if (self.pending_frames.paths_blocked == null or maximum_path_id > self.pending_frames.paths_blocked.?) {
-            self.pending_frames.paths_blocked = maximum_path_id;
-        }
+        return path_frame_queue.queuePathsBlocked(self, maximum_path_id);
     }
 
-    /// Queue a PATH_CIDS_BLOCKED frame on `path_id`. Sent when the peer's
-    /// CID issuance budget for this path is exhausted at
-    /// `next_sequence_number`. draft-ietf-quic-multipath-21 §6.7.
-    pub fn queuePathCidsBlocked(
-        self: *Connection,
-        path_id: u32,
-        next_sequence_number: u64,
-    ) void {
-        self.pending_frames.path_cids_blocked = .{
-            .path_id = path_id,
-            .next_sequence_number = next_sequence_number,
-        };
+    pub fn queuePathCidsBlocked(self: *Connection, path_id: u32, next_sequence_number: u64) void {
+        return path_frame_queue.queuePathCidsBlocked(self, path_id, next_sequence_number);
     }
 
-    /// Returns the pending peer-side PATH_CIDS_BLOCKED report we have
-    /// received, or `null` if the peer is not currently blocked. Drives
-    /// proactive CID issuance via `provideConnectionId`.
     pub fn pendingPathCidsBlocked(self: *const Connection) ?PathCidsBlockedInfo {
-        const path_id = self.peer_path_cids_blocked_path_id orelse return null;
-        return .{
-            .path_id = path_id,
-            .next_sequence_number = self.peer_path_cids_blocked_next_sequence,
-        };
+        return path_frame_queue.pendingPathCidsBlocked(self);
     }
 
-    /// Clear a peer-side PATH_CIDS_BLOCKED report after the embedder has
-    /// issued enough fresh CIDs to satisfy it. The arguments must match the
-    /// `(path_id, next_sequence_number)` from `pendingPathCidsBlocked`;
-    /// mismatches are no-ops to avoid races with newer reports.
-    pub fn clearPendingPathCidsBlocked(
-        self: *Connection,
-        path_id: u32,
-        next_sequence_number: u64,
-    ) void {
-        if (self.peer_path_cids_blocked_path_id == null) return;
-        if (self.peer_path_cids_blocked_path_id.? != path_id) return;
-        if (self.peer_path_cids_blocked_next_sequence != next_sequence_number) return;
-        self.peer_path_cids_blocked_path_id = null;
-        self.peer_path_cids_blocked_next_sequence = 0;
-    }
-
-    fn clearSatisfiedPathCidsBlocked(self: *Connection, path_id: u32) void {
-        const pending = self.pendingPathCidsBlocked() orelse return;
-        if (pending.path_id != path_id) return;
-        if (self.nextLocalCidSequence(path_id) > pending.next_sequence_number) {
-            self.clearPendingPathCidsBlocked(path_id, pending.next_sequence_number);
-        }
+    pub fn clearPendingPathCidsBlocked(self: *Connection, path_id: u32, next_sequence_number: u64) void {
+        return path_frame_queue.clearPendingPathCidsBlocked(self, path_id, next_sequence_number);
     }
 
     /// Bulk-issue local CIDs on the default path (path_id 0) by emitting
@@ -4060,7 +3934,7 @@ pub const Connection = struct {
         return self.replenishLocalConnectionIds(path_id, provisions);
     }
 
-    fn ensureCanIssueCidForPathId(self: *const Connection, path_id: u32) Error!void {
+    pub fn ensureCanIssueCidForPathId(self: *const Connection, path_id: u32) Error!void {
         if (path_id == 0) return;
         if (self.multipathNegotiated() and path_id > self.local_max_path_id) {
             return Error.PathLimitExceeded;
@@ -4126,7 +4000,7 @@ pub const Connection = struct {
         }
 
         if (queued > 0) {
-            self.clearSatisfiedPathCidsBlocked(path_id);
+            path_frame_queue.clearSatisfiedPathCidsBlocked(self, path_id);
             self.refreshConnectionIdEventsForPath(path_id);
         }
         return queued;
