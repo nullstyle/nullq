@@ -65,9 +65,4 @@ and the supported test letters.
 
 ## Pull requests
 
-- Open against `main`.
-- Make sure `zig build` and `zig build test` are green locally.
-- The `test` GitHub workflow must be green before merge. The `interop`
-  workflow runs weekly and is informational, not a hard merge gate.
-- Touch `CHANGELOG.md` under `[Unreleased]` for any user-visible
-  change.
+- Don't.  This is extensively vibe-coded at the moment and probably shouldn't be used by anyone but me.

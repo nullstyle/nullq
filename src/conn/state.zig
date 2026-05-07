@@ -438,6 +438,16 @@ pub const TimerKind = enum {
     loss_detection,
     pto,
     idle,
+    /// RFC 9000 §10.2.1 closing-state expiry. The connection has sent
+    /// a CONNECTION_CLOSE; this timer fires at `now + 3 * PTO` after
+    /// the first emit and transitions the connection to terminal
+    /// closed (skipping draining if the peer's CC never arrives).
+    closing,
+    /// RFC 9000 §10.2.2 draining-state expiry. The connection has
+    /// received the peer's CONNECTION_CLOSE (or hit idle timeout /
+    /// stateless reset); this timer fires after the
+    /// `lifecycle.draining_deadline_us` interval and transitions the
+    /// connection to terminal closed.
     draining,
     path_retirement,
     key_discard,
@@ -1156,10 +1166,18 @@ pub const Connection = struct {
     /// packet activity has been observed yet.
     last_activity_us: u64 = 0,
 
-    /// Close/draining lifecycle: pending CONNECTION_CLOSE, draining
-    /// deadline, sticky close event, and the reason-phrase buffer.
-    /// See `lifecycle.zig`.
+    /// Close/draining lifecycle: pending CONNECTION_CLOSE, closing/
+    /// draining deadlines, rate-limit bookkeeping, sticky close event,
+    /// and the reason-phrase buffer. See `lifecycle.zig`.
     lifecycle: LifecycleState = .{},
+    /// Set whenever an inbound packet authenticates under our keys
+    /// while the connection is in RFC 9000 §10.2.1's closing state.
+    /// `handle` consumes this flag after the per-datagram loop and
+    /// re-arms `pending_close` if the §10.2.1 ¶3 rate-limit allows,
+    /// so the peer gets a fresh CONNECTION_CLOSE. Cleared on every
+    /// `handle` entry so the signal only reflects the current
+    /// datagram.
+    closing_state_attribution_observed: bool = false,
 
     /// Peer-issued connection IDs we've stashed via NEW_CONNECTION_ID.
     /// Phase 9 (migration) will pull from this set; for now, the
@@ -4947,6 +4965,13 @@ pub const Connection = struct {
             considerDeadline(&best, .{ .kind = .draining, .at_us = at_us });
             return best;
         }
+        // RFC 9000 §10.2.1 closing-state expiry: even though `closed`
+        // is already latched, surface the deadline so embedders can
+        // park their event loop on it.
+        if (self.lifecycle.closing_deadline_us) |at_us| {
+            considerDeadline(&best, .{ .kind = .closing, .at_us = at_us });
+            return best;
+        }
         if (self.lifecycle.closed) return null;
 
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
@@ -5090,7 +5115,14 @@ pub const Connection = struct {
         dst: []u8,
         now_us: u64,
     ) Error!?OutgoingDatagram {
-        if (self.lifecycle.closed) return null;
+        // Once `closed` is latched, the only legal outbound is a
+        // CONNECTION_CLOSE frame queued by either the initial close or
+        // a §10.2.1 ¶3 closing-state retransmit. Letting `pollLevel`
+        // run handles both: its CC pre-empt path emits the queued
+        // frame; otherwise nothing is emitted (no streams, no ACKs)
+        // because every other branch is gated on stream/ACK state
+        // that's empty in closing.
+        if (self.lifecycle.closed and self.lifecycle.pending_close == null) return null;
         self.queueHandshakeDoneIfReady();
         try self.refreshEarlyDataStatus();
         self.poll_addr_override = null;
@@ -5252,6 +5284,18 @@ pub const Connection = struct {
         };
         const app_control_blocked = congestion_blocked or path_response_addr_overrides_current;
 
+        // RFC 9000 §10.2.1 ¶2: "An endpoint MUST NOT send any frames
+        // other than CONNECTION_CLOSE in the closing state." Once the
+        // connection has flipped `closed` and there is no queued CC
+        // (the pre-empt path below is the only escape hatch), every
+        // other frame this function would emit — ACKs, CRYPTO retx,
+        // streams, control frames — is illegal. Bail out before any
+        // frame-builder runs. The first emit reaches this point with
+        // `pending_close != null` and proceeds via the pre-empt path;
+        // §10.2.1 ¶3 retransmits re-arm `pending_close` and re-enter
+        // the same path on the next `poll`.
+        if (self.lifecycle.closed and self.lifecycle.pending_close == null) return null;
+
         // CONNECTION_CLOSE pre-empts everything: if pending, that's
         // the only frame we emit, and we mark the connection
         // closed once it goes on the wire.
@@ -5276,8 +5320,14 @@ pub const Connection = struct {
                 .{ .connection_close = close_frame },
             );
             pl_pos += wrote;
+            // RFC 9000 §10.2 ¶2: "After sending a CONNECTION_CLOSE
+            // frame, an endpoint immediately enters the closing
+            // state." We arm the closing-state machinery via
+            // `noteCloseEmit` further below (it needs the sealed-byte
+            // count and the timer derived from PTO). Before the seal,
+            // clear `pending_close` so a recursive `close()` from a
+            // mid-emit error path doesn't double-queue the frame.
             self.lifecycle.pending_close = null;
-            self.lifecycle.closed = true;
             // No ack-eliciting flag — CONNECTION_CLOSE isn't
             // ack-eliciting per §13.2.1, but we do still want to
             // record it (it occupies a PN). Skip stream/CRYPTO/etc.
@@ -5328,9 +5378,14 @@ pub const Connection = struct {
             };
             if (lvl == .application) self.recordApplicationPacketProtected(&close_packet);
             try sent_tracker.record(close_packet);
-            const draining_deadline = now_us + self.drainingDurationUs();
-            self.lifecycle.draining_deadline_us = draining_deadline;
-            self.lifecycle.updateDrainingDeadline(draining_deadline);
+            // RFC 9000 §10.2.1 closing state. The first emit arms a
+            // 3*PTO closing-state deadline; subsequent §10.2.1 ¶3
+            // retransmits leave the deadline at its original value
+            // (extending it would let a chatty peer keep the slot
+            // alive past §10.2 ¶5's bound).
+            const closing_deadline = now_us + self.drainingDurationUs();
+            self.lifecycle.noteCloseEmit(now_us, closing_deadline);
+            self.lifecycle.updateDrainingDeadline(closing_deadline);
             self.qlog_packets_sent +|= 1;
             self.qlog_bytes_sent +|= n_close;
             self.emitPacketSent(lvl, pn, @intCast(n_close), 1);
@@ -6049,13 +6104,28 @@ pub const Connection = struct {
     /// Process an incoming UDP datagram. Splits coalesced packets
     /// (RFC 9000 §12.2) and routes each through the matching
     /// per-level decrypt + frame-dispatch path.
+    ///
+    /// Lifecycle gates per RFC 9000 §10.2:
+    ///   - draining / closed (§10.2.2 ¶1): silently drop.
+    ///   - pre-emit closing  (`pending_close != null`): drop here;
+    ///     the next `poll` will emit the queued CC.
+    ///   - post-emit closing (§10.2.1): keep processing the datagram
+    ///     so we can attribute it (and re-arm a CC retransmit per
+    ///     §10.2.1 ¶3) and so a peer's CC moves us to draining.
+    ///     `dispatchFrames` is suppressed for non-CONNECTION_CLOSE
+    ///     frames in this state via `closingAttributionOnly`.
     pub fn handle(
         self: *Connection,
         bytes: []u8,
         from: ?Address,
         now_us: u64,
     ) Error!void {
-        if (self.lifecycle.pending_close != null or self.lifecycle.closed) return;
+        const entry_state = self.lifecycle.state();
+        if (entry_state == .draining or entry_state == .closed) return;
+        if (entry_state == .closing and self.lifecycle.pending_close != null) return;
+        // Closing-state attribution accumulator. Cleared on entry so
+        // it reflects only this datagram's observations.
+        self.closing_state_attribution_observed = false;
         if (bytes.len > self.localUdpPayloadLimit()) {
             self.emitPacketDropped(null, @intCast(bytes.len), .payload_too_large);
             self.close(true, transport_error_protocol_violation, "udp payload exceeds local limit");
@@ -6099,7 +6169,7 @@ pub const Connection = struct {
                     }
                 }
             }
-            if (self.lifecycle.pending_close != null or self.lifecycle.closed) break;
+            if (self.shouldStopDatagramLoop()) break;
             if (!drain_tls_after_packet) break;
             // Drain CRYPTO into TLS BETWEEN packets, not just at
             // the end. A coalesced Initial+Handshake datagram
@@ -6108,7 +6178,13 @@ pub const Connection = struct {
             // we can decrypt the trailing Handshake packet.
             try self.drainInboxIntoTls();
         }
-        if (self.cryptoInboxQueued()) try self.drainInboxIntoTls();
+        if (self.cryptoInboxQueued() and !self.closingAttributionOnly()) try self.drainInboxIntoTls();
+        // RFC 9000 §10.2.1 ¶3: when in the closing state and an
+        // attributed inbound packet arrived during this datagram,
+        // re-arm a CONNECTION_CLOSE retransmit (subject to the SHOULD
+        // rate-limit). The peer's CC, if any, would have transitioned
+        // us to draining via `dispatchFrames` before we get here.
+        self.maybeRearmClosingStateCloseRepeat(now_us);
 
         // PATH_CHALLENGE → record-and-tick; the validator will
         // either succeed (echo arrived) or time out at PTO * 3.
@@ -6131,6 +6207,93 @@ pub const Connection = struct {
         if (bytes.len >= 5 and std.mem.readInt(u32, bytes[1..5], .big) == 0) return false;
         const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
         return long_type_bits != @intFromEnum(wire_header.LongType.retry);
+    }
+
+    /// True when the connection is in RFC 9000 §10.2.1's closing state
+    /// (the deadline-armed phase that follows the first
+    /// CONNECTION_CLOSE seal) AND no follow-up CC is currently
+    /// queued. The packet-decrypt tails consult this to decide whether
+    /// to run the full record-and-dispatch pipeline or the
+    /// closing-state-only "scan for peer CONNECTION_CLOSE, otherwise
+    /// flag attribution" tail.
+    fn closingAttributionOnly(self: *const Connection) bool {
+        return self.lifecycle.closing_deadline_us != null
+            and self.lifecycle.pending_close == null
+            and self.lifecycle.draining_deadline_us == null;
+    }
+
+    /// Decide whether the per-datagram packet loop should bail out
+    /// after the most recent packet. Terminal states (draining /
+    /// closed) and a freshly-queued local close all force a break;
+    /// closing-state attribution mode keeps iterating so a CC tucked
+    /// into a later coalesced packet still transitions us to
+    /// draining.
+    fn shouldStopDatagramLoop(self: *const Connection) bool {
+        const cs = self.lifecycle.state();
+        if (cs == .draining or cs == .closed) return true;
+        if (cs == .closing and self.lifecycle.pending_close != null) return true;
+        return false;
+    }
+
+    /// Iterate `payload` looking for a peer CONNECTION_CLOSE frame.
+    /// If found, transition the local lifecycle to draining (RFC 9000
+    /// §10.2.2 ¶3 license: "An endpoint MAY enter the draining state
+    /// from the closing state if it receives a CONNECTION_CLOSE
+    /// frame"). Other frames are ignored — §10.2.1 ¶5: "An endpoint
+    /// that is closing is not required to process any received
+    /// frame."
+    fn scanForPeerCloseFrame(
+        self: *Connection,
+        payload: []const u8,
+        now_us: u64,
+    ) void {
+        var it = frame_mod.iter(payload);
+        while (it.next() catch return) |f| {
+            switch (f) {
+                .connection_close => |cc| {
+                    self.enterDraining(
+                        .peer,
+                        closeErrorSpace(cc.is_transport),
+                        cc.error_code,
+                        if (cc.is_transport) cc.frame_type else 0,
+                        cc.reason_phrase,
+                        now_us,
+                    );
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Re-arm `pending_close` so the next `poll` retransmits the
+    /// CONNECTION_CLOSE, but only if (a) we're in the post-emit
+    /// closing state, (b) at least one packet authenticated under our
+    /// keys during the most recent `handle` call, and (c) the
+    /// §10.2.1 ¶3 SHOULD-rate-limit allows another emission.
+    ///
+    /// The retransmit reuses the original close info captured on the
+    /// sticky `lifecycle.close_event` — same error code, same reason
+    /// phrase. Per §10.2.1 ¶2 ("An endpoint MAY send CONNECTION_CLOSE
+    /// frames of different sizes or with different error codes, but
+    /// the error code in all frames SHOULD be consistent"), keeping
+    /// them identical satisfies the SHOULD-consistent guidance.
+    fn maybeRearmClosingStateCloseRepeat(self: *Connection, now_us: u64) void {
+        if (!self.closing_state_attribution_observed) return;
+        self.closing_state_attribution_observed = false;
+        if (self.lifecycle.state() != .closing) return;
+        if (self.lifecycle.closing_deadline_us == null) return;
+        if (self.lifecycle.pending_close != null) return;
+        const base = self.basePtoDurationForLevel(.application);
+        if (!self.lifecycle.shouldRearmCloseRepeat(now_us, base)) return;
+        const stored = self.lifecycle.close_event orelse return;
+        self.lifecycle.pending_close = .{
+            .is_transport = stored.error_space == .transport,
+            .error_code = stored.error_code,
+            .frame_type = stored.frame_type,
+            .reason = self.lifecycle.close_reason_buf[0..stored.reason_len],
+        };
+        self.emitConnectionStateIfChanged();
     }
 
     /// Initiate path validation by queueing a PATH_CHALLENGE on
@@ -6582,6 +6745,16 @@ pub const Connection = struct {
         }
 
         self.last_authenticated_path_id = app_path.id;
+        if (self.closingAttributionOnly()) {
+            // RFC 9000 §10.2.1 ¶3 attribution path. Decrypt has
+            // succeeded; mark the observation, scan for a peer CC,
+            // and skip everything else (no ACK tracker update, no
+            // dispatchFrames). The outer `handle` re-arms a CC
+            // retransmit subject to the SHOULD-rate-limit.
+            self.closing_state_attribution_observed = true;
+            self.scanForPeerCloseFrame(opened.payload, now_us);
+            return bytes.len;
+        }
         recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
         self.qlog_packets_received +|= 1;
         self.emitPacketReceived(.application, opened.pn, @intCast(bytes.len), countFrames(opened.payload));
@@ -6736,6 +6909,12 @@ pub const Connection = struct {
         }
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
+        if (self.closingAttributionOnly()) {
+            // RFC 9000 §10.2.1 ¶3 attribution path. See `handleShort`.
+            self.closing_state_attribution_observed = true;
+            self.scanForPeerCloseFrame(opened.payload, now_us);
+            return opened.bytes_consumed;
+        }
         self.pnSpaceForLevel(.initial).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
         self.qlog_packets_received +|= 1;
         self.emitPacketReceived(.initial, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
@@ -6825,6 +7004,12 @@ pub const Connection = struct {
         }
 
         self.last_authenticated_path_id = app_path.id;
+        if (self.closingAttributionOnly()) {
+            // RFC 9000 §10.2.1 ¶3 attribution path. See `handleShort`.
+            self.closing_state_attribution_observed = true;
+            self.scanForPeerCloseFrame(opened.payload, now_us);
+            return opened.bytes_consumed;
+        }
         recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
         self.qlog_packets_received +|= 1;
         self.emitPacketReceived(.early_data, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
@@ -6862,6 +7047,12 @@ pub const Connection = struct {
         }
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
+        if (self.closingAttributionOnly()) {
+            // RFC 9000 §10.2.1 ¶3 attribution path. See `handleShort`.
+            self.closing_state_attribution_observed = true;
+            self.scanForPeerCloseFrame(opened.payload, now_us);
+            return opened.bytes_consumed;
+        }
         self.pnSpaceForLevel(.handshake).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
         self.qlog_packets_received +|= 1;
         self.emitPacketReceived(.handshake, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
@@ -8568,6 +8759,18 @@ pub const Connection = struct {
         self.discardExpiredApplicationReadKeys(now_us);
 
         if (self.lifecycle.draining_deadline_us) |deadline| {
+            if (now_us >= deadline) {
+                self.finishDraining();
+            }
+            return;
+        }
+        // RFC 9000 §10.2.1 closing-state expiry. The deadline fires at
+        // `first_close_emit + 3 * PTO`. If the peer's CC never came
+        // back (otherwise we'd already be in draining), fall straight
+        // to terminal closed — §10.2 ¶7: "Once its closing or
+        // draining state ends, an endpoint SHOULD discard all
+        // connection state."
+        if (self.lifecycle.closing_deadline_us) |deadline| {
             if (now_us >= deadline) {
                 self.finishDraining();
             }
@@ -10667,7 +10870,11 @@ test "qlog records AEAD confidentiality-limit close" {
     const close_event = conn.closeEvent().?;
     try std.testing.expectEqual(CloseSource.local, close_event.source);
     try std.testing.expectEqual(transport_error_aead_limit_reached, close_event.error_code);
-    try std.testing.expectEqual(CloseState.draining, conn.closeState());
+    // First CC has been sealed → RFC 9000 §10.2.1 closing state. The
+    // peer's CC hasn't arrived (and won't, since this is a unit test
+    // with no peer), so we stay in closing until the §10.2 ¶5
+    // 3*PTO deadline elapses.
+    try std.testing.expectEqual(CloseState.closing, conn.closeState());
 }
 
 test "AEAD authentication failure limit closes the connection" {
@@ -14013,3 +14220,4 @@ fn fuzzCidLifecycle(_: void, smith: *std.testing.Smith) anyerror!void {
         }
     }
 }
+

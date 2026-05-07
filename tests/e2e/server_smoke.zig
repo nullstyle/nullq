@@ -1057,6 +1057,11 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     var drain_buf: [2048]u8 = undefined;
     _ = try gen_1_slot.conn.poll(&drain_buf, 3_000);
     try std.testing.expect(gen_1_slot.conn.isClosed());
+    // RFC 9000 §10.2.1 closing state lasts 3*PTO before transitioning
+    // to terminal closed. `Server.reap` only reclaims slots that are
+    // *terminally* closed (RFC 9000 §10.2 ¶5), so tick well past the
+    // deadline before reaping.
+    try gen_1_slot.conn.tick(60_000_000);
     try std.testing.expectEqual(@as(usize, 1), srv.reap());
     // Draining entry untouched — current-gen slot reaping is a no-op
     // for the refcount path.
@@ -1068,6 +1073,7 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     gen_0_slot.conn.close(true, 0x00, "test");
     _ = try gen_0_slot.conn.poll(&drain_buf, 4_000);
     try std.testing.expect(gen_0_slot.conn.isClosed());
+    try gen_0_slot.conn.tick(60_000_000);
     try std.testing.expectEqual(@as(usize, 1), srv.reap());
     try std.testing.expectEqual(@as(usize, 0), srv.draining_tls_contexts.items.len);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());

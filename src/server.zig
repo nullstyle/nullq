@@ -1614,30 +1614,39 @@ pub const Server = struct {
     }
 
     /// Drive time-based recovery on every live slot. Idempotent and
-    /// cheap — call it on every loop iteration. Closed slots are
-    /// skipped; call `reap` periodically to reclaim them.
+    /// cheap — call it on every loop iteration. Terminal-closed slots
+    /// are skipped (their deadlines have already fired and there's
+    /// nothing more for `tick` to do); call `reap` periodically to
+    /// reclaim them. RFC 9000 §10.2.1/§10.2.2 closing- and
+    /// draining-state slots stay in the loop so their deadlines fire
+    /// and the connection eventually transitions to terminal closed.
     pub fn tick(self: *Server, now_us: u64) ConnectionError!void {
         for (self.slots.items) |slot| {
-            if (slot.conn.isClosed()) continue;
+            if (slot.conn.closeState() == .closed) continue;
             try slot.conn.tick(now_us);
         }
     }
 
-    /// Reap any closed slots from the table. Returns the number of
-    /// slots reclaimed. Iterates back-to-front and uses
+    /// Reap any *terminally-closed* slots from the table. Returns the
+    /// number of slots reclaimed. Iterates back-to-front and uses
     /// `swapRemove`, so reaping N closed slots is O(N), not O(N²).
     /// Each reaped slot drops every CID it owned from `cid_table`.
     /// If a reaped slot was opened against a draining TLS context,
     /// its draining-entry refcount is decremented; when the count
     /// reaches zero the draining context is `deinit`-ed and removed
     /// from `draining_tls_contexts`.
+    ///
+    /// RFC 9000 §10.2 ¶5 mandates that closing and draining states
+    /// "SHOULD persist for at least three times the current PTO
+    /// interval" — slots in those states are deliberately kept alive
+    /// so a peer's late CC retransmit can still find the connection.
     pub fn reap(self: *Server) usize {
         var reaped: usize = 0;
         var i: usize = self.slots.items.len;
         while (i > 0) {
             i -= 1;
             const slot = self.slots.items[i];
-            if (!slot.conn.isClosed()) continue;
+            if (slot.conn.closeState() != .closed) continue;
             // Capture the close-event source and peer address before
             // we tear the connection down — once `slot.conn.deinit`
             // has run, both pointers are dead.

@@ -20,20 +20,15 @@
 //!   RFC9221 §4 ¶2   MUST       frame type 0x31 is LEN-prefixed with a varint length
 //!   RFC9221 §4      MUST       0x30/0x31 round-trip through encode/decode
 //!   RFC9221 §4      MUST       LEN varint with length > buffer is rejected
+//!   RFC9221 §4 ¶3   MUST       reject DATAGRAM in Initial / Handshake packets
+//!                              with PROTOCOL_VIOLATION (gated by
+//!                              `frameAllowedInInitialOrHandshake`)
 //!   RFC9221 §4 ¶6   MUST       receiver-side handler closes with PROTOCOL_VIOLATION
 //!                              on a DATAGRAM larger than its advertised limit
 //!   RFC9221 §4 ¶7   MUST NOT   sender emits DATAGRAM exceeding peer's advertised limit
 //!   RFC9221 §4 ¶7   MUST NOT   sender emits DATAGRAM when peer advertised 0 / no support
 //!   RFC9221 §5.1    NORMATIVE  the frame catalog tags DATAGRAM as non-retransmittable
 //!                              (no entry in `SentPacket.retransmit_frames`)
-//!
-//! Visible debt:
-//!   RFC9221 §4 ¶3   MUST       reject DATAGRAM in Initial / Handshake packets
-//!                              with PROTOCOL_VIOLATION. nullq's frame dispatcher
-//!                              (src/conn/state.zig dispatchFrames) lacks a per-
-//!                              encryption-level allowed-frames table for
-//!                              Initial/Handshake; the broader gap is RFC 9000
-//!                              §12.4 / §17.2 territory (skip_MUST below).
 //!
 //! Out of scope here (covered elsewhere or not yet wired):
 //!   RFC9221 §5.2    DATAGRAM is congestion-controlled — exercised through

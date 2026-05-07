@@ -80,12 +80,22 @@ pub fn closeErrorSpace(is_transport: bool) CloseErrorSpace {
 }
 
 /// Pure close/draining state for a Connection. Owns the queued
-/// CONNECTION_CLOSE info, the closed flag, the draining deadline,
-/// and the sticky close event with its reason buffer.
+/// CONNECTION_CLOSE info, the closed flag, the closing/draining
+/// deadlines, the close-emit rate-limit bookkeeping, and the sticky
+/// close event with its reason buffer.
 ///
 /// All methods are pure with respect to the rest of Connection — the
 /// caller layers in side effects (clearing recovery state, emitting
 /// qlog state transitions) at the call sites.
+///
+/// Lifecycle, mapped to RFC 9000 §10.2:
+///   - open       → no fields set
+///   - closing    → either `pending_close` (CC queued, not yet sealed)
+///                  or `closing_deadline_us` (first CC sealed, awaiting
+///                  closing-state expiry per §10.2.1)
+///   - draining   → `draining_deadline_us` set (entered after peer's
+///                  CC arrives, idle timeout, or stateless reset path)
+///   - closed     → `closed = true` with both deadlines null
 pub const LifecycleState = struct {
     /// CONNECTION_CLOSE we've queued (typically from `close()`); the
     /// next outgoing packet at the highest available encryption
@@ -94,9 +104,26 @@ pub const LifecycleState = struct {
     /// True once we've sent or received a CONNECTION_CLOSE frame, or
     /// an idle timeout has entered draining.
     closed: bool = false,
+    /// Closing-state deadline. Set once the first locally-originated
+    /// CONNECTION_CLOSE goes on the wire and we transition to RFC 9000
+    /// §10.2.1's closing state. While in this state, attributed
+    /// incoming packets re-arm `pending_close` (rate-limited per
+    /// §10.2.1 ¶3) so the peer can re-observe the close if the first
+    /// CC was lost. Cleared when the connection moves on to draining
+    /// or terminal closed.
+    closing_deadline_us: ?u64 = null,
     /// Draining-state deadline. A non-null value means only the
     /// draining timer remains relevant.
     draining_deadline_us: ?u64 = null,
+    /// Wall-clock of the most recent CONNECTION_CLOSE emission. Used
+    /// by `shouldRearmCloseRepeat` to enforce the §10.2.1 ¶3
+    /// rate-limit.
+    last_close_emit_us: ?u64 = null,
+    /// Number of times we've sealed a CONNECTION_CLOSE (initial emit
+    /// + repeats). Used as the exponent for the §10.2.1 ¶3
+    /// "progressively increasing … amount of time" backoff. Saturates
+    /// at the upper bound of `shift` inside the rate-limit math.
+    close_emit_count: u32 = 0,
     /// Sticky close/error status for embedders. The stored event keeps
     /// offsets into `close_reason_buf` so `Connection` can be moved
     /// before bind/init without leaving a self-referential slice
@@ -107,6 +134,7 @@ pub const LifecycleState = struct {
     /// Current public shutdown state derived from the stored fields.
     pub fn state(self: *const LifecycleState) CloseState {
         if (self.draining_deadline_us != null) return .draining;
+        if (self.closing_deadline_us != null) return .closing;
         if (self.pending_close != null) return .closing;
         if (self.closed) return .closed;
         return .open;
@@ -196,15 +224,17 @@ pub const LifecycleState = struct {
             draining_deadline,
         );
         self.pending_close = null;
+        self.closing_deadline_us = null;
         self.closed = true;
         self.draining_deadline_us = draining_deadline;
     }
 
-    /// Drop any queued CONNECTION_CLOSE / draining timer and mark the
-    /// connection terminally closed. Caller clears recovery state
-    /// separately.
+    /// Drop any queued CONNECTION_CLOSE / closing/draining timer and
+    /// mark the connection terminally closed. Caller clears recovery
+    /// state separately.
     pub fn finishDraining(self: *LifecycleState) void {
         self.pending_close = null;
+        self.closing_deadline_us = null;
         self.draining_deadline_us = null;
         self.closed = true;
     }
@@ -230,6 +260,7 @@ pub const LifecycleState = struct {
             null,
         );
         self.pending_close = null;
+        self.closing_deadline_us = null;
         self.draining_deadline_us = null;
         self.closed = true;
     }
@@ -239,6 +270,74 @@ pub const LifecycleState = struct {
     /// caller can emit the corresponding side effects.
     pub fn finishDrainingIfElapsed(self: *LifecycleState, now_us: u64) bool {
         const deadline = self.draining_deadline_us orelse return false;
+        if (now_us < deadline) return false;
+        self.finishDraining();
+        return true;
+    }
+
+    /// Bookkeeping the caller invokes immediately after the seal-and-
+    /// send path emits a CONNECTION_CLOSE. Clears `pending_close`,
+    /// flips the terminal `closed` flag, arms the closing-state
+    /// deadline, and bumps the rate-limit counters that gate further
+    /// CC retransmissions per RFC 9000 §10.2.1 ¶3. The caller passes a
+    /// precomputed `closing_deadline` (typically `now_us + 3 * PTO`,
+    /// matching §10.2 ¶5's "These states SHOULD persist for at least
+    /// three times the current PTO interval").
+    pub fn noteCloseEmit(
+        self: *LifecycleState,
+        now_us: u64,
+        closing_deadline: u64,
+    ) void {
+        self.pending_close = null;
+        self.closed = true;
+        // Only arm the closing-state deadline on the FIRST emit. A
+        // §10.2.1 ¶3 retransmit doesn't extend the timer (otherwise
+        // a chatty peer could keep the slot alive forever — that's
+        // the exact amplification angle the ¶3 SHOULD-rate-limit and
+        // §10.2 ¶5 fixed deadline guard against).
+        if (self.draining_deadline_us == null and self.closing_deadline_us == null) {
+            self.closing_deadline_us = closing_deadline;
+        }
+        self.last_close_emit_us = now_us;
+        self.close_emit_count +|= 1;
+    }
+
+    /// Whether enough time has elapsed since the last CONNECTION_CLOSE
+    /// emission to re-arm `pending_close` for another retransmit. RFC
+    /// 9000 §10.2.1 ¶3 SHOULD: "limit the rate at which it generates
+    /// packets in the closing state. For instance, an endpoint could
+    /// wait for a progressively increasing number of received packets
+    /// or amount of time before responding to received packets."
+    ///
+    /// nullq's policy: exponential time backoff. Wait at least
+    /// `base_interval_us << close_emit_count` before re-arming. The
+    /// shift saturates at 16 (matching the loss-recovery PTO backoff
+    /// cap) so the interval can't run away into u64 overflow.
+    pub fn shouldRearmCloseRepeat(
+        self: *const LifecycleState,
+        now_us: u64,
+        base_interval_us: u64,
+    ) bool {
+        if (self.pending_close != null) return false;
+        if (self.closing_deadline_us == null) return false;
+        const last = self.last_close_emit_us orelse return true;
+        const shift: u6 = @intCast(@min(self.close_emit_count, 16));
+        const max_u64: u64 = std.math.maxInt(u64);
+        const interval = if (base_interval_us > (max_u64 >> shift))
+            max_u64
+        else
+            base_interval_us << shift;
+        return now_us >= last +| interval;
+    }
+
+    /// Drop to terminal-closed once `now_us` crosses the stored
+    /// closing-state deadline. Returns true if the transition fired so
+    /// the caller can emit the corresponding side effects. The closing
+    /// state ends without ever entering draining when the peer never
+    /// returns a CONNECTION_CLOSE — per §10.2 ¶5 the state SHOULD have
+    /// persisted at least 3*PTO, which is what the caller arms.
+    pub fn finishClosingIfElapsed(self: *LifecycleState, now_us: u64) bool {
+        const deadline = self.closing_deadline_us orelse return false;
         if (now_us < deadline) return false;
         self.finishDraining();
         return true;

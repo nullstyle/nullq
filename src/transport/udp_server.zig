@@ -267,7 +267,12 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
         // not tear down the whole server. The connection itself
         // transitions to `.closed` and gets reaped on the next pass.
         for (server.iterator()) |slot| {
-            if (slot.conn.isClosed()) continue;
+            // Terminal closed → nothing to do. Closing/draining slots
+            // stay in the loop so their deadlines fire and the
+            // closing-state CC retransmits can still emit (RFC 9000
+            // §10.2.1 ¶3). `drainSlot`/`tick` are both idempotent on
+            // those states.
+            if (slot.conn.closeState() == .closed) continue;
             drainSlot(slot, tx, now_us, sock, options.io) catch {};
             slot.conn.tick(now_us) catch {};
         }

@@ -49,13 +49,15 @@
 //!   RFC9000 §5.1.1   MUST     active_connection_id_limit honoured on NEW_CONNECTION_ID issuance
 //!   RFC9000 §10.1    MUST     idle timeout uses min(local, peer) idle parameter
 //!   RFC9000 §10.2    MUST     closing → draining → closed lifecycle progression
+//!   RFC9000 §10.2    MUST     terminal-closed transition fires when the closing-state deadline elapses
+//!   RFC9000 §10.2.1  NORMATIVE retransmit CONNECTION_CLOSE on attributed packet in closing state
+//!   RFC9000 §10.2.1  NORMATIVE rate-limit suppresses CONNECTION_CLOSE retransmits in closing state
 //!   RFC9000 §10.2.2  MUST     draining state suppresses new outbound traffic
 //!   RFC9000 §10.3    MUST     stateless-reset token compare is constant-time
 //!   RFC9000 §10.3    MUST     stateless-reset token derive is deterministic per CID
 //!
 //! Visible debt:
 //!   RFC9000 §5.1.2 path migration switches to a fresh peer-issued CID
-//!   RFC9000 §10.2.1 closing state emits CONNECTION_CLOSE periodically (KNOWN DIVERGENCE — see test)
 //!
 //! Out of scope here:
 //!   RFC9000 §2.1   stream-creation transport-parameter wiring → rfc9000_transport_params.zig
@@ -792,41 +794,221 @@ test "MUST allow a stateless reset to skip draining and go straight to closed [R
     try std.testing.expectEqual(lifecycle.CloseSource.stateless_reset, ev.source);
 }
 
-test "skip_MUST emit a CONNECTION_CLOSE periodically while in the closing state [RFC9000 §10.2.1 ¶3]" {
-    // §10.2.1 ¶3: "An endpoint in the closing state sends a packet
-    // containing a CONNECTION_CLOSE frame in response to any incoming
-    // packet that it attributes to the connection."
+test "NORMATIVE retransmit a CONNECTION_CLOSE in response to attributed packets in the closing state [RFC9000 §10.2.1 ¶2]" {
+    // RFC 9000 §10.2.1 ¶2: "An endpoint in the closing state sends a
+    // packet containing a CONNECTION_CLOSE frame in response to any
+    // incoming packet that it attributes to the connection."
     //
-    // CONFORMANT BY DIFFERENT INTERPRETATION (kept as `skip_` to
-    // surface the spec choice for auditors):
+    // (No BCP-14 keyword on this requirement — it's normative
+    // descriptive text; cf. zspec-rfc-testing.md "NORMATIVE" rule.)
     //
-    // RFC 9000 §10.2 ¶3 explicitly licenses the alternative
-    // "skip-closing, go straight to draining" path: "an endpoint
-    // that does not have application data to send to its peer can
-    // transition immediately to the draining state when sending a
-    // CONNECTION_CLOSE frame." nullq's `pollLevel`
-    // (src/conn/state.zig: pending_close → seal CC → mark closed +
-    // arm draining_deadline) takes that path uniformly. §10.2.1 ¶3's
-    // repeater only binds for implementations that *stay* in the
-    // closing state; nullq does not, per §10.2 ¶3 license.
+    // RFC 9000 §10.2.1 ¶3 SHOULD-rate-limit: "An endpoint SHOULD
+    // limit the rate at which it generates packets in the closing
+    // state. For instance, an endpoint could wait for a progressively
+    // increasing number of received packets or amount of time before
+    // responding to received packets." nullq's policy is exponential
+    // time backoff (`shouldRearmCloseRepeat`).
     //
-    // To unskip this test, nullq would need to grow a closing-state
-    // sub-mode (between "first CC sent" and "draining_deadline
-    // elapsed") that:
-    //   1. Doesn't short-circuit `Connection.handle` on incoming
-    //      packets — it processes just enough to attribute the
-    //      packet to this connection.
-    //   2. Re-queues `pending_close` on each attributed inbound
-    //      packet (rate-limited so successive incoming packets don't
-    //      amplify the response volume).
-    //   3. Transitions to `closed` after `draining_deadline_us`
-    //      elapses (existing behaviour for that step).
+    // Test plan: drive a real handshake to confirmed, server-side-
+    // initiate a close (sealing the first CC into the server's
+    // outbox), advance time past the rate-limit interval, then inject
+    // an attributable PING from the client. The server must re-arm a
+    // CONNECTION_CLOSE in response. Feed the re-emitted packet to the
+    // client and confirm the client reports a peer-source close with
+    // the original error code.
+    var pair = try fixture.HandshakePair.init(test_alloc);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const srv = try pair.serverConn();
+    const cli = pair.clientConn();
+
+    // Server-initiated close. The first poll seals the CC and arms
+    // the closing-state deadline. We deliberately do NOT deliver the
+    // sealed bytes to the client here — §10.2.1 ¶2's retransmit
+    // semantics describe the server's response to *subsequent* peer
+    // packets while still in the closing state. Delivering the first
+    // CC immediately would transition the client to draining and
+    // close the bidirectional channel before the test can exercise
+    // the re-arm.
+    srv.close(true, fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, "test repeat");
+    pair.now_us +%= 1_000;
+    var seal_buf: [2048]u8 = undefined;
+    const first_cc_len = (try srv.poll(&seal_buf, pair.now_us)) orelse
+        return error.NoFirstCcEmitted;
+    try std.testing.expect(first_cc_len > 0);
+
+    // Server is now in the closing state with a 3*PTO closing-state
+    // deadline (RFC 9000 §10.2 ¶5 / §10.2.1 ¶2). Surfaced both as the
+    // public CloseState and the public TimerKind.
+    try std.testing.expectEqual(lifecycle.CloseState.closing, srv.closeState());
+    const deadline = srv.nextTimerDeadline(pair.now_us) orelse
+        return error.NoClosingTimer;
+    try std.testing.expectEqual(nullq.TimerKind.closing, deadline.kind);
+
+    // §10.2.1 ¶3 SHOULD-rate-limit: a re-arm attempt at the same
+    // instant would be denied. We bypass that gate by advancing time
+    // 100 ms (well past `2 * basePtoDuration` for a freshly-handshaked
+    // connection — single-digit ms baseline).
+    pair.now_us +%= 100_000;
+
+    // Inject an attributable PING from the client. Sealed under the
+    // live application write keys; the server's `handleShort` will
+    // decrypt it, run the §10.2.1 attribution-only tail (no ACK, no
+    // dispatchFrames), and `handle`'s post-loop hook re-arms
+    // `pending_close` per §10.2.1 ¶2.
+    const cli_keys = (try cli.packetKeys(.application, .write)) orelse
+        return error.NoApplicationWriteKeys;
+    const dcid = cli.peer_dcid.slice();
+    const pn = cli.allocApplicationPacketNumberForTesting() orelse
+        return error.PnSpaceExhausted;
+    const ping_frame = [_]u8{0x01};
+    var ping_packet: [2048]u8 = undefined;
+    const ping_n = try nullq.wire.short_packet.seal1Rtt(&ping_packet, .{
+        .dcid = dcid,
+        .pn = pn,
+        .payload = &ping_frame,
+        .keys = &cli_keys,
+        .key_phase = false,
+    });
+    _ = try pair.server.feed(ping_packet[0..ping_n], pair.peer_addr, pair.now_us);
+
+    // The retransmit is the observable §10.2.1 ¶2 effect. Drain it
+    // from the server and feed it to the client; the client should
+    // transition to draining with peer-sourced close info matching
+    // the original error code.
+    pair.now_us +%= 1_000;
+    const second_cc_len = (try srv.poll(&seal_buf, pair.now_us)) orelse
+        return error.NoSecondCcEmitted;
+    try std.testing.expect(second_cc_len > 0);
+
+    // Server stays in closing state — §10.2.1 ¶2 retransmits do not
+    // shorten the §10.2 ¶5 3*PTO interval.
+    try std.testing.expectEqual(lifecycle.CloseState.closing, srv.closeState());
+
+    // Deliver the re-emitted CC to the client. The client must close
+    // with the *same* error code we set on the server.
+    try cli.handle(seal_buf[0..second_cc_len], null, pair.now_us);
+    const cli_close = cli.closeEvent() orelse return error.ClientDidNotClose;
+    try std.testing.expectEqual(lifecycle.CloseSource.peer, cli_close.source);
+    try std.testing.expectEqual(
+        lifecycle.CloseErrorSpace.transport,
+        cli_close.error_space,
+    );
+    try std.testing.expectEqual(
+        fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION,
+        cli_close.error_code,
+    );
+}
+
+test "NORMATIVE rate-limit suppresses CONNECTION_CLOSE retransmits in the closing state [RFC9000 §10.2.1 ¶3]" {
+    // RFC 9000 §10.2.1 ¶3 SHOULD: "An endpoint SHOULD limit the rate
+    // at which it generates packets in the closing state." Verify
+    // that two attributable packets arriving back-to-back (no time
+    // advance between them) produce only ONE CONNECTION_CLOSE
+    // retransmit, not two — i.e. the second packet is silently
+    // attributed but doesn't re-arm `pending_close` because the
+    // exponential-backoff window hasn't elapsed.
+    var pair = try fixture.HandshakePair.init(test_alloc);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const srv = try pair.serverConn();
+    const cli = pair.clientConn();
+
+    // First CC seals; server enters closing.
+    srv.close(true, fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, "rate limit");
+    pair.now_us +%= 1_000;
+    var seal_buf: [2048]u8 = undefined;
+    _ = (try srv.poll(&seal_buf, pair.now_us)) orelse
+        return error.NoFirstCcEmitted;
+
+    // Advance past the first rate-limit window so the FIRST PING
+    // does re-arm. We then poll out the resulting CC. Now the rate-
+    // limit window has reset (last_close_emit_us = now), and a
+    // second PING arriving immediately after MUST NOT produce a
+    // second retransmit.
+    pair.now_us +%= 100_000;
+    const cli_keys = (try cli.packetKeys(.application, .write)) orelse
+        return error.NoApplicationWriteKeys;
+    const dcid = cli.peer_dcid.slice();
+    const ping_frame = [_]u8{0x01};
+
+    // Helper: build, feed, and try to drain.
+    const sealAndFeed = struct {
+        fn run(
+            inner_pair: *fixture.HandshakePair,
+            inner_cli: *nullq.conn.Connection,
+            inner_keys: nullq.conn.state.PacketKeys,
+            inner_dcid: []const u8,
+        ) !void {
+            const inner_pn = inner_cli.allocApplicationPacketNumberForTesting() orelse
+                return error.PnSpaceExhausted;
+            var pkt: [2048]u8 = undefined;
+            const n = try nullq.wire.short_packet.seal1Rtt(&pkt, .{
+                .dcid = inner_dcid,
+                .pn = inner_pn,
+                .payload = &ping_frame,
+                .keys = &inner_keys,
+                .key_phase = false,
+            });
+            _ = try inner_pair.server.feed(pkt[0..n], inner_pair.peer_addr, inner_pair.now_us);
+        }
+    }.run;
+
+    // First PING: rate-limit allows.
+    try sealAndFeed(&pair, cli, cli_keys, dcid);
+    pair.now_us +%= 1_000;
+    const first_retransmit = try srv.poll(&seal_buf, pair.now_us);
+    try std.testing.expect(first_retransmit != null);
+    try std.testing.expect(first_retransmit.? > 0);
+
+    // Second PING immediately after: rate-limit denies, no retransmit.
+    pair.now_us +%= 1_000;
+    try sealAndFeed(&pair, cli, cli_keys, dcid);
+    pair.now_us +%= 1_000;
+    const second_retransmit = try srv.poll(&seal_buf, pair.now_us);
+    try std.testing.expectEqual(@as(?usize, null), second_retransmit);
+
+    // Server still in closing — neither retransmit nor rate-limit
+    // miss collapses the closing-state deadline.
+    try std.testing.expectEqual(lifecycle.CloseState.closing, srv.closeState());
+}
+
+test "MUST drop to terminal closed when the closing-state deadline elapses [RFC9000 §10.2 ¶5]" {
+    // RFC 9000 §10.2 ¶5: "The closing and draining connection states
+    // exist to ensure that connections close cleanly and that delayed
+    // or reordered packets are properly discarded. These states
+    // SHOULD persist for at least three times the current PTO
+    // interval as defined in [QUIC-RECOVERY]."
     //
-    // The change ripples through ~15 `if (lifecycle.closed) return`
-    // call sites in src/conn/state.zig that currently treat closed
-    // as terminal. Tracked as an architectural-shape change rather
-    // than a real bug.
-    return error.SkipZigTest;
+    // §10.2 ¶7: "Once its closing or draining state ends, an endpoint
+    // SHOULD discard all connection state."
+    //
+    // After the closing-state deadline elapses without a peer CC, the
+    // connection MUST transition to terminal closed (skipping
+    // draining — there's no peer CC to wait on).
+    var pair = try fixture.HandshakePair.init(test_alloc);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const srv = try pair.serverConn();
+    srv.close(true, fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, "deadline");
+    pair.now_us +%= 1_000;
+    var seal_buf: [2048]u8 = undefined;
+    _ = (try srv.poll(&seal_buf, pair.now_us)) orelse
+        return error.NoFirstCcEmitted;
+    try std.testing.expectEqual(lifecycle.CloseState.closing, srv.closeState());
+
+    const deadline = srv.nextTimerDeadline(pair.now_us) orelse
+        return error.NoClosingTimer;
+    try std.testing.expectEqual(nullq.TimerKind.closing, deadline.kind);
+
+    // Tick AT the deadline: the closing-state lifecycle hands off to
+    // terminal closed (skipping draining since the peer's CC never
+    // arrived).
+    try srv.tick(deadline.at_us);
+    try std.testing.expectEqual(lifecycle.CloseState.closed, srv.closeState());
 }
 
 // ---------------------------------------------------------------- §10.1 idle timeout
