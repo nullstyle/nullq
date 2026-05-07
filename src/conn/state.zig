@@ -217,6 +217,12 @@ pub const transport_error_transport_parameter: u64 = 0x08;
 /// hardening guide §8 calls this out as the "memory cap" backstop.
 pub const transport_error_excessive_load: u64 = 0x09;
 pub const transport_error_aead_limit_reached: u64 = 0x0f;
+/// RFC 9000 §20.1 / §10.2.3: the generic transport-error code used when
+/// converting an application-variant CONNECTION_CLOSE (0x1d) to the
+/// transport variant (0x1c) for emission at Initial/Handshake levels —
+/// "the application or application protocol caused the connection to
+/// be closed."
+pub const transport_error_application_error: u64 = 0x0c;
 
 /// Default per-Connection cap on bytes resident in peer-controlled
 /// reassembly buffers (CRYPTO, DATAGRAM, stream send/recv). Hits at
@@ -5157,6 +5163,20 @@ pub const Connection = struct {
         // the only frame we emit, and we mark the connection
         // closed once it goes on the wire.
         if (self.lifecycle.pending_close) |info| {
+            // RFC 9000 §10.2.3 ¶6: emit CONNECTION_CLOSE at the highest
+            // available encryption level. When 1-RTT write keys are
+            // installed, defer emission from Initial / Handshake / 0-RTT
+            // to .application — this preserves the original CC variant
+            // (transport vs. application) end-to-end. Without this, a
+            // server that calls `close(false, ...)` post-handshake while
+            // it still holds Handshake keys would emit the
+            // application-variant CC at .handshake first (line 5159
+            // clears `pending_close` after the first seal), forcing a
+            // §10.2.3 ¶4 conversion to 0x1c on the wire and losing the
+            // application error code on the receive side.
+            if (lvl != .application and self.app_write_current != null) {
+                return null;
+            }
             // Hardening guide §9 / §12: redact the reason on the wire
             // by default. Embedders can opt in to wire-visible reasons
             // via `reveal_close_reason_on_wire = true`. Local sticky
@@ -5166,10 +5186,30 @@ pub const Connection = struct {
                 info.reason
             else
                 &[_]u8{};
+            // RFC 9000 §10.2.3 ¶4 (and Table 3 §12.4): the
+            // application-variant CONNECTION_CLOSE (0x1d) MUST NOT be
+            // emitted at Initial or Handshake encryption levels —
+            // those levels predate application data, so an
+            // application-error code there is meaningless. Convert to
+            // the transport variant (0x1c) with a generic
+            // APPLICATION_ERROR (0x0c) code; the embedder still sees
+            // the original via the sticky `closeEvent()` (the
+            // record(.local, ...) path above ran before queueing
+            // pending_close). At 1-RTT (.application) and 0-RTT
+            // (.early_data) — both of which carry application data —
+            // the original variant goes on the wire unchanged.
+            const force_transport_at_level = !info.is_transport and
+                (lvl == .initial or lvl == .handshake);
+            const wire_is_transport = info.is_transport or force_transport_at_level;
+            const wire_error_code = if (force_transport_at_level)
+                transport_error_application_error
+            else
+                info.error_code;
+            const wire_frame_type = if (wire_is_transport) info.frame_type else 0;
             const close_frame = frame_types.ConnectionClose{
-                .is_transport = info.is_transport,
-                .error_code = info.error_code,
-                .frame_type = info.frame_type,
+                .is_transport = wire_is_transport,
+                .error_code = wire_error_code,
+                .frame_type = wire_frame_type,
                 .reason_phrase = wire_reason,
             };
             const wrote = try frame_mod.encode(
