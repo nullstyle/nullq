@@ -30,6 +30,8 @@
 //!   RFC9001 §5.2 ¶2  MUST       Initial AEAD IV derived with label "quic iv" [KAT]
 //!   RFC9001 §5.2 ¶2  MUST       Initial header-protection key derived with label "quic hp" [KAT]
 //!   RFC9001 §5.2 ¶1  MUST       Initial keys use the v1 fixed salt 38762cf7…cad ccbb7f0a
+//!   RFC9001 §6.1 ¶2  MUST       refuse first key update before handshake confirmation
+//!   RFC9001 §6.5 ¶1  MUST       refuse second key update until peer ACKs the new keys
 //!   RFC9001 §5.3 ¶3  MUST       AEAD nonce = static_iv XOR PN (PN packed into low bytes)
 //!   RFC9001 §5.3 ¶3  MUST       PN=0 leaves the static IV unchanged in the nonce
 //!   RFC9001 §5.3 ¶2  MUST       AEAD opens reject ciphertext with a tampered tag
@@ -39,6 +41,7 @@
 //!   RFC9001 §5.4.2 ¶1 MUST NOT  extract a sample when fewer than PN_offset + 20 bytes are available
 //!   RFC9001 §5.4.3 ¶3 MUST      AES HP mask = first 5 bytes of AES_ECB(hp_key, sample) [§A.2 KAT]
 //!   RFC9001 §5.4.4   MUST       HP mask is involutive (apply twice = no change)
+//!   RFC9001 §5.5 ¶2  MUST       enforce per-key AEAD invocation limits at runtime
 //!   RFC9001 §5.6 ¶3  MUST       0-RTT replay tracker rejects a duplicate within the active window
 //!   RFC9001 §5.6 ¶3  SHOULD     0-RTT replay tracker uses a single bounded-duration mechanism
 //!   RFC9001 §5.7 ¶1  MUST       initial / handshake / 0-RTT / 1-RTT levels are distinct
@@ -53,24 +56,19 @@
 //!   RFC9001 §8.2 ¶1  MUST       only TLS_AES_128/256_GCM_*, TLS_CHACHA20_POLY1305_SHA256 are negotiated
 //!   RFC9001 §4.6.1 ¶3 MUST      0-RTT context digest changes when transport parameters change
 //!   RFC9001 §4.6.1 ¶3 SHOULD    session-ticket context binds ALPN, transport params, and app context
+//!   RFC9001 §4.6 ¶1   MUST      0-RTT remains opt-in (Server.Config.enable_0rtt defaults to false)
 //!
 //! Visible debt:
 //!   RFC9001 §4.1.1 ¶3 MUST     server closes with crypto_error 120 when peer omits ALPN
 //!                              — needs Server fixture + handshake driver; skip_ below.
-//!   RFC9001 §4.6 ¶1   MUST     0-RTT remains opt-in
-//!                              — exercised by Server.Config.enable_0rtt default; skip_ here.
 //!   RFC9001 §4.7 ¶1   MUST     server certificate validates against client trust store
 //!                              — outside the wire/tls scope of this file; skip_.
 //!   RFC9001 §4.8 ¶2   SHOULD   session ticket includes transport-parameter context
 //!                              — covered structurally below; full ticket round-trip is skip_.
-//!   RFC9001 §5.5 ¶2   MUST     enforce per-key AEAD invocation limits at runtime
-//!                              — behavior lives in Connection; skip_ with TODO.
 //!   RFC9001 §5.7 ¶3   MUST     discard Initial keys once Handshake keys are available
-//!                              — needs full Connection fixture; skip_ with TODO.
-//!   RFC9001 §6.1 ¶2   MUST     refuse first key update before handshake confirmation
-//!                              — Connection-driven; skip_ with TODO.
-//!   RFC9001 §6.5 ¶1   MUST     refuse second key update until peer ACKs the new keys
-//!                              — Connection-driven; skip_ with TODO.
+//!                              — implementation gap: nullq derives Initial keys on
+//!                                demand and never clears them post-handshake; skip_
+//!                                until the discard hook lands in `Connection`.
 //!
 //! Out of scope here (covered elsewhere):
 //!   RFC9001 §17.2.5 (Retry framing, packet bytes)            → rfc9000_packet_headers.zig
@@ -79,6 +77,8 @@
 
 const std = @import("std");
 const nullq = @import("nullq");
+const fixture = @import("_initial_fixture.zig");
+const handshake_fixture = @import("_handshake_fixture.zig");
 
 const initial = nullq.wire.initial;
 const protection = nullq.wire.protection;
@@ -537,14 +537,22 @@ test "skip_MUST close with crypto_error 120 when the peer's ClientHello omits AL
     return error.SkipZigTest;
 }
 
-test "skip_MUST keep 0-RTT opt-in (default disabled) [RFC9001 §4.6 ¶1]" {
-    // §4.6: "The server MUST … disable early data by default."
-    // nullq's `Server.Config.enable_0rtt` defaults to false; a
-    // proper conformance test would instantiate two `Config`
-    // values and assert the default. Skipping until the auditor-
-    // facing Config API is reachable through `nullq.*` re-exports
-    // without pulling the full Server fixture.
-    return error.SkipZigTest;
+test "MUST keep 0-RTT opt-in (default disabled) [RFC9001 §4.6 ¶1]" {
+    // §4.6 ¶1: "A server MUST NOT enable 0-RTT … unless it has been
+    // configured to do so." nullq exposes this knob as
+    // `Server.Config.enable_0rtt`; the conformance guarantee is that
+    // a Config built without explicitly opting in carries
+    // `enable_0rtt = false`, so the Server starts up with early-data
+    // disabled.
+    const protos = [_][]const u8{"hq-test"};
+    const cfg: nullq.Server.Config = .{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = fixture.test_cert_pem,
+        .tls_key_pem = fixture.test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = fixture.defaultParams(),
+    };
+    try std.testing.expect(!cfg.enable_0rtt);
 }
 
 test "skip_MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶1]" {
@@ -556,36 +564,154 @@ test "skip_MUST validate the server certificate chain at the client [RFC9001 §4
     return error.SkipZigTest;
 }
 
-test "skip_MUST enforce per-key AEAD invocation limits at runtime [RFC9001 §5.5 ¶2]" {
-    // §5.5: "An endpoint MUST NOT … exceed the confidentiality limit
-    // for an AEAD algorithm." nullq's enforcement lives in
-    // `Connection`'s send path (see ApplicationKeyUpdateLimits +
-    // setApplicationKeyUpdateLimitsForTesting). A full conformance
-    // test would drive a Connection up to the threshold and observe
-    // the close event — outside the wire/tls scope.
-    return error.SkipZigTest;
+test "MUST enforce per-key AEAD invocation limits at runtime [RFC9001 §5.5 ¶2]" {
+    // §5.5 ¶2: "If the total number of encrypted packets with the same
+    // key exceeds the confidentiality limit for the AEAD, the endpoint
+    // MUST stop using those keys." nullq enforces this in
+    // `Connection.prepareApplicationWriteKeys` (src/conn/state.zig):
+    // when `app_write_current.packets_protected` reaches
+    // `app_key_update_limits.confidentiality_limit`, the connection
+    // calls `close(true, AEAD_LIMIT_REACHED, ...)` — wire error code
+    // 0x0f from RFC 9001 §20 / RFC 9000 §20.1.
+    //
+    // We exercise the gate end-to-end: drive a real handshake, snapshot
+    // the server's already-emitted 1-RTT count as `baseline`, set the
+    // server's confidentiality_limit to `baseline + N` (with the
+    // proactive-update threshold and integrity limit pinned high so the
+    // confidentiality cliff is the only gate that fires), then inject N
+    // PINGs from the client. Each injection elicits a single 1-RTT ACK
+    // from the server (PING is ack-eliciting and the application
+    // ack-threshold is 1, so the server emits the ACK in the same poll
+    // pass driven by `pair.step`). The Nth send sees
+    // `packets_protected >= confidentiality_limit` and trips the close
+    // path; the `injectFrameAtServer` return value carries the
+    // CloseEvent snapshot once the server emits its CONNECTION_CLOSE.
+    //
+    // The server side is the natural choice: `injectFrameAtServer`
+    // bypasses the client's `pollLevel` (it seals via short_packet
+    // directly), so the client's `packets_protected` doesn't tick up.
+    // The server's send path, in contrast, runs through `pollLevel` /
+    // `recordApplicationPacketProtected` for every responsive ACK, so
+    // its counter is the one the limit constrains.
+    const TRANSPORT_ERROR_AEAD_LIMIT_REACHED: u64 = 0x0f;
+
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    // Drain any post-handshake follow-ups (NEW_CONNECTION_ID frames,
+    // delayed ACKs, etc.) so the baseline reflects a quiescent
+    // connection. Without this, the limit we set below could be
+    // tripped by residue rather than by the PINGs we inject.
+    try pair.step();
+    try pair.step();
+
+    const srv = try pair.serverConn();
+    const baseline = srv.keyUpdateStatus().write_packets_protected;
+    const headroom: u64 = 5;
+
+    // Pin proactive-update and integrity limits high so the
+    // confidentiality_limit cliff is the only thing that can close the
+    // connection. Otherwise a `proactive_update_threshold` lower than
+    // `confidentiality_limit` would force a key update first and the
+    // hard close would never fire on this epoch.
+    srv.setApplicationKeyUpdateLimitsForTesting(.{
+        .confidentiality_limit = baseline + headroom,
+        .proactive_update_threshold = std.math.maxInt(u64),
+        .integrity_limit = std.math.maxInt(u64),
+    });
+
+    // Inject up to (headroom + 1) PINGs. The (headroom)-th injection's
+    // step() should trip the close: it's the call where
+    // `packets_protected` first reaches `confidentiality_limit` ahead
+    // of the next seal. We give one extra iteration of slack so a
+    // benign reordering between "set pending_close" and "emit
+    // CONNECTION_CLOSE" still surfaces the close before we assert.
+    const ping_frame = [_]u8{0x01};
+    var observed_close: ?nullq.CloseEvent = null;
+    var i: u32 = 0;
+    while (i < headroom + 1) : (i += 1) {
+        observed_close = try pair.injectFrameAtServer(&ping_frame);
+        if (observed_close != null) break;
+    }
+
+    const ev = observed_close orelse return error.TestExpectedAeadLimitClose;
+    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(TRANSPORT_ERROR_AEAD_LIMIT_REACHED, ev.error_code);
 }
 
-test "skip_MUST discard Initial keys once Handshake keys are available [RFC9001 §5.7 ¶3]" {
-    // §5.7: "Endpoints MUST … discard Initial keys when they first
-    // send a Handshake packet." Driven by the connection state
-    // machine; a proper conformance test would step through a real
-    // handshake and observe that subsequent inbound Initial packets
-    // are dropped.
-    return error.SkipZigTest;
+test "MUST discard Initial keys once Handshake keys are available [RFC9001 §5.7 ¶3]" {
+    // §5.7 ¶3: "A client MUST discard Initial keys when it first
+    // sends a Handshake packet … a server MUST discard Initial keys
+    // when it first successfully processes a Handshake packet."
+    //
+    // nullq's `Connection.discardInitialKeys` (src/conn/state.zig)
+    // fires from the BoringSSL `setSecret` callback when Handshake
+    // (or Application) secrets are installed. After
+    // `driveToHandshakeConfirmed`, `initialKeysActive(.read)` and
+    // `initialKeysActive(.write)` MUST both report false on both
+    // peers. The discarded key material is securely zeroed before
+    // the optional is set to null.
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const server_conn = try pair.serverConn();
+    try std.testing.expectEqual(false, server_conn.initialKeysActive(.read));
+    try std.testing.expectEqual(false, server_conn.initialKeysActive(.write));
+
+    const client_conn = pair.clientConn();
+    try std.testing.expectEqual(false, client_conn.initialKeysActive(.read));
+    try std.testing.expectEqual(false, client_conn.initialKeysActive(.write));
 }
 
-test "skip_MUST refuse the first key update before handshake confirmation [RFC9001 §6.1 ¶2]" {
-    // §6.1: "An endpoint MUST NOT initiate a key update prior to
-    // having confirmed the handshake." Connection-driven; out of
-    // scope for the §5 wire-protection layer this file covers.
-    return error.SkipZigTest;
+test "MUST refuse the first key update before handshake confirmation [RFC9001 §6.1 ¶2]" {
+    // §6.1 ¶2: "An endpoint MUST NOT initiate a key update prior to
+    // having confirmed the handshake." nullq surfaces this as
+    // `Connection.requestKeyUpdate` returning `Error.KeyUpdateBlocked`
+    // when no application write epoch has been installed — which is
+    // the gating precondition implied by the spec, since the
+    // application keys come from the handshake itself. A fresh
+    // `HandshakePair` has neither side past TLS Finished yet, so
+    // calling `requestKeyUpdate` on the client must reject with the
+    // documented blocked-error variant.
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+
+    // Sanity: handshake is NOT confirmed yet.
+    try std.testing.expect(!pair.clientConn().handshakeDone());
+
+    try std.testing.expectError(
+        nullq.conn.state.Error.KeyUpdateBlocked,
+        pair.clientConn().requestKeyUpdate(0),
+    );
 }
 
-test "skip_MUST refuse a second key update until the first is acknowledged [RFC9001 §6.5 ¶1]" {
-    // §6.5: "An endpoint MUST NOT initiate a subsequent key update
-    // unless it has received an acknowledgment for a packet that was
-    // sent protected with keys from the current key phase." Driven
-    // by the Connection ack path; needs a state-machine fixture.
-    return error.SkipZigTest;
+test "MUST refuse a second key update until the first is acknowledged [RFC9001 §6.5 ¶1]" {
+    // §6.5 ¶1: "An endpoint MUST NOT initiate a subsequent key
+    // update unless it has received an acknowledgment for a packet
+    // that was sent protected with keys from the current key phase."
+    // nullq enforces this via `app_write_update_pending_ack`: once
+    // `requestKeyUpdate` succeeds, a second invocation before the
+    // matching ACK arrives must reject with
+    // `Error.KeyUpdateBlocked`. We don't drive the ACK path here —
+    // that's covered by the in-file unit test in `state.zig` — we
+    // only assert the gate fires from a real, handshake-confirmed
+    // Connection driven by the fixture.
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const cli = pair.clientConn();
+    // Use a `now_us` strictly past `driveToHandshakeConfirmed`'s last
+    // tick so we don't trip the post-update cooldown deadline (which
+    // lives in the same `canInitiateKeyUpdateAt` predicate).
+    const now_us: u64 = pair.now_us + 1_000_000;
+
+    try cli.requestKeyUpdate(now_us);
+    // Second call before the ACK arrives must be rejected.
+    try std.testing.expectError(
+        nullq.conn.state.Error.KeyUpdateBlocked,
+        cli.requestKeyUpdate(now_us + 1_000),
+    );
 }

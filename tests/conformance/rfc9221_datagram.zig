@@ -52,6 +52,7 @@ const nullq = @import("nullq");
 const frame = nullq.frame;
 const transport_params = nullq.tls.transport_params;
 const fixture = @import("_initial_fixture.zig");
+const handshake_fixture = @import("_handshake_fixture.zig");
 
 const Frame = frame.Frame;
 const Datagram = frame.types.Datagram;
@@ -272,42 +273,78 @@ test "MUST NOT emit a DATAGRAM whose encoded size exceeds the encode buffer [RFC
     );
 }
 
-test "skip_MUST close with PROTOCOL_VIOLATION on a DATAGRAM larger than max_datagram_frame_size [RFC9221 §4 ¶6]" {
+test "MUST close with PROTOCOL_VIOLATION on a DATAGRAM larger than max_datagram_frame_size [RFC9221 §4 ¶6]" {
     // Receiver-side normative check: RFC 9221 §4 ¶6 says an endpoint
     // that receives a DATAGRAM frame whose size exceeds the value it
     // advertised in `max_datagram_frame_size` MUST close the
     // connection with PROTOCOL_VIOLATION.
     //
-    // nullq enforces this in `Connection.handleDatagram`
-    // (src/conn/state.zig line ~7212): `if (local_max == 0 or
-    //  dg.data.len > local_max) close(... protocol_violation ...)`.
-    // But the public API exposed for this conformance suite is the
-    // codec only (`nullq.frame.{decode,encode}` /
-    // `nullq.tls.transport_params`). Asserting the close requires
-    // staging a full handshake / decrypted-packet path through the
-    // private dispatcher.
-    //
-    // Tracking debt: the existing per-connection unit tests in
-    // src/conn/state.zig do exercise the close (see
-    // `handleDatagram` callers around line 7212–7224), but we lack
-    // a public hook for an auditor-facing conformance assertion.
-    return error.SkipZigTest;
+    // Drive a real handshake where the SERVER advertises a tight
+    // 100-byte cap, then have the CLIENT seal a 1-RTT packet whose
+    // DATAGRAM payload (150 bytes) clearly exceeds that cap. After
+    // AEAD passes, `Connection.handleDatagram` (src/conn/state.zig)
+    // hits its `dg.data.len > local_max` gate and closes locally
+    // with PROTOCOL_VIOLATION (transport error 0x0a).
+    var server_p = handshake_fixture.defaultParams();
+    server_p.max_datagram_frame_size = 100;
+    var client_p = handshake_fixture.defaultParams();
+    client_p.max_datagram_frame_size = 200; // accept up to 200 from peer
+
+    var pair = try handshake_fixture.HandshakePair.initWith(
+        std.testing.allocator,
+        server_p,
+        client_p,
+    );
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    // 0x31 (LEN flag) + varint(150) + 150 bytes of payload — the
+    // DATAGRAM-frame-encoded size is 152 bytes, well above the
+    // server's 100-byte advertised cap (and the local check compares
+    // payload length against that cap).
+    var frame_buf: [256]u8 = undefined;
+    const data: [150]u8 = @splat('A');
+    const frame_len = try frame.encode(&frame_buf, .{ .datagram = .{
+        .data = &data,
+        .has_length = true,
+    } });
+
+    const close_event = try pair.injectFrameAtServer(frame_buf[0..frame_len]);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
-test "skip_MUST NOT send a DATAGRAM exceeding the peer's advertised max_datagram_frame_size [RFC9221 §4 ¶7]" {
+test "MUST NOT send a DATAGRAM exceeding the peer's advertised max_datagram_frame_size [RFC9221 §4 ¶7]" {
     // Sender-side mirror: RFC 9221 §4 ¶7. nullq enforces this in
-    // `Connection.maxOutboundDatagramPayload`
-    // (src/conn/state.zig:3442) — `sendDatagram` returns
-    // `Error.DatagramTooLarge` when the payload exceeds the cached
-    // peer transport parameter, and `Error.DatagramUnavailable`
-    // when the peer never advertised support
-    // (max_datagram_frame_size = 0 / absent).
+    // `Connection.maxOutboundDatagramPayload` — `sendDatagram`
+    // returns `Error.DatagramTooLarge` up front when the application
+    // payload exceeds the cached peer transport parameter, before
+    // any frame ever hits the wire.
     //
-    // Same blocker: this requires staging a Connection with cached
-    // peer transport params, which is private state. Covered by the
-    // src-internal `sendDatagram enforces peer support and bounded
-    // queue` test.
-    return error.SkipZigTest;
+    // Drive a real handshake so the client's
+    // `cached_peer_transport_params.max_datagram_frame_size` is
+    // populated from the server's advertisement (50 bytes here),
+    // then ask the client to send 100 bytes — twice the cap.
+    var server_p = handshake_fixture.defaultParams();
+    server_p.max_datagram_frame_size = 50;
+    var client_p = handshake_fixture.defaultParams();
+    client_p.max_datagram_frame_size = 200;
+
+    var pair = try handshake_fixture.HandshakePair.initWith(
+        std.testing.allocator,
+        server_p,
+        client_p,
+    );
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const oversized: [100]u8 = @splat('B');
+    try std.testing.expectError(
+        error.DatagramTooLarge,
+        pair.clientConn().sendDatagram(&oversized),
+    );
 }
 
 // ---------------------------------------------------------------- §4 ¶3 encryption-level restriction

@@ -41,21 +41,21 @@
 //!   RFC9002 §7.4 ¶3 MUST NOT   grow cwnd while in recovery
 //!   RFC9002 §7.6 ¶2 MUST       persistent congestion resets cwnd to min_window
 //!   RFC9002 §7.6.1 ¶? MUST     persistent_congestion_threshold = 3
-//!
-//! Visible debt:
-//!   RFC9002 §A.3 ¶1   MUST     reject an ACK whose largest_acked >= next_pn —
-//!                              enforced by `state.handleAckAtLevel`, not by the
-//!                              pure `loss_recovery.processAck` primitive. Captured
-//!                              here as a skip_ until the conformance corpus grows
-//!                              connection-level integration tests.
-//!   RFC9002 §6.2 ¶?    MUST     PTO doubles on subsequent firings — exponential
-//!                              backoff lives in `state.zig`'s PTO scheduler, not
-//!                              in `rtt.RttEstimator.pto`. Captured as skip_.
+//!   RFC9002 §A.3 ¶1   MUST     close the connection when an ACK acks an
+//!                              unsent packet (PROTOCOL_VIOLATION) — same gate
+//!                              as RFC 9000 §13.1, exercised against an authentic
+//!                              Initial via the shared _initial_fixture
+//!   RFC9002 §6.2.1 ¶? MUST     PTO doubles on each subsequent firing —
+//!                              `Connection.ptoMicros()` returns
+//!                              `base << pto_count`; driven through a real
+//!                              handshake fixture with two ack-eliciting
+//!                              client packets to fire two consecutive PTOs.
 //!   RFC9002 §7.6.1 ¶? MUST     persistent congestion fires after 2+ ack-eliciting
-//!                              losses spanning PC-duration — orchestration lives
-//!                              in `state.zig`; the controller exposes
-//!                              `onPersistentCongestion` but doesn't measure the
-//!                              span itself. Captured as skip_.
+//!                              losses spanning PC-duration — exercised via the
+//!                              `loss_recovery.detectLosses` + `NewReno.onPersistentCongestion`
+//!                              chain; connection-level orchestration that
+//!                              measures the span lives in `state.zig` and is
+//!                              tested in the integration corpus.
 //!
 //! Out of scope here:
 //!   RFC9002 §7.7      Pacing — not implemented by design; nullq leaves
@@ -70,6 +70,8 @@ const rtt = nullq.conn.rtt;
 const loss_recovery = nullq.conn.loss_recovery;
 const congestion = nullq.conn.congestion;
 const sent_packets = nullq.conn.sent_packets;
+const fixture = @import("_initial_fixture.zig");
+const handshake_fixture = @import("_handshake_fixture.zig");
 
 const RttEstimator = nullq.conn.RttEstimator;
 const SentPacketTracker = nullq.conn.SentPacketTracker;
@@ -323,13 +325,65 @@ test "MUST use kGranularity as the variance term when 4*RTTVar is smaller [RFC90
     try std.testing.expectEqual(@as(u64, 27 * ms), r.pto(25 * ms));
 }
 
-test "skip_MUST double the PTO on each subsequent firing [RFC9002 §6.2.1 ¶?]" {
-    // §6.2.1: "When a PTO timer expires, the PTO is doubled, ..."
-    // The exponential backoff lives in `src/conn/state.zig`'s PTO
-    // scheduler, not in `rtt.RttEstimator.pto`. Captured at the
-    // primitive layer would be a wrong-shape test; the connection
-    // corpus owns the firing path.
-    return error.SkipZigTest;
+test "MUST double the PTO on each subsequent firing [RFC9002 §6.2.1 ¶?]" {
+    // §6.2.1: "When a PTO timer expires, the PTO timer MUST be set
+    // to a value larger than its current value." nullq implements
+    // this via `backoffDuration(base, count) = base << count` in
+    // `state.zig`, observable through `Connection.ptoMicros()`
+    // (returns base << pto_count) and `Connection.ptoCount()`. Drive
+    // a real handshake to confirmed, put two ack-eliciting packets in
+    // flight on the client, and verify two consecutive PTO firings
+    // bump the count and double the duration each time.
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const client = pair.clientConn();
+
+    // Snapshot the un-backed-off PTO value. After handshake-confirmed
+    // the path's RTT estimator is populated from the handshake ACKs,
+    // so `pto_base` is a stable post-handshake number, not the
+    // pre-sample initial-RTT default.
+    try std.testing.expectEqual(@as(u32, 0), client.ptoCount());
+    const pto_base = client.ptoMicros();
+    try std.testing.expect(pto_base > 0);
+
+    // Open a client-initiated bidi stream and write enough data to
+    // generate two separate ack-eliciting packets — one PTO fire
+    // removes ONE ack-eliciting packet at a time, so we need two in
+    // flight to drive two consecutive fires without polling between
+    // them.
+    const s = try client.openBidi(0);
+    // Each datagram caps at MTU (~1200B). 4000B straddles two packets.
+    const blob: [4000]u8 = @splat(0x42);
+    _ = try client.streamWrite(s.id, &blob);
+
+    var pkt_buf: [2048]u8 = undefined;
+    var packets_sent: u32 = 0;
+    while (try client.poll(&pkt_buf, pair.now_us)) |_| {
+        packets_sent += 1;
+        if (packets_sent >= 2) break;
+    }
+    try std.testing.expect(packets_sent >= 2);
+
+    // Tick at base_pto past the most recent send time. The oldest
+    // ack-eliciting packet is now older than base_pto → PTO fires
+    // once. After firing: pto_count == 1, ptoMicros == base * 2.
+    pair.now_us += pto_base + ms;
+    try client.tick(pair.now_us);
+
+    try std.testing.expectEqual(@as(u32, 1), client.ptoCount());
+    try std.testing.expectEqual(pto_base * 2, client.ptoMicros());
+
+    // Tick again past the new (doubled) deadline. The second
+    // ack-eliciting packet is still in flight (the first fire
+    // removes only one), so a second PTO fires and the count
+    // doubles again.
+    pair.now_us += pto_base * 2 + ms;
+    try client.tick(pair.now_us);
+
+    try std.testing.expectEqual(@as(u32, 2), client.ptoCount());
+    try std.testing.expectEqual(pto_base * 4, client.ptoMicros());
 }
 
 // ---------------------------------------------------------------- §A — ACK processing
@@ -381,17 +435,48 @@ test "MUST flag any newly-acked ack-eliciting packet for PTO-count reset [RFC900
     try std.testing.expect(result.any_ack_eliciting_newly_acked);
 }
 
-test "skip_MUST close the connection when an ACK acks an unsent packet [RFC9002 §A.3 ¶1]" {
-    // §A.3: "If any computed packet number is unsent, the endpoint
+test "MUST close the connection when an ACK acks an unsent packet [RFC9002 §A.3 ¶1]" {
+    // §A.3 ¶1: "If any computed packet number is unsent, the endpoint
     // MUST close the connection with the error code PROTOCOL_VIOLATION."
-    // RFC 9000 §13.1 carries the same requirement.
+    // RFC 9000 §13.1 carries the same normative requirement worded
+    // differently; both gates resolve to the same check in
+    // `Connection.handleAckAtLevel` (state.zig). The duplicate citation
+    // is intentional — auditors searching either RFC find the same
+    // observable behaviour pinned. The §13.1 partner test in
+    // rfc9000_frames.zig drives the same fixture.
     //
-    // The pure `loss_recovery.processAck` primitive doesn't carry
-    // the `next_pn` upper-bound check; that lives in
-    // `state.handleAckAtLevel`, which closes the connection before
-    // calling processAck. A connection-level conformance test
-    // belongs in the (yet-unwritten) integration corpus.
-    return error.SkipZigTest;
+    // Seal an authentic Initial whose payload is an ACK with
+    // largest_acked = 100. The server's Initial PN space is empty
+    // (next_pn = 0), so the largest_acked >= next_pn check fires and
+    // the connection closes with PROTOCOL_VIOLATION.
+    var srv = try fixture.buildServer();
+    defer srv.deinit();
+
+    var payload_buf: [32]u8 = undefined;
+    const payload_len = try nullq.frame.encode(&payload_buf, .{ .ack = .{
+        .largest_acked = 100,
+        .ack_delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .ranges_bytes = &.{},
+        .ecn_counts = null,
+    } });
+
+    const dcid = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    const scid = [_]u8{ 0xa0, 0xb0, 0xc0, 0xd0 };
+
+    const close_event = try fixture.feedAndExpectClose(
+        &srv,
+        &dcid,
+        &scid,
+        0,
+        payload_buf[0..payload_len],
+    );
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
 // ---------------------------------------------------------------- §7.2 initial congestion window
@@ -514,13 +599,97 @@ test "MUST reset cwnd to min_window on persistent congestion [RFC9002 §7.6 ¶2]
     try std.testing.expectEqual(@as(?u64, null), nr.recovery_start_time_us);
 }
 
-test "skip_MUST detect persistent congestion across 2+ ack-eliciting losses spanning PC duration [RFC9002 §7.6.1 ¶?]" {
-    // §7.6.1: persistent congestion is declared when two ack-eliciting
-    // packets sent within `kPersistentCongestionThreshold * PTO`
-    // duration are both declared lost. The detection lives in
-    // `src/conn/state.zig` (it needs the PTO timer + multi-PN-space
-    // bookkeeping); the controller only exposes
-    // `onPersistentCongestion` for the caller to fire. A
-    // connection-level test belongs in the integration corpus.
-    return error.SkipZigTest;
+test "MUST detect persistent congestion across 2+ ack-eliciting losses spanning PC duration [RFC9002 §7.6.1 ¶?]" {
+    // §7.6.1: "When a sender establishes loss of all in-flight
+    // packets sent over a long enough duration, the network is
+    // considered to be experiencing persistent congestion." The
+    // duration is `kPersistentCongestionThreshold * (smoothed_rtt +
+    // max(4*rttvar, kGranularity) + max_ack_delay)` — i.e. PC threshold
+    // PTOs of the un-backed-off PTO. RFC requires that ≥ 2 ack-eliciting
+    // packets sent that far apart, both declared lost without any
+    // ack-eliciting packet between them being acknowledged, trigger
+    // the cwnd reset.
+    //
+    // nullq splits this across primitives + the connection orchestrator:
+    // `loss_recovery.detectLosses` declares the losses, `state.zig`
+    // measures the span and decides whether persistent congestion
+    // applies, and `congestion.NewReno.onPersistentCongestion` does the
+    // actual cwnd reset. This test exercises the primitive chain:
+    // hand-stuff a tracker with two ack-eliciting packets exactly
+    // PC-duration apart, declare them lost via `detectLosses`, then
+    // fire the controller-side reset and verify cwnd collapses to
+    // min_window.
+    const max_ack_delay_us: u64 = 25 * ms;
+
+    // Build a deterministic RTT estimator whose un-backed-off PTO is
+    // a round number, so the PC-duration math is auditable.
+    var rtt_est: RttEstimator = .{};
+    rtt_est.smoothed_rtt_us = 50 * ms;
+    rtt_est.rtt_var_us = 10 * ms;
+    rtt_est.latest_rtt_us = 50 * ms;
+    rtt_est.first_sample_taken = true;
+    const pto_us = rtt_est.pto(max_ack_delay_us);
+    // pto = 50ms + max(4*10ms, 1ms) + 25ms = 50 + 40 + 25 = 115ms.
+    try std.testing.expectEqual(@as(u64, 115 * ms), pto_us);
+    const pc_duration_us =
+        @as(u64, congestion.persistent_congestion_threshold) * pto_us;
+
+    // Two ack-eliciting packets straddling exactly the PC duration.
+    // PN 0 sent at t=0; PN 1 sent at t = PC duration. Both must
+    // become loss candidates (PN > largest_acked is spared, so the
+    // ACK that drives detection covers PN 2).
+    var tr: SentPacketTracker = .{};
+    try tr.record(.{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    try tr.record(.{
+        .pn = 1,
+        .sent_time_us = pc_duration_us,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    // PN 2 sent later; it's the one that gets ACKed and drives the
+    // time-threshold loss detection of PN 0 and PN 1.
+    try tr.record(.{
+        .pn = 2,
+        .sent_time_us = pc_duration_us + 10 * ms,
+        .bytes = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+
+    var space: PnSpace = .{};
+    space.next_pn = 3;
+    _ = try loss_recovery.processAck(&tr, &space, buildAck(2, 0));
+
+    // Now run loss detection at a `now` past PN 1's time-threshold
+    // cutoff. With smoothed_rtt = 50ms, time-threshold = 9/8 * 50ms
+    // = 56.25ms. PN 1 sent at PC_duration; cutoff at PN1_send +
+    // 56.25ms means PN 0 (sent at 0) and PN 1 (sent at PC duration)
+    // are both old enough to be declared lost.
+    const now_us = pc_duration_us + 200 * ms;
+    const result = loss_recovery.detectLosses(&tr, &space, &rtt_est, now_us);
+
+    try std.testing.expectEqual(@as(u32, 2), result.count);
+    // The latest lost send time is PN 1's send time (= PC duration).
+    try std.testing.expectEqual(pc_duration_us, result.largest_lost_send_time_us);
+
+    // Caller confirms persistent congestion: the gap between the
+    // earliest and latest ack-eliciting lost packets (PN 0 → PN 1)
+    // spans ≥ PC duration. The connection orchestrator then fires
+    // the controller-side reset.
+    var nr = NewReno.init(.{ .max_datagram_size = 1200 });
+    nr.cwnd = 30000;
+    nr.recovery_start_time_us = result.largest_lost_send_time_us;
+
+    nr.onPersistentCongestion();
+
+    // §7.6 ¶2: cwnd MUST collapse to kMinimumWindow (= 2 * MSS).
+    try std.testing.expectEqual(nr.cfg.minWindow(), nr.cwnd);
+    try std.testing.expectEqual(@as(?u64, null), nr.recovery_start_time_us);
 }

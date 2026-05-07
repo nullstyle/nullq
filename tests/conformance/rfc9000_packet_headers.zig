@@ -27,6 +27,8 @@
 //!   RFC9000 §17.2.1 MUST     Reserved Bits (bits 3-2) = 0 on transmit (Initial)
 //!   RFC9000 §17.2.1 MUST     Reserved Bits (bits 3-2) = 0 on transmit (Handshake)
 //!   RFC9000 §17.2.1 MUST     Reserved Bits (bits 3-2) = 0 on transmit (0-RTT)
+//!   RFC9000 §17.2.1 MUST     non-zero long-header Reserved Bits on receive
+//!                            close the connection with PROTOCOL_VIOLATION
 //!   RFC9000 §17.2.2 MUST     Initial carries Token Length varint, then Token
 //!   RFC9000 §17.2.2 MUST NOT accept Initial whose Token Length exceeds buffer
 //!   RFC9000 §17.2.2 MUST     Initial carries Length varint framing PN+payload+tag
@@ -41,18 +43,10 @@
 //!   RFC9000 §17.3   MUST     Key Phase bit (bit 2) round-trips
 //!   RFC9000 §17.3   MUST     Reserved Bits (bits 4-3) = 0 on transmit
 //!   RFC9000 §17.3   MUST     PN Length (bits 1-0) encodes (length - 1)
+//!   RFC9000 §17.3   MUST     non-zero short-header Reserved Bits on receive
+//!                            close the connection with PROTOCOL_VIOLATION
 //!
 //! Visible debt:
-//!   RFC9000 §17.2.1 ¶17  MUST treat non-zero Long-header Reserved Bits as
-//!                        PROTOCOL_VIOLATION on receive — the wire layer
-//!                        decodes them faithfully but neither
-//!                        long_packet.openInitial nor conn/state.zig
-//!                        currently rejects a packet whose post-HP
-//!                        reserved bits are non-zero. See TODO below.
-//!   RFC9000 §17.3   ¶3   MUST treat non-zero Short-header Reserved Bits as
-//!                        PROTOCOL_VIOLATION on receive — same gap as the
-//!                        long-header case; the bits round-trip but no
-//!                        connection-layer enforcement exists yet.
 //!   RFC9000 §17.2   ¶?   MUST NOT accept a long header whose Length field
 //!                        exceeds the available buffer — `long_packet.zig`
 //!                        already enforces this with
@@ -77,6 +71,7 @@ const wire = nullq.wire;
 const header = wire.header;
 const packet_number = wire.packet_number;
 const fixture = @import("_initial_fixture.zig");
+const handshake_fixture = @import("_handshake_fixture.zig");
 
 /// QUIC v1 wire-format version.
 const QUIC_V1: u32 = 0x00000001;
@@ -696,24 +691,30 @@ test "MUST encode the Short Header PN Length (bits 1-0) as (length - 1) [RFC9000
     try std.testing.expectEqual(@as(u2, 0b11), @as(u2, @intCast(buf[0] & 0x03)));
 }
 
-// The §17.3 short-header reserved-bit gate is implemented in
-// `Connection.handleShort` (src/conn/state.zig) — the gate fires on
-// the post-HP first byte after AEAD passes for a 1-RTT packet. We
-// can't yet exercise it from the conformance package because the
-// fixture only has Initial-level keys; producing a valid 1-RTT
-// packet requires a full TLS handshake. Tracked for the next
-// fixture round.
-test "skip_MUST treat non-zero short-header Reserved Bits as PROTOCOL_VIOLATION on receive [RFC9000 §17.3 ¶3]" {
-    // The receiver-side gate is IMPLEMENTED in
-    // `Connection.handleShort` (src/conn/state.zig) — bits 4-3 of the
-    // post-HP first byte are surfaced via `Open1RttResult.reserved_bits`
-    // and the connection closes with PROTOCOL_VIOLATION on a non-zero
-    // value (mirrors the §17.2.1 long-header gate verified live above).
-    // What's missing is conformance-suite coverage: producing an
-    // authentic 1-RTT packet requires Application keys, which only
-    // exist after a real TLS handshake. The conformance fixture
-    // (`_initial_fixture.zig`) currently only carries Initial keys.
-    // Visible debt: extend the fixture to drive a paired Client +
-    // Server through the handshake to handshake-confirmed state.
-    return error.SkipZigTest;
+test "MUST treat non-zero short-header Reserved Bits as PROTOCOL_VIOLATION on receive [RFC9000 §17.3 ¶3]" {
+    // RFC 9000 §17.3 ¶3: "The value included prior to protection MUST
+    // be set to 0. An endpoint MUST treat receipt of a packet that has
+    // a non-zero value for these bits, after removing both packet and
+    // header protection, as a connection error of type
+    // PROTOCOL_VIOLATION."
+    //
+    // Drive a real TLS handshake to handshake-confirmed, then have the
+    // client seal an authentic 1-RTT packet whose pre-HP first byte
+    // carries reserved_bits=0b10. After AEAD passes on the server,
+    // `Connection.handleShort` reads bits 4-3 of the post-HP first
+    // byte (surfaced via `Open1RttResult.reserved_bits`) and observes
+    // the non-zero value — close fires before dispatchFrames runs (so
+    // the PING payload is irrelevant; the gate fires before any frame
+    // is processed).
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const ping_frame = [_]u8{0x01};
+    const close_event = try pair.injectFrameAtServerWithReservedBits(&ping_frame, 0b10);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }

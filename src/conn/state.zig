@@ -1043,6 +1043,12 @@ pub const Connection = struct {
     /// uses `is_server=true` derivation for write).
     initial_keys_read: ?short_packet_mod.PacketKeys = null,
     initial_keys_write: ?short_packet_mod.PacketKeys = null,
+    /// Latched true the first time `discardInitialKeys` fires (i.e.
+    /// when Handshake or higher secrets are installed). Once set,
+    /// `ensureInitialKeys` is a no-op — the discard is one-way and
+    /// any subsequent Initial-level packet can't be sealed/opened
+    /// with re-derived keys. RFC 9001 §5.7 ¶3.
+    initial_keys_discarded: bool = false,
 
     /// Application key-update lifecycle. QUIC key updates derive new
     /// packet-protection key/IV from "quic ku" while retaining the
@@ -1804,6 +1810,22 @@ pub const Connection = struct {
         };
     }
 
+    /// True if Initial-level packet protection keys are still installed
+    /// for the given direction. RFC 9001 §5.7 ¶3 requires that an
+    /// endpoint discard its Initial keys "when it first sends a
+    /// Handshake packet" (write side) and after it "first successfully
+    /// processes a Handshake packet" (read side); after that point
+    /// inbound Initial packets must be dropped and outbound Initial
+    /// packets cannot be sealed. Embedders shouldn't normally inspect
+    /// this — it's exposed primarily for conformance assertions over
+    /// the §5.7 lifecycle.
+    pub fn initialKeysActive(self: *const Connection, dir: Direction) bool {
+        return switch (dir) {
+            .read => self.initial_keys_read != null,
+            .write => self.initial_keys_write != null,
+        };
+    }
+
     /// Cipher suite negotiated for the given encryption level, if
     /// the secret has been installed and the protocol-id is one we
     /// support. RFC 9001 only permits TLS 1.3 cipher suites; nullq
@@ -2071,6 +2093,22 @@ pub const Connection = struct {
         limits: ApplicationKeyUpdateLimits,
     ) void {
         self.app_key_update_limits = limits;
+    }
+
+    /// Test-only: allocate the next outgoing PN in the application
+    /// (1-RTT) packet number space and bump `next_pn` so the
+    /// connection's own send path will pick a strictly larger PN on
+    /// its next outbound packet. Conformance fixtures use this to seal
+    /// a synthetic 1-RTT packet with a PN consistent with the
+    /// connection's bookkeeping — without this, an injected frame
+    /// elicits an ACK whose `largest_acked` would exceed the live
+    /// `next_pn`, which the connection (correctly) treats as an ACK
+    /// of an unsent packet (RFC 9000 §13.1) and closes with
+    /// PROTOCOL_VIOLATION. Only conformance fixtures should reach for
+    /// this; production code drives PN allocation through the normal
+    /// `pollLevel` path.
+    pub fn allocApplicationPacketNumberForTesting(self: *Connection) ?u64 {
+        return self.primaryPath().app_pn_space.nextPn();
     }
 
     fn applicationWriteKeyPhase(self: *const Connection) bool {
@@ -2611,7 +2649,31 @@ pub const Connection = struct {
         self.initial_keys_write = null;
     }
 
+    /// RFC 9001 §5.7 ¶3: "Endpoints MUST discard their Initial keys
+    /// when they first send a Handshake packet." nullq makes the call
+    /// stricter: once Handshake-level secrets are installed (which
+    /// means the TLS handshake has progressed past Initial) we drop
+    /// Initial keys outright. Any further inbound Initial packet is
+    /// rejected by `packetKeys` returning null, and the receiver
+    /// drops it as `keys_unavailable`.
+    ///
+    /// Idempotent: safe to call multiple times. Securely zeroes the
+    /// discarded key material so it can't be recovered from a memory
+    /// dump after the discard point.
+    fn discardInitialKeys(self: *Connection) void {
+        if (self.initial_keys_read) |*k| std.crypto.secureZero(u8, std.mem.asBytes(k));
+        if (self.initial_keys_write) |*k| std.crypto.secureZero(u8, std.mem.asBytes(k));
+        self.initial_keys_read = null;
+        self.initial_keys_write = null;
+        self.initial_keys_discarded = true;
+    }
+
     fn ensureInitialKeys(self: *Connection) Error!void {
+        // RFC 9001 §5.7 ¶3 — once the discard latch is set, never
+        // re-derive. Any Initial-level packet from now on cannot be
+        // sealed (poll path) or opened (handle path); the receiver
+        // drops as `keys_unavailable`.
+        if (self.initial_keys_discarded) return;
         if (self.initial_keys_read != null and self.initial_keys_write != null) return;
         if (!self.initial_dcid_set) return;
         const dcid_slice = self.initial_dcid.slice();
@@ -4747,6 +4809,23 @@ pub const Connection = struct {
     /// spaces and paths. Useful for back-pressure decisions.
     pub fn congestionBytesInFlight(self: *const Connection) u64 {
         return self.bytesInFlight();
+    }
+
+    /// Current PTO duration in microseconds for the primary
+    /// application path, with the §6.2.1 exponential backoff already
+    /// applied (i.e. `base_pto << pto_count`). Test-only diagnostic so
+    /// conformance tests can pin the §6.2.1 doubling invariant; there
+    /// is no production reason an embedder would need this.
+    pub fn ptoMicros(self: *const Connection) u64 {
+        return self.ptoDurationForApplicationPath(self.primaryPathConst());
+    }
+
+    /// Current PTO backoff count for the primary application path.
+    /// Reset to 0 by an ACK that newly acknowledges an ack-eliciting
+    /// packet (§6.2.1). Test-only diagnostic — same justification as
+    /// `ptoMicros`.
+    pub fn ptoCount(self: *const Connection) u32 {
+        return self.primaryPathConst().pto_count;
     }
 
     fn congestionBlocked(self: *const Connection, lvl: EncryptionLevel) bool {
@@ -7455,6 +7534,17 @@ pub const Connection = struct {
         if (!self.inner.handshakeDone()) try self.advanceHandshake();
         if (self.inner.handshakeDone()) try self.cachePeerTransportParams();
         self.queueHandshakeDoneIfReady();
+        // RFC 9001 §5.7 ¶3 / ¶4: discard Initial keys once handshake
+        // confirms. The strict spec timing is "first Handshake packet
+        // sent" (client) / "first Handshake packet processed" (server),
+        // but in nullq's flow the client's first Handshake send is
+        // accompanied by an Initial-level ACK that's still needed by
+        // the server, so we wait until handshake confirms — at which
+        // point no further Initial activity is legitimate. Latched +
+        // idempotent.
+        if (self.inner.handshakeDone() and !self.initial_keys_discarded) {
+            self.discardInitialKeys();
+        }
         try self.refreshEarlyDataStatus();
     }
 

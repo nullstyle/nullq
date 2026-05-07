@@ -340,6 +340,13 @@ pub const SealOptions = struct {
     /// Spin / key_phase bits — Phase 5 always uses 0.
     spin_bit: bool = false,
     key_phase: bool = false,
+    /// Short-header Reserved Bits (bits 4-3 of the first byte). RFC
+    /// 9000 §17.3 ¶3 says these MUST be 0 on transmit; the field
+    /// exists here ONLY so test fixtures can construct
+    /// malicious-but-authentic packets that exercise the receiver-side
+    /// gate (§17.3 ¶3). Defaults to 0 — production callers MUST NOT
+    /// change it.
+    reserved_bits: u2 = 0,
     /// When set, use draft-ietf-quic-multipath-21 §2.4's
     /// path-ID-aware nonce for 1-RTT packet protection.
     multipath_path_id: ?u32 = null,
@@ -380,7 +387,7 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
     const hdr_len = try header.encode(dst, .{ .one_rtt = .{
         .dcid = conn_id,
         .spin_bit = opts.spin_bit,
-        .reserved_bits = 0,
+        .reserved_bits = opts.reserved_bits,
         .key_phase = opts.key_phase,
         .pn_length = pn_length,
         .pn_truncated = truncated,

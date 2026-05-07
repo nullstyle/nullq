@@ -25,6 +25,7 @@
 //!
 //! Covered:
 //!   RFC9000 §2.1     MUST     low-bit encoding of (initiator, direction) on stream id
+//!   RFC9000 §2.1     MUST     reject peer-initiated stream whose initiator bit conflicts with peer role
 //!   RFC9000 §3.1     MUST     SendStream transitions ready→send→data_sent→data_recvd
 //!   RFC9000 §3.1     MUST NOT send STREAM data after a local RESET_STREAM
 //!   RFC9000 §3.1     MUST     RESET_STREAM transitions reset_sent→reset_recvd on ACK
@@ -33,6 +34,7 @@
 //!   RFC9000 §4.1     MUST     reject peer bytes that exceed connection MAX_DATA
 //!   RFC9000 §4.1     MUST     refuse to send beyond peer-advertised connection limit
 //!   RFC9000 §4.1     MUST     ignore stale (lower) MAX_DATA values
+//!   RFC9000 §4.1     MUST     STREAM-frame ingress emits FLOW_CONTROL_ERROR CONNECTION_CLOSE
 //!   RFC9000 §4.2     MUST     reject peer bytes that exceed stream MAX_STREAM_DATA
 //!   RFC9000 §4.2     MUST     refuse to send beyond peer-advertised stream limit
 //!   RFC9000 §4.2     MUST     ignore stale (lower) MAX_STREAM_DATA values
@@ -43,18 +45,17 @@
 //!   RFC9000 §4.6     MUST     refuse to open more streams than peer-advertised limit
 //!   RFC9000 §4.6     MUST     reject peer streams beyond locally-advertised limit (STREAM_LIMIT_ERROR)
 //!   RFC9000 §4.6     MUST     ignore stale (lower) MAX_STREAMS values
+//!   RFC9000 §4.6     MUST     stream open beyond local limit emits STREAM_LIMIT_ERROR CONNECTION_CLOSE
+//!   RFC9000 §5.1.1   MUST     active_connection_id_limit honoured on NEW_CONNECTION_ID issuance
+//!   RFC9000 §10.1    MUST     idle timeout uses min(local, peer) idle parameter
 //!   RFC9000 §10.2    MUST     closing → draining → closed lifecycle progression
 //!   RFC9000 §10.2.2  MUST     draining state suppresses new outbound traffic
 //!   RFC9000 §10.3    MUST     stateless-reset token compare is constant-time
 //!   RFC9000 §10.3    MUST     stateless-reset token derive is deterministic per CID
 //!
 //! Visible debt:
-//!   RFC9000 §4.1   STREAM-frame ingress emits FLOW_CONTROL_ERROR CONNECTION_CLOSE
-//!   RFC9000 §4.6   stream open beyond local limit emits STREAM_LIMIT_ERROR CONNECTION_CLOSE
-//!   RFC9000 §5.1   active_connection_id_limit honoured on NEW_CONNECTION_ID issuance
 //!   RFC9000 §5.1.2 path migration switches to a fresh peer-issued CID
-//!   RFC9000 §10.1  idle timeout uses min(local, peer) idle parameter
-//!   RFC9000 §10.2.1 closing state emits CONNECTION_CLOSE periodically
+//!   RFC9000 §10.2.1 closing state emits CONNECTION_CLOSE periodically (KNOWN DIVERGENCE — see test)
 //!
 //! Out of scope here:
 //!   RFC9000 §2.1   stream-creation transport-parameter wiring → rfc9000_transport_params.zig
@@ -69,6 +70,8 @@ const send_stream = nullq.conn.send_stream;
 const recv_stream = nullq.conn.recv_stream;
 const lifecycle = nullq.conn.lifecycle;
 const stateless_reset = nullq.conn.stateless_reset;
+const frame = nullq.frame;
+const fixture = @import("_handshake_fixture.zig");
 
 const test_alloc = std.testing.allocator;
 
@@ -92,19 +95,40 @@ test "MUST encode (initiator, direction) in the low two bits of a stream id [RFC
     try std.testing.expectEqual(@as(u64, 3), 7 & 0b11);
 }
 
-test "skip_MUST reject a peer-initiated stream whose initiator bit conflicts with peer role [RFC9000 §2.1 ¶3]" {
+test "MUST reject a peer-initiated stream whose initiator bit conflicts with peer role [RFC9000 §2.1 ¶3]" {
     // RFC 9000 §2.1 ¶3: "An endpoint MUST NOT open a stream of a type
-    // that it cannot itself initiate." The check lives on
-    // `Connection.handleStream` (closes the connection with
-    // STREAM_STATE_ERROR when a server tries to send a frame on a
-    // server-initiated stream from the client's perspective). Verifying
-    // this at the conformance layer needs a fully-built `Connection`
-    // with TLS context; the developer-facing test
-    // `STREAM_DATA_BLOCKED tracking is bounded and validates stream
-    // space` in `src/conn/state.zig` already covers it.
-    // TODO(connection-fixture): add a Connection-level conformance
-    // helper that drives `handleStream` without a full TLS handshake.
-    return error.SkipZigTest;
+    // that it cannot itself initiate." A client that sends a STREAM
+    // frame on stream id 1 (low bits 0b01 — server-initiated bidi) is
+    // claiming originator role on a stream the spec reserves for the
+    // server. `Connection.handleStream` catches this on the
+    // `existing == null and streamInitiatedByLocal(s.stream_id)` branch
+    // and closes with STREAM_STATE_ERROR (0x05). Drive a real handshake
+    // to handshake-confirmed, then inject a 1-RTT STREAM frame on
+    // stream id 1 from the client; the server must close the
+    // connection with transport error 0x05.
+    var pair = try fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    // Build a STREAM frame on the wrong-role stream id 1. The OFF flag
+    // is omitted (offset implicitly 0); LEN flag is set so the data
+    // length is explicit. Type byte: 0x08 | LEN(0x02) = 0x0a.
+    var buf: [32]u8 = undefined;
+    const n = try frame.encode(&buf, .{ .stream = .{
+        .stream_id = 1, // server-initiated bidi from the client → forbidden
+        .data = "x",
+        .has_offset = false,
+        .has_length = true,
+        .fin = false,
+    } });
+
+    const close_event = try pair.injectFrameAtServer(buf[0..n]);
+    const ev = close_event orelse return error.TestExpectedClose;
+    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    // RFC 9000 §20.1 STREAM_STATE_ERROR = 0x05. The handler reason
+    // string is "peer referenced unopened local stream"; we assert the
+    // code, not the reason.
+    try std.testing.expectEqual(@as(u64, 0x05), ev.error_code);
 }
 
 // ---------------------------------------------------------------- §3.1 sending stream states
@@ -285,16 +309,43 @@ test "MUST reject a peer-sent total that overflows u64 against our connection li
     );
 }
 
-test "skip_MUST emit a FLOW_CONTROL_ERROR CONNECTION_CLOSE on connection-data overflow [RFC9000 §4.1 ¶3]" {
-    // The Connection state machine wraps `ConnectionData.recordPeerSent`
-    // and, on `PeerExceededLimit`, calls `close(true,
-    // transport_error_flow_control, ...)`. Verifying the wire-level
-    // emission requires a Connection with TLS context; covered by
-    // `STREAM receive enforces stream and connection flow control`
-    // in `src/conn/state.zig`.
-    // TODO(connection-fixture): add a fully-fledged Connection
-    // helper for conformance tests.
-    return error.SkipZigTest;
+test "MUST emit a FLOW_CONTROL_ERROR CONNECTION_CLOSE on connection-data overflow [RFC9000 §4.1 ¶3]" {
+    // RFC 9000 §4.1 ¶3: "An endpoint MUST terminate a connection with
+    // an error of type FLOW_CONTROL_ERROR if it receives more data than
+    // the maximum data value that it has sent." `Connection.handleStream`
+    // checks both per-stream and connection-level limits and closes
+    // with `transport_error_flow_control` (0x03) on either overrun.
+    //
+    // Drive a real handshake to handshake-confirmed, then inject a
+    // STREAM frame on stream id 0 with `offset = 1 << 21 = 2_097_152`
+    // and a 1-byte payload. The default fixture advertises
+    // `initial_max_data = 1 << 20 = 1_048_576` and
+    // `initial_max_stream_data_bidi_remote = 1 << 18 = 262_144`. Both
+    // limits are exceeded; the stream-level check fires first inside
+    // `handleStream`, but it maps to the same wire error code as the
+    // connection-level check — FLOW_CONTROL_ERROR (0x03). That's all
+    // the spec text in §4.1 ¶3 actually pins.
+    var pair = try fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    var buf: [32]u8 = undefined;
+    const n = try frame.encode(&buf, .{ .stream = .{
+        .stream_id = 0, // client-initiated bidi — natural for this direction
+        .offset = 1 << 21,
+        .data = "x",
+        .has_offset = true,
+        .has_length = true,
+        .fin = false,
+    } });
+
+    const close_event = try pair.injectFrameAtServer(buf[0..n]);
+    const ev = close_event orelse return error.TestExpectedClose;
+    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(
+        fixture.TRANSPORT_ERROR_FLOW_CONTROL_ERROR,
+        ev.error_code,
+    );
 }
 
 // ---------------------------------------------------------------- §4.2 stream-level flow control
@@ -476,29 +527,103 @@ test "MUST ignore MAX_STREAMS that does not raise the current limit [RFC9000 §1
     try std.testing.expectEqual(@as(u64, 8), sc.peer_max);
 }
 
-test "skip_MUST emit STREAM_LIMIT_ERROR CONNECTION_CLOSE when peer opens above the local limit [RFC9000 §4.6 ¶2]" {
-    // The wire-level emission lives in `Connection.recordPeerStreamOpenOrClose`
-    // → `close(true, transport_error_stream_limit, ...)`. The unit
-    // test `STREAM_DATA_BLOCKED tracking is bounded and validates
-    // stream space` in `src/conn/state.zig` covers the path.
-    // TODO(connection-fixture): hoist into a conformance-only Connection
-    // helper.
-    return error.SkipZigTest;
+test "MUST emit STREAM_LIMIT_ERROR CONNECTION_CLOSE when peer opens above the local limit [RFC9000 §4.6 ¶2]" {
+    // RFC 9000 §4.6 ¶2: "An endpoint MUST terminate a connection with
+    // a STREAM_LIMIT_ERROR error if a peer opens more streams than was
+    // permitted." `Connection.recordPeerStreamOpenOrClose` is the
+    // bookkeeping hook called from `handleStream` on the first frame
+    // for a previously-unseen stream; it closes with
+    // `transport_error_stream_limit` (0x04) when the stream's
+    // `streamIndex(id) >= local_max_streams_bidi`.
+    //
+    // Default `initial_max_streams_bidi = 100`; client-initiated bidi
+    // stream IDs are 0, 4, 8, …, 396 (indices 0..99). Stream id 400
+    // has index 100, which trips the limit.
+    var pair = try fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    var buf: [32]u8 = undefined;
+    const n = try frame.encode(&buf, .{ .stream = .{
+        .stream_id = 400, // 101st client-bidi — one past the local limit of 100
+        .data = "x",
+        .has_offset = false,
+        .has_length = true,
+        .fin = false,
+    } });
+
+    const close_event = try pair.injectFrameAtServer(buf[0..n]);
+    const ev = close_event orelse return error.TestExpectedClose;
+    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(
+        fixture.TRANSPORT_ERROR_STREAM_LIMIT_ERROR,
+        ev.error_code,
+    );
 }
 
 // ---------------------------------------------------------------- §5 connection IDs
 
-test "skip_MUST honour active_connection_id_limit when issuing NEW_CONNECTION_ID [RFC9000 §5.1.1 ¶3]" {
-    // §5.1.1 ¶3: "An endpoint MUST NOT provide more connection IDs
-    // than the peer's limit." `Connection.localConnectionIdIssueBudget`
-    // computes `min(peer_active_cid_limit, max_supported)`; the
-    // queueing path is `replenishConnectionIds`. Verifying the budget
-    // arithmetic conformance-style is meaningful only against a fully
-    // bound Connection where the cached peer transport params are set.
-    // TODO(connection-fixture): expose a helper that constructs a
-    // Connection with `cached_peer_transport_params` pre-populated so
-    // we can exercise `localConnectionIdIssueBudget` directly.
-    return error.SkipZigTest;
+test "MUST honour active_connection_id_limit when issuing NEW_CONNECTION_ID [RFC9000 §5.1.1 ¶3]" {
+    // RFC 9000 §5.1.1 ¶3: "An endpoint MUST NOT provide more
+    // connection IDs than the peer's limit." nullq enforces the
+    // ceiling in `Connection.localConnectionIdIssueBudget`, which is
+    // consulted both directly and inside `replenishLocalConnectionIds`
+    // — extra provisions past the budget are silently dropped rather
+    // than queued as NEW_CONNECTION_ID frames.
+    //
+    // The fixture's default `active_connection_id_limit = 4`. After
+    // the handshake the server already owns 1 active local SCID
+    // (the initial SCID), so the budget is 3. Try to install 8 fresh
+    // CIDs and verify only 3 are accepted, total active ≤ 4.
+    var pair = try fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const srv_conn = try pair.serverConn();
+
+    // Sanity: the server cached the client's transport params during
+    // the handshake, so the budget reflects the real (peer-supplied)
+    // limit minus already-active SCIDs.
+    const initial_count = srv_conn.localScidCount();
+    try std.testing.expect(initial_count >= 1); // at least the initial SCID
+    try std.testing.expect(initial_count <= 4); // already at or under limit
+
+    const budget = srv_conn.localConnectionIdIssueBudget(0);
+    try std.testing.expect(budget + initial_count <= 4);
+
+    // Try to over-provision: ask for 8 fresh CIDs. The implementation
+    // walks `provisions` and stops once `localConnectionIdIssueBudget`
+    // hits zero, so only `budget` of the 8 should land in the
+    // pending-frames queue and the active SCID list.
+    var provisions: [8]nullq.conn.ConnectionIdProvision = undefined;
+    var cid_bufs: [8][8]u8 = undefined;
+    for (0..8) |i| {
+        // Distinct, non-zero-length CIDs. Bytes don't have to be
+        // cryptographically meaningful — the conformance assertion is
+        // purely about how many get accepted.
+        cid_bufs[i] = .{
+            0xc0, 0xff, 0xee, @as(u8, @intCast(i)),
+            0x01, 0x02, 0x03, 0x04,
+        };
+        provisions[i] = .{
+            .connection_id = &cid_bufs[i],
+            .stateless_reset_token = .{
+                @as(u8, @intCast(i)), 0xa1, 0xa2, 0xa3,
+                0xa4,                  0xa5, 0xa6, 0xa7,
+                0xa8,                  0xa9, 0xaa, 0xab,
+                0xac,                  0xad, 0xae, 0xaf,
+            },
+        };
+    }
+    const queued = try srv_conn.replenishConnectionIds(&provisions);
+    try std.testing.expectEqual(budget, queued);
+
+    // Post-condition: total active SCIDs MUST NOT exceed the peer's
+    // active_connection_id_limit (4). RFC 9000 §5.1.1 ¶3.
+    try std.testing.expect(srv_conn.localScidCount() <= 4);
+    // And the budget is now 0 — no more issuance possible until the
+    // peer retires some.
+    try std.testing.expectEqual(@as(usize, 0), srv_conn.localConnectionIdIssueBudget(0));
 }
 
 test "skip_MUST switch to a freshly-issued peer CID after migration [RFC9000 §5.1.2 ¶1]" {
@@ -603,27 +728,76 @@ test "MUST allow a stateless reset to skip draining and go straight to closed [R
 test "skip_MUST emit a CONNECTION_CLOSE periodically while in the closing state [RFC9000 §10.2.1 ¶3]" {
     // §10.2.1 ¶3: "An endpoint in the closing state sends a packet
     // containing a CONNECTION_CLOSE frame in response to any incoming
-    // packet that it attributes to the connection." nullq's
-    // `pollLevel` re-queues the frame on each outgoing emission while
-    // `pending_close` is set. Verifying the periodicity needs a full
-    // Connection fixture with a packet-pipeline harness.
-    // TODO(connection-fixture): add a one-tick `pollLevel` driver that
-    // exercises the close-frame retransmit path.
+    // packet that it attributes to the connection."
+    //
+    // KNOWN DIVERGENCE: nullq's `pollLevel` (src/conn/state.zig L5121)
+    // emits CONNECTION_CLOSE exactly once and then sets
+    // `lifecycle.closed = true`. From that point `Connection.handle`
+    // (L5908) early-returns on every incoming packet without
+    // re-queueing a fresh CONNECTION_CLOSE — the implementation
+    // collapses the §10.2 lifecycle straight into the draining state
+    // semantics and skips §10.2.1's "respond to every attributed
+    // packet" repeater. RFC 9000 §10.2.1 says this is a SHOULD-flavour
+    // requirement (the spec frames it as MUST in the sentence above
+    // but RFC 9000 §10.2 ¶3 also explicitly permits dropping straight
+    // to draining; nullq's behaviour is a defensible reading).
+    //
+    // Re-enable this test only after the closing-state retransmit
+    // path is implemented (a `closing_response_pending` flag in
+    // `LifecycleState` would do it). The developer-facing tests
+    // `closing and draining ignore incoming datagrams` and
+    // `peer close records transport error details` in
+    // src/conn/state.zig pin the current "closed-after-one" shape.
     return error.SkipZigTest;
 }
 
 // ---------------------------------------------------------------- §10.1 idle timeout
 
-test "skip_MUST honour the smaller of local and peer idle_timeout values [RFC9000 §10.1 ¶2]" {
-    // §10.1 ¶2: "Each endpoint advertises a max_idle_timeout, but the
-    // effective value at an endpoint is computed as the minimum of the
-    // two advertised values." The min() is applied in
-    // `Connection.computeIdleTimeout` against
-    // `local_transport_params.max_idle_timeout` and
-    // `cached_peer_transport_params.?.max_idle_timeout`. Conformance
-    // testing it requires building a Connection with both sides set.
-    // TODO(connection-fixture): hoist into the conformance helper.
-    return error.SkipZigTest;
+test "MUST honour the smaller of local and peer idle_timeout values [RFC9000 §10.1 ¶2]" {
+    // RFC 9000 §10.1 ¶2: "Each endpoint advertises a max_idle_timeout,
+    // but the effective value at an endpoint is computed as the
+    // minimum of the two advertised values." nullq's
+    // `Connection.idleTimeoutUs` computes `@min(local, peer)` (in
+    // microseconds) and `tick` enters draining with `.idle_timeout`
+    // source once `last_activity_us + timeout` has elapsed.
+    //
+    // Set the server side to a 1-second idle timeout and the client
+    // side to 30 seconds. The MIN rule says BOTH sides must idle out
+    // at 1 second after their last activity; if either side honoured
+    // its own value (rather than the negotiated min) the lopsided
+    // settings would expose it.
+    var server_p = fixture.defaultParams();
+    server_p.max_idle_timeout_ms = 1_000;
+    var client_p = fixture.defaultParams();
+    client_p.max_idle_timeout_ms = 30_000;
+
+    var pair = try fixture.HandshakePair.initWith(
+        std.testing.allocator,
+        server_p,
+        client_p,
+    );
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    // Both sides cached the peer's transport params during the
+    // handshake, so the negotiated effective idle timeout should be
+    // 1 second on both ends regardless of who's the local-1s side.
+    // Advance time well past 1s of inactivity (1.5s gives plenty of
+    // slack against the per-iteration 1ms increments
+    // driveToHandshakeConfirmed used) and tick.
+    const idle_advance_us: u64 = 1_500_000;
+    pair.now_us +%= idle_advance_us;
+    try pair.server.tick(pair.now_us);
+    try pair.client.conn.tick(pair.now_us);
+
+    // The MIN rule says BOTH endpoints honour the 1-second value, so
+    // BOTH must have closed by now via idle timeout.
+    const srv_conn = try pair.serverConn();
+    const cli_conn = pair.clientConn();
+    const srv_event = srv_conn.closeEvent() orelse return error.TestExpectedServerIdleClose;
+    const cli_event = cli_conn.closeEvent() orelse return error.TestExpectedClientIdleClose;
+    try std.testing.expectEqual(nullq.CloseSource.idle_timeout, srv_event.source);
+    try std.testing.expectEqual(nullq.CloseSource.idle_timeout, cli_event.source);
 }
 
 // ---------------------------------------------------------------- §10.3 stateless reset

@@ -21,6 +21,8 @@
 //!   RFC9000 §13.3   MUST     STREAM keys are tracked on each sent packet for ack/loss routing
 //!   RFC9000 §13.3   NORMATIVE PADDING / PING are absent from the retransmit-frame union (Table 3)
 //!   RFC9000 §14     MUST     client first-flight Initial datagram is >= 1200 bytes
+//!   RFC9000 §14     MUST     server discards v1 Initial UDP < 1200 bytes
+//!   RFC9000 §14     MUST NOT §14 size gate fires on a non-v1 long-header datagram
 //!   RFC9000 §14     NORMATIVE the on-wire v1 minimum constant equals 1200 (RFC default_mtu)
 //!   RFC9000 §20.1   MUST     transport error code NO_ERROR (0x00) round-trips on CONNECTION_CLOSE
 //!   RFC9000 §20.1   MUST     transport error codes 0x01..0x10 round-trip on CONNECTION_CLOSE
@@ -36,13 +38,6 @@
 //!   RFC9000 §13.2.2 NORMATIVE max_ack_delay handling — covered by transport-params suite.
 //!   RFC9000 §13.3   NORMATIVE PATH_RESPONSE retransmission policy — nullq requeues from the
 //!                            sent-packet record (RFC says "send a new one" in §13.3 ¶8).
-//!   RFC9000 §14     MUST     server discards v1 Initial UDP < 1200 bytes — needs a real
-//!                            `Server` instance, which depends on test PEM fixtures under
-//!                            `tests/data/`. Those sit outside this conformance package's
-//!                            embedFile root, so the test is `skip_*` here and lives in
-//!                            `tests/e2e/server_smoke.zig`.
-//!   RFC9000 §14     MUST NOT §14 size gate fires on a non-v1 datagram — same package-path
-//!                            constraint. Covered by `tests/e2e/server_smoke.zig`.
 //!
 //! Out of scope here:
 //!   RFC9000 §12.4   frames-per-packet-type matrix          → rfc9000_frames.zig
@@ -52,6 +47,7 @@
 
 const std = @import("std");
 const nullq = @import("nullq");
+const fixture = @import("_initial_fixture.zig");
 
 const conn = nullq.conn;
 const frame = nullq.frame;
@@ -349,24 +345,51 @@ test "NORMATIVE the v1 minimum UDP payload size constant equals 1200 bytes [RFC9
     try std.testing.expectEqual(@as(usize, 1200), conn.state.default_mtu);
 }
 
-test "skip_MUST server discards v1 Initial UDP datagrams smaller than 1200 bytes [RFC9000 §14 ¶1]" {
-    // The observable behaviour requires standing up a real `Server`
-    // (TLS context + cert/key). nullq's test cert/key live under
-    // `tests/data/`, which sits outside the conformance package's
-    // `@embedFile` root. The full assertion lives in
-    // `tests/e2e/server_smoke.zig` ("Server.feed drops QUIC v1
-    // Initial datagrams below the 1200-byte minimum") and asserts
-    // the same wire behaviour plus the `feeds_initial_too_small`
-    // counter increment.
-    return error.SkipZigTest;
+test "MUST server discards v1 Initial UDP datagrams smaller than 1200 bytes [RFC9000 §14 ¶1]" {
+    // RFC 9000 §14 ¶1: "A server MUST discard an Initial packet that
+    // is carried in a UDP datagram with a payload that is smaller
+    // than the smallest allowed maximum datagram size of 1200 bytes."
+    // The drop fires *before* any Connection state is allocated, so
+    // no slot is created. The outcome MUST be `.dropped`, the
+    // distinct `feeds_initial_too_small` counter MUST tick (so ops
+    // can grep amplification probes without conflating with generic
+    // malformed-packet drops), and `feeds_dropped` MUST tick.
+    var srv = try fixture.buildServer();
+    defer srv.deinit();
+
+    // Long-header Initial with QUIC v1 version, but the UDP datagram
+    // payload is 7 bytes — well below the 1200-byte floor.
+    var tiny_v1_initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x01) };
+    const outcome = try srv.feed(&tiny_v1_initial, addr, 1_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+
+    const metrics = srv.metricsSnapshot();
+    try std.testing.expect(metrics.feeds_initial_too_small >= 1);
+    try std.testing.expect(metrics.feeds_dropped >= 1);
 }
 
-test "skip_MUST NOT §14 size gate fire on a non-v1 long-header datagram [RFC9000 §14 ¶1]" {
-    // Same package-path constraint as the v1 case above. The full
-    // assertion (including the `feeds_initial_too_small` counter
-    // staying at zero while `FeedOutcome.version_negotiated` fires)
-    // lives in `tests/e2e/server_smoke.zig`.
-    return error.SkipZigTest;
+test "MUST NOT §14 size gate fire on a non-v1 long-header datagram [RFC9000 §14 ¶1]" {
+    // RFC 9000 §14 ¶1's 1200-byte floor is scoped to v1 Initial
+    // packets — version negotiation (RFC 9000 §6) owns unsupported
+    // versions, regardless of datagram size. A short long-header
+    // datagram with a non-v1 version MUST take the VN path and the
+    // `feeds_initial_too_small` counter MUST stay at zero (so the
+    // §14 gate isn't masquerading as a VN trigger in the metrics).
+    var srv = try fixture.buildServer();
+    defer srv.deinit();
+
+    // Same shape as the v1 fixture above but with a non-v1 version.
+    // dcid_len=4 then 4 dcid bytes, scid_len=4 then 4 scid bytes.
+    var tiny_unsupported_version = [_]u8{ 0xc0, 0xde, 0xad, 0xbe, 0xef, 4, 0xa, 0xb, 0xc, 0xd, 4, 0x1, 0x2, 0x3, 0x4 };
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0x02) };
+    const outcome = try srv.feed(&tiny_unsupported_version, addr, 2_000);
+    try std.testing.expectEqual(nullq.Server.FeedOutcome.version_negotiated, outcome);
+
+    const metrics = srv.metricsSnapshot();
+    try std.testing.expectEqual(@as(u64, 0), metrics.feeds_initial_too_small);
+    try std.testing.expect(metrics.feeds_version_negotiated >= 1);
 }
 
 test "MUST pad the client first-flight Initial UDP datagram to >= 1200 bytes [RFC9000 §14 ¶1]" {
