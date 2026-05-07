@@ -260,8 +260,54 @@ test "encode then decode round-trip with realistic gaps" {
 //   `decode` with the same length, must reproduce the same recovered
 //   PN — the recovery function is idempotent under its own output.
 
+// Seed corpus drives the §A.3 recovery algorithm at PN-space boundaries.
+// Smith consumption order (must match `fuzzPacketNumberDecode`):
+//   1. value(u64) → truncated   (8 bytes LE)
+//   2. valueRangeAtMost(u8, 1, 4) → length (8 bytes LE; in-range else 1)
+//   3. value(u64) → largest_pn  (8 bytes LE; harness masks with max_value)
+// Each entry is exactly 24 bytes.
 test "fuzz: packet_number decode §A.3 invariants" {
-    try std.testing.fuzz({}, fuzzPacketNumberDecode, .{});
+    try std.testing.fuzz({}, fuzzPacketNumberDecode, .{
+        .corpus = &.{
+            // truncated=0, length=1, largest_pn=0 (fresh PN space)
+            "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // truncated=0, length=1, largest_pn=2^31 (mid-range)
+            "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x00\x00\x00\x80\x00\x00\x00\x00",
+            // truncated=0xff, length=1, largest_pn=2^62-1 (top of range)
+            "\xff\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++
+                "\xff\xff\xff\xff\xff\xff\xff\x3f",
+            // Idempotent decode: truncated matches low byte of largest_pn
+            // truncated=0xea (low byte of 0xa82f30ea), length=1, largest_pn=0xa82f30ea
+            "\xea\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++
+                "\xea\x30\x2f\xa8\x00\x00\x00\x00",
+            // RFC 9000 §A.3 worked example: truncated=0x9b32, length=2, largest_pn=0xa82f30ea
+            "\x32\x9b\x00\x00\x00\x00\x00\x00" ++
+                "\x02\x00\x00\x00\x00\x00\x00\x00" ++
+                "\xea\x30\x2f\xa8\x00\x00\x00\x00",
+            // Forward-snap region: truncated=0x12, length=1, largest_pn=200 (snaps to 274)
+            "\x12\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++
+                "\xc8\x00\x00\x00\x00\x00\x00\x00",
+            // Backward-snap region: truncated=0xff, length=1, largest_pn=1280 (snaps to 1279)
+            "\xff\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x00\x05\x00\x00\x00\x00\x00\x00",
+            // 4-byte truncated near max: truncated=0xffffffff, length=4, largest_pn=max-5
+            "\xff\xff\xff\xff\x00\x00\x00\x00" ++
+                "\x04\x00\x00\x00\x00\x00\x00\x00" ++
+                "\xfa\xff\xff\xff\xff\xff\xff\x3f",
+            // 3-byte truncated mid-range: truncated=0x123456, length=3, largest_pn=0x100000
+            "\x56\x34\x12\x00\x00\x00\x00\x00" ++
+                "\x03\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x00\x00\x10\x00\x00\x00\x00\x00",
+        },
+    });
 }
 
 fn fuzzPacketNumberDecode(_: void, smith: *std.testing.Smith) anyerror!void {

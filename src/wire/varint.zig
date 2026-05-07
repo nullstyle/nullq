@@ -259,8 +259,39 @@ test "round-trip: deterministic random" {
 // reaches abort the harness. Invariant violations from `expectEqual`
 // are minimized + saved to the corpus.
 
+// Seed corpus targets the four legal varint widths (RFC 9000 §16) and
+// each width's min/max boundary. Smith.slice reads a 4-byte LE length
+// prefix, so each entry begins with that prefix; the remaining bytes
+// are what the harness's `decode(input)` actually sees.
 test "fuzz: varint decode/encode round-trip" {
-    try std.testing.fuzz({}, fuzzVarintRoundTrip, .{});
+    try std.testing.fuzz({}, fuzzVarintRoundTrip, .{
+        .corpus = &.{
+            // length=0 → input = "" (empty, decode returns InsufficientBytes)
+            "\x00\x00\x00\x00",
+            // length=1, byte 0x00 → 1-byte varint = 0
+            "\x01\x00\x00\x00\x00",
+            // length=1, byte 0x3f → 1-byte varint = 63 (max for length 1)
+            "\x01\x00\x00\x00\x3f",
+            // length=2, bytes 0x40 0x00 → non-minimal 2-byte = 0
+            "\x02\x00\x00\x00\x40\x00",
+            // length=2, bytes 0x40 0x40 → 2-byte = 64 (min meaningful 2-byte)
+            "\x02\x00\x00\x00\x40\x40",
+            // length=2, bytes 0x7f 0xff → 2-byte = 16383 (max for length 2)
+            "\x02\x00\x00\x00\x7f\xff",
+            // length=4, bytes 0x80 0x00 0x40 0x00 → 4-byte = 16384 (min meaningful)
+            "\x04\x00\x00\x00\x80\x00\x40\x00",
+            // length=4, bytes 0xbf 0xff 0xff 0xff → 4-byte = 2^30 - 1 (max for length 4)
+            "\x04\x00\x00\x00\xbf\xff\xff\xff",
+            // length=8, bytes 0xc0..0x40.. → 8-byte = 2^30 (min meaningful 8-byte)
+            "\x08\x00\x00\x00\xc0\x00\x00\x00\x40\x00\x00\x00",
+            // length=8, all 0xff → 8-byte = 2^62 - 1 (max varint value)
+            "\x08\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff",
+            // RFC 9000 Appendix A.1 worked example: 151288809941952652
+            "\x08\x00\x00\x00\xc2\x19\x7c\x5e\xff\x14\xe8\x8c",
+            // Truncated 4-byte varint (only 2 bytes of payload follow header)
+            "\x02\x00\x00\x00\x80\x00",
+        },
+    });
 }
 
 fn fuzzVarintRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {

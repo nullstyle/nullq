@@ -833,8 +833,65 @@ test "Header.dcid accessor returns the right CID for each variant" {
 // returned. Aborts on panic / unreachable. Invariant violations
 // minimize and save to the corpus.
 
+// Seed corpus shapes well-known QUIC v1 header layouts (RFC 9000 §17,
+// RFC 8999 §6) plus a few truncated/garbage inputs. Smith consumption:
+//   1. slice(buf)        → input  (4-byte LE length + N payload bytes)
+//   2. valueRangeAtMost  → dcid_len_for_short (8 bytes LE; in 0..20)
 test "fuzz: header parse never panics and reports consistent offsets" {
-    try std.testing.fuzz({}, fuzzHeaderParse, .{});
+    try std.testing.fuzz({}, fuzzHeaderParse, .{
+        .corpus = &.{
+            // Empty input (length=0), dcid_len_short=0
+            "\x00\x00\x00\x00" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Single byte 0x00 (short header form, all zeros), dcid_len=0
+            "\x01\x00\x00\x00\x00" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Short header: 0x40 (form=0, fixed=1, pn_len=1) + 8-byte DCID + 1 PN byte
+            "\x0a\x00\x00\x00" ++
+                "\x40" ++ "\x01\x02\x03\x04\x05\x06\x07\x08" ++ "\x42" ++
+                "\x08\x00\x00\x00\x00\x00\x00\x00",
+            // RFC 9001 §A.2 unprotected client Initial header (canonical KAT)
+            "\x16\x00\x00\x00" ++
+                "\xc3" ++ "\x00\x00\x00\x01" ++ "\x08" ++
+                "\x83\x94\xc8\xf0\x3e\x51\x57\x08" ++
+                "\x00" ++ "\x00" ++ "\x44\x9e" ++ "\x00\x00\x00\x02" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Initial with empty DCID/SCID, length=0 token, length=0 payload, 1-byte PN
+            "\x0a\x00\x00\x00" ++
+                "\xc0" ++ "\x00\x00\x00\x01" ++ "\x00" ++ "\x00" ++ "\x00" ++ "\x00" ++ "\x00" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Version Negotiation: first=0xc0, version=0, DCID=2, SCID=2, 2 supported versions
+            "\x10\x00\x00\x00" ++
+                "\xc0" ++ "\x00\x00\x00\x00" ++ "\x02\xaa\xbb" ++ "\x02\xcc\xdd" ++
+                "\x00\x00\x00\x01" ++ "\x6b\x33\x43\xcf" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Long header truncated mid-token-length (token_len=0x40 starts 2-byte varint)
+            "\x10\x00\x00\x00" ++
+                "\xc0" ++ "\x00\x00\x00\x01" ++ "\x04\x01\x02\x03\x04" ++ "\x00" ++ "\x40" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Retry packet: type bits 0xf0 = retry, 16-byte integrity tag tail
+            "\x1c\x00\x00\x00" ++
+                "\xf0" ++ "\x00\x00\x00\x01" ++ "\x02\x11\x22" ++ "\x04\xaa\xbb\xcc\xdd" ++
+                "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Long header with DCID len > 20 (rejected; ConnIdTooLong)
+            "\x06\x00\x00\x00" ++
+                "\xc0" ++ "\x00\x00\x00\x01" ++ "\x15" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // 0-RTT (long_type=1): first=0xd0, version=1, empty CIDs, payload_len=16, 1 PN
+            "\x0c\x00\x00\x00" ++
+                "\xd0" ++ "\x00\x00\x00\x01" ++ "\x00" ++ "\x00" ++ "\x10" ++ "\x42" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Handshake (long_type=2): first=0xe0, payload_len=16, 1 PN
+            "\x0c\x00\x00\x00" ++
+                "\xe0" ++ "\x00\x00\x00\x01" ++ "\x00" ++ "\x00" ++ "\x10" ++ "\x42" ++
+                "\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Short header with 4-byte DCID, dcid_len_short=4
+            "\x09\x00\x00\x00" ++
+                "\x43" ++ "\xaa\xbb\xcc\xdd" ++ "\x12\x34\x56\x78" ++
+                "\x04\x00\x00\x00\x00\x00\x00\x00",
+        },
+    });
 }
 
 fn fuzzHeaderParse(_: void, smith: *std.testing.Smith) anyerror!void {

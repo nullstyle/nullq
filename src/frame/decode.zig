@@ -858,8 +858,71 @@ test "decode accepts ACK with ranges at the boundary" {
 // type tag must match the QUIC v1 frame catalog. Crashes / panics
 // abort. Invariant violations save to corpus.
 
+// Seed corpus targets each frame type's minimal byte form (RFC 9000 §19).
+// Smith consumes a single slice — entries are `<u32 LE len><payload>`.
 test "fuzz: frame decode single-frame property" {
-    try std.testing.fuzz({}, fuzzFrameDecode, .{});
+    try std.testing.fuzz({}, fuzzFrameDecode, .{
+        .corpus = &.{
+            // Empty input
+            "\x00\x00\x00\x00",
+            // PADDING (single 0x00)
+            "\x01\x00\x00\x00\x00",
+            // PING (0x01)
+            "\x01\x00\x00\x00\x01",
+            // ACK (no ECN): largest=0, ack_delay=0, range_count=0, first_range=0
+            "\x05\x00\x00\x00\x02\x00\x00\x00\x00",
+            // ACK_ECN: same fields plus ect0/ect1/ce
+            "\x08\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00",
+            // RESET_STREAM: stream_id=0, app_err=0, final_size=0
+            "\x04\x00\x00\x00\x04\x00\x00\x00",
+            // STOP_SENDING: stream_id=0, app_err=0
+            "\x03\x00\x00\x00\x05\x00\x00",
+            // CRYPTO: offset=0, len=0, no data
+            "\x03\x00\x00\x00\x06\x00\x00",
+            // NEW_TOKEN: len=0
+            "\x02\x00\x00\x00\x07\x00",
+            // STREAM (0x08, no offset, no length, no fin): stream_id=0
+            "\x02\x00\x00\x00\x08\x00",
+            // MAX_DATA: maximum=0
+            "\x02\x00\x00\x00\x10\x00",
+            // MAX_STREAM_DATA: stream_id=0, maximum=0
+            "\x03\x00\x00\x00\x11\x00\x00",
+            // MAX_STREAMS bidi: maximum=0
+            "\x02\x00\x00\x00\x12\x00",
+            // DATA_BLOCKED: maximum=0
+            "\x02\x00\x00\x00\x14\x00",
+            // NEW_CONNECTION_ID: seq=1, retire=0, len=0x10, 16 CID bytes, 16 token bytes
+            "\x24\x00\x00\x00" ++
+                "\x18\x01\x00\x10" ++
+                "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f" ++
+                "\xaa\xbb\xcc\xdd\xee\xff\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99",
+            // RETIRE_CONNECTION_ID: seq=0
+            "\x02\x00\x00\x00\x19\x00",
+            // PATH_CHALLENGE: 8 random bytes
+            "\x09\x00\x00\x00\x1a\x01\x02\x03\x04\x05\x06\x07\x08",
+            // PATH_RESPONSE: 8 random bytes
+            "\x09\x00\x00\x00\x1b\x01\x02\x03\x04\x05\x06\x07\x08",
+            // CONNECTION_CLOSE transport: error=0, frame_type=0, reason_len=0
+            "\x04\x00\x00\x00\x1c\x00\x00\x00",
+            // CONNECTION_CLOSE application: error=0, reason_len=0
+            "\x03\x00\x00\x00\x1d\x00\x00",
+            // HANDSHAKE_DONE
+            "\x01\x00\x00\x00\x1e",
+            // DATAGRAM (no LEN, runs to end)
+            "\x05\x00\x00\x00\x30\xde\xad\xbe\xef",
+            // DATAGRAM (LEN-prefixed): len=4 + 4 bytes
+            "\x06\x00\x00\x00\x31\x04\xde\xad\xbe\xef",
+            // PATH_ACK (multipath, 2-byte varint type 0x3e): path_id=0,
+            // largest=0, ack_delay=0, range_count=0, first_range=0
+            "\x06\x00\x00\x00\x40\x3e\x00\x00\x00\x00",
+            // Adjacent ACK ranges (gap=0): largest=30, first_range=10, gap=0, length=8
+            "\x07\x00\x00\x00\x02\x1e\x00\x01\x0a\x00\x08",
+            // ACK with overflowing range_count (rejected by AckRangeCountTooLarge)
+            "\x07\x00\x00\x00\x02\x00\x00\x43\xe8\x00",
+            // Unknown frame type 0x40 0x40 = varint = 64 (not in catalog)
+            "\x02\x00\x00\x00\x40\x40",
+        },
+    });
 }
 
 fn fuzzFrameDecode(_: void, smith: *std.testing.Smith) anyerror!void {

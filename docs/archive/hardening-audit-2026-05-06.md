@@ -495,6 +495,8 @@ Each item: PASS / FAIL / N/A with citation.
     `/Users/nullstyle/prj/ai-workspace/nullq/tests/fuzz_smoke.zig` are
     canonical-roundtrip / malformed-input smoke tests, not extended
     fuzz harnesses. No coverage-guided fuzzing has run.
+    **[Update 2026-05-07: tests/fuzz_smoke.zig was lifted into in-source
+    std.testing.fuzz harnesses; see commit 52abdd9.]**
 
 ---
 

@@ -6,7 +6,8 @@ required fuzz targets and §11.2 regression classes onto the codebase,
 and records the gaps that remain (very few, after the recent hardening
 pass).
 
-Last refreshed: 2026-05-06 (CID lifecycle fuzz + all-unknown-frames regression).
+Last refreshed: 2026-05-07 (in-source fuzz lift; `tests/fuzz_smoke.zig`
+removed in commit `52abdd9`).
 
 Scope notes:
 
@@ -19,15 +20,23 @@ Scope notes:
 - nullq uses Zig 0.15.x's structured fuzzer (`std.testing.Smith` +
   `std.testing.fuzz`), not raw libFuzzer. Existing harnesses double as
   unit tests so they always run under `zig build test`; `zig build
-  fuzz` runs them under coverage feedback.
-- "fuzz_smoke" tests in `tests/fuzz_smoke.zig` are deterministic
-  randomized property tests, not coverage-guided fuzzers. They are
-  treated below as regression tests, not as fuzz coverage.
+  fuzz` runs them under coverage feedback as a per-callsite parallel
+  step (one filtered test binary per fuzz site, 30+ binaries with
+  `-j8`; see the `fuzz_targets` list in `build.zig`). The `just fuzz`
+  recipe wraps this. Note the workaround for ziglang/zig#25352:
+  `n_instances=1` in limit mode so each binary runs a single
+  fuzz-target child.
+- The former `tests/fuzz_smoke.zig` deterministic property tests were
+  lifted into in-source `std.testing.fuzz` callbacks (or deleted as
+  redundant) in commit `52abdd9` (2026-05-07); see the inventory
+  below.
 
 ## 1. Inventory of `std.testing.fuzz` sites
 
 Verified via `rg "std.testing.fuzz" /Users/nullstyle/prj/ai-workspace/nullq/src`.
-Nineteen harnesses across thirteen files:
+34 in-source harnesses across the tree (the table below lists the original
+nineteen; the additional sites land via the lift in commit `52abdd9` — see
+the `fuzz_targets` list in `build.zig` for the full set):
 
 | # | File | Test name | Target |
 |---|---|---|---|
@@ -55,11 +64,14 @@ Nineteen harnesses across thirteen files:
 (Nineteen harness sites — `src/conn/state.zig` contributes four;
 the row count above is 20 because we list each by its line number.)
 
-The `tests/fuzz_smoke.zig` harness adds nine deterministic randomized
-round-trip tests covering varint, frame, transport-parameter, packet
-header, ACK-range iterator, and `RecvStream` reassembly. These are
-broad property tests under fixed seeds — high signal for shaking out
-encode/decode asymmetry, but not coverage-guided.
+As of commit `52abdd9` (2026-05-07), `tests/fuzz_smoke.zig` is gone:
+its five novel property tests (varint, frame round-trip, transport
+parameters, packet headers, ACK range iter, recv_stream shuffled)
+were lifted into in-source `std.testing.fuzz` callbacks in the
+matching `src/` files with stronger oracles and coverage feedback;
+the remaining four were deleted as redundant with existing in-source
+harnesses (`fuzzVarintRoundTrip`, `fuzzFrameDecode`,
+`fuzzTransportParams`, `fuzzHeaderParse`).
 
 ## 2. §11.1 required fuzz targets
 
@@ -68,8 +80,7 @@ Status legend:
 - **COVERED** — a coverage-guided harness exists and exercises the
   parser surface.
 - **PARTIAL** — touched indirectly (e.g. through a higher-level
-  harness, or by deterministic property tests in `fuzz_smoke.zig`),
-  but no dedicated coverage-guided harness.
+  harness), but no dedicated coverage-guided harness.
 - **MISSING** — no fuzz harness, but the implementation exists.
 - **MISSING (no impl)** — code path doesn't exist in nullq yet.
 
@@ -79,11 +90,11 @@ Status legend:
 | 2 | Long-header parser | COVERED | `src/wire/header.zig:836` (handles all six variants) and `src/server.zig:2051` (peek surface) |
 | 3 | Short-header parser | COVERED | `src/wire/header.zig:836` walks short headers under fuzzer-chosen DCID length; `src/server.zig:2081` is the routing-level peek |
 | 4 | Coalesced datagram parser | COVERED | `src/wire/long_packet.zig:973` `fuzz: coalesced long-header walker terminates with bounded advance` — structural walker mirrors the receive-path coalesce loop (parse header, advance by `pn_offset + payload_length`); asserts bounded iteration, in-bounds advance, and termination on Retry/VN/short. Plus the original positive `bytes_consumed` test at `src/wire/long_packet.zig:918`. |
-| 5 | Transport parameter parser | COVERED | `src/tls/transport_params.zig:619` `fuzz: transport_params decode never panics and respects RFC bounds` — drives `Params.decode` with arbitrary bytes; asserts RFC 9000 §18.2 bounds and encode→decode round-trip stability. Plus the deterministic `tests/fuzz_smoke.zig:217/276` round-trip and malformed-buffer sweeps. |
+| 5 | Transport parameter parser | COVERED | `src/tls/transport_params.zig:619` `fuzz: transport_params decode never panics and respects RFC bounds` — drives `Params.decode` with arbitrary bytes; asserts RFC 9000 §18.2 bounds and encode→decode round-trip stability. The former `tests/fuzz_smoke.zig` round-trip and malformed-buffer sweeps were lifted into in-source `fuzzTransportParams` (commit `52abdd9`). |
 | 6 | Retry token parser | COVERED | `src/conn/retry_token.zig:562` `fuzz: retry_token validate never panics` — drives `validate` against arbitrary bytes with fuzzer-chosen expected fields under the v2 AES-GCM-256 format (commit `474a71b`); asserts no panic, never `.valid` for unauthentic input. Plus the existing 3 negative tests at `src/conn/retry_token.zig:178,197,230` (wrong address, wrong CIDs, wrong version, expired, future, malformed prefix). |
 | 7 | ACK frame parser | COVERED | The ACK frame is decoded inside `frame.decode` (covered). The ACK *range tracker* has a coverage-guided harness at `src/conn/ack_tracker.zig:512` `fuzz: ack_tracker range-list invariants` — drives `add` / `addPacket` / `addPacketDelayed` / `markAckSent` / `promoteDelayedAck` / `toAckFrameLimitedRanges` with arbitrary u64 PNs; asserts sorted-disjoint range list, `range_count <= max_ranges`, `largest >= smallest` per interval, no overlap. Plus `decode rejects ACK with overlapping ranges` at `src/frame/decode.zig:751` (commit `0baa170`) and the `max_incoming_ack_ranges = 256` cap at `src/frame/decode.zig:64` (commit `3a64820`). |
 | 8 | CRYPTO frame reassembly | COVERED | `src/conn/state.zig:13193` `fuzz: Connection.handleCrypto reassembly invariants` (commit `9fb1142`) — drives `Connection.handleCrypto` via `dispatchFrames` with arbitrary offsets / lengths / PN-spaces under a tight `max_connection_memory = 1024` cap; asserts no panic, `bytes_resident` cap, monotonic `crypto_recv_offset[idx]` per level, duplicate offsets don't push residency higher. Reassembly unit tests at `src/conn/state.zig:8667, 8711, 8735` retained. |
-| 9 | STREAM frame parser | COVERED | The frame-level decoder is in `src/frame/decode.zig` (covered). `src/conn/state.zig:13285` `fuzz: Connection.handleStream reassembly invariants` (commit `9fb1142`) drives `Connection.handleStream` with fuzzer-chosen stream IDs / offsets / lengths / FIN flag; asserts `bytes_resident` cap, monotonic `read_offset`, well-formed send-side state after RESET_STREAM, `final_size` invariants. Plus the deterministic shuffle test in `tests/fuzz_smoke.zig:435` and the offset/overlap unit tests in `src/conn/recv_stream.zig`. |
+| 9 | STREAM frame parser | COVERED | The frame-level decoder is in `src/frame/decode.zig` (covered). `src/conn/state.zig:13285` `fuzz: Connection.handleStream reassembly invariants` (commit `9fb1142`) drives `Connection.handleStream` with fuzzer-chosen stream IDs / offsets / lengths / FIN flag; asserts `bytes_resident` cap, monotonic `read_offset`, well-formed send-side state after RESET_STREAM, `final_size` invariants. The former `tests/fuzz_smoke.zig` shuffle test was lifted into the recv_stream in-source fuzz callback (commit `52abdd9`); offset/overlap unit tests in `src/conn/recv_stream.zig` retained. |
 | 10 | HTTP/3 frame parser | MISSING (no impl) | nullq has no HTTP/3 layer. |
 | 11 | HTTP/3 SETTINGS parser | MISSING (no impl) | nullq has no HTTP/3 layer. |
 | 12 | HTTP/3 request field validator | MISSING (no impl) | nullq has no HTTP/3 layer. |

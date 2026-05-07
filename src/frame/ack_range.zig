@@ -247,8 +247,78 @@ test "rangesEncodedLen matches writeRanges output" {
 //        First ACK Range plus one per `(gap, length)` pair). Anything
 //        else is a counter or reassembly bug.
 
+// Seed corpus drives both adversarial and generative passes of the
+// iterator. Smith consumption (must match `fuzzAckRangeIterator`):
+//   adversarial: value(u64) largest_acked, value(u64) first_range,
+//     valueRangeAtMost(u8, 0, 32) range_count, slice(...) ranges_bytes
+//   generative:  value(u64) largest_acked', value(u64) first_range',
+//     valueRangeAtMost(u8, 0, 6) wanted, then per-range value(u64)
+//     gap, value(u64) length
 test "fuzz: ack_range Iterator descending invariants" {
-    try std.testing.fuzz({}, fuzzAckRangeIterator, .{});
+    try std.testing.fuzz({}, fuzzAckRangeIterator, .{
+        .corpus = &.{
+            // Minimal entry: all zeros — adversarial pass yields one
+            // interval [0..0] then null; generative pass yields one
+            // (largest_acked=100, first_range=0).
+            "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // largest_acked = 0
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // first_range = 0
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // range_count = 0
+                "\x00\x00\x00\x00" ++ // ranges_bytes len = 0
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen largest_acked
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen first_range
+                "\x00\x00\x00\x00\x00\x00\x00\x00", // wanted = 0
+            // range_count=1 with gap=0, length=0 → strict-descending
+            // (cursor underflow guards). Generative wanted=1.
+            "\x64\x00\x00\x00\x00\x00\x00\x00" ++ // largest_acked = 100
+                "\x05\x00\x00\x00\x00\x00\x00\x00" ++ // first_range = 5
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++ // range_count = 1
+                "\x02\x00\x00\x00\x00\x00" ++ // ranges_bytes = "\x00\x00"
+                "\xe8\x03\x00\x00\x00\x00\x00\x00" ++ // gen largest_acked
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++ // gen first_range
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++ // wanted = 1
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gap = 0
+                "\x00\x00\x00\x00\x00\x00\x00\x00", // length = 0
+            // Deep descent: 5 ranges. Adversarial path mostly fails on
+            // arbitrary bytes but the iterator will stop cleanly.
+            "\xe8\x03\x00\x00\x00\x00\x00\x00" ++ // largest_acked = 1000
+                "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ // first_range = 10
+                "\x05\x00\x00\x00\x00\x00\x00\x00" ++ // range_count = 5
+                "\x0a\x00\x00\x00" ++ "\x01\x02\x01\x03\x02\x01\x04\x02\x01\x00" ++
+                "\xe8\x03\x00\x00\x00\x00\x00\x00" ++ // gen largest_acked
+                "\x05\x00\x00\x00\x00\x00\x00\x00" ++ // gen first_range
+                "\x05\x00\x00\x00\x00\x00\x00\x00" ++ // wanted = 5
+                "\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00" ++
+                "\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00",
+            // first_range = largest_acked: smallest of First ACK Range = 0
+            "\x05\x00\x00\x00\x00\x00\x00\x00" ++ // largest_acked = 5
+                "\x05\x00\x00\x00\x00\x00\x00\x00" ++ // first_range = 5
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // range_count = 0
+                "\x00\x00\x00\x00" ++ // ranges_bytes empty
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen largest_acked = 100
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen first_range = 0
+                "\x00\x00\x00\x00\x00\x00\x00\x00", // wanted = 0
+            // first_range > largest_acked: triggers Error.InvalidLength on first next()
+            "\x64\x00\x00\x00\x00\x00\x00\x00" ++ // largest_acked = 100
+                "\xc8\x00\x00\x00\x00\x00\x00\x00" ++ // first_range = 200
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // range_count = 0
+                "\x00\x00\x00\x00" ++ // ranges_bytes empty
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen largest_acked
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen first_range
+                "\x00\x00\x00\x00\x00\x00\x00\x00", // wanted = 0
+            // Underflow on later range: largest=10, first_range=2 → [8..10],
+            // gap=10 → next_largest = 8 - 10 - 2 → InvalidLength
+            "\x0a\x00\x00\x00\x00\x00\x00\x00" ++ // largest_acked = 10
+                "\x02\x00\x00\x00\x00\x00\x00\x00" ++ // first_range = 2
+                "\x01\x00\x00\x00\x00\x00\x00\x00" ++ // range_count = 1
+                "\x02\x00\x00\x00" ++ "\x0a\x00" ++ // ranges_bytes = gap=10, length=0
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen largest_acked
+                "\x00\x00\x00\x00\x00\x00\x00\x00" ++ // gen first_range
+                "\x00\x00\x00\x00\x00\x00\x00\x00", // wanted = 0
+        },
+    });
 }
 
 fn fuzzAckRangeIterator(_: void, smith: *std.testing.Smith) anyerror!void {
