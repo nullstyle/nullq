@@ -880,3 +880,130 @@ fn fuzzHeaderParse(_: void, smith: *std.testing.Smith) anyerror!void {
         },
     }
 }
+
+// Build a well-formed `Header` from corpus bytes (covering all six
+// variants: Initial, ZeroRtt, Handshake, Retry, OneRtt,
+// VersionNegotiation), encode it, parse the bytes back, and assert
+// the re-encoded bytes match the original byte-for-byte. This is the
+// generative-input counterpart to `fuzzHeaderParse` above (which
+// only feeds malformed bytes into `parse`).
+//
+// Properties:
+//   - `encode` accepts every well-formed Header we construct.
+//   - `parse` recovers the same wire-shape (re-encode is byte-equal).
+//   - `pn_offset` lies inside the encoded buffer.
+
+test "fuzz: header encode/parse canonical round-trip" {
+    try std.testing.fuzz({}, fuzzHeaderRoundTrip, .{});
+}
+
+fn fuzzHeaderRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {
+    var dcid_buf: [max_cid_len]u8 = undefined;
+    smith.bytes(&dcid_buf);
+    const dcid_len = smith.valueRangeAtMost(u8, 0, max_cid_len);
+    const dcid = ConnId.fromSlice(dcid_buf[0..dcid_len]) catch return;
+
+    var scid_buf: [max_cid_len]u8 = undefined;
+    smith.bytes(&scid_buf);
+    const scid_len = smith.valueRangeAtMost(u8, 0, max_cid_len);
+    const scid = ConnId.fromSlice(scid_buf[0..scid_len]) catch return;
+
+    var token_buf: [48]u8 = undefined;
+    smith.bytes(&token_buf);
+    const token_len = smith.valueRangeAtMost(u8, 0, token_buf.len);
+    const token = token_buf[0..token_len];
+
+    var integrity_tag: [16]u8 = undefined;
+    smith.bytes(&integrity_tag);
+
+    // VersionNegotiation supported_versions is a non-zero multiple of
+    // 4 bytes (RFC 8999 §6). Generate 1..3 versions from corpus.
+    var versions_buf: [12]u8 = undefined;
+    smith.bytes(&versions_buf);
+    const versions_count = smith.valueRangeAtMost(u8, 1, 3);
+    const versions_bytes = versions_buf[0 .. @as(usize, versions_count) * 4];
+
+    // PN length and PN value: PN is 1..4 bytes, value MUST fit.
+    const pn_length: PnLength = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => .one,
+        1 => .two,
+        2 => .three,
+        else => .four,
+    };
+    const pn_mask: u64 = (@as(u64, 1) << @intCast(pn_length.bytes() * 8)) - 1;
+    const pn_truncated = smith.value(u64) & pn_mask;
+    const reserved_bits: u2 = @intCast(smith.valueRangeAtMost(u8, 0, 3));
+
+    const header: Header = switch (smith.valueRangeAtMost(u8, 0, 5)) {
+        0 => .{ .initial = .{
+            .version = 1,
+            .dcid = dcid,
+            .scid = scid,
+            .token = token,
+            .pn_length = pn_length,
+            .pn_truncated = pn_truncated,
+            // payload_length is the on-wire Length field; minimum is
+            // PN bytes plus an AEAD tag (16). Anything plausible is
+            // fine — encode just writes it as a varint.
+            .payload_length = 16 + @as(u64, pn_length.bytes()),
+            .reserved_bits = reserved_bits,
+        } },
+        1 => .{ .zero_rtt = .{
+            .version = 1,
+            .dcid = dcid,
+            .scid = scid,
+            .pn_length = pn_length,
+            .pn_truncated = pn_truncated,
+            .payload_length = 32 + @as(u64, pn_length.bytes()),
+            .reserved_bits = reserved_bits,
+        } },
+        2 => .{ .handshake = .{
+            .version = 1,
+            .dcid = dcid,
+            .scid = scid,
+            .pn_length = pn_length,
+            .pn_truncated = pn_truncated,
+            .payload_length = 24 + @as(u64, pn_length.bytes()),
+            .reserved_bits = reserved_bits,
+        } },
+        3 => .{ .retry = .{
+            .version = 1,
+            .dcid = dcid,
+            .scid = scid,
+            .retry_token = token,
+            .integrity_tag = integrity_tag,
+            .unused_bits = @intCast(smith.valueRangeAtMost(u8, 0, 15)),
+        } },
+        4 => .{ .one_rtt = .{
+            .dcid = dcid,
+            .spin_bit = smith.valueRangeAtMost(u8, 0, 1) == 1,
+            .reserved_bits = reserved_bits,
+            .key_phase = smith.valueRangeAtMost(u8, 0, 1) == 1,
+            .pn_length = pn_length,
+            .pn_truncated = pn_truncated,
+        } },
+        else => .{ .version_negotiation = .{
+            .unused_bits = @intCast(smith.valueRangeAtMost(u8, 0, 127)),
+            .dcid = dcid,
+            .scid = scid,
+            .versions_bytes = versions_bytes,
+        } },
+    };
+
+    var encoded: [256]u8 = undefined;
+    const encoded_len = encode(&encoded, header) catch return;
+
+    // For short headers the parser needs to know the local DCID
+    // length out-of-band (it isn't on the wire). For long headers
+    // the argument is ignored.
+    const short_dcid_len: u8 = switch (header) {
+        .one_rtt => |o| o.dcid.len,
+        else => 0,
+    };
+    const parsed = try parse(encoded[0..encoded_len], short_dcid_len);
+    try std.testing.expect(parsed.pn_offset <= encoded_len);
+
+    var reencoded: [256]u8 = undefined;
+    const reencoded_len = try encode(&reencoded, parsed.header);
+    try std.testing.expectEqualSlices(u8, encoded[0..encoded_len], reencoded[0..reencoded_len]);
+}

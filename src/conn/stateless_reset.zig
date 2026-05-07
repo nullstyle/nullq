@@ -166,3 +166,45 @@ test "generateKey produces non-zero, non-equal keys on successive calls" {
     try testing.expect(!std.mem.eql(u8, &k1, &zero));
     try testing.expect(!std.mem.eql(u8, &k1, &k2));
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `derive` with arbitrary CIDs (≤ 20 bytes, the QUIC v1 max)
+// and assert the two cryptographic properties the construction must
+// satisfy: determinism (same inputs → same output) and non-collision
+// (different CIDs under the same key → different outputs in at least
+// one byte). Properties:
+//
+// - No panic, no error from the HMAC primitive on any byte input.
+// - `derive(key, cid_a) == derive(key, cid_a)` (determinism).
+// - If `cid_a != cid_b`, `derive(key, cid_b) != derive(key, cid_a)`.
+// - Output is exactly `token_len` (16) bytes.
+
+test "fuzz: stateless_reset derive determinism and uniqueness" {
+    try std.testing.fuzz({}, fuzzDerive, .{});
+}
+
+fn fuzzDerive(_: void, smith: *std.testing.Smith) anyerror!void {
+    const fuzz_key: Key = @splat(0x42);
+    const max_cid_len: usize = 20;
+
+    var cid_a_buf: [max_cid_len]u8 = undefined;
+    const cid_a_len: usize = smith.valueRangeAtMost(u8, 0, @intCast(max_cid_len));
+    smith.bytes(cid_a_buf[0..cid_a_len]);
+    const cid_a = cid_a_buf[0..cid_a_len];
+
+    var cid_b_buf: [max_cid_len]u8 = undefined;
+    const cid_b_len: usize = smith.valueRangeAtMost(u8, 0, @intCast(max_cid_len));
+    smith.bytes(cid_b_buf[0..cid_b_len]);
+    const cid_b = cid_b_buf[0..cid_b_len];
+
+    const t1 = try derive(&fuzz_key, cid_a);
+    const t2 = try derive(&fuzz_key, cid_a);
+    try testing.expectEqualSlices(u8, &t1, &t2);
+    try testing.expectEqual(@as(usize, token_len), t1.len);
+
+    if (!std.mem.eql(u8, cid_a, cid_b)) {
+        const t3 = try derive(&fuzz_key, cid_b);
+        try testing.expect(!std.mem.eql(u8, &t1, &t3));
+    }
+}

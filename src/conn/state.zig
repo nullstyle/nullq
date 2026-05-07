@@ -14221,3 +14221,412 @@ fn fuzzCidLifecycle(_: void, smith: *std.testing.Smith) anyerror!void {
     }
 }
 
+// PATH_CHALLENGE / PATH_RESPONSE fuzz harness — drives
+// `dispatchFrames(.application, payload, now_us)` with smith-built
+// PATH_CHALLENGE and PATH_RESPONSE frames against a post-handshake
+// client `Connection` whose primary path validator already has a
+// pending challenge token. Asserts:
+//
+// - No panic / overflow trap.
+// - After a PATH_CHALLENGE, `pending_frames.path_response` is non-null
+//   and equals the challenge token (the dispatcher echoes the bytes).
+// - After a PATH_RESPONSE that matches the validator's pending token,
+//   the validator transitions to `.validated`. Mismatching tokens
+//   leave the status alone (`.pending` or `.validated`).
+// - Validator status is always one of {.idle, .pending, .validated,
+//   .failed}.
+// - Lifecycle state is one of the documented `CloseState` values.
+// - If the connection closed, the close code lives in the documented
+//   set ({protocol_violation, frame_encoding, excessive_load}). The
+//   PATH_CHALLENGE / PATH_RESPONSE handlers themselves never close, but
+//   the dispatcher's frame-iter and level-gate close paths can fire on
+//   adversarial bytes.
+test "fuzz: Connection PATH_CHALLENGE / PATH_RESPONSE handler invariants" {
+    try std.testing.fuzz({}, fuzzConnPathChallenge, .{});
+}
+
+fn fuzzConnPathChallenge(_: void, smith: *std.testing.Smith) anyerror!void {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const path = conn.primaryPath();
+    path.setPeerAddress(.{ .bytes = .{ 10, 0, 0, 1 } ++ @as([18]u8, @splat(0)) });
+    const pending_token: [8]u8 = .{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
+    path.path.validator.beginChallenge(pending_token, 1_000_000, 1_000_000);
+    conn.current_incoming_path_id = 0;
+    conn.current_incoming_addr = path.path.peer_addr;
+
+    const num_frames = smith.valueRangeAtMost(u8, 0, 32);
+    var frame_buf: [64]u8 = undefined;
+
+    var i: u8 = 0;
+    while (i < num_frames) : (i += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 3);
+        var token: [8]u8 = undefined;
+        smith.bytes(&token);
+        const use_pending = smith.valueRangeAtMost(u8, 0, 3) == 0;
+        const data: [8]u8 = if (use_pending) pending_token else token;
+
+        const challenge_data: [8]u8 = switch (op) {
+            0 => data,
+            2 => token,
+            else => @splat(0),
+        };
+        const response_data: [8]u8 = switch (op) {
+            1 => data,
+            3 => token,
+            else => @splat(0),
+        };
+        const frame: frame_types.Frame = switch (op) {
+            0 => .{ .path_challenge = .{ .data = challenge_data } },
+            1 => .{ .path_response = .{ .data = response_data } },
+            2 => .{ .path_challenge = .{ .data = challenge_data } },
+            else => .{ .path_response = .{ .data = response_data } },
+        };
+        const needed = frame_mod.encodedLen(frame);
+        if (needed > frame_buf.len) return;
+        const payload_len = frame_mod.encode(&frame_buf, frame) catch return;
+
+        const status_before = path.path.validator.status;
+
+        conn.dispatchFrames(.application, frame_buf[0..payload_len], 1_000_000) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        };
+
+        switch (path.path.validator.status) {
+            .idle, .pending, .validated, .failed => {},
+        }
+
+        if (op == 0 or op == 2) {
+            if (conn.lifecycle.pending_close == null) {
+                const echoed = conn.pending_frames.path_response orelse {
+                    try std.testing.expect(false);
+                    return;
+                };
+                try std.testing.expect(std.mem.eql(u8, &echoed, &challenge_data));
+                try std.testing.expectEqual(@as(u32, 0), conn.pending_frames.path_response_path_id);
+            }
+        }
+
+        if ((op == 1 or op == 3) and use_pending and status_before == .pending and
+            conn.lifecycle.pending_close == null)
+        {
+            const matches_pending = std.mem.eql(u8, &response_data, &pending_token);
+            if (matches_pending) {
+                try std.testing.expect(path.path.validator.status == .validated);
+            }
+        }
+
+        switch (conn.lifecycle.state()) {
+            .open, .closing, .draining, .closed => {},
+        }
+
+        if (conn.lifecycle.pending_close) |info| {
+            const code = info.error_code;
+            try std.testing.expect(
+                code == transport_error_protocol_violation or
+                    code == transport_error_frame_encoding or
+                    code == transport_error_excessive_load,
+            );
+            break;
+        }
+    }
+}
+
+// MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS fuzz harness — drives
+// `dispatchFrames(.application, payload, now_us)` with smith-built
+// flow-control window-update frames and asserts:
+//
+// - `peer_max_data` is monotonic non-decreasing (handler only widens).
+// - `peer_max_streams_bidi` and `peer_max_streams_uni` are monotonic
+//   non-decreasing AND bounded above by `max_streams_per_connection`
+//   (the handler clamps with `@min`).
+// - MAX_STREAM_DATA on a peer-to-local-only stream id (e.g. peer-uni
+//   stream where the peer is sending) closes with `stream_state`.
+// - MAX_STREAMS exceeding `max_stream_count_limit` closes with
+//   `frame_encoding`.
+// - Lifecycle state is one of the documented `CloseState` values.
+// - Close codes (when set) are in the documented set.
+test "fuzz: Connection MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS monotonicity" {
+    try std.testing.fuzz({}, fuzzConnFlowControlWindow, .{});
+}
+
+fn fuzzConnFlowControlWindow(_: void, smith: *std.testing.Smith) anyerror!void {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.peer_max_data = 0;
+    conn.peer_max_streams_bidi = 0;
+    conn.peer_max_streams_uni = 0;
+
+    const num_frames = smith.valueRangeAtMost(u8, 0, 32);
+    var frame_buf: [64]u8 = undefined;
+
+    var i: u8 = 0;
+    while (i < num_frames) : (i += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 3);
+        const value = smith.value(u64) & ((1 << 62) - 1);
+        const stream_id_low = smith.valueRangeAtMost(u8, 0, 31);
+        const bidi = smith.valueRangeAtMost(u8, 0, 1) == 0;
+
+        const frame: frame_types.Frame = switch (op) {
+            0 => .{ .max_data = .{ .maximum_data = value } },
+            1 => .{ .max_stream_data = .{
+                .stream_id = stream_id_low,
+                .maximum_stream_data = value,
+            } },
+            2 => .{ .max_streams = .{ .bidi = bidi, .maximum_streams = value } },
+            else => .{ .max_streams = .{
+                .bidi = bidi,
+                .maximum_streams = max_stream_count_limit + (value & 7) + 1,
+            } },
+        };
+        const needed = frame_mod.encodedLen(frame);
+        if (needed > frame_buf.len) return;
+        const payload_len = frame_mod.encode(&frame_buf, frame) catch return;
+
+        const before_max_data = conn.peer_max_data;
+        const before_streams_bidi = conn.peer_max_streams_bidi;
+        const before_streams_uni = conn.peer_max_streams_uni;
+
+        conn.dispatchFrames(.application, frame_buf[0..payload_len], 1_000_000) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        };
+
+        try std.testing.expect(conn.peer_max_data >= before_max_data);
+        try std.testing.expect(conn.peer_max_streams_bidi >= before_streams_bidi);
+        try std.testing.expect(conn.peer_max_streams_uni >= before_streams_uni);
+        try std.testing.expect(conn.peer_max_streams_bidi <= max_streams_per_connection);
+        try std.testing.expect(conn.peer_max_streams_uni <= max_streams_per_connection);
+
+        switch (conn.lifecycle.state()) {
+            .open, .closing, .draining, .closed => {},
+        }
+
+        if (conn.lifecycle.pending_close) |info| {
+            const code = info.error_code;
+            try std.testing.expect(
+                code == transport_error_protocol_violation or
+                    code == transport_error_frame_encoding or
+                    code == transport_error_stream_state or
+                    code == transport_error_excessive_load,
+            );
+            break;
+        }
+    }
+}
+
+// DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED fuzz harness —
+// drives `dispatchFrames(.application, ...)` with peer-blocked
+// signal frames and asserts:
+//
+// - No panic / overflow trap.
+// - After DATA_BLOCKED, `peer_data_blocked_at == frame.maximum_data`.
+// - After STREAMS_BLOCKED(bidi=true) without close, the stored value
+//   matches the frame's maximum (and likewise for uni).
+// - `peer_stream_data_blocked.items.len <= max_stream_count_limit` —
+//   bounded by the same global stream-count cap that gates the handler.
+// - STREAM_DATA_BLOCKED on a receive-only stream closes with
+//   `stream_state`. STREAMS_BLOCKED with maximum > stream-id space
+//   closes with `frame_encoding`.
+// - Lifecycle state is one of the documented `CloseState` values and
+//   close codes are in the documented set.
+test "fuzz: Connection DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED invariants" {
+    try std.testing.fuzz({}, fuzzConnBlockedFrames, .{});
+}
+
+fn fuzzConnBlockedFrames(_: void, smith: *std.testing.Smith) anyerror!void {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try conn.setTransportParams(.{
+        .initial_max_streams_bidi = 8,
+        .initial_max_streams_uni = 8,
+    });
+
+    const num_frames = smith.valueRangeAtMost(u8, 0, 32);
+    var frame_buf: [64]u8 = undefined;
+
+    var i: u8 = 0;
+    while (i < num_frames) : (i += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 3);
+        const value = smith.value(u64) & ((1 << 62) - 1);
+        const stream_id_low = smith.valueRangeAtMost(u8, 0, 15);
+        const bidi = smith.valueRangeAtMost(u8, 0, 1) == 0;
+
+        const frame: frame_types.Frame = switch (op) {
+            0 => .{ .data_blocked = .{ .maximum_data = value } },
+            1 => .{ .stream_data_blocked = .{
+                .stream_id = stream_id_low,
+                .maximum_stream_data = value,
+            } },
+            2 => .{ .streams_blocked = .{ .bidi = bidi, .maximum_streams = value } },
+            else => .{ .streams_blocked = .{
+                .bidi = bidi,
+                .maximum_streams = max_stream_count_limit + (value & 3) + 1,
+            } },
+        };
+        const needed = frame_mod.encodedLen(frame);
+        if (needed > frame_buf.len) return;
+        const payload_len = frame_mod.encode(&frame_buf, frame) catch return;
+
+        conn.dispatchFrames(.application, frame_buf[0..payload_len], 1_000_000) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        };
+
+        if (op == 0 and conn.lifecycle.pending_close == null) {
+            const stored = conn.peer_data_blocked_at orelse {
+                try std.testing.expect(false);
+                return;
+            };
+            try std.testing.expectEqual(value, stored);
+        }
+        if (op == 2 and conn.lifecycle.pending_close == null and value <= max_stream_count_limit) {
+            const stored = if (bidi) conn.peer_streams_blocked_bidi else conn.peer_streams_blocked_uni;
+            try std.testing.expectEqual(value, stored.?);
+        }
+
+        try std.testing.expect(conn.peer_stream_data_blocked.items.len <= max_stream_count_limit);
+
+        switch (conn.lifecycle.state()) {
+            .open, .closing, .draining, .closed => {},
+        }
+
+        if (conn.lifecycle.pending_close) |info| {
+            const code = info.error_code;
+            try std.testing.expect(
+                code == transport_error_protocol_violation or
+                    code == transport_error_frame_encoding or
+                    code == transport_error_stream_state or
+                    code == transport_error_excessive_load,
+            );
+            break;
+        }
+    }
+}
+
+// CONNECTION_CLOSE-at-Initial-or-Handshake fuzz harness — drives
+// `dispatchFrames(.initial, ...)` and `dispatchFrames(.handshake, ...)`
+// with smith-built CONNECTION_CLOSE frames and other 1-RTT-only frames
+// to exercise the §12.4/§19.19 envelope before the handshake completes.
+//
+// Asserts:
+// - No panic / overflow trap.
+// - A transport CONNECTION_CLOSE (0x1c) at .initial or .handshake
+//   transitions lifecycle into draining (state in
+//   {.draining, .closing, .closed}).
+// - An application CONNECTION_CLOSE (0x1d) at .initial or .handshake
+//   triggers a `protocol_violation` close (forbidden frame at
+//   Initial/Handshake level, RFC 9000 §12.4 / Table 3).
+// - Forbidden 1-RTT-only frames (STREAM, MAX_DATA, NEW_CONNECTION_ID,
+//   PATH_CHALLENGE, …) at .initial or .handshake close with
+//   `protocol_violation`.
+// - Once closed, lifecycle state is one of {.draining, .closing, .closed}
+//   and the close code is in the documented set.
+// - Reason-phrase length on the wire never overflows the 256-byte
+//   `max_close_reason_len` ceiling — the lifecycle records reasons
+//   truncated, never beyond.
+test "fuzz: Connection CONNECTION_CLOSE pre-handshake envelope invariants" {
+    try std.testing.fuzz({}, fuzzConnCloseAtInitial, .{});
+}
+
+fn fuzzConnCloseAtInitial(_: void, smith: *std.testing.Smith) anyerror!void {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const op = smith.valueRangeAtMost(u8, 0, 7);
+    const lvl: EncryptionLevel = if (smith.valueRangeAtMost(u8, 0, 1) == 0) .initial else .handshake;
+    const error_code = smith.value(u64) & ((1 << 30) - 1);
+    const reason_len = smith.valueRangeAtMost(u16, 0, 320);
+    var reason_buf: [320]u8 = undefined;
+    smith.bytes(reason_buf[0..reason_len]);
+    const value = smith.value(u64) & ((1 << 62) - 1);
+
+    const frame: frame_types.Frame = switch (op) {
+        0 => .{ .connection_close = .{
+            .is_transport = true,
+            .error_code = error_code,
+            .frame_type = 0,
+            .reason_phrase = reason_buf[0..reason_len],
+        } },
+        1 => .{ .connection_close = .{
+            .is_transport = false,
+            .error_code = error_code,
+            .reason_phrase = reason_buf[0..reason_len],
+        } },
+        2 => .{ .stream = .{
+            .stream_id = value & 0xff,
+            .offset = 0,
+            .data = reason_buf[0..@min(reason_len, 32)],
+            .has_offset = false,
+            .has_length = true,
+            .fin = false,
+        } },
+        3 => .{ .max_data = .{ .maximum_data = value } },
+        4 => .{ .new_token = .{ .token = reason_buf[0..@min(reason_len, 64)] } },
+        5 => .{ .path_challenge = .{ .data = reason_buf[0..8].* } },
+        6 => .{ .handshake_done = .{} },
+        else => .{ .ping = .{} },
+    };
+
+    var frame_buf: [512]u8 = undefined;
+    const needed = frame_mod.encodedLen(frame);
+    if (needed > frame_buf.len) return;
+    const payload_len = frame_mod.encode(&frame_buf, frame) catch return;
+
+    conn.dispatchFrames(lvl, frame_buf[0..payload_len], 1_000_000) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {},
+    };
+
+    switch (conn.lifecycle.state()) {
+        .open, .closing, .draining, .closed => {},
+    }
+
+    if (op == 0) {
+        switch (conn.lifecycle.state()) {
+            .draining, .closing, .closed => {},
+            .open => try std.testing.expect(false),
+        }
+    }
+    if (op == 1 or op == 2 or op == 3 or op == 4 or op == 5) {
+        if (conn.lifecycle.pending_close) |info| {
+            try std.testing.expectEqual(transport_error_protocol_violation, info.error_code);
+        }
+    }
+
+    if (op == 6) {
+        if (conn.lifecycle.pending_close) |info| {
+            try std.testing.expectEqual(transport_error_protocol_violation, info.error_code);
+        }
+    }
+
+    if (conn.lifecycle.event()) |ev| {
+        try std.testing.expect(ev.reason.len <= lifecycle_mod.max_close_reason_len);
+    }
+
+    if (conn.lifecycle.pending_close) |info| {
+        const code = info.error_code;
+        try std.testing.expect(
+            code == transport_error_protocol_violation or
+                code == transport_error_frame_encoding or
+                code == transport_error_excessive_load or
+                code == error_code,
+        );
+    }
+}

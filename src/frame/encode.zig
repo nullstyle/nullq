@@ -463,3 +463,209 @@ test "encode rejects buffer too small" {
         } }),
     );
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Build a `Frame` from corpus bytes (covering all 33 wire-shape
+// variants nullq parses or emits: PADDING, PING, HANDSHAKE_DONE,
+// RESET_STREAM, STOP_SENDING, CRYPTO, NEW_TOKEN, two STREAM shapes
+// (LEN-prefixed and implicit-tail), two ACK shapes (with/without
+// ECN), MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS, DATA_BLOCKED,
+// STREAM_DATA_BLOCKED, STREAMS_BLOCKED, NEW_CONNECTION_ID,
+// RETIRE_CONNECTION_ID, PATH_CHALLENGE, PATH_RESPONSE, two
+// CONNECTION_CLOSE shapes (transport vs. application), DATAGRAM,
+// PATH_ACK, PATH_ABANDON, PATH_STATUS_BACKUP/AVAILABLE,
+// PATH_NEW_CONNECTION_ID, PATH_RETIRE_CONNECTION_ID, MAX_PATH_ID,
+// PATHS_BLOCKED, PATH_CIDS_BLOCKED), then drive the encode → decode →
+// re-encode pipeline. Properties:
+//
+// - No panic during encode or decode.
+// - `decode` consumes exactly `bytes_consumed == encoded_len`.
+// - The decoded frame re-encodes byte-for-byte to the original bytes
+//   (canonical round-trip — varint length agreement plus payload
+//   preservation).
+
+test "fuzz: frame encode/decode canonical round-trip" {
+    try std.testing.fuzz({}, fuzzFrameRoundTrip, .{});
+}
+
+fn fuzzFrameRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {
+    const decode_mod = @import("decode.zig");
+    const ack_range_mod = @import("ack_range.zig");
+
+    var payload_buf: [96]u8 = undefined;
+    smith.bytes(&payload_buf);
+    const payload_len = smith.valueRangeAtMost(u8, 0, payload_buf.len);
+    const payload = payload_buf[0..payload_len];
+
+    var ranges_buf: [16]u8 = undefined;
+    const range_count: u64 = if (smith.valueRangeAtMost(u8, 0, 1) == 0) 0 else 1;
+    const ranges_len = if (range_count == 0) 0 else try ack_range_mod.writeRanges(
+        &ranges_buf,
+        &.{.{ .gap = 1, .length = 0 }},
+    );
+
+    var cid_buf: [20]u8 = undefined;
+    smith.bytes(&cid_buf);
+    const cid_len = smith.valueRangeAtMost(u8, 0, 20);
+    const cid = wire_header.ConnId.fromSlice(cid_buf[0..cid_len]) catch return;
+
+    var reset_token: [16]u8 = undefined;
+    smith.bytes(&reset_token);
+
+    const value: u64 = smith.value(u64) & varint.max_value;
+    const path_id: u32 = smith.valueRangeAtMost(u8, 0, 255);
+
+    // PATH_CHALLENGE / PATH_RESPONSE carry an 8-byte fixed payload.
+    // Carve two non-overlapping windows out of `reset_token` so a
+    // single corpus draw covers both.
+    const challenge_data: [8]u8 = reset_token[0..8].*;
+    const response_data: [8]u8 = reset_token[8..16].*;
+
+    const frame: Frame = switch (smith.valueRangeAtMost(u8, 0, 32)) {
+        0 => .{ .padding = .{ .count = smith.valueRangeAtMost(u8, 1, 16) } },
+        1 => .{ .ping = .{} },
+        2 => .{ .handshake_done = .{} },
+        3 => .{ .reset_stream = .{
+            .stream_id = value,
+            .application_error_code = value >> 2,
+            .final_size = value >> 3,
+        } },
+        4 => .{ .stop_sending = .{
+            .stream_id = value,
+            .application_error_code = value >> 4,
+        } },
+        5 => .{ .crypto = .{ .offset = value % 4096, .data = payload } },
+        6 => .{ .new_token = .{ .token = payload } },
+        7 => .{ .stream = .{
+            .stream_id = value,
+            .offset = if (smith.valueRangeAtMost(u8, 0, 1) == 0) 0 else value % 4096,
+            .data = payload,
+            .has_offset = smith.valueRangeAtMost(u8, 0, 1) == 1,
+            .has_length = true,
+            .fin = smith.valueRangeAtMost(u8, 0, 1) == 1,
+        } },
+        8 => .{ .stream = .{
+            .stream_id = value,
+            .data = payload,
+            .has_length = false,
+        } },
+        9 => .{ .ack = .{
+            .largest_acked = 32 + (value % 2048),
+            .ack_delay = value % 1024,
+            .first_range = value % 16,
+            .range_count = range_count,
+            .ranges_bytes = ranges_buf[0..ranges_len],
+            .ecn_counts = null,
+        } },
+        10 => .{ .ack = .{
+            .largest_acked = 32 + (value % 2048),
+            .ack_delay = value % 1024,
+            .first_range = value % 16,
+            .range_count = range_count,
+            .ranges_bytes = ranges_buf[0..ranges_len],
+            .ecn_counts = .{ .ect0 = value % 17, .ect1 = value % 19, .ecn_ce = value % 23 },
+        } },
+        11 => .{ .max_data = .{ .maximum_data = value } },
+        12 => .{ .max_stream_data = .{
+            .stream_id = value >> 1,
+            .maximum_stream_data = value,
+        } },
+        13 => .{ .max_streams = .{
+            .bidi = smith.valueRangeAtMost(u8, 0, 1) == 0,
+            .maximum_streams = value,
+        } },
+        14 => .{ .data_blocked = .{ .maximum_data = value } },
+        15 => .{ .stream_data_blocked = .{
+            .stream_id = value >> 1,
+            .maximum_stream_data = value,
+        } },
+        16 => .{ .streams_blocked = .{
+            .bidi = smith.valueRangeAtMost(u8, 0, 1) == 0,
+            .maximum_streams = value,
+        } },
+        17 => .{ .new_connection_id = .{
+            .sequence_number = value % 64,
+            .retire_prior_to = value % 8,
+            .connection_id = cid,
+            .stateless_reset_token = reset_token,
+        } },
+        18 => .{ .retire_connection_id = .{ .sequence_number = value } },
+        19 => .{ .path_challenge = .{ .data = challenge_data } },
+        20 => .{ .path_response = .{ .data = response_data } },
+        21 => .{ .connection_close = .{
+            .is_transport = true,
+            .error_code = value % 256,
+            .frame_type = 0x06,
+            .reason_phrase = payload,
+        } },
+        22 => .{ .connection_close = .{
+            .is_transport = false,
+            .error_code = value % 256,
+            .reason_phrase = payload,
+        } },
+        23 => .{ .datagram = .{
+            .data = payload,
+            .has_length = smith.valueRangeAtMost(u8, 0, 1) == 0,
+        } },
+        24 => .{ .path_ack = .{
+            .path_id = path_id,
+            .largest_acked = 32 + (value % 2048),
+            .ack_delay = value % 1024,
+            .first_range = value % 16,
+            .range_count = range_count,
+            .ranges_bytes = ranges_buf[0..ranges_len],
+            .ecn_counts = if (smith.valueRangeAtMost(u8, 0, 1) == 0)
+                null
+            else
+                .{ .ect0 = 1, .ect1 = 2, .ecn_ce = 3 },
+        } },
+        25 => .{ .path_abandon = .{
+            .path_id = path_id,
+            .error_code = value,
+        } },
+        26 => .{ .path_status_backup = .{
+            .path_id = path_id,
+            .sequence_number = value,
+        } },
+        27 => .{ .path_status_available = .{
+            .path_id = path_id,
+            .sequence_number = value,
+        } },
+        28 => .{ .path_new_connection_id = .{
+            .path_id = path_id,
+            .sequence_number = value % 64,
+            .retire_prior_to = value % 8,
+            .connection_id = cid,
+            .stateless_reset_token = reset_token,
+        } },
+        29 => .{ .path_retire_connection_id = .{
+            .path_id = path_id,
+            .sequence_number = value,
+        } },
+        30 => .{ .max_path_id = .{ .maximum_path_id = path_id } },
+        31 => .{ .paths_blocked = .{ .maximum_path_id = path_id } },
+        else => .{ .path_cids_blocked = .{
+            .path_id = path_id,
+            .next_sequence_number = value,
+        } },
+    };
+
+    // The DATAGRAM/STREAM implicit-length variants extend to the end
+    // of the encoded buffer when decoded — so the canonical re-encode
+    // is byte-equal only when the original encoding's tail is exactly
+    // the payload. That is true here because we encode each frame
+    // alone (no trailing padding).
+    var enc1: [1024]u8 = undefined;
+    const len1 = encode(&enc1, frame) catch return;
+    // encodedLen agrees with what we just wrote.
+    try std.testing.expectEqual(encodedLen(frame), len1);
+
+    const d = try decode_mod.decode(enc1[0..len1]);
+    try std.testing.expectEqual(len1, d.bytes_consumed);
+
+    var enc2: [1024]u8 = undefined;
+    const len2 = try encode(&enc2, d.frame);
+    try std.testing.expectEqual(encodedLen(d.frame), len2);
+    try std.testing.expectEqualSlices(u8, enc1[0..len1], enc2[0..len2]);
+}

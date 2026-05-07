@@ -224,3 +224,113 @@ test "rangesEncodedLen matches writeRanges output" {
     const written = try writeRanges(&buf, &ranges);
     try std.testing.expectEqual(rangesEncodedLen(&ranges), written);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `Iterator.next` on an `Ack`-shaped record built from
+// fuzzer-chosen inputs. Two modes per fuzz iteration:
+//
+// 1. Adversarial: feed arbitrary `(largest_acked, first_range,
+//    range_count, ranges_bytes)`. Properties:
+//      - No panic, no overflow trap.
+//      - Each emitted interval has `smallest <= largest`.
+//      - Intervals are strictly descending (RFC 9000 §19.3.1).
+//      - Iterator yields at most `range_count + 1` intervals.
+//
+// 2. Generative: build a well-formed `[]AckRange` from the corpus
+//    such that the wire-format arithmetic stays within `u64` and
+//    every interval is non-negative. Properties (in addition to the
+//    above):
+//      - The encoded `(first_range, ranges_bytes)` round-trips
+//        through `writeRanges` -> `iter` losslessly.
+//      - Iterator emits exactly `count + 1` intervals (one for the
+//        First ACK Range plus one per `(gap, length)` pair). Anything
+//        else is a counter or reassembly bug.
+
+test "fuzz: ack_range Iterator descending invariants" {
+    try std.testing.fuzz({}, fuzzAckRangeIterator, .{});
+}
+
+fn fuzzAckRangeIterator(_: void, smith: *std.testing.Smith) anyerror!void {
+    // ---- adversarial pass ----
+    {
+        const largest_acked = smith.value(u64) & varint.max_value;
+        const first_range = smith.value(u64) & varint.max_value;
+        const range_count: u64 = smith.valueRangeAtMost(u8, 0, 32);
+
+        var ranges_buf: [256]u8 = undefined;
+        const ranges_len = smith.slice(&ranges_buf);
+
+        var it = Iterator{
+            .largest_acked = largest_acked,
+            .first_range = first_range,
+            .range_count = range_count,
+            .ranges_bytes = ranges_buf[0..ranges_len],
+        };
+
+        var emitted: u64 = 0;
+        var prev: ?Interval = null;
+        const cap = range_count + 1;
+        while (emitted < cap + 1) {
+            const maybe = it.next() catch break;
+            if (maybe == null) break;
+            const cur = maybe.?;
+            try std.testing.expect(cur.smallest <= cur.largest);
+            if (prev) |p| {
+                try std.testing.expect(cur.largest < p.smallest);
+            }
+            prev = cur;
+            emitted += 1;
+        }
+        try std.testing.expect(emitted <= cap);
+    }
+
+    // ---- generative pass: build a well-formed ACK and assert the
+    // strong "emitted == count + 1" oracle ----
+    {
+        const largest_acked = 100 + (smith.value(u64) % 10_000);
+        const first_range = smith.value(u64) % 16;
+        // The smallest PN in the First ACK Range. We descend from
+        // here for each subsequent (gap, length) pair, abandoning
+        // the construction (early-break) if the next range would
+        // underflow.
+        if (first_range > largest_acked) return; // implausible — skip
+        var previous_smallest = largest_acked - first_range;
+
+        var ranges: [6]AckRange = undefined;
+        const wanted = smith.valueRangeAtMost(u8, 0, ranges.len);
+        var count: usize = 0;
+        while (count < wanted) : (count += 1) {
+            const gap = smith.value(u64) % 8;
+            if (previous_smallest < gap + 2) break;
+            const largest_this = previous_smallest - gap - 2;
+            const length = @min(smith.value(u64) % 16, largest_this);
+            ranges[count] = .{ .gap = gap, .length = length };
+            previous_smallest = largest_this - length;
+        }
+
+        var ranges_buf: [96]u8 = undefined;
+        const ranges_len = try writeRanges(&ranges_buf, ranges[0..count]);
+        try std.testing.expectEqual(rangesEncodedLen(ranges[0..count]), ranges_len);
+
+        var it = iter(.{
+            .largest_acked = largest_acked,
+            .ack_delay = 0,
+            .first_range = first_range,
+            .range_count = count,
+            .ranges_bytes = ranges_buf[0..ranges_len],
+        });
+
+        var last_smallest: ?u64 = null;
+        var emitted: usize = 0;
+        while (try it.next()) |interval| {
+            try std.testing.expect(interval.smallest <= interval.largest);
+            if (last_smallest) |last| try std.testing.expect(interval.largest + 1 < last);
+            last_smallest = interval.smallest;
+            emitted += 1;
+        }
+        // Strong oracle: every well-formed ACK emits exactly one
+        // interval per range plus one for the First ACK Range.
+        try std.testing.expectEqual(count + 1, emitted);
+    }
+}

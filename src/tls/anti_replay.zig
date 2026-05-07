@@ -361,3 +361,85 @@ test "consume re-insertion after age-out preserves single-shot semantics" {
     // Same id within the new window: replay again.
     try testing.expectEqual(Verdict.replay, try tracker.consume(idOf(0xff), 3_500));
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `consume` / `prune` / `consumeUsingInternalClock` /
+// `bumpClock` with corpus-derived ids and timestamps under tight
+// `max_entries` and `max_age_us` to exercise the eviction and
+// pruning paths. Properties:
+//
+// - No panic, no leak (testing allocator catches leaks at deinit).
+// - `size() <= max_entries` always.
+// - First `consume(id, t)` returns `.fresh`; second call with the
+//   same id at any t' where (t' - t) < max_age_us returns `.replay`,
+//   provided the id has not been evicted by a cap-overflow in between.
+// - `prune(t)` and `consume` keep the tracker structurally consistent:
+//   `entries.items.len == seen.count()` only invariantly when no
+//   re-insertion-after-aged-out interleaves. We assert the weaker
+//   `size() == entries.items.len` (the intended public meaning).
+
+test "fuzz: anti_replay tracker invariants" {
+    try std.testing.fuzz({}, fuzzAntiReplay, .{});
+}
+
+fn fuzzAntiReplay(_: void, smith: *std.testing.Smith) anyerror!void {
+    const max_entries: usize = 8;
+    const max_age_us: u64 = 1_000_000;
+    var tracker = try AntiReplayTracker.init(testing.allocator, .{
+        .max_entries = max_entries,
+        .max_age_us = max_age_us,
+    });
+    defer tracker.deinit();
+
+    // Track a small id pool so consume hits real replays often.
+    const pool_size: u8 = 32;
+
+    var steps: u32 = 0;
+    while (steps < 256 and !smith.eos()) : (steps += 1) {
+        const op = smith.valueRangeAtMost(u8, 0, 4);
+        switch (op) {
+            0, 1, 2 => {
+                // consume — biased 3/5 so the tracker actually sees traffic.
+                var id: Id = @splat(0);
+                id[0] = smith.valueRangeAtMost(u8, 0, pool_size - 1);
+                const now_us = smith.value(u32);
+                _ = tracker.consume(id, now_us) catch |e| switch (e) {
+                    error.OutOfMemory => return,
+                };
+            },
+            3 => {
+                const now_us = smith.value(u32);
+                tracker.prune(now_us);
+            },
+            4 => {
+                const now_us = smith.value(u32);
+                tracker.bumpClock(now_us);
+                var id: Id = @splat(0);
+                id[0] = smith.valueRangeAtMost(u8, 0, pool_size - 1);
+                _ = tracker.consumeUsingInternalClock(id) catch |e| switch (e) {
+                    error.OutOfMemory => return,
+                };
+            },
+            else => unreachable,
+        }
+
+        // Bound is never exceeded.
+        try testing.expect(tracker.size() <= max_entries);
+        try testing.expectEqual(tracker.entries.items.len, tracker.size());
+    }
+
+    // Cross-cutting: the freshness contract for a *fresh* id must
+    // hold within a stable time window. Pick a `now_us` past every
+    // entry's max_age_us so prune empties the cache regardless of
+    // whatever the fuzzer steered the internal clock to.
+    const t0: u64 = std.math.maxInt(u32) + max_age_us + 1;
+    tracker.prune(t0);
+    try testing.expectEqual(@as(usize, 0), tracker.size());
+
+    var probe_id: Id = @splat(0);
+    probe_id[0] = pool_size; // not in the fuzzer's pool
+    try testing.expectEqual(Verdict.fresh, try tracker.consume(probe_id, t0));
+    try testing.expectEqual(Verdict.replay, try tracker.consume(probe_id, t0 + 1));
+    try testing.expectEqual(Verdict.fresh, try tracker.consume(probe_id, t0 + max_age_us));
+}

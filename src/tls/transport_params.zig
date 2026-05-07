@@ -950,3 +950,90 @@ fn fuzzTransportParams(_: void, smith: *std.testing.Smith) anyerror!void {
     try testing.expectEqual(p.disable_active_migration, p2.disable_active_migration);
     try testing.expectEqual(p.initial_max_path_id, p2.initial_max_path_id);
 }
+
+// Build a `Params` struct with every field populated from corpus
+// bytes, using value ranges that fit each parameter's RFC bounds, and
+// then assert encode → decode → encode is canonical (the second
+// encode must match the first byte-for-byte). This is the
+// generative-input counterpart to `fuzzTransportParams` above (which
+// only feeds malformed bytes into `decode`).
+//
+// Properties:
+//   - `encode` accepts every well-formed `Params` we construct.
+//   - `decode` recovers the same structurally-bound fields.
+//   - The encode is canonical: re-encoding the decoded value yields
+//     identical bytes.
+test "fuzz: transport_params canonical round-trip" {
+    try std.testing.fuzz({}, fuzzTransportParamsRoundTrip, .{});
+}
+
+fn fuzzTransportParamsRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {
+    var token: [16]u8 = undefined;
+    smith.bytes(&token);
+
+    var cid_a_buf: [path_mod.max_cid_len]u8 = undefined;
+    smith.bytes(&cid_a_buf);
+    const cid_a_len = smith.valueRangeAtMost(u8, 0, @intCast(path_mod.max_cid_len));
+    const cid_a = ConnectionId.fromSlice(cid_a_buf[0..cid_a_len]);
+
+    var cid_b_buf: [path_mod.max_cid_len]u8 = undefined;
+    smith.bytes(&cid_b_buf);
+    const cid_b_len = smith.valueRangeAtMost(u8, 0, @intCast(path_mod.max_cid_len));
+    const cid_b = ConnectionId.fromSlice(cid_b_buf[0..cid_b_len]);
+
+    var cid_c_buf: [path_mod.max_cid_len]u8 = undefined;
+    smith.bytes(&cid_c_buf);
+    const cid_c_len = smith.valueRangeAtMost(u8, 0, @intCast(path_mod.max_cid_len));
+    const cid_c = ConnectionId.fromSlice(cid_c_buf[0..cid_c_len]);
+
+    const have_preferred = smith.valueRangeAtMost(u8, 0, 1) == 0;
+    const preferred_address: ?PreferredAddress = if (!have_preferred) null else blk: {
+        var ipv4: [4]u8 = undefined;
+        smith.bytes(&ipv4);
+        var ipv6: [16]u8 = undefined;
+        smith.bytes(&ipv6);
+        var preferred_token: [16]u8 = undefined;
+        smith.bytes(&preferred_token);
+        var pa_cid_buf: [path_mod.max_cid_len]u8 = undefined;
+        smith.bytes(&pa_cid_buf);
+        const pa_cid_len = smith.valueRangeAtMost(u8, 0, @intCast(path_mod.max_cid_len));
+        const pa_cid = ConnectionId.fromSlice(pa_cid_buf[0..pa_cid_len]);
+        break :blk .{
+            .ipv4_address = ipv4,
+            .ipv4_port = smith.value(u16),
+            .ipv6_address = ipv6,
+            .ipv6_port = smith.value(u16),
+            .connection_id = pa_cid,
+            .stateless_reset_token = preferred_token,
+        };
+    };
+
+    const params: Params = .{
+        .original_destination_connection_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else cid_a,
+        .max_idle_timeout_ms = smith.valueRangeAtMost(u64, 0, 60_000),
+        .stateless_reset_token = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else token,
+        .max_udp_payload_size = 1200 + smith.valueRangeAtMost(u64, 0, 2895),
+        .initial_max_data = smith.valueRangeAtMost(u64, 0, 16 * 1024 * 1024 - 1),
+        .initial_max_stream_data_bidi_local = smith.valueRangeAtMost(u64, 0, 1024 * 1024 - 1),
+        .initial_max_stream_data_bidi_remote = smith.valueRangeAtMost(u64, 0, 1024 * 1024 - 1),
+        .initial_max_stream_data_uni = smith.valueRangeAtMost(u64, 0, 1024 * 1024 - 1),
+        .initial_max_streams_bidi = smith.valueRangeAtMost(u64, 0, 255),
+        .initial_max_streams_uni = smith.valueRangeAtMost(u64, 0, 255),
+        .ack_delay_exponent = smith.valueRangeAtMost(u64, 0, 20),
+        .max_ack_delay_ms = smith.valueRangeAtMost(u64, 0, (@as(u64, 1) << 14) - 1),
+        .disable_active_migration = smith.valueRangeAtMost(u8, 0, 1) == 0,
+        .preferred_address = preferred_address,
+        .active_connection_id_limit = 2 + smith.valueRangeAtMost(u64, 0, 14),
+        .initial_source_connection_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else cid_b,
+        .retry_source_connection_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else cid_c,
+        .max_datagram_frame_size = smith.valueRangeAtMost(u64, 0, 4095),
+        .initial_max_path_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else smith.valueRangeAtMost(u32, 0, 255),
+    };
+
+    var encoded: [1024]u8 = undefined;
+    const encoded_len = try params.encode(&encoded);
+    const decoded = try Params.decode(encoded[0..encoded_len]);
+    var reencoded: [1024]u8 = undefined;
+    const reencoded_len = try decoded.encode(&reencoded);
+    try testing.expectEqualSlices(u8, encoded[0..encoded_len], reencoded[0..reencoded_len]);
+}

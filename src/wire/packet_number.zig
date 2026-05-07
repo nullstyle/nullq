@@ -244,3 +244,47 @@ test "encode then decode round-trip with realistic gaps" {
         try std.testing.expectEqual(pn_to_send, recovered);
     }
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `decode` (the §A.3 recovery algorithm) with arbitrary values
+// for truncated_pn, length, and largest_pn. Properties:
+//
+// - No panic / no overflow trap.
+// - On success, recovered PN fits in `max_value` (62 bits).
+// - When `largest_pn = 0`, `decode(t, len, 0)` collapses to
+//   `t & pn_mask`: the §A.3 forward-snap branch is unreachable because
+//   there is no band below 0.
+// - The decoded PN's low `length` bytes equal the truncated input.
+// - The truncated low bytes of the recovered PN, fed back through
+//   `decode` with the same length, must reproduce the same recovered
+//   PN — the recovery function is idempotent under its own output.
+
+test "fuzz: packet_number decode §A.3 invariants" {
+    try std.testing.fuzz({}, fuzzPacketNumberDecode, .{});
+}
+
+fn fuzzPacketNumberDecode(_: void, smith: *std.testing.Smith) anyerror!void {
+    const truncated = smith.value(u64);
+    const length: u8 = smith.valueRangeAtMost(u8, 1, 4);
+    const largest_pn = smith.value(u64) & max_value;
+
+    const recovered = decode(truncated, length, largest_pn) catch return;
+
+    try std.testing.expect(recovered <= max_value);
+
+    // Mask of the bits the truncated PN actually covers.
+    const pn_nbits: u6 = @intCast(@as(u32, length) * 8);
+    const pn_mask: u64 = (@as(u64, 1) << pn_nbits) - 1;
+    try std.testing.expectEqual(truncated & pn_mask, recovered & pn_mask);
+
+    // largest_pn = 0 collapses to candidate = truncated & pn_mask: no
+    // forward/backward window snap can fire.
+    const fresh = try decode(truncated, length, 0);
+    try std.testing.expectEqual(truncated & pn_mask, fresh);
+
+    // Idempotence: decoding the recovered PN's low bytes against the
+    // same largest_pn yields the same value.
+    const again = try decode(recovered & pn_mask, length, largest_pn);
+    try std.testing.expectEqual(recovered, again);
+}

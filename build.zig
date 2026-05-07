@@ -198,4 +198,85 @@ pub fn build(b: *std.Build) void {
     // discover every `std.testing.fuzz` site, and drive each through
     // libFuzzer-equivalent coverage feedback. Crashes are minimized
     // and saved to `.zig-cache/v/`.
+
+    // Parallel fuzz step.
+    //
+    // `zig build test --fuzz=10M` only saturates one CPU core: the
+    // 0.17 build runner hard-codes `n_instances = 1` for limit-mode
+    // fuzzing (see `std/Build/Step/Run.zig` ~line 2057, tracked
+    // upstream as ziglang/zig#25352). When that lands the workaround
+    // here becomes obsolete and this whole block can be deleted.
+    //
+    // Until then we expose every `std.testing.fuzz` site as its own
+    // `addTest` filtered to that single test name. Each filtered
+    // binary links against the same `nullq_mod`, so Zig's compile
+    // cache shares the underlying object across all link steps —
+    // only linking is repeated. Running them under `-j` then gives
+    // real parallelism:
+    //
+    //     zig build fuzz --fuzz=10M -j8   # 8 fuzzers in parallel
+    //     zig build fuzz --fuzz           # forever (until Ctrl-C)
+    //
+    // Each test runs in its own binary, so `-j<N>` is the throttle
+    // for how many cores are saturated. With no `--fuzz` flag each
+    // binary just runs once for a smoke check (about one fuzz
+    // iteration per site), which is what CI uses to confirm the
+    // harness still compiles and the seed input is well-formed.
+    //
+    // The existing `zig build test` still includes every fuzz test
+    // in the single `unit_tests` binary; this step is purely
+    // additive.
+    const FuzzTarget = struct { label: []const u8, filter: []const u8 };
+    const fuzz_targets = [_]FuzzTarget{
+        .{ .label = "varint", .filter = "fuzz: varint decode/encode round-trip" },
+        .{ .label = "header", .filter = "fuzz: header parse never panics and reports consistent offsets" },
+        .{ .label = "header-roundtrip", .filter = "fuzz: header encode/parse canonical round-trip" },
+        .{ .label = "long-packet", .filter = "fuzz: coalesced long-header walker terminates with bounded advance" },
+        .{ .label = "packet-number", .filter = "fuzz: packet_number decode §A.3 invariants" },
+        .{ .label = "protection-hp", .filter = "fuzz: protection.aesHpMask determinism and sensitivity" },
+        .{ .label = "ack-range-iter", .filter = "fuzz: ack_range Iterator descending invariants" },
+        .{ .label = "frame-single", .filter = "fuzz: frame decode single-frame property" },
+        .{ .label = "frame-loop", .filter = "fuzz: frame decode loop until exhausted" },
+        .{ .label = "frame-roundtrip", .filter = "fuzz: frame encode/decode canonical round-trip" },
+        .{ .label = "server-peek-long", .filter = "fuzz: peekLongHeaderIds never panics" },
+        .{ .label = "server-is-initial", .filter = "fuzz: isInitialLongHeader never panics" },
+        .{ .label = "server-peek-dcid", .filter = "fuzz: peekDcidForServer never panics across all CID lengths" },
+        .{ .label = "transport-params", .filter = "fuzz: transport_params decode never panics and respects RFC bounds" },
+        .{ .label = "transport-params-roundtrip", .filter = "fuzz: transport_params canonical round-trip" },
+        .{ .label = "path-validator", .filter = "fuzz: path_validator state-machine invariants" },
+        .{ .label = "flow-control", .filter = "fuzz: flow_control ConnectionData state-machine invariants" },
+        .{ .label = "send-stream", .filter = "fuzz: send_stream lifecycle invariants" },
+        .{ .label = "retry-token", .filter = "fuzz: retry_token validate never panics" },
+        .{ .label = "new-token", .filter = "fuzz: new_token validate never panics" },
+        .{ .label = "ack-tracker", .filter = "fuzz: ack_tracker range-list invariants" },
+        .{ .label = "recv-stream", .filter = "fuzz: recv_stream reassembly invariants" },
+        .{ .label = "recv-stream-shuffled", .filter = "fuzz: recv_stream shuffled-delivery byte-equal reassembly" },
+        .{ .label = "loss-recovery", .filter = "fuzz: loss_recovery processAck invariants" },
+        .{ .label = "stateless-reset", .filter = "fuzz: stateless_reset derive determinism and uniqueness" },
+        .{ .label = "anti-replay", .filter = "fuzz: anti_replay tracker invariants" },
+        .{ .label = "conn-crypto", .filter = "fuzz: Connection.handleCrypto reassembly invariants" },
+        .{ .label = "conn-stream", .filter = "fuzz: Connection.handleStream reassembly invariants" },
+        .{ .label = "conn-migration", .filter = "fuzz: Connection.recordAuthenticatedDatagramAddress migration sequences" },
+        .{ .label = "conn-cid-lifecycle", .filter = "fuzz: Connection NEW_CONNECTION_ID / RETIRE_CONNECTION_ID lifecycle invariants" },
+        .{ .label = "conn-path-challenge", .filter = "fuzz: Connection PATH_CHALLENGE / PATH_RESPONSE handler invariants" },
+        .{ .label = "conn-flow-window", .filter = "fuzz: Connection MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS monotonicity" },
+        .{ .label = "conn-blocked-frames", .filter = "fuzz: Connection DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED invariants" },
+        .{ .label = "conn-close-pre-handshake", .filter = "fuzz: Connection CONNECTION_CLOSE pre-handshake envelope invariants" },
+    };
+
+    const fuzz_step = b.step(
+        "fuzz",
+        "Run each std.testing.fuzz site in its own binary so -j<N> parallelises limit-mode fuzzing",
+    );
+
+    for (fuzz_targets) |t| {
+        const tst = b.addTest(.{
+            .name = b.fmt("fuzz-{s}", .{t.label}),
+            .root_module = nullq_mod,
+            .filters = &.{t.filter},
+        });
+        const run_tst = b.addRunArtifact(tst);
+        if (b.args) |args| run_tst.addArgs(args);
+        fuzz_step.dependOn(&run_tst.step);
+    }
 }

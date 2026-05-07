@@ -416,3 +416,36 @@ test "sampleAt extracts the right 16 bytes" {
     while (j < 16) : (j += 1) expected[j] = 22 + j;
     try std.testing.expectEqualSlices(u8, &expected, &s);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `aesHpMask` with arbitrary AES-128 keys and 16-byte samples.
+// Header protection (RFC 9001 §5.4.3) is the first 5 bytes of
+// AES-ECB(hp_key, sample); BoringSSL's AES is the implementation, so
+// the property we check is functional rather than cryptographic:
+//
+// - No panic on any input.
+// - Determinism: same (key, sample) produces byte-identical mask.
+// - Sensitivity: flipping a single sample byte changes the mask
+//   (catches a no-op stub or a swap-bug that ignores the sample).
+
+test "fuzz: protection.aesHpMask determinism and sensitivity" {
+    try std.testing.fuzz({}, fuzzAesHpMask, .{});
+}
+
+fn fuzzAesHpMask(_: void, smith: *std.testing.Smith) anyerror!void {
+    var key: [16]u8 = undefined;
+    smith.bytes(&key);
+    var sample: [sample_len]u8 = undefined;
+    smith.bytes(&sample);
+
+    const m1 = aesHpMask(&key, &sample) catch return;
+    const m2 = try aesHpMask(&key, &sample);
+    try std.testing.expectEqualSlices(u8, &m1, &m2);
+
+    var sample_alt = sample;
+    const flip_idx: u8 = smith.valueRangeAtMost(u8, 0, sample_len - 1);
+    sample_alt[flip_idx] ^= 0x01;
+    const m_alt = try aesHpMask(&key, &sample_alt);
+    try std.testing.expect(!std.mem.eql(u8, &m1, &m_alt));
+}

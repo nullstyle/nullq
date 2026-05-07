@@ -11,6 +11,10 @@ ZIG_GLOBAL_CACHE_DIR = "{{config_root}}/.zig-global-cache"
 description = "Run the nullq Zig test suite"
 run = "zig build test"
 
+[tasks.fuzz]
+description = "Run coverage-guided fuzzing in parallel (one binary per fuzz site)"
+run = "zig build fuzz --fuzz=10M -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
+
 [tasks.qns-endpoint]
 description = "Build the QNS endpoint binary"
 run = "zig build qns-endpoint"

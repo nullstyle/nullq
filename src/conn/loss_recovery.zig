@@ -330,3 +330,107 @@ test "detectLosses with no largest_acked_sent is a no-op" {
     try std.testing.expectEqual(@as(u32, 0), result.count);
     try std.testing.expectEqual(@as(u32, 1), tr.count);
 }
+
+// -- fuzz harness --------------------------------------------------------
+//
+// Drive `processAck` against an arbitrary `SentPacketTracker` seeded
+// with strictly-increasing PNs and an arbitrary `Ack` frame whose
+// range bytes come from the corpus. Properties:
+//
+// - No panic, no overflow trap, no unreachable.
+// - On success, `bytes_in_flight` and `ack_eliciting_in_flight` after
+//   are ≤ before (ACK only frees, never adds).
+// - `count` after ≤ before; `newly_acked_count` equals the delta.
+// - The tracker remains sorted strictly ascending by PN.
+// - `result.bytes_acked` ≥ `result.in_flight_bytes_acked`.
+// - `space.largest_acked_sent` is monotonically non-decreasing across
+//   the call (onAckReceived enforces this).
+
+test "fuzz: loss_recovery processAck invariants" {
+    try std.testing.fuzz({}, fuzzProcessAck, .{});
+}
+
+fn fuzzProcessAck(_: void, smith: *std.testing.Smith) anyerror!void {
+    var tr: SentPacketTracker = .{};
+
+    // Seed the tracker with up to 64 packets at strictly-increasing
+    // PNs. Gap between PNs comes from the corpus so contiguous,
+    // sparse, and large-gap layouts are all exercised.
+    const seed_count = smith.valueRangeAtMost(u8, 0, 64);
+    var pn: u64 = 0;
+    var seeded: u8 = 0;
+    while (seeded < seed_count and !smith.eos()) : (seeded += 1) {
+        const gap = smith.valueRangeAtMost(u16, 1, 0xff);
+        pn += gap;
+        const bytes = smith.valueRangeAtMost(u16, 0, 1500);
+        const sent_time_us = smith.value(u32);
+        const eliciting = smith.valueRangeAtMost(u8, 0, 1) == 1;
+        const in_flight = smith.valueRangeAtMost(u8, 0, 1) == 1;
+        tr.record(.{
+            .pn = pn,
+            .sent_time_us = sent_time_us,
+            .bytes = bytes,
+            .ack_eliciting = eliciting,
+            .in_flight = in_flight,
+        }) catch break;
+    }
+
+    var space: PnSpace = .{};
+    space.next_pn = pn + 1;
+    if (smith.valueRangeAtMost(u8, 0, 1) == 1) {
+        space.largest_acked_sent = smith.value(u64);
+    }
+
+    // Build an arbitrary ACK frame. Bias largest_acked into the
+    // tracker's covered range half the time so we actually hit
+    // packets; the other half exercises malformed/out-of-range cases.
+    const largest_acked: u64 = if (smith.valueRangeAtMost(u8, 0, 1) == 1 and tr.count > 0)
+        tr.packets[smith.indexWithHash(tr.count, 0xc0de)].pn
+    else
+        smith.value(u64);
+    const first_range = smith.value(u64);
+
+    var ranges_buf: [256]u8 = undefined;
+    const ranges_len = smith.slice(&ranges_buf);
+    const range_count = smith.valueRangeAtMost(u8, 0, 16);
+
+    const ack: frame_types.Ack = .{
+        .largest_acked = largest_acked,
+        .ack_delay = 0,
+        .first_range = first_range,
+        .range_count = range_count,
+        .ranges_bytes = ranges_buf[0..ranges_len],
+        .ecn_counts = null,
+    };
+
+    const before_bytes_in_flight = tr.bytes_in_flight;
+    const before_eliciting_in_flight = tr.ack_eliciting_in_flight;
+    const before_count = tr.count;
+    const before_largest_acked_sent = space.largest_acked_sent;
+
+    if (processAck(&tr, &space, ack)) |result| {
+        // bytes_in_flight monotonically decreases under processAck.
+        try std.testing.expect(tr.bytes_in_flight <= before_bytes_in_flight);
+        try std.testing.expect(tr.ack_eliciting_in_flight <= before_eliciting_in_flight);
+        try std.testing.expect(tr.count <= before_count);
+        try std.testing.expectEqual(before_count - tr.count, result.newly_acked_count);
+        try std.testing.expect(result.in_flight_bytes_acked <= result.bytes_acked);
+    } else |_| {
+        // Errored ACK frames may leave the tracker partially modified;
+        // we only check structural invariants below.
+    }
+
+    // largest_acked_sent is monotonically non-decreasing.
+    if (before_largest_acked_sent) |old| {
+        try std.testing.expect(space.largest_acked_sent != null);
+        try std.testing.expect(space.largest_acked_sent.? >= old);
+    }
+
+    // Tracker remains strictly ascending by PN.
+    if (tr.count > 1) {
+        var i: u32 = 1;
+        while (i < tr.count) : (i += 1) {
+            try std.testing.expect(tr.packets[i - 1].pn < tr.packets[i].pn);
+        }
+    }
+}

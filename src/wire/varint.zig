@@ -279,4 +279,45 @@ fn fuzzVarintRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {
     const w = try encodeFixed(&rt_buf, d.value, d.bytes_read);
     try std.testing.expectEqual(@as(usize, d.bytes_read), w);
     try std.testing.expectEqualSlices(u8, input[0..d.bytes_read], rt_buf[0..w]);
+
+    // Cross-length round-trip property: pick a fuzzer-supplied value
+    // and a fuzzer-supplied legal length (1, 2, 4, 8). Any value in
+    // that length's representable range MUST round-trip through
+    // `encodeFixed` -> `decode` losslessly. This exercises the same
+    // canonicalization the wire-builder relies on for fields it pads
+    // out (e.g. the Initial / Handshake length field that is
+    // rewritten in place once the encrypted payload size is known).
+    const length_choice: u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        else => 8,
+    };
+    const max_for_length: u64 = switch (length_choice) {
+        1 => (1 << 6) - 1,
+        2 => (1 << 14) - 1,
+        4 => (1 << 30) - 1,
+        8 => max_value,
+        else => unreachable,
+    };
+    const raw_value = smith.value(u64);
+    const value = if (max_for_length == max_value)
+        raw_value & max_value
+    else
+        raw_value % (max_for_length + 1);
+
+    var fixed_buf: [max_len]u8 = undefined;
+    const written = try encodeFixed(&fixed_buf, value, length_choice);
+    try std.testing.expectEqual(@as(usize, length_choice), written);
+    const decoded = try decode(fixed_buf[0..written]);
+    try std.testing.expectEqual(value, decoded.value);
+    try std.testing.expectEqual(length_choice, decoded.bytes_read);
+    // Truncation: dropping the last byte (when length > 1) must
+    // surface as InsufficientBytes — never as a silent under-read.
+    if (length_choice > 1) {
+        try std.testing.expectError(
+            Error.InsufficientBytes,
+            decode(fixed_buf[0 .. written - 1]),
+        );
+    }
 }

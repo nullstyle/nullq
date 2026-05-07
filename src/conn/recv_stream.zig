@@ -695,3 +695,67 @@ fn fuzzRecvStream(_: void, smith: *std.testing.Smith) anyerror!void {
         }
     }
 }
+
+// Generative reassembly: lock down the strong oracle that the
+// adversarial harness above can't carry — that the bytes the app
+// reads back equal the bytes the peer wrote, regardless of how the
+// chunks were split, shuffled, or duplicated. Build a known
+// `[total]u8` payload from corpus bytes, then deliver it as `chunks`
+// fixed-size pieces in a fuzzer-driven order (with occasional
+// overlapping retransmits). After a final FIN, drain via `read` and
+// compare byte-for-byte.
+
+test "fuzz: recv_stream shuffled-delivery byte-equal reassembly" {
+    try std.testing.fuzz({}, fuzzRecvStreamShuffled, .{});
+}
+
+fn fuzzRecvStreamShuffled(_: void, smith: *std.testing.Smith) anyerror!void {
+    const total: usize = 256;
+    const chunk: usize = 16;
+    const chunks = total / chunk;
+
+    var data: [total]u8 = undefined;
+    smith.bytes(&data);
+
+    // Build a permutation of [0, chunks) using a corpus-driven
+    // Fisher-Yates shuffle: at each step pick the next chunk to
+    // deliver from the unfilled tail of the array. The fuzzer's
+    // index choices steer which order chunks land in.
+    var indices: [chunks]u16 = undefined;
+    for (&indices, 0..) |*slot, i| slot.* = @intCast(i);
+    var i: u16 = chunks;
+    while (i > 1) : (i -= 1) {
+        const j = smith.valueRangeAtMost(u16, 0, i - 1);
+        const tmp = indices[i - 1];
+        indices[i - 1] = indices[j];
+        indices[j] = tmp;
+    }
+
+    var stream = RecvStream.init(test_alloc);
+    defer stream.deinit();
+
+    for (indices, 0..) |idx, order| {
+        const off = idx * chunk;
+        try stream.recv(@intCast(off), data[off..][0..chunk], false);
+        // Periodically retransmit a partially-overlapping window to
+        // exercise duplicate-handling paths.
+        if (smith.valueRangeAtMost(u8, 0, 7) == 0 and !smith.eos()) {
+            const overlap_off = if (off == 0) off else off - @min(off, chunk / 2);
+            const overlap_len = @min(chunk, total - overlap_off);
+            try stream.recv(@intCast(overlap_off), data[overlap_off..][0..overlap_len], false);
+        }
+        _ = order;
+    }
+    try stream.recv(@intCast(total), "", true);
+
+    var read_buf: [33]u8 = undefined;
+    var consumed: usize = 0;
+    while (consumed < total) {
+        const n = stream.read(&read_buf);
+        try testing.expect(n > 0);
+        try testing.expectEqualSlices(u8, data[consumed..][0..n], read_buf[0..n]);
+        consumed += n;
+    }
+    try testing.expectEqual(total, consumed);
+    try testing.expectEqual(State.data_recvd, stream.state);
+}

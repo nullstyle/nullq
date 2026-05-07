@@ -11,5 +11,9 @@ check-tools:
 test:
     zig build test
 
+# Run coverage-guided fuzzing in parallel (one binary per fuzz site).
+fuzz:
+    zig build fuzz --fuzz=10M -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
 clean:
     rm -rf .zig-cache zig-out

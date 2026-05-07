@@ -886,6 +886,7 @@ test "fuzz: frame decode loop until exhausted" {
 }
 
 fn fuzzFrameDecodeLoop(_: void, smith: *std.testing.Smith) anyerror!void {
+    const encode_mod = @import("encode.zig");
     var input_buf: [4096]u8 = undefined;
     const len = smith.slice(&input_buf);
     const input = input_buf[0..len];
@@ -896,6 +897,14 @@ fn fuzzFrameDecodeLoop(_: void, smith: *std.testing.Smith) anyerror!void {
         const d = decode(input[pos..]) catch return;
         try std.testing.expect(d.bytes_consumed >= 1);
         try std.testing.expect(d.bytes_consumed <= input.len - pos);
+        // The encoder produces minimum-length varints; the decoder
+        // accepts any valid length encoding (RFC 9000 §16 doesn't
+        // mandate minimal encoding on incoming values). So
+        // `encodedLen` is a lower bound on what `bytes_consumed`
+        // can be: the decoder may have consumed extra bytes for
+        // non-minimal varint forms, but never fewer than the
+        // canonical re-encoding would produce.
+        try std.testing.expect(encode_mod.encodedLen(d.frame) <= d.bytes_consumed);
         pos += d.bytes_consumed;
         // Cap loop iterations as a defense against an O(1)-per-frame
         // payload like all-PADDING (one byte per frame). 16k frames
