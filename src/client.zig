@@ -113,6 +113,14 @@ const ConfigImpl = struct {
     /// close events is unaffected.
     reveal_close_reason_on_wire: bool = false,
 
+    /// Number of ack-eliciting application packets the client requires
+    /// before forcing an immediate ACK (RFC 9000 §13.2.1 ¶2). Default
+    /// matches `nullq.conn.state.application_ack_eliciting_threshold`.
+    /// Lower this to 1 for low-RTT links where every packet should be
+    /// ACKed; raise it to amortize ACK overhead at the cost of more
+    /// peer PTOs.
+    delayed_ack_packet_threshold: u8 = conn_mod.state.application_ack_eliciting_threshold,
+
     /// Optional NEW_TOKEN bytes from a prior connection to the same
     /// server (RFC 9000 §8.1.3). When set, the client embeds the
     /// token in its first Initial's long-header Token field so the
@@ -247,6 +255,7 @@ pub const Client = struct {
         conn_ptr.* = try Connection.initClient(config.allocator, tls_ctx, server_name_z);
         errdefer conn_ptr.deinit();
         conn_ptr.reveal_close_reason_on_wire = config.reveal_close_reason_on_wire;
+        conn_ptr.delayed_ack_packet_threshold = config.delayed_ack_packet_threshold;
 
         if (config.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, config.qlog_user_data);
 

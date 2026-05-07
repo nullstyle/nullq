@@ -107,6 +107,11 @@ pub const PacketKeys = struct {
     key: [32]u8 = @splat(0),
     iv: [12]u8 = @splat(0),
     hp: [32]u8 = @splat(0),
+    /// Cached header-protection cipher context. Populated eagerly by
+    /// `derivePacketKeys` and refreshed by `setHp`; lets every seal/open
+    /// reuse the AES key schedule instead of re-running
+    /// `AES_set_encrypt_key` per packet.
+    hp_cipher: protection.HpCipher = .{ .chacha20 = {} },
 
     /// Borrow the AEAD key slice trimmed to the suite's `keyLen()`.
     pub fn keySlice(self: *const PacketKeys) []const u8 {
@@ -120,7 +125,27 @@ pub const PacketKeys = struct {
     pub fn hpSlice(self: *const PacketKeys) []const u8 {
         return self.hp[0..self.suite.hpLen()];
     }
+
+    /// Replace the header-protection key bytes and refresh the cached
+    /// cipher context atomically. Used by the application key-update
+    /// path (RFC 9001 §6) where the new traffic secret is derived but
+    /// the HP key is intentionally retained from the previous epoch.
+    pub fn setHp(self: *PacketKeys, new_hp: []const u8) protection.Error!void {
+        const hp_len = self.suite.hpLen();
+        std.debug.assert(new_hp.len == hp_len);
+        @memcpy(self.hp[0..hp_len], new_hp);
+        @memset(self.hp[hp_len..], 0);
+        self.hp_cipher = try buildHpCipher(self.suite, self.hp[0..hp_len]);
+    }
 };
+
+fn buildHpCipher(suite: Suite, hp: []const u8) protection.Error!protection.HpCipher {
+    return switch (suite) {
+        .aes128_gcm_sha256 => .{ .aes128 = try boringssl.crypto.aes.Aes128.init(@ptrCast(hp[0..16])) },
+        .aes256_gcm_sha384 => .{ .aes256 = try boringssl.crypto.aes.Aes256.init(@ptrCast(hp[0..32])) },
+        .chacha20_poly1305_sha256 => .{ .chacha20 = {} },
+    };
+}
 
 /// Errors returned by 1-RTT seal/open and key-derivation routines.
 pub const Error = error{
@@ -157,6 +182,7 @@ pub fn derivePacketKeys(suite: Suite, secret: []const u8) Error!PacketKeys {
         "quic hp",
         "",
     );
+    keys.hp_cipher = try buildHpCipher(suite, keys.hp[0..suite.hpLen()]);
     return keys;
 }
 
@@ -178,13 +204,13 @@ pub fn deriveNextTrafficSecret(suite: Suite, secret: []const u8) Error!TrafficSe
 }
 
 /// Compute the 5-byte header-protection mask using the suite-specific
-/// algorithm (RFC 9001 §5.4.3 / §5.4.4).
+/// algorithm (RFC 9001 §5.4.3 / §5.4.4). Reuses the AES key schedule
+/// cached in `keys.hp_cipher`.
 pub fn headerProtectionMask(keys: *const PacketKeys, sample: *const [protection.sample_len]u8) protection.Error![protection.mask_len]u8 {
-    return switch (keys.suite) {
-        .aes128_gcm_sha256 => try protection.aesHpMask(@ptrCast(keys.hp[0..16]), sample),
-        .aes256_gcm_sha384 => try protection.aes256HpMask(@ptrCast(keys.hp[0..32]), sample),
-        .chacha20_poly1305_sha256 => protection.chacha20HpMask(@ptrCast(keys.hp[0..32]), sample),
-    };
+    // The error union return type is preserved so callers don't have
+    // to change. The AES key schedule was validated at install time
+    // by `derivePacketKeys` / `setHp`.
+    return keys.hp_cipher.mask(sample, keys.hp[0..keys.suite.hpLen()]);
 }
 
 /// AEAD-seal `plaintext` for a packet with `packet_header` as AAD.
@@ -772,7 +798,7 @@ test "1-RTT key update opens with next traffic secret and stable HP" {
     const keys = try derivePacketKeys(.aes128_gcm_sha256, &secret);
     const next_secret = try deriveNextTrafficSecret(.aes128_gcm_sha256, &secret);
     var next_keys = try derivePacketKeys(.aes128_gcm_sha256, next_secret[0..Suite.aes128_gcm_sha256.secretLen()]);
-    next_keys.hp = keys.hp;
+    try next_keys.setHp(keys.hp[0..Suite.aes128_gcm_sha256.hpLen()]);
 
     const dcid: [8]u8 = .{ 1, 3, 5, 7, 9, 11, 13, 15 };
     const payload = "post-update stream frame bytes";

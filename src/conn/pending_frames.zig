@@ -223,3 +223,281 @@ pub const PendingSendDatagram = struct {
     id: u64,
     data: []u8,
 };
+
+// -- tests ---------------------------------------------------------------
+//
+// `PendingFrameQueues` is a plain typed home for control-frame backlogs:
+// `Connection` mutates the optional fields directly and pushes/pops the
+// `ArrayList` queues itself. The methods on the struct are limited to
+// `deinit`, the two `remove*BySequence` helpers, and `popRecvDatagram`.
+// These tests cover (a) the `empty` zero-state, (b) the documented
+// direct-field semantics callers depend on, and (c) the helper methods
+// end-to-end.
+
+test "pending_frames: empty initial state has nothing pending" {
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?u64, null), q.max_data);
+    try std.testing.expectEqual(@as(?u64, null), q.max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, null), q.max_streams_uni);
+    try std.testing.expectEqual(@as(?u64, null), q.data_blocked);
+    try std.testing.expectEqual(@as(?u64, null), q.streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, null), q.streams_blocked_uni);
+    try std.testing.expect(q.new_token == null);
+    try std.testing.expect(q.path_response == null);
+    try std.testing.expect(q.path_challenge == null);
+    try std.testing.expect(q.path_response_addr == null);
+    try std.testing.expectEqual(@as(?u32, null), q.max_path_id);
+    try std.testing.expectEqual(@as(?u32, null), q.paths_blocked);
+    try std.testing.expect(q.path_cids_blocked == null);
+
+    try std.testing.expectEqual(@as(usize, 0), q.max_stream_data.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.stop_sending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.retire_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.path_abandons.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.path_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.path_retire_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.send_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.recv_datagrams.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.send_datagram_bytes);
+    try std.testing.expectEqual(@as(usize, 0), q.recv_datagram_bytes);
+}
+
+test "pending_frames: set and clear MAX_DATA" {
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(std.testing.allocator);
+
+    q.max_data = 16384;
+    try std.testing.expectEqual(@as(?u64, 16384), q.max_data);
+
+    // The drain path clears by assigning null after emitting the frame.
+    q.max_data = null;
+    try std.testing.expectEqual(@as(?u64, null), q.max_data);
+
+    // Re-arming after a clear must work.
+    q.max_data = 32768;
+    try std.testing.expectEqual(@as(?u64, 32768), q.max_data);
+}
+
+test "pending_frames: MAX_STREAMS bidi vs uni do not alias" {
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(std.testing.allocator);
+
+    q.max_streams_bidi = 100;
+    try std.testing.expectEqual(@as(?u64, 100), q.max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, null), q.max_streams_uni);
+
+    q.max_streams_uni = 50;
+    try std.testing.expectEqual(@as(?u64, 100), q.max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, 50), q.max_streams_uni);
+
+    q.max_streams_bidi = null;
+    try std.testing.expectEqual(@as(?u64, null), q.max_streams_bidi);
+    try std.testing.expectEqual(@as(?u64, 50), q.max_streams_uni);
+}
+
+test "pending_frames: STREAMS_BLOCKED and STREAM_DATA_BLOCKED are independent slots" {
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(std.testing.allocator);
+
+    q.streams_blocked_bidi = 7;
+    q.streams_blocked_uni = 9;
+    try q.stream_data_blocked.append(std.testing.allocator, .{
+        .stream_id = 4,
+        .maximum_stream_data = 1024,
+    });
+
+    // streams_blocked_* are connection-wide caps; stream_data_blocked is
+    // a per-stream queue. They must not alias each other.
+    try std.testing.expectEqual(@as(?u64, 7), q.streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, 9), q.streams_blocked_uni);
+    try std.testing.expectEqual(@as(usize, 1), q.stream_data_blocked.items.len);
+    try std.testing.expectEqual(@as(u64, 4), q.stream_data_blocked.items[0].stream_id);
+    try std.testing.expectEqual(@as(u64, 1024), q.stream_data_blocked.items[0].maximum_stream_data);
+
+    // Clearing one of the optionals leaves the others (and the queue)
+    // untouched.
+    q.streams_blocked_bidi = null;
+    try std.testing.expectEqual(@as(?u64, null), q.streams_blocked_bidi);
+    try std.testing.expectEqual(@as(?u64, 9), q.streams_blocked_uni);
+    try std.testing.expectEqual(@as(usize, 1), q.stream_data_blocked.items.len);
+}
+
+test "pending_frames: PATH_RESPONSE token round-trip" {
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(std.testing.allocator);
+
+    const token: [8]u8 = .{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe };
+    var addr: Address = .{};
+    addr.bytes[0] = 0x7f; // 127.0.0.1 placeholder
+
+    q.path_response = token;
+    q.path_response_path_id = 3;
+    q.path_response_addr = addr;
+
+    try std.testing.expect(q.path_response != null);
+    try std.testing.expectEqualSlices(u8, &token, &q.path_response.?);
+    try std.testing.expectEqual(@as(u32, 3), q.path_response_path_id);
+    try std.testing.expect(q.path_response_addr != null);
+    try std.testing.expect(Address.eql(addr, q.path_response_addr.?));
+
+    // The packetizer clears the slot once the frame is on the wire.
+    q.path_response = null;
+    q.path_response_addr = null;
+    try std.testing.expect(q.path_response == null);
+    try std.testing.expect(q.path_response_addr == null);
+}
+
+test "pending_frames: NEW_CONNECTION_ID and RETIRE_CONNECTION_ID lifecycle" {
+    const allocator = std.testing.allocator;
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(allocator);
+
+    const cid_bytes: [4]u8 = .{ 0x01, 0x02, 0x03, 0x04 };
+    const cid = try frame_types.ConnId.fromSlice(&cid_bytes);
+
+    try q.new_connection_ids.append(allocator, .{
+        .sequence_number = 1,
+        .retire_prior_to = 0,
+        .connection_id = cid,
+        .stateless_reset_token = @splat(0xAA),
+    });
+    try q.new_connection_ids.append(allocator, .{
+        .sequence_number = 2,
+        .retire_prior_to = 0,
+        .connection_id = cid,
+        .stateless_reset_token = @splat(0xBB),
+    });
+    try q.new_connection_ids.append(allocator, .{
+        .sequence_number = 3,
+        .retire_prior_to = 0,
+        .connection_id = cid,
+        .stateless_reset_token = @splat(0xCC),
+    });
+
+    try q.retire_connection_ids.append(allocator, .{ .sequence_number = 0 });
+
+    try std.testing.expectEqual(@as(usize, 3), q.new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 1), q.retire_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 2), q.new_connection_ids.items[1].sequence_number);
+
+    // `removeNewConnectionIdBySequence` drops the matching entry and
+    // preserves order of the rest.
+    q.removeNewConnectionIdBySequence(2);
+    try std.testing.expectEqual(@as(usize, 2), q.new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u64, 1), q.new_connection_ids.items[0].sequence_number);
+    try std.testing.expectEqual(@as(u64, 3), q.new_connection_ids.items[1].sequence_number);
+
+    // Removing a non-existent sequence number is a no-op.
+    q.removeNewConnectionIdBySequence(99);
+    try std.testing.expectEqual(@as(usize, 2), q.new_connection_ids.items.len);
+
+    // Drain everything by removing the remaining sequence numbers.
+    q.removeNewConnectionIdBySequence(1);
+    q.removeNewConnectionIdBySequence(3);
+    try std.testing.expectEqual(@as(usize, 0), q.new_connection_ids.items.len);
+}
+
+test "pending_frames: removePathNewConnectionIdBySequence keys on (path_id, sequence)" {
+    const allocator = std.testing.allocator;
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(allocator);
+
+    const cid = try frame_types.ConnId.fromSlice(&[_]u8{ 0xAA, 0xBB });
+    try q.path_new_connection_ids.append(allocator, .{
+        .path_id = 1,
+        .sequence_number = 5,
+        .retire_prior_to = 0,
+        .connection_id = cid,
+        .stateless_reset_token = @splat(0),
+    });
+    try q.path_new_connection_ids.append(allocator, .{
+        .path_id = 2,
+        .sequence_number = 5, // same seq, different path
+        .retire_prior_to = 0,
+        .connection_id = cid,
+        .stateless_reset_token = @splat(0),
+    });
+
+    // Removing (path 1, seq 5) leaves (path 2, seq 5) intact.
+    q.removePathNewConnectionIdBySequence(1, 5);
+    try std.testing.expectEqual(@as(usize, 1), q.path_new_connection_ids.items.len);
+    try std.testing.expectEqual(@as(u32, 2), q.path_new_connection_ids.items[0].path_id);
+}
+
+test "pending_frames: NEW_TOKEN slot stores bytes inline" {
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(std.testing.allocator);
+
+    const token = "addr-validation-token-bytes";
+    var item: NewTokenItem = .{};
+    @memcpy(item.bytes[0..token.len], token);
+    item.len = @intCast(token.len);
+    q.new_token = item;
+
+    try std.testing.expect(q.new_token != null);
+    try std.testing.expectEqualSlices(u8, token, q.new_token.?.slice());
+
+    // Drain.
+    q.new_token = null;
+    try std.testing.expect(q.new_token == null);
+}
+
+test "pending_frames: popRecvDatagram drains FIFO and tracks bytes" {
+    const allocator = std.testing.allocator;
+    var q: PendingFrameQueues = .empty;
+    defer q.deinit(allocator);
+
+    try std.testing.expect(q.popRecvDatagram() == null);
+
+    const a = try allocator.dupe(u8, "alpha");
+    const b = try allocator.dupe(u8, "br");
+    try q.recv_datagrams.append(allocator, .{ .data = a });
+    try q.recv_datagrams.append(allocator, .{ .data = b });
+    q.recv_datagram_bytes = a.len + b.len;
+
+    const first = q.popRecvDatagram() orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("alpha", first.data);
+    try std.testing.expectEqual(@as(usize, 2), q.recv_datagram_bytes);
+    allocator.free(first.data);
+
+    const second = q.popRecvDatagram() orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("br", second.data);
+    try std.testing.expectEqual(@as(usize, 0), q.recv_datagram_bytes);
+    allocator.free(second.data);
+
+    try std.testing.expect(q.popRecvDatagram() == null);
+}
+
+test "pending_frames: deinit frees datagram payload bytes" {
+    const allocator = std.testing.allocator;
+    var q: PendingFrameQueues = .empty;
+
+    // Populate both directions; deinit must free the payload buffers.
+    const sd = try allocator.dupe(u8, "send-payload");
+    try q.send_datagrams.append(allocator, .{ .id = 7, .data = sd });
+    q.send_datagram_bytes = sd.len;
+
+    const rd = try allocator.dupe(u8, "recv-payload");
+    try q.recv_datagrams.append(allocator, .{ .data = rd });
+    q.recv_datagram_bytes = rd.len;
+
+    // Also stage a few non-datagram queue entries to confirm deinit
+    // tears down every backing ArrayList. `std.testing.allocator` will
+    // assert if any of these leak.
+    try q.stop_sending.append(allocator, .{
+        .stream_id = 1,
+        .application_error_code = 0,
+    });
+    try q.max_stream_data.append(allocator, .{
+        .stream_id = 1,
+        .maximum_stream_data = 4096,
+    });
+    try q.retire_connection_ids.append(allocator, .{ .sequence_number = 0 });
+
+    q.deinit(allocator);
+}

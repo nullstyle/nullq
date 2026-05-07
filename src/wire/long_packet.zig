@@ -474,7 +474,11 @@ pub fn sealRetry(dst: []u8, opts: RetrySealOptions) Error!usize {
 pub fn validateRetryIntegrity(original_dcid: []const u8, retry_packet: []const u8) Error!bool {
     if (retry_packet.len < 16) return Error.PayloadTooShort;
     const expected = try retryIntegrityTag(original_dcid, retry_packet[0 .. retry_packet.len - 16]);
-    return std.mem.eql(u8, &expected, retry_packet[retry_packet.len - 16 ..]);
+    // Constant-time compare: per RFC 9001 §5.8 the tag is AEAD-derived
+    // so a partial-match timing oracle on the wire would let a peer
+    // bias forgery attempts byte-by-byte.
+    const observed: *const [16]u8 = retry_packet[retry_packet.len - 16 ..][0..16];
+    return std.crypto.timing_safe.eql([16]u8, expected, observed.*);
 }
 
 // -- shared open path ----------------------------------------------------
@@ -822,8 +826,21 @@ test "Retry seal validates integrity tag" {
     const parsed = try header.parse(packet[0..len], 0);
     try testing.expect(parsed.header == .retry);
     try testing.expectEqualSlices(u8, token, parsed.header.retry.retry_token);
+
+    // Flip a bit in the last tag byte → mismatch detected.
     packet[len - 1] ^= 0x01;
     try testing.expect(!try validateRetryIntegrity(&original_dcid, packet[0..len]));
+    packet[len - 1] ^= 0x01; // restore
+
+    // Flip a bit in the first tag byte → still mismatched. Catches
+    // any short-circuit compare that would only inspect the prefix.
+    packet[len - 16] ^= 0x80;
+    try testing.expect(!try validateRetryIntegrity(&original_dcid, packet[0..len]));
+    packet[len - 16] ^= 0x80;
+
+    // Restored packet validates again — confirms the in-place flips
+    // were the only thing failing the prior asserts.
+    try testing.expect(try validateRetryIntegrity(&original_dcid, packet[0..len]));
 }
 
 test "Handshake and 0-RTT support every negotiated QUIC v1 suite" {

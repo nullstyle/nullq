@@ -343,3 +343,155 @@ pub const LifecycleState = struct {
         return true;
     }
 };
+
+// -- tests ---------------------------------------------------------------
+
+test "lifecycle: default-initialized state is open" {
+    const ls: LifecycleState = .{};
+    try std.testing.expectEqual(CloseState.open, ls.state());
+    try std.testing.expectEqual(@as(?StoredCloseEvent, null), ls.close_event);
+    try std.testing.expectEqual(@as(u32, 0), ls.close_emit_count);
+    try std.testing.expectEqual(@as(?u64, null), ls.last_close_emit_us);
+    try std.testing.expectEqual(@as(?u64, null), ls.closing_deadline_us);
+}
+
+test "lifecycle: noteCloseEmit arms closing deadline and bumps counter" {
+    var ls: LifecycleState = .{};
+    const pto_us: u64 = 100_000; // 100 ms
+    const now_us: u64 = 1_000_000;
+    const deadline = now_us + 3 * pto_us;
+
+    ls.noteCloseEmit(now_us, deadline);
+
+    try std.testing.expectEqual(CloseState.closing, ls.state());
+    try std.testing.expectEqual(@as(?u64, deadline), ls.closing_deadline_us);
+    try std.testing.expectEqual(@as(?u64, now_us), ls.last_close_emit_us);
+    try std.testing.expectEqual(@as(u32, 1), ls.close_emit_count);
+    try std.testing.expect(ls.closed);
+    try std.testing.expectEqual(@as(?ConnectionCloseInfo, null), ls.pending_close);
+}
+
+test "lifecycle: noteCloseEmit retransmit doesn't extend the closing deadline" {
+    var ls: LifecycleState = .{};
+    const first_now: u64 = 1_000_000;
+    const first_deadline: u64 = first_now + 300_000;
+    ls.noteCloseEmit(first_now, first_deadline);
+
+    // Second emit at a later time: deadline must NOT be moved (§10.2.1 ¶3
+    // amplification guard) but the counter and last-emit must update.
+    const second_now: u64 = first_now + 50_000;
+    const stale_deadline: u64 = second_now + 999_999_999;
+    ls.noteCloseEmit(second_now, stale_deadline);
+
+    try std.testing.expectEqual(@as(?u64, first_deadline), ls.closing_deadline_us);
+    try std.testing.expectEqual(@as(?u64, second_now), ls.last_close_emit_us);
+    try std.testing.expectEqual(@as(u32, 2), ls.close_emit_count);
+}
+
+test "lifecycle: shouldRearmCloseRepeat applies exponential backoff per emit count" {
+    var ls: LifecycleState = .{};
+    const base: u64 = 1_000; // 1 ms base interval
+    const t0: u64 = 10_000;
+
+    // Pre-arm: the closing-state deadline must be set for rearm to fire.
+    ls.noteCloseEmit(t0, t0 + 300_000);
+    // After first emit, count==1, shift=1, interval = base << 1 = 2*base.
+    try std.testing.expect(!ls.shouldRearmCloseRepeat(t0 + (2 * base) - 1, base));
+    try std.testing.expect(ls.shouldRearmCloseRepeat(t0 + 2 * base, base));
+
+    // Second emit: count==2 → interval = base << 2 = 4*base.
+    const t1 = t0 + 2 * base;
+    ls.noteCloseEmit(t1, t0 + 300_000); // deadline ignored (already armed).
+    try std.testing.expect(!ls.shouldRearmCloseRepeat(t1 + (4 * base) - 1, base));
+    try std.testing.expect(ls.shouldRearmCloseRepeat(t1 + 4 * base, base));
+
+    // Third emit: count==3 → interval = 8*base.
+    const t2 = t1 + 4 * base;
+    ls.noteCloseEmit(t2, t0 + 300_000);
+    try std.testing.expect(!ls.shouldRearmCloseRepeat(t2 + (8 * base) - 1, base));
+    try std.testing.expect(ls.shouldRearmCloseRepeat(t2 + 8 * base, base));
+}
+
+test "lifecycle: shouldRearmCloseRepeat is false while pending_close is queued" {
+    var ls: LifecycleState = .{};
+    ls.noteCloseEmit(0, 300_000);
+    ls.pending_close = .{ .is_transport = true, .error_code = 0 };
+    // Even past the backoff window the rearm path must short-circuit on
+    // pending_close — we already have a CC queued for the next packet.
+    try std.testing.expect(!ls.shouldRearmCloseRepeat(1_000_000_000, 1));
+}
+
+test "lifecycle: finishClosingIfElapsed is no-op before the deadline" {
+    var ls: LifecycleState = .{};
+    const t0: u64 = 0;
+    const pto: u64 = 100_000;
+    ls.noteCloseEmit(t0, t0 + 3 * pto);
+
+    try std.testing.expect(!ls.finishClosingIfElapsed(t0 + pto));
+    try std.testing.expectEqual(CloseState.closing, ls.state());
+    try std.testing.expectEqual(@as(?u64, t0 + 3 * pto), ls.closing_deadline_us);
+}
+
+test "lifecycle: finishClosingIfElapsed transitions to closed past the deadline" {
+    var ls: LifecycleState = .{};
+    const t0: u64 = 0;
+    const pto: u64 = 100_000;
+    const deadline = t0 + 3 * pto;
+    ls.noteCloseEmit(t0, deadline);
+
+    try std.testing.expect(ls.finishClosingIfElapsed(deadline + 1));
+    try std.testing.expectEqual(CloseState.closed, ls.state());
+    try std.testing.expectEqual(@as(?u64, null), ls.closing_deadline_us);
+    try std.testing.expectEqual(@as(?u64, null), ls.draining_deadline_us);
+    try std.testing.expect(ls.closed);
+}
+
+test "lifecycle: record truncates reason phrases longer than max_close_reason_len" {
+    var ls: LifecycleState = .{};
+    var long_reason: [max_close_reason_len + 32]u8 = undefined;
+    @memset(&long_reason, 'x');
+
+    ls.record(.local, .application, 0x42, 0, &long_reason, 100, null);
+    const ev = ls.event() orelse return error.MissingEvent;
+    try std.testing.expectEqual(max_close_reason_len, ev.reason.len);
+    try std.testing.expect(ev.reason_truncated);
+    for (ev.reason) |b| try std.testing.expectEqual(@as(u8, 'x'), b);
+}
+
+test "lifecycle: record is sticky — first close wins" {
+    var ls: LifecycleState = .{};
+    ls.record(.local, .application, 1, 0, "first", 10, null);
+    ls.record(.peer, .transport, 2, 7, "second", 20, 50);
+
+    const ev = ls.event() orelse return error.MissingEvent;
+    try std.testing.expectEqual(CloseSource.local, ev.source);
+    try std.testing.expectEqual(CloseErrorSpace.application, ev.error_space);
+    try std.testing.expectEqual(@as(u64, 1), ev.error_code);
+    try std.testing.expectEqual(@as(u64, 0), ev.frame_type);
+    try std.testing.expectEqualStrings("first", ev.reason);
+    try std.testing.expectEqual(@as(?u64, 10), ev.at_us);
+    try std.testing.expect(!ev.reason_truncated);
+}
+
+test "lifecycle: enterDraining transitions and arms the draining deadline" {
+    var ls: LifecycleState = .{};
+    // Simulate that we'd already sent our own CC and were in closing.
+    ls.noteCloseEmit(0, 300_000);
+    try std.testing.expectEqual(CloseState.closing, ls.state());
+
+    const draining_deadline: u64 = 600_000;
+    ls.enterDraining(.peer, .transport, 0x0a, 0, "peer-cc", 100, draining_deadline);
+
+    try std.testing.expectEqual(CloseState.draining, ls.state());
+    try std.testing.expectEqual(@as(?u64, draining_deadline), ls.draining_deadline_us);
+    try std.testing.expectEqual(@as(?u64, null), ls.closing_deadline_us);
+    try std.testing.expect(ls.closed);
+
+    const ev = ls.event() orelse return error.MissingEvent;
+    try std.testing.expectEqual(CloseSource.peer, ev.source);
+    try std.testing.expectEqual(@as(?u64, draining_deadline), ev.draining_deadline_us);
+
+    // Past the draining deadline, finishDrainingIfElapsed transitions to closed.
+    try std.testing.expect(ls.finishDrainingIfElapsed(draining_deadline + 1));
+    try std.testing.expectEqual(CloseState.closed, ls.state());
+}

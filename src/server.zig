@@ -618,6 +618,14 @@ const ConfigImpl = struct {
     /// caps to do their job before this aggregate cap fires.
     max_connection_memory: u64 = conn_mod.state.default_max_connection_memory,
 
+    /// Number of ack-eliciting application packets the server requires
+    /// before forcing an immediate ACK (RFC 9000 §13.2.1 ¶2). Default
+    /// matches `nullq.conn.state.application_ack_eliciting_threshold`.
+    /// Lower this to 1 for low-RTT links where every packet should be
+    /// ACKed; raise it to amortize ACK overhead at the cost of more
+    /// peer PTOs. Threaded onto every Connection at slot-open time.
+    delayed_ack_packet_threshold: u8 = conn_mod.state.application_ack_eliciting_threshold,
+
     /// Listener-level packet rate limit (hardening guide §4.1):
     /// drop incoming UDP datagrams when the global per-window count
     /// exceeds this cap. Off by default (`null`) so embedders
@@ -972,6 +980,10 @@ pub const Server = struct {
     /// a per-connection cap. Hardening guide §3.5 / §8.
     max_connection_memory: u64,
 
+    /// Captured `Config.delayed_ack_packet_threshold` — threaded onto
+    /// every Connection at slot-open time. RFC 9000 §13.2.1.
+    delayed_ack_packet_threshold: u8,
+
     /// Captured `Config.max_datagrams_per_window`. Null disables the
     /// listener-level packet rate limit; otherwise gates *every*
     /// inbound datagram (existing-slot routes included) at the very
@@ -1220,6 +1232,7 @@ pub const Server = struct {
             .early_data_anti_replay = config.early_data_anti_replay,
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .max_connection_memory = config.max_connection_memory,
+            .delayed_ack_packet_threshold = config.delayed_ack_packet_threshold,
             .max_datagrams_per_window = config.max_datagrams_per_window,
             .max_bytes_per_window = config.max_bytes_per_window,
             .listener_rate_window_us = config.listener_rate_window_us,
@@ -1823,6 +1836,7 @@ pub const Server = struct {
         errdefer conn_ptr.deinit();
         conn_ptr.reveal_close_reason_on_wire = self.reveal_close_reason_on_wire;
         conn_ptr.max_connection_memory = self.max_connection_memory;
+        conn_ptr.delayed_ack_packet_threshold = self.delayed_ack_packet_threshold;
 
         try conn_ptr.bind();
         if (self.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, self.qlog_user_data);

@@ -248,6 +248,19 @@ pub const application_ack_eliciting_threshold: u8 = 1;
 pub const max_application_ack_ranges_bytes: usize = 128;
 /// Hard cap on the number of additional (non-largest) ACK ranges per application packet.
 pub const max_application_ack_lower_ranges: u64 = 16;
+/// Per-`handle`-cycle ceiling on cumulative ACK ranges drained from
+/// inbound ACK / PATH_ACK frames. Sized at 4× the per-frame decoder
+/// cap (`frame.decode.max_incoming_ack_ranges = 256`) so well-behaved
+/// multipath peers can ACK across roughly 4 active paths in one
+/// datagram before tripping the gate. Beyond that, additional frames
+/// are skipped (see RFC 9000 §19.3 — ACK is not ack-eliciting and
+/// dropping does not affect connection liveness).
+pub const incoming_ack_range_cap: u64 = 4 * @import("../frame/decode.zig").max_incoming_ack_ranges;
+/// Per-`handle`-cycle ceiling on RETIRE_CONNECTION_ID frames. The
+/// `active_connection_id_limit` hard cap is 16 (transport_params.zig);
+/// 4× that gives steady-state churn headroom for a legitimate peer
+/// rotating CIDs aggressively without enabling a flood attack.
+pub const incoming_retire_cid_cap: u64 = 64;
 
 /// Default per-stream receive credit advertised in transport params.
 pub const default_stream_receive_window: u64 = 1024 * 1024;
@@ -941,6 +954,22 @@ pub const Connection = struct {
     /// individual buffer stays under its own cap.
     max_connection_memory: u64 = default_max_connection_memory,
 
+    /// Number of ack-eliciting application packets received before
+    /// forcing an immediate ACK (RFC 9000 §13.2.1 ¶2: "An endpoint
+    /// MUST acknowledge ack-eliciting packets within its advertised
+    /// max_ack_delay, with the following exception: it MUST send an
+    /// immediate ACK for ack-eliciting packets that are received after
+    /// receiving at least 2 ack-eliciting packets without sending an
+    /// ACK..."). RFC 9000 §13.2.2 lets implementations tune this
+    /// threshold; 2 is the RFC-recommended starting point.
+    /// Set lower (e.g. 1) to ACK every ack-eliciting packet
+    /// immediately — useful in low-RTT environments where the
+    /// `max_ack_delay` deadline rarely fires. Set higher to amortize
+    /// ACK overhead at the cost of triggering more peer PTOs.
+    /// `Server.Config` and `Client.Config` thread the chosen value
+    /// onto every Connection at construction time.
+    delayed_ack_packet_threshold: u8 = application_ack_eliciting_threshold,
+
     /// Running total of bytes currently resident in peer-controlled
     /// buffers — see `max_connection_memory`. Mutated by
     /// `tryReserveResidentBytes` / `releaseResidentBytes` at every
@@ -1072,6 +1101,26 @@ pub const Connection = struct {
     /// RFC 9000 §19.16 ¶3 (a peer MUST NOT retire the CID it just
     /// used to send to us — PROTOCOL_VIOLATION).
     current_incoming_local_cid_seq: ?u64 = null,
+
+    /// Cumulative count of ACK ranges processed across every ACK /
+    /// PATH_ACK frame in the current `handle` cycle. Reset on entry to
+    /// `handle`. Incremented by `range_count + 1` per frame (the +1
+    /// accounts for `first_range`, which is real but encoded out of
+    /// the gap-list). The decoder already caps each individual frame
+    /// at `frame.decode.max_incoming_ack_ranges = 256`; without a
+    /// per-cycle ceiling, an attacker on N paths could submit
+    /// N × 256 ranges per datagram and force unbounded
+    /// loss-detection walks. We cap at `incoming_ack_range_cap` —
+    /// enough headroom for legitimate multipath aggregation across
+    /// ~4 active paths in one datagram, not enough to amplify.
+    incoming_ack_range_count: u64 = 0,
+    /// Cumulative count of RETIRE_CONNECTION_ID frames processed in
+    /// the current `handle` cycle. Reset on entry to `handle`.
+    /// Bounded at `incoming_retire_cid_cap` so a peer flooding
+    /// retires inside one datagram is treated as adversarial and
+    /// closed with PROTOCOL_VIOLATION rather than allowed to spend
+    /// CPU walking `local_cids` once per frame.
+    incoming_retire_cid_count: u64 = 0,
 
     /// Application key-update lifecycle. QUIC key updates derive new
     /// packet-protection key/IV from "quic ku" while retaining the
@@ -1354,6 +1403,9 @@ pub const Connection = struct {
             std.crypto.secureZero(u8, &epoch.keys.key);
             std.crypto.secureZero(u8, &epoch.keys.iv);
             std.crypto.secureZero(u8, &epoch.keys.hp);
+            // The cached HP cipher holds an AES key schedule derived
+            // from `hp`; zero its raw bytes too.
+            std.crypto.secureZero(u8, std.mem.asBytes(&epoch.keys.hp_cipher));
         }
     }
 
@@ -1943,7 +1995,11 @@ pub const Connection = struct {
             suite,
             material.secret[0..material.secret_len],
         );
-        next_keys.hp = current.keys.hp;
+        // RFC 9001 §6: HP keys don't rotate on a key update; only the
+        // AEAD key/IV change. `setHp` keeps the cached HP cipher in
+        // sync with the bytes — a bare `next_keys.hp = …` would leave
+        // the cache pointing at the just-derived (but unused) HP key.
+        try next_keys.setHp(current.keys.hp[0..suite.hpLen()]);
         return .{
             .material = material,
             .keys = next_keys,
@@ -2389,6 +2445,22 @@ pub const Connection = struct {
             }
         }
         return next;
+    }
+
+    /// Smallest sequence number still resident in `local_cids` for
+    /// `path_id`, or null when the path has no local CIDs at all.
+    /// Used by `handleRetireConnectionId` to short-circuit an
+    /// O(N) walk when the peer retires a sequence already gone from
+    /// the table.
+    fn smallestLiveLocalCidSeq(self: *const Connection, path_id: u32) ?u64 {
+        var smallest: ?u64 = null;
+        for (self.local_cids.items) |item| {
+            if (item.path_id != path_id) continue;
+            if (smallest == null or item.sequence_number < smallest.?) {
+                smallest = item.sequence_number;
+            }
+        }
+        return smallest;
     }
 
     /// Sequence number to use for the next NEW_CONNECTION_ID
@@ -3166,8 +3238,14 @@ pub const Connection = struct {
     fn queueMaxStreams(self: *Connection, bidi: bool, maximum_streams: u64) void {
         if (maximum_streams > max_stream_count_limit) return;
         const bounded_maximum_streams = @min(maximum_streams, max_streams_per_connection);
+        // Early-out if the limit has not strictly advanced. RFC 9000
+        // §19.11: a peer MUST ignore MAX_STREAMS that does not advance.
+        // Locally we mirror that — no point clearing peer-blocked state
+        // or re-queuing a frame that doesn't move the cursor.
+        const current = if (bidi) self.local_max_streams_bidi else self.local_max_streams_uni;
+        if (bounded_maximum_streams <= current) return;
         if (bidi) {
-            if (bounded_maximum_streams > self.local_max_streams_bidi) self.local_max_streams_bidi = bounded_maximum_streams;
+            self.local_max_streams_bidi = bounded_maximum_streams;
             if (self.peer_streams_blocked_bidi) |limit| {
                 if (bounded_maximum_streams > limit) self.peer_streams_blocked_bidi = null;
             }
@@ -3175,7 +3253,7 @@ pub const Connection = struct {
                 self.pending_frames.max_streams_bidi = bounded_maximum_streams;
             }
         } else {
-            if (bounded_maximum_streams > self.local_max_streams_uni) self.local_max_streams_uni = bounded_maximum_streams;
+            self.local_max_streams_uni = bounded_maximum_streams;
             if (self.peer_streams_blocked_uni) |limit| {
                 if (bounded_maximum_streams > limit) self.peer_streams_blocked_uni = null;
             }
@@ -4172,14 +4250,17 @@ pub const Connection = struct {
     }
 
     fn idleTimeoutUs(self: *const Connection) ?u64 {
-        const local = self.local_transport_params.max_idle_timeout_ms * rtt_mod.ms;
-        const peer = if (self.cached_peer_transport_params) |params|
-            params.max_idle_timeout_ms * rtt_mod.ms
-        else
-            0;
-        if (local == 0) return if (peer == 0) null else peer;
-        if (peer == 0) return local;
-        return @min(local, peer);
+        // RFC 9000 §10.1 ¶2: "An idle timeout value of 0 is equivalent
+        // to no timeout." The effective value is the minimum of local
+        // and peer; if either is 0 the connection has no idle timeout.
+        // We treat "peer params not yet cached" the same as "peer
+        // advertised 0" — pre-handshake there is no negotiated value
+        // so no idle deadline applies.
+        const local = self.local_transport_params.max_idle_timeout_ms;
+        if (local == 0) return null;
+        const params = self.cached_peer_transport_params orelse return null;
+        if (params.max_idle_timeout_ms == 0) return null;
+        return @min(local, params.max_idle_timeout_ms) * rtt_mod.ms;
     }
 
     fn primaryPath(self: *Connection) *PathState {
@@ -6126,6 +6207,10 @@ pub const Connection = struct {
         // Closing-state attribution accumulator. Cleared on entry so
         // it reflects only this datagram's observations.
         self.closing_state_attribution_observed = false;
+        // Per-handle-cycle DoS gates. See `incoming_ack_range_cap` /
+        // `incoming_retire_cid_cap` for the rationale.
+        self.incoming_ack_range_count = 0;
+        self.incoming_retire_cid_count = 0;
         if (bytes.len > self.localUdpPayloadLimit()) {
             self.emitPacketDropped(null, @intCast(bytes.len), .payload_too_large);
             self.close(true, transport_error_protocol_violation, "udp payload exceeds local limit");
@@ -6640,6 +6725,7 @@ pub const Connection = struct {
         pn: u64,
         now_us: u64,
         payload: []const u8,
+        delayed_ack_threshold: u8,
     ) void {
         const ack_eliciting = packetPayloadAckEliciting(payload);
         if (ack_eliciting and packetPayloadNeedsImmediateAck(payload)) {
@@ -6650,7 +6736,7 @@ pub const Connection = struct {
             pn,
             now_us / rtt_mod.ms,
             ack_eliciting,
-            application_ack_eliciting_threshold,
+            delayed_ack_threshold,
         );
     }
 
@@ -6755,7 +6841,7 @@ pub const Connection = struct {
             self.scanForPeerCloseFrame(opened.payload, now_us);
             return bytes.len;
         }
-        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
+        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload, self.delayed_ack_packet_threshold);
         self.qlog_packets_received +|= 1;
         self.emitPacketReceived(.application, opened.pn, @intCast(bytes.len), countFrames(opened.payload));
         try self.dispatchFrames(.application, opened.payload, now_us);
@@ -7010,7 +7096,7 @@ pub const Connection = struct {
             self.scanForPeerCloseFrame(opened.payload, now_us);
             return opened.bytes_consumed;
         }
-        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
+        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload, self.delayed_ack_packet_threshold);
         self.qlog_packets_received +|= 1;
         self.emitPacketReceived(.early_data, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
         try self.dispatchFrames(.early_data, opened.payload, now_us);
@@ -7130,8 +7216,14 @@ pub const Connection = struct {
             }
             switch (f) {
                 .padding, .ping, .handshake_done => {},
-                .ack => |a| try self.handleAckAtLevel(lvl, a, now_us),
-                .path_ack => |a| try self.handlePathAck(a, now_us),
+                .ack => |a| {
+                    if (self.exceedsIncomingAckRangeCap(a.range_count)) continue;
+                    try self.handleAckAtLevel(lvl, a, now_us);
+                },
+                .path_ack => |a| {
+                    if (self.exceedsIncomingAckRangeCap(a.range_count)) continue;
+                    try self.handlePathAck(a, now_us);
+                },
                 .crypto => |cr| try self.handleCrypto(lvl, cr),
                 .stream => |s| try self.handleStream(lvl, s),
                 .reset_stream => |rs| try self.handleResetStream(rs),
@@ -7413,10 +7505,33 @@ pub const Connection = struct {
         try self.registerPeerCid(0, nc.sequence_number, nc.retire_prior_to, cid, nc.stateless_reset_token);
     }
 
+    /// Returns true (and increments the per-cycle counter) when the
+    /// cumulative ACK range count for this `handle` cycle would exceed
+    /// `incoming_ack_range_cap`. Skipping rather than closing is RFC
+    /// 9000 §19.3-aligned: ACK is not ack-eliciting, dropping it
+    /// re-issues no liveness obligation, and the peer's loss-recovery
+    /// will retransmit anything we miss.
+    fn exceedsIncomingAckRangeCap(self: *Connection, range_count: u64) bool {
+        const next = self.incoming_ack_range_count +| range_count +| 1;
+        if (next > incoming_ack_range_cap) return true;
+        self.incoming_ack_range_count = next;
+        return false;
+    }
+
     fn handleRetireConnectionId(
         self: *Connection,
         rc: frame_types.RetireConnectionId,
     ) void {
+        // Per-cycle flood gate (DoS hardening). A peer bursting
+        // RETIRE_CONNECTION_ID frames forces O(N) walks of `local_cids`
+        // per frame; once the count exceeds the cap there's no
+        // legitimate flow that needs that many retires in one
+        // datagram.
+        self.incoming_retire_cid_count +|= 1;
+        if (self.incoming_retire_cid_count > incoming_retire_cid_cap) {
+            self.close(true, transport_error_protocol_violation, "retire_connection_id flood");
+            return;
+        }
         // RFC 9000 §19.16 ¶3: "The sequence number specified in a
         // RETIRE_CONNECTION_ID frame MUST NOT refer to the
         // Destination Connection ID field of the packet in which the
@@ -7441,6 +7556,15 @@ pub const Connection = struct {
                 self.close(true, transport_error_protocol_violation, "retire_connection_id sequence not yet issued");
                 return;
             }
+        }
+        // Fast-path skip: if this seq is below the smallest still-live
+        // local CID seq for path 0, the retire is a no-op (the entry
+        // is already gone or was never installed). Skipping spares the
+        // O(N) walk through `local_cids` and `pending_frames`. Equality
+        // with an existing entry still goes through the slow path so
+        // promotion fires correctly.
+        if (self.smallestLiveLocalCidSeq(0)) |smallest| {
+            if (rc.sequence_number < smallest) return;
         }
         self.retireLocalCidFromPeer(0, rc.sequence_number);
         self.dropPendingLocalCidAdvertisement(0, rc.sequence_number);
@@ -8007,6 +8131,12 @@ pub const Connection = struct {
             self.close(true, transport_error_flow_control, "peer reset exceeds connection data limit");
             return;
         }
+        // Hardening guide §3.5 / §8: snapshot the recv buffer length
+        // before `resetStream`, which discards buffered-but-undelivered
+        // bytes (no-longer-needed reassembly state) and shrinks the
+        // backing allocation to zero. Reconcile the global
+        // resident-bytes counter against that drop.
+        const recv_before = ptr.recv.bytes.items.len;
         ptr.recv.resetStream(rs.application_error_code, rs.final_size) catch |err| switch (err) {
             error.BeyondFinalSize, error.FinalSizeChanged => {
                 self.close(true, transport_error_final_size, "reset stream final size changed");
@@ -8014,6 +8144,9 @@ pub const Connection = struct {
             },
             else => return err,
         };
+        if (ptr.recv.bytes.items.len < recv_before) {
+            self.releaseResidentBytes(recv_before - ptr.recv.bytes.items.len);
+        }
         self.peer_sent_stream_data += delta;
         self.maybeReturnPeerStreamCredit(ptr);
     }
@@ -9782,6 +9915,40 @@ test "timer deadline reports ACK delay" {
     try std.testing.expectEqual(@as(u64, 1_010_000), deadline.at_us);
 }
 
+test "delayed_ack_packet_threshold tunes the immediate-ACK gate" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Threshold = 1: every ack-eliciting packet forces an immediate
+    // ACK with no delayed-ACK arming.
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(0, 1_000, true, 1);
+    var tracker = &conn.primaryPath().app_pn_space.received;
+    try std.testing.expect(tracker.pending_ack);
+
+    // Reset and try threshold=4. The first three ack-eliciting
+    // packets arm but don't promote; the fourth promotes.
+    conn.primaryPath().app_pn_space.received = .{};
+    tracker = &conn.primaryPath().app_pn_space.received;
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(10, 1_000, true, 4);
+    try std.testing.expect(!tracker.pending_ack);
+    try std.testing.expect(tracker.delayed_ack_armed);
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(11, 1_001, true, 4);
+    try std.testing.expect(!tracker.pending_ack);
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(12, 1_002, true, 4);
+    try std.testing.expect(!tracker.pending_ack);
+    conn.primaryPath().app_pn_space.recordReceivedPacketDelayed(13, 1_003, true, 4);
+    try std.testing.expect(tracker.pending_ack);
+
+    // The Connection-level field defaults to
+    // `application_ack_eliciting_threshold`.
+    try std.testing.expectEqual(application_ack_eliciting_threshold, conn.delayed_ack_packet_threshold);
+    conn.delayed_ack_packet_threshold = 4;
+    try std.testing.expectEqual(@as(u8, 4), conn.delayed_ack_packet_threshold);
+}
+
 test "application delayed ACK waits for configured threshold or timer" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
@@ -10577,6 +10744,55 @@ test "PATH_ACK routes ACK processing to the indicated application path" {
     try std.testing.expectEqual(@as(u64, 0), path.sent.bytes_in_flight);
     try std.testing.expectEqual(@as(?u64, 0), path.app_pn_space.largest_acked_sent);
     try std.testing.expectEqual(@as(u64, 50_000), path.path.rtt.latest_rtt_us);
+}
+
+test "ACK / PATH_ACK range-count sum is bounded per handle cycle" {
+    // Build a payload of 16 PATH_ACK frames each declaring 256 ranges
+    // (the per-frame decoder cap). 16 * (256 + 1) > incoming_ack_range_cap,
+    // so dispatch must skip frames once the cumulative count exceeds
+    // the cap. We can't easily run real decode (the ranges are
+    // synthetic), so drive `dispatchFrames` with a hand-rolled
+    // payload using `range_count = 256, first_range = 0`.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Pre-record sent packets so handleAckAtLevel doesn't bail with
+    // "ack of unsent packet". We'll only ack pn=0 from each frame,
+    // since the synthetic ranges_bytes is empty (range_count is the
+    // declared count; the iterator stops at the first invalid byte —
+    // but we feed it through the in-source dispatch path using
+    // pre-built frame_types.PathAck values that don't go through the
+    // decoder).
+    conn.paths.primary().app_pn_space.next_pn = 1;
+    try conn.paths.primary().sent.record(.{
+        .pn = 0,
+        .sent_time_us = 1_000,
+        .bytes = 32,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+
+    // Simulate per-handle-cycle entry: counters reset.
+    conn.incoming_ack_range_count = 0;
+
+    // First frame: range_count = 256 → bump cumulative to 257.
+    try std.testing.expect(!conn.exceedsIncomingAckRangeCap(256));
+    try std.testing.expectEqual(@as(u64, 257), conn.incoming_ack_range_count);
+
+    // Three more frames bump the count past 4*256 = 1024.
+    try std.testing.expect(!conn.exceedsIncomingAckRangeCap(256));
+    try std.testing.expect(!conn.exceedsIncomingAckRangeCap(256));
+    // Fourth would push to 1028 — beyond the 1024 cap.
+    try std.testing.expect(conn.exceedsIncomingAckRangeCap(256));
+    // Counter stops advancing once the cap is reached.
+    try std.testing.expectEqual(@as(u64, 771), conn.incoming_ack_range_count);
+    // Subsequent frames continue to be rejected without further
+    // bumping the counter (cap stays sticky for this cycle).
+    try std.testing.expect(conn.exceedsIncomingAckRangeCap(256));
+    try std.testing.expectEqual(@as(u64, 771), conn.incoming_ack_range_count);
 }
 
 fn installTestApplicationWriteSecret(conn: *Connection) !void {
@@ -13157,7 +13373,11 @@ test "idle timer closes and enters draining" {
     var conn = try Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
 
+    // Per RFC 9000 §10.1 ¶2 the effective idle timeout is the min of
+    // local and peer; either side advertising 0 means no timeout. Set
+    // both so the idle gate actually arms.
     try conn.setTransportParams(.{ .max_idle_timeout_ms = 5 });
+    conn.cached_peer_transport_params = .{ .max_idle_timeout_ms = 5 };
     conn.last_activity_us = 1_000;
     const deadline = conn.nextTimerDeadline(1_000).?;
     try std.testing.expectEqual(TimerKind.idle, deadline.kind);
@@ -13176,6 +13396,47 @@ test "idle timer closes and enters draining" {
     try conn.tick(conn.lifecycle.draining_deadline_us.?);
     try std.testing.expectEqual(CloseState.closed, conn.closeState());
     try std.testing.expect(conn.nextTimerDeadline(10_000) == null);
+}
+
+test "idle timer disabled when either endpoint advertises 0 [RFC9000 §10.1 ¶2]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+
+    const Helper = struct {
+        fn run(
+            a: std.mem.Allocator,
+            tls_ctx: boringssl.tls.Context,
+            local_ms: u64,
+            peer_ms: u64,
+        ) !?TimerDeadline {
+            const conn_ptr = try a.create(Connection);
+            defer a.destroy(conn_ptr);
+            conn_ptr.* = try Connection.initClient(a, tls_ctx, "x");
+            defer conn_ptr.deinit();
+            try conn_ptr.setTransportParams(.{ .max_idle_timeout_ms = local_ms });
+            conn_ptr.cached_peer_transport_params = .{ .max_idle_timeout_ms = peer_ms };
+            conn_ptr.last_activity_us = 1_000;
+            return conn_ptr.nextTimerDeadline(1_000);
+        }
+    };
+
+    // Local says 0 → no timeout regardless of peer.
+    {
+        const next = try Helper.run(allocator, ctx, 0, 30_000);
+        try std.testing.expect(next == null or next.?.kind != TimerKind.idle);
+    }
+    // Peer says 0 → no timeout regardless of local.
+    {
+        const next = try Helper.run(allocator, ctx, 30_000, 0);
+        try std.testing.expect(next == null or next.?.kind != TimerKind.idle);
+    }
+    // Both non-zero → uses min.
+    {
+        const deadline = (try Helper.run(allocator, ctx, 30_000, 5)).?;
+        try std.testing.expectEqual(TimerKind.idle, deadline.kind);
+        try std.testing.expectEqual(@as(u64, 6_000), deadline.at_us);
+    }
 }
 
 test "qlog: connection_started and connection_state_updated fire on bind+close" {
@@ -14056,6 +14317,68 @@ fn fuzzConnMigrationImpl(_: void, smith: *std.testing.Smith) anyerror!void {
 // the same state-machine surface that §11.1 #19 calls out.
 test "fuzz: Connection NEW_CONNECTION_ID / RETIRE_CONNECTION_ID lifecycle invariants" {
     try std.testing.fuzz({}, fuzzCidLifecycle, .{});
+}
+
+test "RETIRE_CONNECTION_ID flood beyond per-cycle cap closes with PROTOCOL_VIOLATION" {
+    // Seed corpus entry mirroring an adversarial peer that bursts
+    // `incoming_retire_cid_cap + 1` RETIRE frames in one datagram.
+    // The fast-path skip handles the bulk (each retire targets a
+    // sequence below the smallest live entry), so the closing
+    // signal is the per-cycle counter, not the per-frame walk.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 8 };
+    try conn.setLocalScid(&.{0xb0});
+    try conn.queueNewConnectionId(1, 0, &.{0xb1}, @splat(0xb1));
+    try conn.queueNewConnectionId(2, 0, &.{0xb2}, @splat(0xb2));
+
+    // Fresh handle cycle.
+    conn.incoming_retire_cid_count = 0;
+
+    var i: u64 = 0;
+    while (i <= incoming_retire_cid_cap) : (i += 1) {
+        // Use sequence 0 every time — it's a real local CID, so
+        // the retire actually does something on the first call,
+        // then the fast-path skip kicks in for the rest. Either
+        // way, the per-cycle counter advances.
+        conn.handleRetireConnectionId(.{ .sequence_number = 0 });
+        if (conn.lifecycle.pending_close != null) break;
+    }
+    const close = conn.lifecycle.pending_close orelse return error.TestExpectedFloodClose;
+    try std.testing.expectEqual(transport_error_protocol_violation, close.error_code);
+    try std.testing.expectEqualStrings("retire_connection_id flood", close.reason);
+}
+
+test "RETIRE_CONNECTION_ID fast-path skips sequences already retired" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 8 };
+    try conn.setLocalScid(&.{0xc0});
+    try conn.queueNewConnectionId(1, 0, &.{0xc1}, @splat(0xc1));
+    try conn.queueNewConnectionId(2, 0, &.{0xc2}, @splat(0xc2));
+    try conn.queueNewConnectionId(3, 0, &.{0xc3}, @splat(0xc3));
+
+    // Real retire: removes seq 0 and 1 from local_cids.
+    conn.handleRetireConnectionId(.{ .sequence_number = 0 });
+    conn.handleRetireConnectionId(.{ .sequence_number = 1 });
+
+    // smallestLiveLocalCidSeq(0) is now 2. A retire of seq 0 must
+    // hit the fast-path skip (no close, no further state change).
+    const closes_before = conn.incoming_retire_cid_count;
+    conn.handleRetireConnectionId(.{ .sequence_number = 0 });
+    try std.testing.expect(conn.lifecycle.pending_close == null);
+    // Counter still bumped (the cap gates total frame count, not
+    // just slow-path frames) but no work was done.
+    try std.testing.expectEqual(closes_before + 1, conn.incoming_retire_cid_count);
+    try std.testing.expectEqual(@as(u64, 2), conn.smallestLiveLocalCidSeq(0).?);
 }
 
 fn fuzzCidLifecycle(_: void, smith: *std.testing.Smith) anyerror!void {

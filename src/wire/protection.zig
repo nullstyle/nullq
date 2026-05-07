@@ -74,8 +74,14 @@ pub fn aeadNonceForPath(iv: *const [12]u8, path_id: u32, pn: u64) [12]u8 {
 /// 5 bytes of `AES_encrypt(hp_key, sample)`. RFC 9001 §5.4.3.
 pub fn aesHpMask(hp_key: *const [16]u8, sample: *const [sample_len]u8) Error![mask_len]u8 {
     const aes = try Aes128.init(hp_key);
+    return aesHpMaskWithCtx(&aes, sample);
+}
+
+/// Same as `aesHpMask` but reuses a pre-initialized AES-128 block
+/// context. Avoids `AES_set_encrypt_key` overhead on every packet.
+pub fn aesHpMaskWithCtx(ctx: *const Aes128, sample: *const [sample_len]u8) [mask_len]u8 {
     var block: [16]u8 = undefined;
-    aes.encryptBlock(sample, &block);
+    ctx.encryptBlock(sample, &block);
     var mask: [mask_len]u8 = undefined;
     @memcpy(&mask, block[0..mask_len]);
     return mask;
@@ -84,8 +90,14 @@ pub fn aesHpMask(hp_key: *const [16]u8, sample: *const [sample_len]u8) Error![ma
 /// AES-256-GCM uses AES-256 for QUIC header protection.
 pub fn aes256HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) Error![mask_len]u8 {
     const aes = try Aes256.init(hp_key);
+    return aes256HpMaskWithCtx(&aes, sample);
+}
+
+/// Same as `aes256HpMask` but reuses a pre-initialized AES-256 block
+/// context.
+pub fn aes256HpMaskWithCtx(ctx: *const Aes256, sample: *const [sample_len]u8) [mask_len]u8 {
     var block: [16]u8 = undefined;
-    aes.encryptBlock(sample, &block);
+    ctx.encryptBlock(sample, &block);
     var mask: [mask_len]u8 = undefined;
     @memcpy(&mask, block[0..mask_len]);
     return mask;
@@ -95,6 +107,28 @@ pub fn aes256HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) Error!
 pub fn chacha20HpMask(hp_key: *const [32]u8, sample: *const [sample_len]u8) [mask_len]u8 {
     return chacha20.quicHpMask(hp_key, sample);
 }
+
+/// Pre-initialized header-protection cipher context. Cached alongside
+/// the raw HP key bytes inside `short_packet.PacketKeys` so we don't
+/// pay `AES_set_encrypt_key` per packet (RFC 9001 §5.4.3 calls
+/// `AES_ECB(hp_key, sample)` — the key schedule is fixed for the
+/// lifetime of the HP key, only the sample varies).
+pub const HpCipher = union(enum) {
+    aes128: Aes128,
+    aes256: Aes256,
+    /// ChaCha20 has no key-schedule init step (`crypto.chacha20.quicHpMask`
+    /// runs the keystream straight from the raw key), so we don't
+    /// cache anything for it.
+    chacha20: void,
+
+    pub fn mask(self: *const HpCipher, sample: *const [sample_len]u8, hp_key: []const u8) [mask_len]u8 {
+        return switch (self.*) {
+            .aes128 => |*ctx| aesHpMaskWithCtx(ctx, sample),
+            .aes256 => |*ctx| aes256HpMaskWithCtx(ctx, sample),
+            .chacha20 => chacha20HpMask(@ptrCast(hp_key[0..32]), sample),
+        };
+    }
+};
 
 /// Whether a packet uses the long-header or short-header form. Drives
 /// how many low bits of the first byte are masked by header

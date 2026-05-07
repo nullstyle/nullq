@@ -296,6 +296,18 @@ pub const RecvStream = struct {
         }
 
         self.maybeAdvanceState();
+
+        // Once the stream is fully drained and FIN has been seen,
+        // the buffer will never grow again — release the backing
+        // capacity so a long-lived connection doesn't accumulate
+        // peak-sized allocations across short streams. The connection
+        // budget is keyed on `bytes.items.len`, which is already 0
+        // here, so this is purely a physical-allocator return; no
+        // additional budget bookkeeping is required.
+        if (self.state == .data_recvd and self.bytes.items.len == 0) {
+            self.compact();
+        }
+
         return take;
     }
 
@@ -316,6 +328,42 @@ pub const RecvStream = struct {
         self.reset = .{ .error_code = error_code, .final_size = final_size_in };
         self.final_size = final_size_in;
         self.state = .reset_recvd;
+        // Any buffered bytes are now dead — the application will never
+        // see them. Drop the live items and release the backing
+        // capacity. The caller (Connection.handleResetStream) is
+        // responsible for releasing the connection-wide budget for the
+        // bytes that just disappeared from `bytes.items.len`.
+        self.compact();
+    }
+
+    /// Drop any buffered bytes and reassembly metadata, returning
+    /// backing capacity to the allocator. Safe to call any time the
+    /// caller has decided no further bytes will be delivered to the
+    /// app — i.e. after RESET_STREAM, or after FIN-and-fully-drained
+    /// (state == .data_recvd or .data_read).
+    ///
+    /// Idempotent. Does not touch `read_offset`, `end_offset`,
+    /// `final_size`, `fin_seen`, `reset`, or `state`.
+    ///
+    /// The connection-wide resident-bytes budget is keyed on
+    /// `bytes.items.len`, so a caller that snapshots `items.len`
+    /// before invoking `compact` (directly or via `read` / `resetStream`
+    /// /`recv` after final-size lock) and releases the difference will
+    /// keep the budget honest. This method does NOT call back into the
+    /// connection — `RecvStream` has no knowledge of it.
+    pub fn compact(self: *RecvStream) void {
+        if (self.bytes.items.len > 0) {
+            self.bytes.clearRetainingCapacity();
+        }
+        if (self.bytes.capacity > 0) {
+            self.bytes.shrinkAndFree(self.allocator, 0);
+        }
+        if (self.ranges.items.len > 0) {
+            self.ranges.clearRetainingCapacity();
+        }
+        if (self.ranges.capacity > 0) {
+            self.ranges.shrinkAndFree(self.allocator, 0);
+        }
     }
 
     /// Mark the stream as fully read by the app — only meaningful
@@ -596,6 +644,76 @@ test "stress: 64 KiB random shuffle reassembles in order with FIN" {
     }
     try testing.expectEqual(total, consumed);
     try testing.expectEqual(State.data_recvd, s.state);
+}
+
+test "compact: peak buffer capacity is released after fully draining a 1 MiB stream" {
+    var s = RecvStream.init(test_alloc);
+    defer s.deinit();
+    s.max_buffered_span = 4 * 1024 * 1024;
+
+    const total: usize = 1024 * 1024;
+    const payload = try test_alloc.alloc(u8, total);
+    defer test_alloc.free(payload);
+    var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    prng.random().bytes(payload);
+
+    try s.recv(0, payload, true);
+    try testing.expectEqual(State.size_known, s.state);
+    try testing.expect(s.bytes.capacity >= total);
+
+    var rbuf: [4096]u8 = undefined;
+    var consumed: usize = 0;
+    while (consumed < total) {
+        const n = s.read(&rbuf);
+        try testing.expect(n > 0);
+        try testing.expectEqualSlices(u8, payload[consumed..][0..n], rbuf[0..n]);
+        consumed += n;
+    }
+
+    try testing.expectEqual(State.data_recvd, s.state);
+    // Capacity must be released to the allocator: the prior peak of
+    // ~1 MiB is unrecoverable until close without compact().
+    try testing.expectEqual(@as(usize, 0), s.bytes.items.len);
+    try testing.expectEqual(@as(usize, 0), s.bytes.capacity);
+    try testing.expectEqual(@as(usize, 0), s.ranges.items.len);
+}
+
+test "compact: RESET_STREAM after buffered data drops the backing capacity" {
+    var s = RecvStream.init(test_alloc);
+    defer s.deinit();
+
+    // Drive the buffer to a non-trivial peak and confirm it grew.
+    var chunk: [1024]u8 = undefined;
+    @memset(&chunk, 0xab);
+    var off: u64 = 0;
+    while (off < 64 * 1024) : (off += chunk.len) {
+        try s.recv(off, &chunk, false);
+    }
+    try testing.expect(s.bytes.capacity >= 64 * 1024);
+    try testing.expect(s.ranges.capacity >= 1);
+
+    // RESET at the current high-water mark must drop the buffer.
+    try s.resetStream(7, off);
+    try testing.expectEqual(State.reset_recvd, s.state);
+    try testing.expectEqual(@as(usize, 0), s.bytes.items.len);
+    try testing.expectEqual(@as(usize, 0), s.bytes.capacity);
+    try testing.expectEqual(@as(usize, 0), s.ranges.items.len);
+    try testing.expectEqual(@as(usize, 0), s.ranges.capacity);
+}
+
+test "compact is idempotent and safe when called twice" {
+    var s = RecvStream.init(test_alloc);
+    defer s.deinit();
+
+    try s.recv(0, "hello", true);
+    var out: [16]u8 = undefined;
+    _ = s.read(&out);
+    // First compact triggered inside read(); a manual second call must
+    // be a no-op rather than a panic.
+    s.compact();
+    s.compact();
+    try testing.expectEqual(@as(usize, 0), s.bytes.capacity);
+    try testing.expectEqual(@as(usize, 0), s.ranges.capacity);
 }
 
 // -- fuzz harness --------------------------------------------------------
