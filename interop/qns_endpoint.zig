@@ -228,10 +228,19 @@ const NewTokenStore = struct {
 
 const StreamState = struct {
     buf: std.ArrayList(u8) = .empty,
+    /// Allocator-owned response bytes that still need to be written to the
+    /// send half. Populated once we've parsed the request; flushed across
+    /// however many `processStream` calls it takes for `streamWrite` to
+    /// accept all of them (the connection short-writes when the per-stream
+    /// send queue is full — hardening §8 / `default_max_buffered_send`).
+    /// `null` until the response is decided; non-null thereafter.
+    response: ?[]u8 = null,
+    response_offset: usize = 0,
     responded: bool = false,
 
     fn deinit(self: *StreamState, allocator: std.mem.Allocator) void {
         self.buf.deinit(allocator);
+        if (self.response) |bytes| allocator.free(bytes);
         self.* = undefined;
     }
 };
@@ -290,34 +299,43 @@ const Http09App = struct {
         const state = try self.stateFor(stream_id);
         if (state.responded) return;
 
-        var tmp: [4096]u8 = undefined;
-        while (true) {
-            const n = try conn.streamRead(stream_id, &tmp);
-            if (n == 0) break;
-            try state.buf.appendSlice(self.allocator, tmp[0..n]);
+        // Decide the response once, the first time we see the full request.
+        // After that, `state.response` carries the bytes we still owe the
+        // peer and `processStream` is re-entered each event-loop tick by
+        // `Http09App.process` until everything has been accepted by
+        // `streamWrite`.
+        if (state.response == null) {
+            var tmp: [4096]u8 = undefined;
+            while (true) {
+                const n = try conn.streamRead(stream_id, &tmp);
+                if (n == 0) break;
+                try state.buf.appendSlice(self.allocator, tmp[0..n]);
+            }
+
+            const stream = conn.stream(stream_id) orelse return;
+            if (!(stream.recv.state == .data_recvd or stream.recv.state == .data_read)) return;
+
+            if (parseGetPath(state.buf.items)) |rel| {
+                state.response = self.readFile(rel) catch |err| switch (err) {
+                    error.FileNotFound => try self.allocator.dupe(u8, "404"),
+                    else => return err,
+                };
+            } else {
+                state.response = try self.allocator.dupe(u8, "400");
+            }
         }
 
-        const stream = conn.stream(stream_id) orelse return;
-        if (!(stream.recv.state == .data_recvd or stream.recv.state == .data_read)) return;
-
-        const rel = parseGetPath(state.buf.items) orelse {
-            _ = try conn.streamWrite(stream_id, "400");
-            try conn.streamFinish(stream_id);
-            state.responded = true;
-            return;
-        };
-
-        const contents = self.readFile(rel) catch |err| switch (err) {
-            error.FileNotFound => blk: {
-                _ = try conn.streamWrite(stream_id, "404");
-                break :blk null;
-            },
-            else => return err,
-        };
-        if (contents) |bytes| {
-            defer self.allocator.free(bytes);
-            _ = try conn.streamWrite(stream_id, bytes);
+        // Drain whatever the send queue can take this tick. `streamWrite`
+        // is allowed to short-write (returns `accepted < data.len`) when
+        // the per-stream send buffer is full; we just resume from the
+        // updated offset on the next call.
+        const buf = state.response.?;
+        while (state.response_offset < buf.len) {
+            const accepted = try conn.streamWrite(stream_id, buf[state.response_offset..]);
+            if (accepted == 0) return;
+            state.response_offset += accepted;
         }
+
         try conn.streamFinish(stream_id);
         state.responded = true;
     }
