@@ -57,12 +57,23 @@
 //!   RFC9001 §4.6.1 ¶3 MUST      0-RTT context digest changes when transport parameters change
 //!   RFC9001 §4.6.1 ¶3 SHOULD    session-ticket context binds ALPN, transport params, and app context
 //!   RFC9001 §4.6 ¶1   MUST      0-RTT remains opt-in (Server.Config.enable_0rtt defaults to false)
+//!   RFC9001 §4.7 ¶1   MUST      client rejects the server's certificate chain when no
+//!                              trust anchor matches (handshake-fixture-driven; chain
+//!                              failure surfaces as `error.PeerAlerted` from `advance`
+//!                              / `handle` until the dedicated CRYPTO_ERROR-bearing
+//!                              CloseEvent translation lands)
 //!
 //! Visible debt:
-//!   RFC9001 §4.1.1 ¶3 MUST     server closes with crypto_error 120 when peer omits ALPN
-//!                              — needs Server fixture + handshake driver; skip_ below.
-//!   RFC9001 §4.7 ¶1   MUST     server certificate validates against client trust store
-//!                              — outside the wire/tls scope of this file; skip_.
+//!   RFC9001 §4.1.1 ¶3 MUST     server closes with crypto_error 120 when peer
+//!                              omits ALPN — kept as skip_ below. BoringSSL's
+//!                              client-side `ext_alpn_add_clienthello` refuses
+//!                              to construct a no-ALPN ClientHello whenever
+//!                              QUIC is active, so Approach A (an override TLS
+//!                              context with empty ALPN) fails inside the
+//!                              client before any bytes hit the wire.
+//!                              Approach B (synthetic ClientHello bytes) needs
+//!                              a regeneration tool and a fixture file; tracked
+//!                              in the test body.
 //!   RFC9001 §4.8 ¶2   SHOULD   session ticket includes transport-parameter context
 //!                              — covered structurally below; full ticket round-trip is skip_.
 //!   RFC9001 §5.7 ¶3   MUST     discard Initial keys once Handshake keys are available
@@ -529,11 +540,63 @@ test "SHOULD bind the session-ticket context to ALPN as well as transport parame
 // ---------------------------------------------------------------- visible debt
 
 test "skip_MUST close with crypto_error 120 when the peer's ClientHello omits ALPN [RFC9001 §4.1.1 ¶3]" {
-    // §4.1.1: "endpoints MUST send the no_application_protocol TLS
+    // §4.1.1 ¶3: "endpoints MUST send the no_application_protocol TLS
     // alert (QUIC error code 0x0178) when ALPN is absent."
-    // TODO: needs a Server fixture driving a synthetic ClientHello
-    // through `Server.feed`; not exercisable from the wire/tls layer
-    // alone. Tracked alongside the rest of the §4 surface.
+    //
+    // Updated rationale (was: "needs Server fixture + handshake
+    // driver"). The fixture surface is now in place — what's blocking
+    // is a peer-side ClientHello-construction limitation.
+    //
+    // Approach A (build a Client whose TLS context omits ALPN): blocked
+    // upstream by BoringSSL itself. `ext_alpn_add_clienthello` in
+    // ssl/extensions.cc fails *before emitting any bytes* with
+    // `SSL_R_NO_APPLICATION_PROTOCOL` whenever
+    // `alpn_client_proto_list.empty() && SSL_is_quic(ssl)`. So a
+    // BoringSSL-built QUIC client cannot produce a no-ALPN ClientHello
+    // at all — `Client.connect` followed by `client.conn.advance`
+    // returns `Error.HandshakeFailed` from the client side, never
+    // reaching the wire. Verified empirically: dropping ALPN on the
+    // override TLS context fails the client's first
+    // `tls.handshake()` call inside `advanceHandshake`. Bypassing this
+    // would require either patching BoringSSL or a "raw CRYPTO byte
+    // injection" entry point on `Connection` that skips the TLS state
+    // machine for the first flight — neither is in scope.
+    //
+    // Approach B (synthetic ClientHello bytes replayed through
+    // `Server.feed`): a TLS 1.3 QUIC ClientHello carries a keyshare,
+    // signature_algorithms, supported_versions, transport_parameters,
+    // SNI, etc. — several hundred bytes, all of which are version- and
+    // build-tied (BoringSSL's QUIC transport-parameter codec, the
+    // ClientHello compression behavior, and the keyshare ECDHE point
+    // would all need to match). Capturing once and embedding as a hex
+    // blob is feasible but the fixture would silently rot the next
+    // time we bump boringssl-zig or change `defaultParams()`. Out of
+    // scope without a regeneration tool that re-mints the bytes from
+    // a freshly-built BoringSSL.
+    //
+    // Server-side gate confirmed by inspection: BoringSSL's
+    // `ssl_negotiate_alpn` (extensions.cc:1493) raises
+    // `SSL_AD_NO_APPLICATION_PROTOCOL` whenever a QUIC server gets a
+    // ClientHello without the ALPN extension. The alert byte (0x78)
+    // is captured by `Connection.alert` via the `send_alert` callback
+    // (src/conn/state.zig:8632); `Connection.handle` then returns
+    // `error.PeerAlerted` and `Server.dispatchToSlot`'s catch-all
+    // closes the slot with INTERNAL_ERROR (0x01). RFC 9001 §4.8
+    // would have the close carry `0x100 | 0x78 = 0x178` instead;
+    // wiring `conn.alert` through to the CONNECTION_CLOSE error code
+    // is the missing translation step in nullq.
+    //
+    // Unblocking work needed (any one of):
+    //   1. A test-only `Connection` entry point that forwards
+    //      caller-supplied raw CRYPTO bytes into `provideQuicData`
+    //      *without* running them through the BoringSSL ClientHello
+    //      builder. The test would mint such bytes (no-ALPN
+    //      ClientHello) via a separate non-QUIC TLS context.
+    //   2. A captured-ClientHello fixture file under tests/data/
+    //      with a regen tool committed alongside it.
+    //   3. The CRYPTO_ERROR translation patch (alert → wire code)
+    //      together with an ALPN-omission assertion against an
+    //      end-to-end harness once option 1 or 2 lands.
     return error.SkipZigTest;
 }
 
@@ -555,13 +618,133 @@ test "MUST keep 0-RTT opt-in (default disabled) [RFC9001 §4.6 ¶1]" {
     try std.testing.expect(!cfg.enable_0rtt);
 }
 
-test "skip_MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶1]" {
-    // §4.7: "The TLS handshake provides authentication … the client
-    // MUST verify the server's certificate chain." Validation lives
-    // inside BoringSSL plus our `verify=...` plumbing; auditing it
-    // against §4.7 would require a TLS fixture that's outside the
-    // wire/tls scope of this file.
-    return error.SkipZigTest;
+test "MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶1]" {
+    // §4.7 ¶1: "Authentication is performed by checking that the peer
+    // is in possession of the private key … the client MUST verify
+    // the server's certificate chain." nullq delegates the chain
+    // walk to BoringSSL via `boringssl.tls.VerifyMode`. The test
+    // fixture's server uses a self-signed cert (data/test_cert.pem)
+    // for "localhost"; a client that points BoringSSL at the system
+    // trust store has no path to that root, so peer verification
+    // MUST fail and BoringSSL MUST raise a TLS alert (typically
+    // `bad_certificate` 42 or `unknown_ca` 48).
+    //
+    // The wrapper-built `Client` only exposes verification via the
+    // `ca_pem != null` flag, which selects `.system`. We pre-build
+    // the TLS context explicitly here so the assertion chains
+    // directly to the public `boringssl.tls.VerifyMode` enum: build
+    // a TLS-1.3 client context with `verify = .system`, hand it to
+    // `Client.connect` via `tls_context_override`, and drive the
+    // handshake. BoringSSL's `send_alert` callback fires on chain
+    // failure, the `Connection` records `self.alert`, and `advance`
+    // / `handle` surface this as `error.PeerAlerted` — the
+    // implementation's current proxy for "TLS rejected the peer".
+    //
+    // (nullq does not yet translate `self.alert` into a
+    // CRYPTO_ERROR-prefixed CloseEvent on the client side; that's a
+    // separate wire-level concern. The §4.7 contract is the
+    // verification *decision*, which this test pins to the alert
+    // bubble surface.)
+    const boringssl = @import("boringssl");
+
+    const protos = [_][]const u8{"hq-test"};
+    var srv = try nullq.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = handshake_fixture.test_cert_pem,
+        .tls_key_pem = handshake_fixture.test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = handshake_fixture.defaultParams(),
+    });
+    defer srv.deinit();
+
+    // Strict-verify TLS context. `.system` points BoringSSL at the
+    // OS trust store, which does NOT contain the self-signed test
+    // cert — so chain validation MUST fail. If the platform refuses
+    // to install default verify paths (rare, but possible in
+    // hermetic CI sandboxes) the configuration step itself errors;
+    // skip rather than misreport the §4.7 contract.
+    var tls_ctx = boringssl.tls.Context.initClient(.{
+        .verify = .system,
+        .min_version = boringssl.raw.TLS1_3_VERSION,
+        .max_version = boringssl.raw.TLS1_3_VERSION,
+        .alpn = &protos,
+    }) catch return error.SkipZigTest;
+    defer tls_ctx.deinit();
+
+    var client = try nullq.Client.connect(.{
+        .allocator = std.testing.allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = handshake_fixture.defaultParams(),
+        .tls_context_override = tls_ctx,
+    });
+    defer client.deinit();
+
+    // Kick the very first ClientHello into the client's outbox.
+    try client.conn.advance();
+
+    // Pump packets until the client TLS layer rejects the chain. The
+    // rejection can surface as either `error.HandshakeFailed` (the
+    // BoringSSL `SSL_do_handshake` return that `mapSslError` produces
+    // when SSL_ERROR_SSL is signaled — the standard X509-validation
+    // path) or `error.PeerAlerted` (when BoringSSL's `send_alert`
+    // callback runs but `SSL_do_handshake` returns 1, e.g. on
+    // post-handshake message processing). Either route is acceptable
+    // proof that BoringSSL's chain check ran and failed.
+    var rx: [4096]u8 = undefined;
+    var iter: u32 = 0;
+    const peer_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xab) };
+    var saw_rejection = false;
+    pump: while (iter < 32) : (iter += 1) {
+        const now_us: u64 = @as(u64, iter) * 1_000;
+
+        // Client → Server.
+        while (true) {
+            const len_opt = client.conn.poll(&rx, now_us) catch |err| switch (err) {
+                error.HandshakeFailed, error.PeerAlerted => {
+                    saw_rejection = true;
+                    break :pump;
+                },
+                else => return err,
+            };
+            const len = len_opt orelse break;
+            _ = try srv.feed(rx[0..len], peer_addr, now_us);
+        }
+
+        // Server → Client. The Server's response carries the cert
+        // chain; the client validates it on `handle` and, on failure,
+        // BoringSSL surfaces the rejection through `mapSslError`.
+        for (srv.iterator()) |slot| {
+            while (true) {
+                const len_opt = try slot.conn.poll(&rx, now_us);
+                const len = len_opt orelse break;
+                client.conn.handle(rx[0..len], null, now_us) catch |err| switch (err) {
+                    error.HandshakeFailed, error.PeerAlerted => {
+                        saw_rejection = true;
+                        break :pump;
+                    },
+                    else => return err,
+                };
+            }
+        }
+
+        try srv.tick(now_us);
+        client.conn.tick(now_us) catch |err| switch (err) {
+            error.HandshakeFailed, error.PeerAlerted => {
+                saw_rejection = true;
+                break :pump;
+            },
+            else => return err,
+        };
+
+        if (client.conn.handshakeDone()) break;
+    }
+
+    // The client MUST have rejected the chain. A successful
+    // handshake here would mean BoringSSL silently accepted the
+    // self-signed cert against the system store — a §4.7 violation.
+    try std.testing.expect(saw_rejection);
+    try std.testing.expect(!client.conn.handshakeDone());
 }
 
 test "MUST enforce per-key AEAD invocation limits at runtime [RFC9001 §5.5 ¶2]" {

@@ -16,6 +16,8 @@
 //!   §6 (RFC 8999 §6) MUST  VN lists at least one supported version (encoder)
 //!   §6.1 ¶1   MUST       VN response advertises QUIC v1 in supported_versions
 //!   §6.1 ¶1   MUST       VN response swaps the client's DCID/SCID
+//!   §6.2 ¶1   MUST NOT   client must not initiate a fresh connection from VN
+//!                        (replay defense — feeds a synthetic VN at the live Client)
 //!
 //! Covered (RFC 9000 §8 — Address Validation):
 //!   §8.1.2 ¶1 MUST       Retry token validates with matching bound material
@@ -43,25 +45,20 @@
 //!   §8.1 ¶3   MUST       unvalidated server allowance is 3x bytes received
 //!   §8.1 ¶3   MUST       allowance reaches zero once 3x has been spent
 //!   §8.1 ¶?   MUST       validated path lifts the anti-amp cap entirely
+//!   §8.1 ¶3   MUST       Server.poll stops emitting once the 3x cap is reached
 //!
 //! Covered (RFC 9000 §9 — Migration):
 //!   §9.4 ¶1   MUST       migration resets the per-path RTT/CC state
 //!   §9.4 ¶?   MUST       migration drops validation status on the affected path
 //!   §9.3 ¶?   MUST       migration zeroes the anti-amp byte counters
 //!   §9.4 ¶?   MAY        roll back failed migration to the prior 4-tuple
+//!   §9.6 ¶?   MUST       reject pre-handshake migration attempts (drop + qlog)
 //!
 //! Visible debt (skip_, see TODOs in the body):
-//!   §6.2 ¶1   MUST NOT   client must not initiate a fresh connection from VN
-//!                        (replay defense — needs Client harness; debt: replay test)
-//!   §8.1   ¶3 MUST       server stops sending once 3x cap is hit
-//!                        (verified via Path.antiAmpAllowance directly; the
-//!                        Server-feed integration test lives in tests/e2e/)
 //!   §9.5   ¶1 SHOULD     use a fresh CID after migration (privacy)
 //!                        (validated by NEW_CONNECTION_ID issuance suite)
 //!   §9.6   ¶1 SHOULD     server's preferred address handling
 //!                        (preferred-address transport param: out of scope here)
-//!   §9.6   ¶? MUST       reject pre-handshake migration attempts
-//!                        (covered by tests/e2e — fixture too heavy to repro inline)
 //!
 //! Out of scope here:
 //!   §6 wire-shape invariants (Version=0, supported_versions multiple-of-4)
@@ -72,6 +69,7 @@
 
 const std = @import("std");
 const nullq = @import("nullq");
+const initial_fixture = @import("_initial_fixture.zig");
 
 const retry_token = nullq.conn.retry_token;
 const new_token = nullq.conn.new_token;
@@ -191,20 +189,97 @@ test "MUST swap the client's DCID and SCID in the emitted VN response [RFC9000 �
     );
 }
 
-test "skip_MUST NOT initiate a new connection in response to a Version Negotiation packet [RFC9000 §6.2 ¶1]" {
+test "MUST NOT initiate a new connection in response to a Version Negotiation packet [RFC9000 §6.2 ¶1]" {
     // RFC 9000 §6.2 ¶1: "A client MUST discard a Version Negotiation
     // packet that lists the QUIC version selected by the client. ...
     // and... MUST NOT respond to a Version Negotiation packet by
     // initiating a new connection." This is the on-path-attacker
     // replay defense (a stale VN cannot force the client to reset).
     //
-    // TODO: cover via the public Client harness once the VN-receive
-    // path is wired in. The Client today drops VN at the wire layer
-    // (search `dropVersionNegotiation` in src/client.zig); the
-    // reach-around assertion that a VN does NOT trigger a fresh
-    // Initial requires inspecting `pollDatagram` after a synthetic
-    // VN is fed, which the Client public API doesn't expose yet.
-    return error.SkipZigTest;
+    // Shape: stand up a real Client, drain its first Initial to
+    // observe its DCID/SCID, hand-build a VN that matches the §6.1 ¶3
+    // CID-swap rule and lists ONLY an unsupported sentinel version,
+    // feed it via `Connection.handle`, and assert no fresh outbound
+    // packet (i.e. no fresh Initial spawning a new handshake) appears
+    // on the next `poll`. The handler in src/conn/state.zig
+    // `handleVersionNegotiation` terminates the connection rather
+    // than restarting it; either way, no new connection is initiated.
+    const fixture = @import("_handshake_fixture.zig");
+
+    const protos = [_][]const u8{"hq-test"};
+    var client = try nullq.Client.connect(.{
+        .allocator = std.testing.allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = fixture.defaultParams(),
+    });
+    defer client.deinit();
+    try client.conn.advance();
+
+    // Drain the client's first Initial. Its long-header DCID is the
+    // random initial DCID the client chose; its SCID is the client's
+    // local source CID. The §6.1 ¶3 swap rule says a VN that the
+    // client will accept carries DCID = client's SCID and SCID =
+    // client's original initial DCID.
+    var init_buf: [1500]u8 = undefined;
+    const init_n = (try client.conn.poll(&init_buf, 0)) orelse
+        return error.TestExpectedInitial;
+
+    const parsed_initial = try wire.header.parse(init_buf[0..init_n], 0);
+    try std.testing.expect(parsed_initial.header == .initial);
+    const client_initial_dcid = parsed_initial.header.initial.dcid;
+    const client_initial_scid = parsed_initial.header.initial.scid;
+
+    // Sanity: with no peer input and no PTO elapsed, a second poll
+    // produces no further bytes — pin this so the post-VN poll-null
+    // assertion below is meaningful (we're not tautologically
+    // observing "client never re-polls anyway").
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        try client.conn.poll(&init_buf, 0),
+    );
+
+    // Build a VN packet on the wire. §6.1 ¶3 swap: VN.dcid =
+    // client's SCID, VN.scid = client's chosen initial DCID. List
+    // ONLY an unsupported sentinel version (0xCAFEF00D) so the
+    // client's handler classifies this as "no compatible version"
+    // rather than the "discard if v1 listed" branch — both branches
+    // forbid a fresh handshake, but this branch is the more
+    // adversarial one and exercises the closure path explicitly.
+    const unsupported_version: u32 = 0xCAFEF00D;
+    var versions_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, versions_bytes[0..4], unsupported_version, .big);
+    const vn = wire.header.VersionNegotiation{
+        .dcid = client_initial_scid,
+        .scid = client_initial_dcid,
+        .versions_bytes = versions_bytes[0..],
+    };
+    var vn_buf: [128]u8 = undefined;
+    const vn_n = try wire.header.encode(&vn_buf, .{ .version_negotiation = vn });
+
+    // Feed the VN to the client. The handler runs in handle() and
+    // terminates the connection on the "no compatible version"
+    // branch — but critically, does NOT generate a fresh Initial.
+    try client.conn.handle(vn_buf[0..vn_n], null, 1_000);
+
+    // §6.2 ¶1 enforcement: no new connection initiated. After VN
+    // delivery, polling MUST NOT produce a fresh outbound packet
+    // belonging to a "restarted" handshake. The connection is
+    // terminally closed at this point, so poll returns null.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        try client.conn.poll(&init_buf, 1_000),
+    );
+    // Belt-and-suspenders on the closure shape: the handler entered
+    // .closed via the version_negotiation source, not via an Initial
+    // re-mint that ate the VN-as-server-Initial.
+    try std.testing.expect(client.conn.isClosed());
+    const close_event = client.conn.closeEvent() orelse
+        return error.TestExpectedCloseEvent;
+    try std.testing.expectEqual(
+        nullq.CloseSource.version_negotiation,
+        close_event.source,
+    );
 }
 
 // ================================================================
@@ -673,16 +748,72 @@ test "MUST lift the anti-amp cap once the path is validated [RFC9000 §8.1 ¶?]"
     try std.testing.expectEqual(std.math.maxInt(u64), p.antiAmpAllowance());
 }
 
-test "skip_MUST stop sending on the wire once the 3x cap is reached [RFC9000 §8.1 ¶3]" {
-    // The per-path counter assertions above pin the cap arithmetic;
-    // verifying that `Server.poll` actually refuses to dequeue when
-    // the path is at its cap requires a Server fixture with a real
-    // TLS context (the cert/key pair lives in tests/data/, behind a
-    // tests/e2e relative-path import that isn't available to the
-    // conformance binary). The integration check is exercised by
-    // the e2e suite; revisit when conformance gains access to the
-    // shared cert fixture.
-    return error.SkipZigTest;
+test "MUST stop sending on the wire once the 3x cap is reached [RFC9000 §8.1 ¶3]" {
+    // RFC 9000 §8.1 ¶3: "Until the server has validated the client's
+    // address, the server MUST NOT send more than three times the
+    // amount of data it has received." The per-path counter
+    // assertions above pin the cap arithmetic; this test pins the
+    // *wire-observable* consequence: once the cap is reached on an
+    // unvalidated path, `Connection.poll` MUST return null instead
+    // of emitting a packet.
+    //
+    // Stand up a real Server, feed a single 1200-byte authenticated
+    // Initial (PING-only payload — AEAD passes, no protocol gates
+    // fire), drain whatever the server naturally has to send while
+    // verifying the running total never exceeds 3 * bytes_received.
+    // Then push `bytes_sent` up to the cap directly and assert the
+    // next `poll` returns null.
+    var srv = try initial_fixture.buildServer();
+    defer srv.deinit();
+
+    const dcid = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    const scid = [_]u8{ 0xa0, 0xb0, 0xc0, 0xd0 };
+    // PING (RFC 9000 §19.2): single-byte 0x01, ack-eliciting,
+    // permitted in Initial. Lets the server allocate a slot and
+    // queue an Initial ACK without invoking the TLS state machine.
+    const payload = [_]u8{0x01};
+
+    try initial_fixture.feedInitial(&srv, &dcid, &scid, &payload);
+
+    const slots = srv.iterator();
+    try std.testing.expect(slots.len > 0);
+    const slot = slots[0];
+
+    // `PathSet.ensurePrimary` seeds the primary path as validated for
+    // the typical "client whose handshake completes here" case. A
+    // pre-handshake server peer MUST NOT have that exemption — model
+    // that here by forcibly clearing the validated bit and resetting
+    // the validator. (Real handshake-completion paths flip these back
+    // on; the e2e suite covers that side.)
+    const path = &slot.conn.paths.primary().path;
+    path.validated = false;
+    path.validator = .{};
+    try std.testing.expect(!path.isValidated());
+
+    const received = path.bytes_received;
+    try std.testing.expect(received >= 1200);
+    const cap = 3 * received;
+
+    // Drain the server's outbound queue. Every poll's running total
+    // is bounded by the cap (the per-level send loop at
+    // `pollLevelOnPath` clamps `packet_capacity` to `antiAmpAllowance`).
+    var dst: [1500]u8 = undefined;
+    var total_sent: usize = 0;
+    while (try slot.conn.poll(&dst, 1_000)) |n| {
+        total_sent += n;
+        try std.testing.expect(total_sent <= cap);
+    }
+    try std.testing.expect(path.bytes_sent <= cap);
+
+    // Saturate the cap: bookkeep enough additional bytes_sent to
+    // bring the path to its anti-amp ceiling. A subsequent poll
+    // MUST return null even if there were still acks/PINGs queued —
+    // the wire-level gate is what RFC 9000 §8.1 ¶3 normatively requires.
+    if (path.bytes_sent < cap) {
+        path.onDatagramSent(cap - path.bytes_sent);
+    }
+    try std.testing.expectEqual(@as(u64, 0), path.antiAmpAllowance());
+    try std.testing.expectEqual(@as(?usize, null), try slot.conn.poll(&dst, 2_000));
 }
 
 // ================================================================
@@ -811,17 +942,115 @@ test "MAY roll back a failed migration to the prior 4-tuple [RFC9000 §9.4 ¶?]"
     try std.testing.expect(ps.path.isValidated());
 }
 
-test "skip_MUST reject a peer migration attempt before the handshake confirms [RFC9000 §9.6 ¶?]" {
+/// Bounded qlog-event recorder for the pre-handshake-migration test.
+/// Captures every `QlogEvent` the server-side `Connection` emits so
+/// the test can assert on the `migration_path_failed` / `pre_handshake`
+/// signal without poking at internal state. 64 slots is generous —
+/// a vanilla v1 handshake datagram emits well under that.
+const QlogPreHandshakeRecorder = struct {
+    events: [64]nullq.QlogEvent = undefined,
+    count: usize = 0,
+
+    fn callback(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
+        const self: *QlogPreHandshakeRecorder = @ptrCast(@alignCast(user_data.?));
+        if (self.count >= self.events.len) return;
+        self.events[self.count] = event;
+        self.count += 1;
+    }
+
+    fn first(self: *const QlogPreHandshakeRecorder, name: nullq.QlogEventName) ?nullq.QlogEvent {
+        for (self.events[0..self.count]) |ev| if (ev.name == name) return ev;
+        return null;
+    }
+};
+
+test "MUST reject a peer migration attempt before the handshake confirms [RFC9000 §9.6 ¶?]" {
     // RFC 9000 §9.6 / hardening guide §4.8: a server MUST NOT honor
-    // an apparent migration before the handshake is confirmed (the
-    // peer's source address is unauthenticated until then; obeying
-    // a "migration" would let a passive observer redirect the
-    // connection to a chosen address).
+    // an apparent migration before the handshake is confirmed. The
+    // peer's source address is unauthenticated until handshake
+    // completion; honoring a "migration" mid-handshake would let an
+    // off-path observer that has glimpsed the Initial keys redirect
+    // the server's response stream to a chosen 4-tuple.
     //
-    // TODO: the negative path is exercised by tests/e2e — driving
-    // it here requires a Connection up to the post-Initial /
-    // pre-handshake-confirmed state, which means standing up paired
-    // Connections with real Initial keys. Conformance suite has no
-    // shared TLS-fixture access yet; revisit when it does.
-    return error.SkipZigTest;
+    // nullq's policy: drop the datagram entirely (no anti-amp credit,
+    // no PATH_CHALLENGE minted, peer_addr unchanged on the existing
+    // path) and surface a `migration_path_failed` qlog event with
+    // reason `pre_handshake`. The connection stays open — the peer
+    // can keep handshaking on the original 4-tuple.
+    //
+    // Drive: pump exactly one C→S→C round so the server has a slot
+    // (peer_addr_set) and the client has Handshake keys, then feed
+    // the client's next packet (carrying the Handshake Finished)
+    // FROM A DIFFERENT `from` address. The packet authenticates
+    // under the server's Handshake keys, the migration gate fires,
+    // and the datagram is dropped.
+    const fixture = @import("_handshake_fixture.zig");
+    var pair = try fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+
+    try pair.client.conn.advance();
+    var rx: [4096]u8 = undefined;
+    const now0: u64 = 1_000;
+
+    // Round 1: Client → Server (Initial w/ ClientHello). Creates the
+    // server slot; `peer_addr_set` flips true on the primary path.
+    while (try pair.client.conn.poll(&rx, now0)) |len| {
+        _ = try pair.server.feed(rx[0..len], pair.peer_addr, now0);
+    }
+    while (pair.server.drainStatelessResponse()) |_| {}
+    try std.testing.expect(pair.server.iterator().len > 0);
+
+    // Round 2: Server → Client (Initial+Handshake response). Lets
+    // the client derive Handshake keys so its next poll produces a
+    // Handshake-level packet (carrying the Finished message).
+    const now1: u64 = 2_000;
+    for (pair.server.iterator()) |slot| {
+        while (try slot.conn.poll(&rx, now1)) |len| {
+            try pair.client.conn.handle(rx[0..len], null, now1);
+        }
+    }
+
+    const srv_conn = pair.server.iterator()[0].conn;
+
+    // Sanity: server is mid-handshake. The migration gate keys off
+    // exactly this — `handshakeDone() == false` makes the rebind
+    // attempt below pre-handshake by definition.
+    try std.testing.expect(!srv_conn.handshakeDone());
+
+    // Wire up the qlog recorder AFTER the handshake setup so the
+    // recorder window covers only the migration attempt.
+    var recorder: QlogPreHandshakeRecorder = .{};
+    srv_conn.setQlogCallback(QlogPreHandshakeRecorder.callback, &recorder);
+
+    // Round 3 (the test): client polls a Handshake-level packet
+    // (Finished). Feed it FROM A DIFFERENT `from` address.
+    const now2: u64 = 3_000;
+    const migration_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xcd) };
+    try std.testing.expect(!nullq.conn.path.Address.eql(migration_addr, pair.peer_addr));
+
+    var fed_any = false;
+    while (try pair.client.conn.poll(&rx, now2)) |len| {
+        _ = try pair.server.feed(rx[0..len], migration_addr, now2);
+        fed_any = true;
+    }
+    try std.testing.expect(fed_any);
+
+    // Drop semantics — connection must NOT have closed. A migration-
+    // gate firing is graceful: the peer can still recover by sending
+    // again from the original address.
+    try std.testing.expectEqual(@as(?nullq.CloseEvent, null), srv_conn.closeEvent());
+
+    // The load-bearing assertion: a `migration_path_failed` qlog
+    // event with reason `pre_handshake` was emitted. This is the
+    // observable signal that the gate fired and the datagram was
+    // dropped (rather than honored as a migration). Without the
+    // gate, the server would have credited the Finished against
+    // a new path tied to `migration_addr`, anchoring connection
+    // state to a half-handshaked 4-tuple of the attacker's choosing.
+    const evt = recorder.first(.migration_path_failed) orelse
+        return error.ExpectedMigrationPathFailedEvent;
+    try std.testing.expectEqual(
+        @as(?nullq.QlogMigrationFailReason, .pre_handshake),
+        evt.migration_fail_reason,
+    );
 }

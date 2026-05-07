@@ -59,6 +59,7 @@
 //!   RFC9000 §19.20  ¶?   MUST NOT    server accepts HANDSHAKE_DONE from a client peer (PROTOCOL_VIOLATION)
 //!   RFC9000 §19.21  ¶1   MUST        unknown frame type bytes are rejected (FRAME_ENCODING_ERROR)
 //!   RFC9000 §12.4   ¶?   NORMATIVE   varint-encoded extension frame types decode the same as 1-byte
+//!   RFC9000 §12.4   ¶?   NORMATIVE   0-RTT level forbids ACK / NEW_TOKEN / HANDSHAKE_DONE
 //!   RFC9000 §16     ¶?   MUST NOT    accept any frame whose body is truncated (varint InsufficientBytes)
 //!
 //! Visible debt (gates not yet implemented in conn/state.zig):
@@ -69,7 +70,6 @@
 //!                                      missing. Conformance test pins the
 //!                                      observed (no-close) behavior so a
 //!                                      future fix surfaces here.
-//!   RFC9000 §12.4   ¶?   level-allowed-frames table for 0-RTT (needs a 0-RTT-keys fixture)
 //!
 //! Out of scope here (covered elsewhere):
 //!   RFC9000 §16     varint encoding rules                  → rfc9000_varint.zig
@@ -1090,15 +1090,67 @@ test "NORMATIVE Initial / Handshake levels reject frames outside {PADDING, PING,
     try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
-test "skip_NORMATIVE 0-RTT level forbids ACK / NEW_TOKEN / HANDSHAKE_DONE [RFC9000 §12.4]" {
-    // §12.4 / §17.2.3: 0-RTT permits stream data frames,
-    // PATH_CHALLENGE, PADDING, PING, CONNECTION_CLOSE — but
+test "NORMATIVE 0-RTT level forbids ACK [RFC9000 §12.4]" {
+    // §12.4 / §17.2.3: 0-RTT permits stream-data frames,
+    // PATH_CHALLENGE, PADDING, PING, CONNECTION_CLOSE-0x1c — but
     // explicitly NOT ACK, NEW_TOKEN, or HANDSHAKE_DONE. The
-    // connection-layer filter is implemented in
-    // `Connection.frameAllowedInEarlyData` (src/conn/state.zig) and
-    // verified by the in-source tests there. Conformance verification
-    // would need a 0-RTT-keys fixture (TLS resumption with a session
-    // ticket), which the conformance package's Server fixture cannot
-    // produce yet. Tracked for the next round of fixture work.
-    return error.SkipZigTest;
+    // receiver-side filter is `Connection.frameAllowedInEarlyData`
+    // (src/conn/state.zig), reached from `dispatchFrames(.early_data,
+    // ...)` after AEAD-decrypt of a long-header 0-RTT packet.
+    //
+    // The fixture's `injectFrameAtServer0Rtt` describes how it lands
+    // a 0-RTT packet on a post-handshake server: it doesn't need a
+    // real resumption flow because the gate is structural (it
+    // inspects the parsed Frame tag, independent of any TLS state).
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    // ACK at type 0x02 with largest_acked=0, ack_delay=0,
+    // range_count=0, first_range=0 — minimal well-formed ACK.
+    const ack_frame = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00 };
+    const close_event = try pair.injectFrameAtServer0Rtt(&ack_frame);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
+}
+
+test "NORMATIVE 0-RTT level forbids NEW_TOKEN [RFC9000 §12.4]" {
+    // §12.4: NEW_TOKEN is not in the 0-RTT allowed-frames table —
+    // the receiver MUST close with PROTOCOL_VIOLATION. NEW_TOKEN is
+    // also forbidden in the client→server direction at any level
+    // (server is the only legitimate sender, RFC 9000 §19.7), but
+    // the §12.4 level-allowed-frames gate fires first because
+    // `dispatchFrames` checks the level filter before per-frame
+    // role rules.
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    // NEW_TOKEN: type 0x07, length 1, then one token byte.
+    const new_token_frame = [_]u8{ 0x07, 0x01, 0xAA };
+    const close_event = try pair.injectFrameAtServer0Rtt(&new_token_frame);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
+}
+
+test "NORMATIVE 0-RTT level forbids HANDSHAKE_DONE [RFC9000 §12.4]" {
+    // §12.4: HANDSHAKE_DONE (type 0x1e) is server→client only AND
+    // 1-RTT only. Like NEW_TOKEN above, it's blocked twice over —
+    // by the level-allowed-frames filter (§12.4) and by the
+    // server-only role check (§19.20) — but the level filter fires
+    // first.
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const handshake_done_frame = [_]u8{0x1e};
+    const close_event = try pair.injectFrameAtServer0Rtt(&handshake_done_frame);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }

@@ -99,6 +99,36 @@ pub fn feedAndExpectClose(
     return slots[0].conn.closeEvent();
 }
 
+/// Build an authenticated Initial packet (1200-byte padded, sealed
+/// with the canonical Initial keys derived from `dcid`) and feed it
+/// to `server`. Unlike `feedAndExpectClose`, this helper does not
+/// assert anything about the post-feed connection state — used by
+/// tests that want a healthy-but-unvalidated server slot to inspect
+/// (e.g. the §8.1 anti-amp wire-cap test).
+pub fn feedInitial(
+    server: *nullq.Server,
+    dcid: []const u8,
+    scid: []const u8,
+    payload: []const u8,
+) !void {
+    const client_secret = try initial.deriveInitialKeys(dcid, false);
+    const pkt_keys = try wire.short_packet.derivePacketKeys(.aes128_gcm_sha256, &client_secret.secret);
+
+    var pkt: [1500]u8 = undefined;
+    const n = try long_packet.sealInitial(&pkt, .{
+        .dcid = dcid,
+        .scid = scid,
+        .pn = 0,
+        .payload = payload,
+        .keys = &pkt_keys,
+        .pad_to = 1200,
+        .reserved_bits = 0,
+    });
+
+    const addr = nullq.conn.path.Address{ .bytes = @splat(0xfe) };
+    _ = try server.feed(pkt[0..n], addr, 1_000);
+}
+
 /// Construct a fresh `Server` ready to receive Initials. The caller
 /// owns the returned value and `defer srv.deinit()`s it.
 pub fn buildServer() !nullq.Server {

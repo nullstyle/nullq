@@ -31,6 +31,8 @@ const std = @import("std");
 const nullq = @import("nullq");
 const wire = nullq.wire;
 const short_packet = wire.short_packet;
+const long_packet = wire.long_packet;
+const conn_state = nullq.conn.state;
 
 /// Test cert/key — same fixture used by tests/e2e/. Embedded here so
 /// the fixture can stand up a real Server alongside a real Client.
@@ -311,6 +313,92 @@ pub const HandshakePair = struct {
         try self.step();
 
         return self.clientConn().closeEvent();
+    }
+
+    /// Inject a 0-RTT-protected (long-header type=0x01) packet at the
+    /// SERVER carrying `frame_bytes`. Used by the §12.4 conformance
+    /// test that pins `frameAllowedInEarlyData` — the receiver-side
+    /// gate in `Connection.dispatchFrames` that closes with
+    /// PROTOCOL_VIOLATION when the peer sends ACK / NEW_TOKEN /
+    /// HANDSHAKE_DONE in a 0-RTT packet.
+    ///
+    /// The high-level `nullq.Server` does NOT auto-wire
+    /// `setEarlyDataContext` on freshly-accepted slots, so a real
+    /// resumption flow at the public API would land BoringSSL on
+    /// `earlyDataStatus() == .rejected` and the server would silently
+    /// drop the 0-RTT packet at `keys_unavailable` BEFORE
+    /// `dispatchFrames` runs. To reach the gate we want, this helper
+    /// instead drives a normal handshake to completion, then forcibly
+    /// installs a deterministic shared early-data secret on both the
+    /// client (write side) and the server's slot (read side). A
+    /// post-handshake server connection has `earlyDataStatus() ==
+    /// .not_offered` (BoringSSL never advertised early data because
+    /// no resumption was attempted), which is NOT `.rejected`, so the
+    /// `handleZeroRtt` keys-available branch runs the AEAD-decrypt
+    /// against our installed material and `dispatchFrames(.early_data,
+    /// ...)` gets the parsed payload — exactly the path that
+    /// `frameAllowedInEarlyData` guards.
+    ///
+    /// The trick is sound because the gate under test is structural
+    /// (it inspects the parsed Frame tag, not any TLS state). The
+    /// in-source test
+    /// `"server rejects forbidden frames in 0-RTT"` in
+    /// `src/conn/state.zig` uses the same secret-injection technique
+    /// against a bare `Connection` to assert the same gate.
+    pub fn injectFrameAtServer0Rtt(
+        self: *HandshakePair,
+        frame_bytes: []const u8,
+    ) !?nullq.CloseEvent {
+        // 32 zero bytes paired with `cipher_protocol_id = 0x1301`
+        // (TLS_AES_128_GCM_SHA256) deterministically derives identical
+        // PacketKeys on both sides — the in-source helpers
+        // `installTestEarlyDataReadSecret` / `testEarlyDataPacketKeys`
+        // use the same recipe. We're not asserting AEAD strength here;
+        // we just need the packet to authenticate so the receiver
+        // dispatches its frames.
+        var material: conn_state.SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
+        material.secret_len = 32;
+        // Direct field write into `Connection.levels` mirrors the
+        // existing in-source test pattern. The field has no
+        // production-API setter for early-data secrets because
+        // BoringSSL's `set_read_secret` / `set_write_secret`
+        // trampolines are the only legitimate writers in production.
+        const early_idx = conn_state.EncryptionLevel.early_data.idx();
+        const cli_conn = self.clientConn();
+        cli_conn.levels[early_idx].write = material;
+        const srv_conn_ptr = try self.serverConn();
+        srv_conn_ptr.levels[early_idx].read = material;
+
+        // Derive matching PacketKeys for sealing on the client side.
+        // The server independently re-derives the same keys via
+        // `Connection.packetKeys(.early_data, .read)` at decrypt time.
+        const keys = try short_packet.derivePacketKeys(.aes128_gcm_sha256, material.secret[0..32]);
+
+        const dcid = cli_conn.peer_dcid.slice();
+        // Synthesize a stable SCID — only the wire shape matters here
+        // (the server already routes by DCID for the existing slot).
+        const scid: [4]u8 = .{ 0x01, 0x02, 0x03, 0x04 };
+        // 0-RTT shares the Application PN space (RFC 9000 §12.3), so
+        // `allocApplicationPacketNumberForTesting` is the right
+        // allocator here too — it bumps `next_pn` so the connection's
+        // own subsequent send doesn't reuse this PN.
+        const pn = cli_conn.allocApplicationPacketNumberForTesting() orelse
+            return error.PnSpaceExhausted;
+
+        var pkt: [2048]u8 = undefined;
+        const n = try long_packet.sealZeroRtt(&pkt, .{
+            .dcid = dcid,
+            .scid = &scid,
+            .pn = pn,
+            .payload = frame_bytes,
+            .keys = &keys,
+        });
+
+        self.now_us +%= 1_000;
+        _ = try self.server.feed(pkt[0..n], self.peer_addr, self.now_us);
+        try self.step();
+
+        return srv_conn_ptr.closeEvent();
     }
 
     /// Drain stateless responses, tick both sides, and advance time

@@ -628,12 +628,45 @@ test "MUST honour active_connection_id_limit when issuing NEW_CONNECTION_ID [RFC
 
 test "skip_MUST switch to a freshly-issued peer CID after migration [RFC9000 §5.1.2 ¶1]" {
     // §5.1.2 ¶1: "An endpoint MUST NOT use the same connection ID on
-    // different paths." The implementation routes peer-issued CIDs
-    // through `registerPeerCid` and consumes one on path validation
-    // success. Conformance verification needs a multi-path Connection
-    // fixture — easier to add once the §5.1 conformance helper exists.
-    // TODO(connection-fixture): full multi-path fixture with two
-    // 4-tuples and a populated peer_cids list.
+    // different paths." Verifying this requires the migrating endpoint
+    // to swap its `path.peer_cid` from the CID used on the old path to
+    // a different peer-issued CID (drawn from `peer_cids`, populated by
+    // a prior NEW_CONNECTION_ID exchange) before / on path validation.
+    //
+    // GAP (implementation, not fixture): the migration pathway in
+    // `src/conn/state.zig` — `recordAuthenticatedDatagramAddress` →
+    // `handlePeerAddressChange` → `path.beginMigration` and the
+    // post-validation hook `recordPathResponse` →
+    // `resetPathRecoveryAfterMigration` — does NOT rotate
+    // `path.peer_cid`. The path keeps the SAME peer-issued CID
+    // through migration. There is no `consumePeerCidForNewPath` (or
+    // equivalent) call in the migration handlers, and
+    // `peer_cids.items` is only consumed by `promotePeerCidForPath`
+    // when a CID is RETIRED — not when a path migrates. So even with
+    // a perfect multi-path fixture, the assertion
+    // `peer_dcid_after != peer_dcid_before` would fail because nullq
+    // has not yet implemented the §5.1.2 ¶1 CID swap.
+    //
+    // Unblocking work (in src/conn/state.zig):
+    //   1. On `beginMigration` (or just before queuing the
+    //      PATH_CHALLENGE), pop a peer_cids entry for the new path
+    //      and assign it to `path.peer_cid` (preserving the old CID
+    //      in `migration_rollback` so a failed validation can put it
+    //      back).
+    //   2. Emit a RETIRE_CONNECTION_ID for the previously-used
+    //      sequence so the peer can recycle the slot.
+    //   3. Refuse migration when `peer_cids` has no usable entry (per
+    //      §5.1.2 ¶1, an endpoint that cannot pick a fresh CID MUST
+    //      NOT migrate).
+    // Once that lands, this test should:
+    //   - Use `_handshake_fixture.HandshakePair` to drive handshake
+    //     to confirmation,
+    //   - Issue at least one NEW_CONNECTION_ID server-side so the
+    //     client has a peer_cids pool > 1,
+    //   - Snapshot `pair.clientConn().peer_dcid`,
+    //   - Mutate `pair.peer_addr` and pump until path validation
+    //     succeeds (PATH_CHALLENGE / PATH_RESPONSE round-trip),
+    //   - Assert `peer_dcid` rotated to a different CID.
     return error.SkipZigTest;
 }
 
