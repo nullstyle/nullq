@@ -41,6 +41,11 @@ pub const stateless_reset_mod = @import("stateless_reset.zig");
 pub const path_frame_queue = @import("path_frame_queue.zig");
 pub const _internal = @import("_internal.zig");
 const conn_recv_flow_handlers = @import("conn_recv_flow_handlers.zig");
+const conn_recv_cid_token_handlers = @import("conn_recv_cid_token_handlers.zig");
+const conn_recv_multipath_handlers = @import("conn_recv_multipath_handlers.zig");
+const conn_recv_stream_control_handlers = @import("conn_recv_stream_control_handlers.zig");
+const conn_recv_packet_handlers = @import("conn_recv_packet_handlers.zig");
+const conn_recv_ack_handlers = @import("conn_recv_ack_handlers.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -1706,7 +1711,7 @@ pub const Connection = struct {
 
     /// One-shot `connection_started` emitter. Called from `bind` for
     /// clients and from the handshake-progress callback for servers.
-    fn emitConnectionStartedOnce(self: *Connection) void {
+    pub fn emitConnectionStartedOnce(self: *Connection) void {
         if (self.qlog_callback == null or self.qlog_started) return;
         self.qlog_started = true;
         self.emitQlog(.{
@@ -1770,7 +1775,7 @@ pub const Connection = struct {
         });
     }
 
-    fn emitPacketReceived(
+    pub fn emitPacketReceived(
         self: *Connection,
         lvl: EncryptionLevel,
         pn: u64,
@@ -1789,7 +1794,7 @@ pub const Connection = struct {
         });
     }
 
-    fn emitPacketDropped(
+    pub fn emitPacketDropped(
         self: *Connection,
         lvl: ?EncryptionLevel,
         size: u32,
@@ -1843,7 +1848,7 @@ pub const Connection = struct {
 
     /// Compute the current congestion phase for the primary application
     /// path and emit `congestion_state_updated` if it changed.
-    fn emitCongestionStateIfChanged(self: *Connection, now_us: u64) void {
+    pub fn emitCongestionStateIfChanged(self: *Connection, now_us: u64) void {
         if (self.qlog_callback == null) return;
         const path = self.primaryPath();
         const cc = &path.path.cc;
@@ -1870,7 +1875,7 @@ pub const Connection = struct {
 
     /// Emit `metrics_updated` with a snapshot of the primary path's
     /// congestion / RTT counters.
-    fn emitMetricsSnapshot(self: *Connection, now_us: u64) void {
+    pub fn emitMetricsSnapshot(self: *Connection, now_us: u64) void {
         if (self.qlog_callback == null) return;
         const path = self.primaryPath();
         const cc = &path.path.cc;
@@ -2124,7 +2129,7 @@ pub const Connection = struct {
         });
     }
 
-    fn maybeRespondToPeerKeyUpdate(self: *Connection, now_us: u64) Error!void {
+    pub fn maybeRespondToPeerKeyUpdate(self: *Connection, now_us: u64) Error!void {
         const read = self.app_read_current orelse return;
         const write = self.app_write_current orelse return;
         if (write.key_phase == read.key_phase) return;
@@ -2262,7 +2267,7 @@ pub const Connection = struct {
         }
     }
 
-    fn noteApplicationAuthFailure(self: *Connection) void {
+    pub fn noteApplicationAuthFailure(self: *Connection) void {
         self.app_failed_auth_packets +|= 1;
         if (self.app_failed_auth_packets >= self.app_key_update_limits.integrity_limit) {
             self.emitQlog(.{
@@ -2379,7 +2384,7 @@ pub const Connection = struct {
         }
     }
 
-    fn retireLocalCidFromPeer(self: *Connection, path_id: u32, sequence_number: u64) void {
+    pub fn retireLocalCidFromPeer(self: *Connection, path_id: u32, sequence_number: u64) void {
         const before_budget = self.localConnectionIdIssueBudget(path_id);
         self.retireLocalCid(path_id, sequence_number);
         if (self.localConnectionIdIssueBudget(path_id) > before_budget) {
@@ -2387,7 +2392,7 @@ pub const Connection = struct {
         }
     }
 
-    fn dropPendingLocalCidAdvertisement(
+    pub fn dropPendingLocalCidAdvertisement(
         self: *Connection,
         path_id: u32,
         sequence_number: u64,
@@ -2726,7 +2731,7 @@ pub const Connection = struct {
         self.initial_keys_discarded = true;
     }
 
-    fn ensureInitialKeys(self: *Connection) Error!void {
+    pub fn ensureInitialKeys(self: *Connection) Error!void {
         // RFC 9001 §5.7 ¶3 — once the discard latch is set, never
         // re-derive. Any Initial-level packet from now on cannot be
         // sealed (poll path) or opened (handle path); the receiver
@@ -2825,7 +2830,7 @@ pub const Connection = struct {
         return !self.streamInitiatedByLocal(id);
     }
 
-    fn initialRecvStreamLimit(self: *const Connection, id: u64) u64 {
+    pub fn initialRecvStreamLimit(self: *const Connection, id: u64) u64 {
         const params = self.local_transport_params;
         if (streamIsUni(id)) {
             if (self.streamInitiatedByLocal(id)) return 0;
@@ -2837,7 +2842,7 @@ pub const Connection = struct {
         return params.initial_max_stream_data_bidi_remote;
     }
 
-    fn initialSendStreamLimit(self: *const Connection, id: u64) u64 {
+    pub fn initialSendStreamLimit(self: *const Connection, id: u64) u64 {
         const params = self.cached_peer_transport_params orelse return std.math.maxInt(u64);
         if (streamIsUni(id)) {
             if (!self.streamInitiatedByLocal(id)) return 0;
@@ -2868,7 +2873,7 @@ pub const Connection = struct {
         }
     }
 
-    fn recordPeerStreamOpenOrClose(self: *Connection, id: u64) bool {
+    pub fn recordPeerStreamOpenOrClose(self: *Connection, id: u64) bool {
         const idx = streamIndex(id);
         if (idx >= max_stream_count_limit) {
             self.close(true, transport_error_frame_encoding, "stream id exceeds stream count space");
@@ -3189,7 +3194,7 @@ pub const Connection = struct {
         }
     }
 
-    fn maybeReturnPeerStreamCredit(self: *Connection, s: *Stream) void {
+    pub fn maybeReturnPeerStreamCredit(self: *Connection, s: *Stream) void {
         if (self.streamInitiatedByLocal(s.id)) return;
         if (s.stream_count_credit_returned) return;
         if (!(s.recv.state == .data_recvd or
@@ -3275,7 +3280,7 @@ pub const Connection = struct {
         };
     }
 
-    fn recordConnectionIdsNeeded(
+    pub fn recordConnectionIdsNeeded(
         self: *Connection,
         path_id: u32,
         reason: ConnectionIdReplenishReason,
@@ -3307,7 +3312,7 @@ pub const Connection = struct {
         self.datagram_send_events.push(event);
     }
 
-    fn recordDatagramAcked(self: *Connection, packet: *const sent_packets_mod.SentPacket) void {
+    pub fn recordDatagramAcked(self: *Connection, packet: *const sent_packets_mod.SentPacket) void {
         const event = event_queue_mod.datagramEventFromPacket(packet) orelse return;
         self.recordDatagramSendEvent(.{ .acked = event });
     }
@@ -3980,12 +3985,12 @@ pub const Connection = struct {
         }
     }
 
-    fn peerAckDelayExponent(self: *const Connection) u6 {
+    pub fn peerAckDelayExponent(self: *const Connection) u6 {
         const params = self.cached_peer_transport_params orelse return 3;
         return @intCast(@min(params.ack_delay_exponent, 20));
     }
 
-    fn peerMaxAckDelayUs(self: *const Connection) u64 {
+    pub fn peerMaxAckDelayUs(self: *const Connection) u64 {
         const params = self.cached_peer_transport_params orelse return 25 * rtt_mod.ms;
         return params.max_ack_delay_ms * rtt_mod.ms;
     }
@@ -4042,11 +4047,11 @@ pub const Connection = struct {
         return self.paths.primaryConst();
     }
 
-    fn activePath(self: *Connection) *PathState {
+    pub fn activePath(self: *Connection) *PathState {
         return self.paths.active();
     }
 
-    fn pathForId(self: *Connection, path_id: u32) *PathState {
+    pub fn pathForId(self: *Connection, path_id: u32) *PathState {
         return self.paths.get(path_id) orelse self.primaryPath();
     }
 
@@ -4493,7 +4498,7 @@ pub const Connection = struct {
         self.clearPendingPings();
     }
 
-    fn resetInitialRecoveryForRetry(self: *Connection) Error!void {
+    pub fn resetInitialRecoveryForRetry(self: *Connection) Error!void {
         const idx = EncryptionLevel.initial.idx();
         try self.crypto_retx[idx].ensureUnusedCapacity(
             self.allocator,
@@ -4640,7 +4645,7 @@ pub const Connection = struct {
         return saturatingMul(3, self.largestApplicationPtoDurationUs());
     }
 
-    fn retirePath(
+    pub fn retirePath(
         self: *Connection,
         path_id: u32,
         error_code: u64,
@@ -6072,7 +6077,7 @@ pub const Connection = struct {
     /// to run the full record-and-dispatch pipeline or the
     /// closing-state-only "scan for peer CONNECTION_CLOSE, otherwise
     /// flag attribution" tail.
-    fn closingAttributionOnly(self: *const Connection) bool {
+    pub fn closingAttributionOnly(self: *const Connection) bool {
         return self.lifecycle.closing_deadline_us != null
             and self.lifecycle.pending_close == null
             and self.lifecycle.draining_deadline_us == null;
@@ -6098,7 +6103,7 @@ pub const Connection = struct {
     /// frame"). Other frames are ignored — §10.2.1 ¶5: "An endpoint
     /// that is closing is not required to process any received
     /// frame."
-    fn scanForPeerCloseFrame(
+    pub fn scanForPeerCloseFrame(
         self: *Connection,
         payload: []const u8,
         now_us: u64,
@@ -6243,7 +6248,7 @@ pub const Connection = struct {
         self.emitConnectionStateIfChanged();
     }
 
-    fn enterClosed(
+    pub fn enterClosed(
         self: *Connection,
         source: CloseSource,
         error_space: CloseErrorSpace,
@@ -6264,7 +6269,7 @@ pub const Connection = struct {
         self.emitConnectionStateIfChanged();
     }
 
-    fn enterStatelessReset(self: *Connection, now_us: u64) void {
+    pub fn enterStatelessReset(self: *Connection, now_us: u64) void {
         self.enterDraining(
             .stateless_reset,
             .transport,
@@ -6491,7 +6496,7 @@ pub const Connection = struct {
         return false;
     }
 
-    fn recordApplicationReceivedPacket(
+    pub fn recordApplicationReceivedPacket(
         app_pn_space: *PnSpace,
         pn: u64,
         now_us: u64,
@@ -6511,7 +6516,7 @@ pub const Connection = struct {
         );
     }
 
-    fn versionListContains(vn: wire_header.VersionNegotiation, version: u32) bool {
+    pub fn versionListContains(vn: wire_header.VersionNegotiation, version: u32) bool {
         var i: usize = 0;
         while (i < vn.versionCount()) : (i += 1) {
             if (vn.version(i) == version) return true;
@@ -6519,107 +6524,11 @@ pub const Connection = struct {
         return false;
     }
 
-    fn handleVersionNegotiation(
-        self: *Connection,
-        bytes: []u8,
-        now_us: u64,
-    ) usize {
-        if (self.role != .client or self.inner.handshakeDone()) return bytes.len;
-        const parsed = wire_header.parse(bytes, 0) catch return bytes.len;
-        if (parsed.header != .version_negotiation) return bytes.len;
-        const vn = parsed.header.version_negotiation;
-        if (!self.local_scid_set or !self.initial_dcid_set) return bytes.len;
-        if (!std.mem.eql(u8, vn.dcid.slice(), self.local_scid.slice())) return bytes.len;
-        const odcid = if (self.original_initial_dcid_set)
-            self.original_initial_dcid
-        else
-            self.initial_dcid;
-        if (!std.mem.eql(u8, vn.scid.slice(), odcid.slice())) return bytes.len;
-        if (versionListContains(vn, quic_version_1)) return bytes.len;
+    pub fn handleVersionNegotiation( self: *Connection, bytes: []u8, now_us: u64, ) usize { return conn_recv_packet_handlers.handleVersionNegotiation(self, bytes, now_us); }
 
-        self.enterClosed(
-            .version_negotiation,
-            .transport,
-            0,
-            0,
-            "no compatible QUIC version",
-            now_us,
-        );
-        return bytes.len;
-    }
+    pub fn handleShort( self: *Connection, bytes: []u8, now_us: u64, ) Error!usize { return conn_recv_packet_handlers.handleShort(self, bytes, now_us); }
 
-    pub fn handleShort(
-        self: *Connection,
-        bytes: []u8,
-        now_us: u64,
-    ) Error!usize {
-        const app_path = self.incomingShortPath(bytes) orelse
-            self.pathForId(self.current_incoming_path_id);
-        self.current_incoming_path_id = app_path.id;
-        const app_pn_space = &app_path.app_pn_space;
-        const largest_received = if (app_pn_space.received.largest) |l| l else 0;
-        const multipath_path_id: ?u32 = if (self.multipathNegotiated()) app_path.id else null;
-        if (self.app_read_current == null) {
-            if (self.isKnownStatelessReset(bytes)) {
-                self.emitPacketDropped(.application, @intCast(bytes.len), .stateless_reset);
-                self.enterStatelessReset(now_us);
-            } else {
-                self.emitPacketDropped(.application, @intCast(bytes.len), .keys_unavailable);
-            }
-            return bytes.len;
-        }
-
-        var pt_buf: [max_recv_plaintext]u8 = undefined;
-        const open_result = (try self.openApplicationPacket(
-            &pt_buf,
-            bytes,
-            app_path,
-            largest_received,
-            multipath_path_id,
-        )) orelse {
-            if (self.isKnownStatelessReset(bytes)) {
-                self.emitPacketDropped(.application, @intCast(bytes.len), .stateless_reset);
-                self.enterStatelessReset(now_us);
-                return bytes.len;
-            }
-            self.emitPacketDropped(.application, @intCast(bytes.len), .decryption_failure);
-            self.noteApplicationAuthFailure();
-            return bytes.len;
-        };
-        if (open_result.slot == .next) {
-            try self.promoteApplicationReadKeys(now_us);
-            try self.maybeRespondToPeerKeyUpdate(now_us);
-        }
-        const opened = open_result.opened;
-
-        // RFC 9000 §17.3 ¶3: short-header Reserved Bits MUST be 0 after
-        // header protection is removed. AEAD just authenticated the
-        // post-HP first byte (it's mixed into the AAD), so a non-zero
-        // value is a peer protocol violation.
-        if (opened.reserved_bits != 0) {
-            self.close(true, transport_error_protocol_violation, "non-zero short-header reserved bits");
-            return bytes.len;
-        }
-
-        self.last_authenticated_path_id = app_path.id;
-        if (self.closingAttributionOnly()) {
-            // RFC 9000 §10.2.1 ¶3 attribution path. Decrypt has
-            // succeeded; mark the observation, scan for a peer CC,
-            // and skip everything else (no ACK tracker update, no
-            // dispatchFrames). The outer `handle` re-arms a CC
-            // retransmit subject to the SHOULD-rate-limit.
-            self.closing_state_attribution_observed = true;
-            self.scanForPeerCloseFrame(opened.payload, now_us);
-            return bytes.len;
-        }
-        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload, self.delayed_ack_packet_threshold);
-        self.qlog_packets_received +|= 1;
-        self.emitPacketReceived(.application, opened.pn, @intCast(bytes.len), countFrames(opened.payload));
-        try self.dispatchFrames(.application, opened.payload, now_us);
-        return bytes.len;
-    }
-
-    fn countFrames(payload: []const u8) u32 {
+    pub fn countFrames(payload: []const u8) u32 {
         var count: u32 = 0;
         var it = frame_mod.iter(payload);
         while (it.next() catch return count) |_| {
@@ -6628,7 +6537,7 @@ pub const Connection = struct {
         return count;
     }
 
-    fn openApplicationPacket(
+    pub fn openApplicationPacket(
         self: *Connection,
         pt_buf: *[max_recv_plaintext]u8,
         bytes: []u8,
@@ -6692,230 +6601,13 @@ pub const Connection = struct {
         return .{ .opened = opened, .slot = slot };
     }
 
-    fn handleInitial(
-        self: *Connection,
-        bytes: []u8,
-        now_us: u64,
-    ) Error!usize {
-        // Server-side bootstrap: discover `initial_dcid` from the
-        // unprotected long-header bytes before any decryption can
-        // happen. RFC 9001 §5.2 derives Initial keys from the DCID
-        // the client put on its first Initial.
-        if (self.role == .server and !self.initial_dcid_set) {
-            if (bytes.len < 6) {
-                self.emitPacketDropped(.initial, @intCast(bytes.len), .header_decode_failure);
-                return bytes.len;
-            }
-            const dcid_len = bytes[5];
-            if (dcid_len > path_mod.max_cid_len) {
-                self.emitPacketDropped(.initial, @intCast(bytes.len), .header_decode_failure);
-                return bytes.len;
-            }
-            if (bytes.len < @as(usize, 6) + dcid_len) {
-                self.emitPacketDropped(.initial, @intCast(bytes.len), .header_decode_failure);
-                return bytes.len;
-            }
-            try self.setInitialDcid(bytes[6 .. 6 + dcid_len]);
-        }
-        try self.ensureInitialKeys();
-        const r_keys_opt = self.initial_keys_read;
-        const r_keys = r_keys_opt orelse {
-            self.emitPacketDropped(.initial, @intCast(bytes.len), .keys_unavailable);
-            return bytes.len;
-        };
+    pub fn handleInitial( self: *Connection, bytes: []u8, now_us: u64, ) Error!usize { return conn_recv_packet_handlers.handleInitial(self, bytes, now_us); }
 
-        var pt_buf: [max_recv_plaintext]u8 = undefined;
-        const opened = long_packet_mod.openInitial(&pt_buf, bytes, .{
-            .keys = &r_keys,
-            .largest_received = if (self.pnSpaceForLevel(.initial).received.largest) |l| l else 0,
-        }) catch |e| switch (e) {
-            boringssl.crypto.aead.Error.Auth => {
-                self.emitPacketDropped(.initial, @intCast(bytes.len), .decryption_failure);
-                return bytes.len;
-            },
-            else => return e,
-        };
+    pub fn handleRetry( self: *Connection, bytes: []u8, now_us: u64, ) Error!usize { return conn_recv_packet_handlers.handleRetry(self, bytes, now_us); }
 
-        // RFC 9000 §17.2.1 ¶17: long-header Reserved Bits MUST be 0
-        // after header protection is removed. AEAD has authenticated
-        // the post-HP first byte by now, so a non-zero value is a
-        // peer protocol violation.
-        if (opened.reserved_bits != 0) {
-            self.close(true, transport_error_protocol_violation, "non-zero long-header reserved bits");
-            return bytes.len;
-        }
+    pub fn handleZeroRtt( self: *Connection, bytes: []u8, now_us: u64, ) Error!usize { return conn_recv_packet_handlers.handleZeroRtt(self, bytes, now_us); }
 
-        // Server side: discover peer's CIDs from the very first Initial.
-        if (self.role == .server) {
-            if (!self.peer_dcid_set) {
-                self.peer_dcid = ConnectionId.fromSlice(opened.scid.slice());
-                self.peer_dcid_set = true;
-            }
-            if (!self.initial_dcid_set) {
-                self.initial_dcid = ConnectionId.fromSlice(opened.dcid.slice());
-                self.initial_dcid_set = true;
-                try self.ensureInitialKeys();
-            }
-            self.emitConnectionStartedOnce();
-        }
-        if (self.role == .client) {
-            const server_scid = ConnectionId.fromSlice(opened.scid.slice());
-            if (!ConnectionId.eql(self.primaryPath().path.peer_cid, server_scid)) {
-                try self.setPeerDcid(server_scid.slice());
-            }
-        }
-
-        self.last_authenticated_path_id = self.current_incoming_path_id;
-        if (self.closingAttributionOnly()) {
-            // RFC 9000 §10.2.1 ¶3 attribution path. See `handleShort`.
-            self.closing_state_attribution_observed = true;
-            self.scanForPeerCloseFrame(opened.payload, now_us);
-            return opened.bytes_consumed;
-        }
-        self.pnSpaceForLevel(.initial).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
-        self.qlog_packets_received +|= 1;
-        self.emitPacketReceived(.initial, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
-        try self.dispatchFrames(.initial, opened.payload, now_us);
-        return opened.bytes_consumed;
-    }
-
-    fn handleRetry(
-        self: *Connection,
-        bytes: []u8,
-        now_us: u64,
-    ) Error!usize {
-        _ = now_us;
-        if (self.role != .client or self.retry_accepted or self.inner.handshakeDone()) {
-            return bytes.len;
-        }
-        const parsed = wire_header.parse(bytes, 0) catch return bytes.len;
-        if (parsed.header != .retry) return bytes.len;
-        const retry = parsed.header.retry;
-        if (retry.version != quic_version_1) return bytes.len;
-        if (!self.local_scid_set or !self.initial_dcid_set) return bytes.len;
-        if (!std.mem.eql(u8, retry.dcid.slice(), self.local_scid.slice())) return bytes.len;
-
-        const odcid = if (self.original_initial_dcid_set)
-            self.original_initial_dcid
-        else
-            self.initial_dcid;
-        if (std.mem.eql(u8, retry.scid.slice(), odcid.slice())) {
-            return bytes.len;
-        }
-        const retry_valid = long_packet_mod.validateRetryIntegrity(odcid.slice(), bytes) catch return bytes.len;
-        if (!retry_valid) {
-            return bytes.len;
-        }
-
-        try self.retry_token.resize(self.allocator, retry.retry_token.len);
-        @memcpy(self.retry_token.items, retry.retry_token);
-        self.retry_source_cid = ConnectionId.fromSlice(retry.scid.slice());
-        self.retry_source_cid_set = true;
-        self.retry_accepted = true;
-
-        try self.setPeerDcid(retry.scid.slice());
-        try self.setInitialDcid(retry.scid.slice());
-        try self.resetInitialRecoveryForRetry();
-        return bytes.len;
-    }
-
-    fn handleZeroRtt(
-        self: *Connection,
-        bytes: []u8,
-        now_us: u64,
-    ) Error!usize {
-        if (self.role != .server) {
-            self.emitPacketDropped(.early_data, @intCast(bytes.len), .other);
-            return bytes.len;
-        }
-        if (self.inner.earlyDataStatus() == .rejected) {
-            self.emitPacketDropped(.early_data, @intCast(bytes.len), .keys_unavailable);
-            return bytes.len;
-        }
-
-        const r_keys_opt = try self.packetKeys(.early_data, .read);
-        const r_keys = r_keys_opt orelse {
-            self.emitPacketDropped(.early_data, @intCast(bytes.len), .keys_unavailable);
-            return bytes.len;
-        };
-        const app_path = self.pathForId(self.current_incoming_path_id);
-        const app_pn_space = &app_path.app_pn_space;
-        const largest_received = if (app_pn_space.received.largest) |l| l else 0;
-
-        var pt_buf: [max_recv_plaintext]u8 = undefined;
-        const opened = long_packet_mod.openZeroRtt(&pt_buf, bytes, .{
-            .keys = &r_keys,
-            .largest_received = largest_received,
-        }) catch |e| switch (e) {
-            boringssl.crypto.aead.Error.Auth => {
-                self.emitPacketDropped(.early_data, @intCast(bytes.len), .decryption_failure);
-                return bytes.len;
-            },
-            else => return e,
-        };
-
-        // RFC 9000 §17.2.1 ¶17 long-header Reserved Bits gate.
-        if (opened.reserved_bits != 0) {
-            self.close(true, transport_error_protocol_violation, "non-zero long-header reserved bits");
-            return bytes.len;
-        }
-
-        self.last_authenticated_path_id = app_path.id;
-        if (self.closingAttributionOnly()) {
-            // RFC 9000 §10.2.1 ¶3 attribution path. See `handleShort`.
-            self.closing_state_attribution_observed = true;
-            self.scanForPeerCloseFrame(opened.payload, now_us);
-            return opened.bytes_consumed;
-        }
-        recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload, self.delayed_ack_packet_threshold);
-        self.qlog_packets_received +|= 1;
-        self.emitPacketReceived(.early_data, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
-        try self.dispatchFrames(.early_data, opened.payload, now_us);
-        return opened.bytes_consumed;
-    }
-
-    fn handleHandshake(
-        self: *Connection,
-        bytes: []u8,
-        now_us: u64,
-    ) Error!usize {
-        const r_keys_opt = try self.packetKeys(.handshake, .read);
-        const r_keys = r_keys_opt orelse {
-            self.emitPacketDropped(.handshake, @intCast(bytes.len), .keys_unavailable);
-            return bytes.len;
-        };
-
-        var pt_buf: [max_recv_plaintext]u8 = undefined;
-        const opened = long_packet_mod.openHandshake(&pt_buf, bytes, .{
-            .keys = &r_keys,
-            .largest_received = if (self.pnSpaceForLevel(.handshake).received.largest) |l| l else 0,
-        }) catch |e| switch (e) {
-            boringssl.crypto.aead.Error.Auth => {
-                self.emitPacketDropped(.handshake, @intCast(bytes.len), .decryption_failure);
-                return bytes.len;
-            },
-            else => return e,
-        };
-
-        // RFC 9000 §17.2.1 ¶17 long-header Reserved Bits gate.
-        if (opened.reserved_bits != 0) {
-            self.close(true, transport_error_protocol_violation, "non-zero long-header reserved bits");
-            return bytes.len;
-        }
-
-        self.last_authenticated_path_id = self.current_incoming_path_id;
-        if (self.closingAttributionOnly()) {
-            // RFC 9000 §10.2.1 ¶3 attribution path. See `handleShort`.
-            self.closing_state_attribution_observed = true;
-            self.scanForPeerCloseFrame(opened.payload, now_us);
-            return opened.bytes_consumed;
-        }
-        self.pnSpaceForLevel(.handshake).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
-        self.qlog_packets_received +|= 1;
-        self.emitPacketReceived(.handshake, opened.pn, @intCast(opened.bytes_consumed), countFrames(opened.payload));
-        try self.dispatchFrames(.handshake, opened.payload, now_us);
-        return opened.bytes_consumed;
-    }
+    pub fn handleHandshake( self: *Connection, bytes: []u8, now_us: u64, ) Error!usize { return conn_recv_packet_handlers.handleHandshake(self, bytes, now_us); }
 
     pub fn dispatchFrames(
         self: *Connection,
@@ -7116,7 +6808,7 @@ pub const Connection = struct {
         return false;
     }
 
-    fn pathIdAllowedByLocalLimit(self: *Connection, path_id: u32) bool {
+    pub fn pathIdAllowedByLocalLimit(self: *Connection, path_id: u32) bool {
         if (path_id <= self.local_max_path_id) return true;
         self.close(true, transport_error_protocol_violation, "multipath path id exceeds local limit");
         return false;
@@ -7210,7 +6902,7 @@ pub const Connection = struct {
         self.promotePeerCidForPath(path_id);
     }
 
-    fn registerPeerCid(
+    pub fn registerPeerCid(
         self: *Connection,
         path_id: u32,
         sequence_number: u64,
@@ -7268,13 +6960,7 @@ pub const Connection = struct {
         }
     }
 
-    pub fn handleNewConnectionId(
-        self: *Connection,
-        nc: frame_types.NewConnectionId,
-    ) Error!void {
-        const cid = ConnectionId.fromSlice(nc.connection_id.slice());
-        try self.registerPeerCid(0, nc.sequence_number, nc.retire_prior_to, cid, nc.stateless_reset_token);
-    }
+    pub fn handleNewConnectionId( self: *Connection, nc: frame_types.NewConnectionId, ) Error!void { return conn_recv_cid_token_handlers.handleNewConnectionId(self, nc); }
 
     /// Returns true (and increments the per-cycle counter) when the
     /// cumulative ACK range count for this `handle` cycle would exceed
@@ -7289,57 +6975,7 @@ pub const Connection = struct {
         return false;
     }
 
-    pub fn handleRetireConnectionId(
-        self: *Connection,
-        rc: frame_types.RetireConnectionId,
-    ) void {
-        // Per-cycle flood gate (DoS hardening). A peer bursting
-        // RETIRE_CONNECTION_ID frames forces O(N) walks of `local_cids`
-        // per frame; once the count exceeds the cap there's no
-        // legitimate flow that needs that many retires in one
-        // datagram.
-        self.incoming_retire_cid_count +|= 1;
-        if (self.incoming_retire_cid_count > incoming_retire_cid_cap) {
-            self.close(true, transport_error_protocol_violation, "retire_connection_id flood");
-            return;
-        }
-        // RFC 9000 §19.16 ¶3: "The sequence number specified in a
-        // RETIRE_CONNECTION_ID frame MUST NOT refer to the
-        // Destination Connection ID field of the packet in which the
-        // frame is contained. The peer MAY treat this as a
-        // connection error of type PROTOCOL_VIOLATION." Server
-        // routing has already populated `current_incoming_local_cid_seq`
-        // with the seq of the CID this datagram was addressed to;
-        // any retire-frame referencing that exact seq is a peer
-        // protocol violation.
-        if (self.current_incoming_local_cid_seq) |incoming_seq| {
-            if (rc.sequence_number == incoming_seq) {
-                self.close(true, transport_error_protocol_violation, "retire_connection_id refers to receiving CID");
-                return;
-            }
-        }
-        // RFC 9000 §19.16: a sequence number greater than any we ever
-        // sent is a PROTOCOL_VIOLATION. Without this gate, an off-path
-        // attacker (or a misbehaving peer) could spam RETIRE_CONNECTION_ID
-        // for fabricated sequences and waste server processing per packet.
-        if (self.paths.getConst(0)) |path| {
-            if (rc.sequence_number >= path.next_local_cid_seq) {
-                self.close(true, transport_error_protocol_violation, "retire_connection_id sequence not yet issued");
-                return;
-            }
-        }
-        // Fast-path skip: if this seq is below the smallest still-live
-        // local CID seq for path 0, the retire is a no-op (the entry
-        // is already gone or was never installed). Skipping spares the
-        // O(N) walk through `local_cids` and `pending_frames`. Equality
-        // with an existing entry still goes through the slow path so
-        // promotion fires correctly.
-        if (self.smallestLiveLocalCidSeq(0)) |smallest| {
-            if (rc.sequence_number < smallest) return;
-        }
-        self.retireLocalCidFromPeer(0, rc.sequence_number);
-        self.dropPendingLocalCidAdvertisement(0, rc.sequence_number);
-    }
+    pub fn handleRetireConnectionId( self: *Connection, rc: frame_types.RetireConnectionId, ) void { return conn_recv_cid_token_handlers.handleRetireConnectionId(self, rc); }
 
     /// RFC 9000 §19.7 — server-issued NEW_TOKEN. The frame is only
     /// legal at application encryption level (filtered upstream by
@@ -7347,130 +6983,27 @@ pub const Connection = struct {
     /// NEW_TOKEN; if a peer-acting-as-server sends it to us we
     /// silently drop the bytes. Clients hand the borrowed slice
     /// straight to the embedder callback if one is installed.
-    fn handleNewToken(self: *Connection, nt: frame_types.NewToken) void {
-        if (self.role != .client) {
-            // Per §19.7: receiving NEW_TOKEN with role=server is a
-            // PROTOCOL_VIOLATION. The frame-level check is here so
-            // we don't bake server-side state on a malicious peer
-            // sending the wrong-direction frame.
-            self.close(true, transport_error_protocol_violation, "new_token from peer to server");
-            return;
-        }
-        if (nt.token.len == 0) {
-            // Zero-length NEW_TOKEN is FRAME_ENCODING_ERROR per
-            // §19.7. We could emit a more specific code; nullq
-            // already wires PROTOCOL_VIOLATION for parse-shape
-            // issues so reuse it.
-            self.close(true, transport_error_frame_encoding, "zero-length new_token");
-            return;
-        }
-        if (self.new_token_callback) |cb| cb(self.new_token_user_data, nt.token);
-    }
+    pub fn handleNewToken(self: *Connection, nt: frame_types.NewToken) void { return conn_recv_cid_token_handlers.handleNewToken(self, nt); }
 
-    fn pathAckToAck(pa: frame_types.PathAck) frame_types.Ack {
-        return .{
-            .largest_acked = pa.largest_acked,
-            .ack_delay = pa.ack_delay,
-            .first_range = pa.first_range,
-            .range_count = pa.range_count,
-            .ranges_bytes = pa.ranges_bytes,
-            .ecn_counts = pa.ecn_counts,
-        };
-    }
+    pub fn pathAckToAck(pa: frame_types.PathAck) frame_types.Ack { return conn_recv_multipath_handlers.pathAckToAck(pa); }
 
-    pub fn handlePathAck(
-        self: *Connection,
-        pa: frame_types.PathAck,
-        now_us: u64,
-    ) Error!void {
-        if (pa.path_id == 0) {
-            return self.handleAckAtLevel(.application, pathAckToAck(pa), now_us);
-        }
-        const path = self.paths.get(pa.path_id) orelse return;
-        try self.handleApplicationAckOnPath(path, pathAckToAck(pa), now_us);
-    }
+    pub fn handlePathAck( self: *Connection, pa: frame_types.PathAck, now_us: u64, ) Error!void { return conn_recv_multipath_handlers.handlePathAck(self, pa, now_us); }
 
-    fn handlePathAbandon(
-        self: *Connection,
-        pa: frame_types.PathAbandon,
-        now_us: u64,
-    ) void {
-        _ = self.retirePath(pa.path_id, pa.error_code, now_us, true);
-    }
+    pub fn handlePathAbandon( self: *Connection, pa: frame_types.PathAbandon, now_us: u64, ) void { return conn_recv_multipath_handlers.handlePathAbandon(self, pa, now_us); }
 
-    fn handlePathStatus(
-        self: *Connection,
-        ps: frame_types.PathStatus,
-        available: bool,
-    ) void {
-        const path = self.paths.get(ps.path_id) orelse return;
-        path.recordPeerStatus(available, ps.sequence_number);
-    }
+    pub fn handlePathStatus( self: *Connection, ps: frame_types.PathStatus, available: bool, ) void { return conn_recv_multipath_handlers.handlePathStatus(self, ps, available); }
 
-    pub fn handlePathNewConnectionId(
-        self: *Connection,
-        nc: frame_types.PathNewConnectionId,
-    ) Error!void {
-        const cid = ConnectionId.fromSlice(nc.connection_id.slice());
-        try self.registerPeerCid(nc.path_id, nc.sequence_number, nc.retire_prior_to, cid, nc.stateless_reset_token);
-    }
+    pub fn handlePathNewConnectionId( self: *Connection, nc: frame_types.PathNewConnectionId, ) Error!void { return conn_recv_multipath_handlers.handlePathNewConnectionId(self, nc); }
 
-    pub fn handlePathRetireConnectionId(
-        self: *Connection,
-        rc: frame_types.PathRetireConnectionId,
-    ) void {
-        // Multipath analogue of RFC 9000 §19.16. Same DoS surface — a
-        // peer that walks ahead of the issued sequence forces us to do
-        // a lookup-and-discard per frame.
-        if (self.paths.getConst(rc.path_id)) |path| {
-            if (rc.sequence_number >= path.next_local_cid_seq) {
-                self.close(true, transport_error_protocol_violation, "path_retire_connection_id sequence not yet issued");
-                return;
-            }
-        }
-        self.retireLocalCidFromPeer(rc.path_id, rc.sequence_number);
-        self.dropPendingLocalCidAdvertisement(rc.path_id, rc.sequence_number);
-    }
+    pub fn handlePathRetireConnectionId( self: *Connection, rc: frame_types.PathRetireConnectionId, ) void { return conn_recv_multipath_handlers.handlePathRetireConnectionId(self, rc); }
 
-    pub fn handleMaxPathId(self: *Connection, mp: frame_types.MaxPathId) void {
-        if (self.cached_peer_transport_params) |params| {
-            if (params.initial_max_path_id) |initial_max_path_id| {
-                if (mp.maximum_path_id < initial_max_path_id) {
-                    self.close(true, transport_error_protocol_violation, "max path id below peer initial limit");
-                    return;
-                }
-            }
-        }
-        if (mp.maximum_path_id > self.peer_max_path_id) {
-            self.peer_max_path_id = @min(mp.maximum_path_id, max_supported_path_id);
-        }
-    }
+    pub fn handleMaxPathId(self: *Connection, mp: frame_types.MaxPathId) void { return conn_recv_multipath_handlers.handleMaxPathId(self, mp); }
 
-    pub fn handlePathsBlocked(self: *Connection, pb: frame_types.PathsBlocked) void {
-        if (!self.pathIdAllowedByLocalLimit(pb.maximum_path_id)) return;
-        if (pb.maximum_path_id < self.local_max_path_id) return;
-        self.peer_paths_blocked_at = pb.maximum_path_id;
-    }
+    pub fn handlePathsBlocked(self: *Connection, pb: frame_types.PathsBlocked) void { return conn_recv_multipath_handlers.handlePathsBlocked(self, pb); }
 
-    pub fn handlePathCidsBlocked(self: *Connection, pcb: frame_types.PathCidsBlocked) void {
-        if (!self.pathIdAllowedByLocalLimit(pcb.path_id)) return;
-        const next = _internal.nextLocalCidSequence(self,pcb.path_id);
-        if (pcb.next_sequence_number > next) {
-            self.close(true, transport_error_protocol_violation, "path cids blocked skips local cid sequence");
-            return;
-        }
-        self.peer_path_cids_blocked_path_id = pcb.path_id;
-        self.peer_path_cids_blocked_next_sequence = pcb.next_sequence_number;
-        self.recordConnectionIdsNeeded(pcb.path_id, .path_cids_blocked, pcb.next_sequence_number);
-    }
+    pub fn handlePathCidsBlocked(self: *Connection, pcb: frame_types.PathCidsBlocked) void { return conn_recv_multipath_handlers.handlePathCidsBlocked(self, pcb); }
 
-    fn handleStopSending(
-        self: *Connection,
-        ss: frame_types.StopSending,
-    ) Error!void {
-        const ptr = self.streams.get(ss.stream_id) orelse return;
-        try ptr.send.resetStream(ss.application_error_code);
-    }
+    pub fn handleStopSending( self: *Connection, ss: frame_types.StopSending, ) Error!void { return conn_recv_stream_control_handlers.handleStopSending(self, ss); }
 
     pub fn handleMaxData(self: *Connection, md: frame_types.MaxData) void {
         return conn_recv_flow_handlers.handleMaxData(self, md);
@@ -7796,229 +7329,11 @@ pub const Connection = struct {
         }
     }
 
-    fn handleResetStream(self: *Connection, rs: frame_types.ResetStream) Error!void {
-        if (!self.peerMaySendOnStream(rs.stream_id)) {
-            self.close(true, transport_error_stream_state, "reset stream on receive-only stream");
-            return;
-        }
-        const existing = self.streams.get(rs.stream_id);
-        if (existing == null and self.streamInitiatedByLocal(rs.stream_id)) {
-            self.close(true, transport_error_stream_state, "peer reset unopened local stream");
-            return;
-        }
-        if (existing == null and !self.recordPeerStreamOpenOrClose(rs.stream_id)) return;
-        const ptr = existing orelse blk: {
-            const new_ptr = try self.allocator.create(Stream);
-            errdefer self.allocator.destroy(new_ptr);
-            new_ptr.* = .{
-                .id = rs.stream_id,
-                .send = SendStream.init(self.allocator),
-                .recv = RecvStream.init(self.allocator),
-                .recv_max_data = self.initialRecvStreamLimit(rs.stream_id),
-                .send_max_data = self.initialSendStreamLimit(rs.stream_id),
-            };
-            try self.streams.put(self.allocator, rs.stream_id, new_ptr);
-            break :blk new_ptr;
-        };
-        const old_highest = ptr.recv.peerHighestOffset();
-        const new_highest = @max(old_highest, rs.final_size);
-        if (new_highest > ptr.recv_max_data) {
-            self.close(true, transport_error_flow_control, "peer reset exceeds stream data limit");
-            return;
-        }
-        const delta = new_highest - old_highest;
-        if (delta > 0 and
-            (delta > self.local_max_data or self.peer_sent_stream_data > self.local_max_data - delta))
-        {
-            self.close(true, transport_error_flow_control, "peer reset exceeds connection data limit");
-            return;
-        }
-        // Hardening guide §3.5 / §8: snapshot the recv buffer length
-        // before `resetStream`, which discards buffered-but-undelivered
-        // bytes (no-longer-needed reassembly state) and shrinks the
-        // backing allocation to zero. Reconcile the global
-        // resident-bytes counter against that drop.
-        const recv_before = ptr.recv.bytes.items.len;
-        ptr.recv.resetStream(rs.application_error_code, rs.final_size) catch |err| switch (err) {
-            error.BeyondFinalSize, error.FinalSizeChanged => {
-                self.close(true, transport_error_final_size, "reset stream final size changed");
-                return;
-            },
-            else => return err,
-        };
-        if (ptr.recv.bytes.items.len < recv_before) {
-            self.releaseResidentBytes(recv_before - ptr.recv.bytes.items.len);
-        }
-        self.peer_sent_stream_data += delta;
-        self.maybeReturnPeerStreamCredit(ptr);
-    }
+    pub fn handleResetStream(self: *Connection, rs: frame_types.ResetStream) Error!void { return conn_recv_stream_control_handlers.handleResetStream(self, rs); }
 
-    pub fn handleAckAtLevel(
-        self: *Connection,
-        lvl: EncryptionLevel,
-        a: frame_types.Ack,
-        now_us: u64,
-    ) Error!void {
-        // Walk ACK ranges and notify each PN at this level to:
-        //   1. every open SendStream (application level only),
-        //   2. the per-level SentPacketTracker.
-        //
-        // Phase 5b v1 walks streams brute-force per PN; a per-PN
-        // side-table is the obvious next optimization.
-        const pn_space = self.pnSpaceForLevel(lvl);
-        const sent = self.sentForLevel(lvl);
-        // RFC 9000 §13.1 / RFC 9002 §A.3: an ACK that claims a packet
-        // number we never sent (largest_acked >= next_pn) is a
-        // PROTOCOL_VIOLATION. We must reject it before updating
-        // largest_acked_sent — otherwise the bogus value would
-        // poison packet-threshold loss detection on legitimate
-        // in-flight packets.
-        if (a.largest_acked >= pn_space.next_pn) {
-            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
-            return;
-        }
-        pn_space.onAckReceived(a.largest_acked);
-        var largest_acked_send_time_us: ?u64 = null;
-        var largest_acked_ack_eliciting = false;
-        var any_ack_eliciting_newly_acked = false;
-        var in_flight_bytes_acked: u64 = 0;
-        var newest_acked_sent_time_us: u64 = 0;
+    pub fn handleAckAtLevel( self: *Connection, lvl: EncryptionLevel, a: frame_types.Ack, now_us: u64, ) Error!void { return conn_recv_ack_handlers.handleAckAtLevel(self, lvl, a, now_us); }
 
-        var ack_it = ack_range_mod.iter(a);
-        while (try ack_it.next()) |interval| {
-            // Walk the (small, bounded) sent-packet tracker rather
-            // than every PN in [smallest, largest]. A peer-chosen
-            // first_range can stretch interval.smallest down to 0;
-            // iterating the PN range directly would let a single
-            // ACK force O(next_pn) work, which on a long-lived
-            // connection is a real DoS surface (RFC 9000 §13.1
-            // only constrains largest_acked < next_pn). Walking
-            // the tracker is O(K log N) where K = packets matched
-            // and N = tracker size, both bounded by our own send
-            // rate × CWND.
-            while (sent.lowerBound(interval.smallest)) |idx| {
-                if (sent.packets[idx].pn > interval.largest) break;
-                var acked = sent.removeAt(idx);
-                defer acked.deinit(self.allocator);
-                if (acked.pn == a.largest_acked) {
-                    largest_acked_send_time_us = acked.sent_time_us;
-                    largest_acked_ack_eliciting = acked.ack_eliciting;
-                }
-                if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
-                if (acked.in_flight) {
-                    in_flight_bytes_acked += acked.bytes;
-                    if (acked.sent_time_us > newest_acked_sent_time_us) {
-                        newest_acked_sent_time_us = acked.sent_time_us;
-                    }
-                }
-                if (lvl == .application) {
-                    self.onApplicationPacketAckedForKeys(&acked, now_us);
-                    self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
-                }
-                self.discardSentCryptoForPacket(lvl, acked.pn);
-                self.dispatchAckedControlFrames(&acked);
-                self.recordDatagramAcked(&acked);
-            }
-        }
-        if (largest_acked_send_time_us) |sent_time_us| {
-            if (largest_acked_ack_eliciting and now_us >= sent_time_us) {
-                const ack_delay_us = a.ack_delay << self.peerAckDelayExponent();
-                self.rttForLevel(lvl).update(
-                    now_us - sent_time_us,
-                    ack_delay_us,
-                    self.handshakeDone(),
-                    self.peerMaxAckDelayUs(),
-                );
-            }
-        }
-        if (any_ack_eliciting_newly_acked) self.ptoCountForLevel(lvl).* = 0;
-        if (in_flight_bytes_acked > 0) {
-            if (lvl == .application) {
-                self.ccForApplication().onPacketAcked(in_flight_bytes_acked, newest_acked_sent_time_us);
-            }
-        }
-
-        // Loss detection at the same level — packet-threshold only
-        // (time-threshold lives in `tick`).
-        try self.detectLossesByPacketThresholdAtLevel(lvl);
-
-        // Snapshot metrics + congestion phase after a meaningful ACK.
-        if (any_ack_eliciting_newly_acked or in_flight_bytes_acked > 0) {
-            self.emitCongestionStateIfChanged(now_us);
-            self.emitMetricsSnapshot(now_us);
-        }
-    }
-
-    fn handleApplicationAckOnPath(
-        self: *Connection,
-        path: *PathState,
-        a: frame_types.Ack,
-        now_us: u64,
-    ) Error!void {
-        // RFC 9000 §13.1 / RFC 9002 §A.3: reject ACKs claiming PNs
-        // we never sent on this path.
-        if (a.largest_acked >= path.app_pn_space.next_pn) {
-            self.close(true, transport_error_protocol_violation, "ack of unsent packet");
-            return;
-        }
-        path.app_pn_space.onAckReceived(a.largest_acked);
-        var largest_acked_send_time_us: ?u64 = null;
-        var largest_acked_ack_eliciting = false;
-        var any_ack_eliciting_newly_acked = false;
-        var in_flight_bytes_acked: u64 = 0;
-        var newest_acked_sent_time_us: u64 = 0;
-
-        var ack_it = ack_range_mod.iter(a);
-        while (try ack_it.next()) |interval| {
-            // See `handleAckAtLevel` above for the rationale; this
-            // is the per-application-path twin walk and uses the
-            // same tracker-bounded iteration.
-            while (path.sent.lowerBound(interval.smallest)) |idx| {
-                if (path.sent.packets[idx].pn > interval.largest) break;
-                var acked = path.sent.removeAt(idx);
-                defer acked.deinit(self.allocator);
-                if (acked.pn == a.largest_acked) {
-                    largest_acked_send_time_us = acked.sent_time_us;
-                    largest_acked_ack_eliciting = acked.ack_eliciting;
-                }
-                if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
-                if (acked.in_flight) {
-                    in_flight_bytes_acked += acked.bytes;
-                    if (acked.sent_time_us > newest_acked_sent_time_us) {
-                        newest_acked_sent_time_us = acked.sent_time_us;
-                    }
-                }
-                self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
-                self.onApplicationPacketAckedForKeys(&acked, now_us);
-                self.discardSentCryptoForPacket(.application, acked.pn);
-                self.dispatchAckedControlFrames(&acked);
-                self.recordDatagramAcked(&acked);
-            }
-        }
-        if (largest_acked_send_time_us) |sent_time_us| {
-            if (largest_acked_ack_eliciting and now_us >= sent_time_us) {
-                const ack_delay_us = a.ack_delay << self.peerAckDelayExponent();
-                path.path.rtt.update(
-                    now_us - sent_time_us,
-                    ack_delay_us,
-                    self.handshakeDone(),
-                    self.peerMaxAckDelayUs(),
-                );
-            }
-        }
-        if (any_ack_eliciting_newly_acked) path.pto_count = 0;
-        if (in_flight_bytes_acked > 0) {
-            path.path.cc.onPacketAcked(in_flight_bytes_acked, newest_acked_sent_time_us);
-        }
-
-        try self.detectLossesByPacketThresholdOnApplicationPath(path);
-
-        // Snapshot metrics + congestion phase after a meaningful ACK.
-        if (any_ack_eliciting_newly_acked or in_flight_bytes_acked > 0) {
-            self.emitCongestionStateIfChanged(now_us);
-            self.emitMetricsSnapshot(now_us);
-        }
-    }
+    pub fn handleApplicationAckOnPath( self: *Connection, path: *PathState, a: frame_types.Ack, now_us: u64, ) Error!void { return conn_recv_ack_handlers.handleApplicationAckOnPath(self, path, a, now_us); }
 
     fn dispatchAckedToStreams(self: *Connection, pn: u64) Error!void {
         var s_it = self.streams.iterator();
@@ -8037,7 +7352,7 @@ pub const Connection = struct {
         }
     }
 
-    fn dispatchAckedPacketToStreams(
+    pub fn dispatchAckedPacketToStreams(
         self: *Connection,
         packet: *const sent_packets_mod.SentPacket,
     ) Error!void {
@@ -8072,7 +7387,7 @@ pub const Connection = struct {
         return any;
     }
 
-    fn discardSentCryptoForPacket(
+    pub fn discardSentCryptoForPacket(
         self: *Connection,
         lvl: EncryptionLevel,
         pn: u64,
@@ -8115,7 +7430,7 @@ pub const Connection = struct {
         return any;
     }
 
-    fn dispatchAckedControlFrames(
+    pub fn dispatchAckedControlFrames(
         self: *Connection,
         packet: *const sent_packets_mod.SentPacket,
     ) void {
@@ -8136,14 +7451,9 @@ pub const Connection = struct {
         }
     }
 
-    pub fn dispatchLostControlFrames(
-        self: *Connection,
-        packet: *const sent_packets_mod.SentPacket,
-    ) Error!bool {
-        return self.dispatchLostControlFramesOnPath(packet, self.activePath().id);
-    }
+    pub fn dispatchLostControlFrames( self: *Connection, packet: *const sent_packets_mod.SentPacket, ) Error!bool { return conn_recv_ack_handlers.dispatchLostControlFrames(self, packet); }
 
-    fn dispatchLostControlFramesOnPath(
+    pub fn dispatchLostControlFramesOnPath(
         self: *Connection,
         packet: *const sent_packets_mod.SentPacket,
         path_id: u32,
@@ -8370,7 +7680,7 @@ pub const Connection = struct {
         }
     }
 
-    fn detectLossesByPacketThresholdAtLevel(
+    pub fn detectLossesByPacketThresholdAtLevel(
         self: *Connection,
         lvl: EncryptionLevel,
     ) Error!void {
@@ -8401,7 +7711,7 @@ pub const Connection = struct {
         self.emitCongestionStateIfChanged(0);
     }
 
-    fn detectLossesByPacketThresholdOnApplicationPath(
+    pub fn detectLossesByPacketThresholdOnApplicationPath(
         self: *Connection,
         path: *PathState,
     ) Error!void {
