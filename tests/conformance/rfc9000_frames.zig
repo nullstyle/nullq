@@ -841,24 +841,39 @@ test "MUST NOT accept RETIRE_CONNECTION_ID for an unissued sequence number [RFC9
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
-test "skip_MUST NOT retire the connection ID currently in use to receive [RFC9000 §19.16 ¶?]" {
+test "MUST NOT retire the connection ID currently in use to receive [RFC9000 §19.16 ¶3]" {
     // §19.16 ¶3: "The sequence number specified in a
     // RETIRE_CONNECTION_ID frame MUST NOT refer to the Destination
     // Connection ID field of the packet in which the frame is
     // contained. The peer MAY treat this as a connection error of
     // type PROTOCOL_VIOLATION."
     //
-    // VISIBLE DEBT — real implementation gap. Enforcing this gate
-    // needs the wire→server→connection layers to plumb "the DCID this
-    // packet was addressed to" through `Connection.handle` so
-    // `handleRetireConnectionId` can compare the frame's sequence
-    // number against the currently-incoming DCID's sequence. nullq
-    // tracks per-slot `tracked_cids` in `src/server.zig` but does NOT
-    // yet propagate the matched CID's sequence number into the
-    // connection on each `Server.feed`. Adding this is its own
-    // multi-file change (server routing + connection state +
-    // handleRetireConnectionId gate); tracked separately.
-    return error.SkipZigTest;
+    // Plumbing flows wire→server→connection:
+    //   * `Server.dispatchToSlot` peeks the inbound DCID, looks up
+    //     its issuance sequence via `Connection.findLocalCidSequence`,
+    //     and sets `Connection.current_incoming_local_cid_seq` before
+    //     calling `Connection.handle`.
+    //   * `Connection.handleRetireConnectionId` checks the field
+    //     against the frame's `sequence_number`; equality fires
+    //     PROTOCOL_VIOLATION.
+    //
+    // The handshake-confirmed pair routes 1-RTT packets via the
+    // server's initial SCID (sequence 0), so a peer-sent
+    // RETIRE_CONNECTION_ID(seq=0) is exactly "retire the CID this
+    // datagram was addressed to."
+    var pair = try handshake_fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    var buf: [4]u8 = undefined;
+    const n = try encode(&buf, .{ .retire_connection_id = .{ .sequence_number = 0 } });
+
+    const close_event = try pair.injectFrameAtServer(buf[0..n]);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
 // ---------------------------------------------------------------- §19.17 PATH_CHALLENGE

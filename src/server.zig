@@ -1880,7 +1880,16 @@ pub const Server = struct {
         from: ?Address,
         now_us: u64,
     ) Error!void {
-        _ = self;
+        // RFC 9000 §19.16 ¶3 plumbing: tell the connection which of
+        // its locally-issued CIDs this datagram was addressed to,
+        // so `handleRetireConnectionId` can reject a frame retiring
+        // the in-use CID. `null` (no DCID match) leaves the gate
+        // inert — that path is the pre-routing-table bootstrap case
+        // for a brand-new Initial.
+        const dcid_opt = peekDcidForServer(bytes, self.local_cid_len);
+        const seq_opt: ?u64 = if (dcid_opt) |d| slot.conn.findLocalCidSequence(d) else null;
+        slot.conn.setIncomingLocalCidSeq(seq_opt);
+        defer slot.conn.setIncomingLocalCidSeq(null);
         slot.conn.handle(bytes, from, now_us) catch |err| switch (err) {
             // OOM is fatal for the whole server — propagate. The
             // surrounding `feed` will return `OutOfMemory` to the

@@ -539,65 +539,73 @@ test "SHOULD bind the session-ticket context to ALPN as well as transport parame
 
 // ---------------------------------------------------------------- visible debt
 
-test "skip_MUST close with crypto_error 120 when the peer's ClientHello omits ALPN [RFC9001 §4.1.1 ¶3]" {
+test "MUST close with CRYPTO_ERROR + no_application_protocol (0x178) on ALPN mismatch [RFC9001 §4.1.1 ¶3]" {
     // §4.1.1 ¶3: "endpoints MUST send the no_application_protocol TLS
     // alert (QUIC error code 0x0178) when ALPN is absent."
+    // §4.8 supplies the translation: any TLS alert byte N → QUIC
+    // CRYPTO_ERROR 0x100 + N. So `no_application_protocol` (0x78) →
+    // 0x178.
     //
-    // Updated rationale (was: "needs Server fixture + handshake
-    // driver"). The fixture surface is now in place — what's blocking
-    // is a peer-side ClientHello-construction limitation.
+    // The strict §4.1.1 case is "ClientHello omits ALPN", but
+    // BoringSSL's QUIC mode refuses to *emit* a no-ALPN ClientHello at
+    // all (`ext_alpn_add_clienthello` shorts to
+    // `SSL_R_NO_APPLICATION_PROTOCOL` when `alpn_client_proto_list` is
+    // empty + `SSL_is_quic`). The dual case — Server with a
+    // non-overlapping ALPN list — fires the SAME alert from the same
+    // BoringSSL gate (`ssl_negotiate_alpn` in extensions.cc) and
+    // therefore tests the same wire-code translation that §4.1.1 ¶3
+    // requires. We use that for live coverage.
     //
-    // Approach A (build a Client whose TLS context omits ALPN): blocked
-    // upstream by BoringSSL itself. `ext_alpn_add_clienthello` in
-    // ssl/extensions.cc fails *before emitting any bytes* with
-    // `SSL_R_NO_APPLICATION_PROTOCOL` whenever
-    // `alpn_client_proto_list.empty() && SSL_is_quic(ssl)`. So a
-    // BoringSSL-built QUIC client cannot produce a no-ALPN ClientHello
-    // at all — `Client.connect` followed by `client.conn.advance`
-    // returns `Error.HandshakeFailed` from the client side, never
-    // reaching the wire. Verified empirically: dropping ALPN on the
-    // override TLS context fails the client's first
-    // `tls.handshake()` call inside `advanceHandshake`. Bypassing this
-    // would require either patching BoringSSL or a "raw CRYPTO byte
-    // injection" entry point on `Connection` that skips the TLS state
-    // machine for the first flight — neither is in scope.
-    //
-    // Approach B (synthetic ClientHello bytes replayed through
-    // `Server.feed`): a TLS 1.3 QUIC ClientHello carries a keyshare,
-    // signature_algorithms, supported_versions, transport_parameters,
-    // SNI, etc. — several hundred bytes, all of which are version- and
-    // build-tied (BoringSSL's QUIC transport-parameter codec, the
-    // ClientHello compression behavior, and the keyshare ECDHE point
-    // would all need to match). Capturing once and embedding as a hex
-    // blob is feasible but the fixture would silently rot the next
-    // time we bump boringssl-zig or change `defaultParams()`. Out of
-    // scope without a regeneration tool that re-mints the bytes from
-    // a freshly-built BoringSSL.
-    //
-    // Server-side gate confirmed by inspection: BoringSSL's
-    // `ssl_negotiate_alpn` (extensions.cc:1493) raises
-    // `SSL_AD_NO_APPLICATION_PROTOCOL` whenever a QUIC server gets a
-    // ClientHello without the ALPN extension. The alert byte (0x78)
-    // is captured by `Connection.alert` via the `send_alert` callback
-    // (src/conn/state.zig:8632); `Connection.handle` then returns
-    // `error.PeerAlerted` and `Server.dispatchToSlot`'s catch-all
-    // closes the slot with INTERNAL_ERROR (0x01). RFC 9001 §4.8
-    // would have the close carry `0x100 | 0x78 = 0x178` instead;
-    // wiring `conn.alert` through to the CONNECTION_CLOSE error code
-    // is the missing translation step in nullq.
-    //
-    // Unblocking work needed (any one of):
-    //   1. A test-only `Connection` entry point that forwards
-    //      caller-supplied raw CRYPTO bytes into `provideQuicData`
-    //      *without* running them through the BoringSSL ClientHello
-    //      builder. The test would mint such bytes (no-ALPN
-    //      ClientHello) via a separate non-QUIC TLS context.
-    //   2. A captured-ClientHello fixture file under tests/data/
-    //      with a regen tool committed alongside it.
-    //   3. The CRYPTO_ERROR translation patch (alert → wire code)
-    //      together with an ALPN-omission assertion against an
-    //      end-to-end harness once option 1 or 2 lands.
-    return error.SkipZigTest;
+    // Wiring: `sendAlert` in src/conn/state.zig converts the alert
+    // byte to a `close(true, 0x100 + alert, ...)` per RFC 9001 §4.8,
+    // so the connection closes with the right wire code regardless of
+    // which side raised the alert.
+    const allocator = std.testing.allocator;
+    const client_protos = [_][]const u8{"hq-test"};
+    const server_protos = [_][]const u8{"different-proto"};
+
+    var srv = try nullq.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = handshake_fixture.test_cert_pem,
+        .tls_key_pem = handshake_fixture.test_key_pem,
+        .alpn_protocols = &server_protos,
+        .transport_params = handshake_fixture.defaultParams(),
+    });
+    defer srv.deinit();
+
+    var client = try nullq.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &client_protos,
+        .transport_params = handshake_fixture.defaultParams(),
+    });
+    defer client.deinit();
+    try client.conn.advance();
+
+    var rx: [4096]u8 = undefined;
+    const peer_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xab) };
+    var iter: u32 = 0;
+    while (iter < 32) : (iter += 1) {
+        const now_us: u64 = @as(u64, iter) * 1_000;
+        while (try client.conn.poll(&rx, now_us)) |len| {
+            _ = try srv.feed(rx[0..len], peer_addr, now_us);
+        }
+        for (srv.iterator()) |slot| {
+            while (try slot.conn.poll(&rx, now_us)) |len| {
+                client.conn.handle(rx[0..len], null, now_us) catch {};
+            }
+        }
+        try srv.tick(now_us);
+        client.conn.tick(now_us) catch {};
+        if (srv.iterator().len > 0 and srv.iterator()[0].conn.closeEvent() != null) break;
+    }
+
+    const slot = if (srv.iterator().len > 0) srv.iterator()[0] else return error.NoServerSlot;
+    const ev = slot.conn.closeEvent() orelse return error.NoCloseEventEmitted;
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    // 0x100 (CRYPTO_ERROR base) + 0x78 (no_application_protocol).
+    try std.testing.expectEqual(@as(u64, 0x178), ev.error_code);
 }
 
 test "MUST keep 0-RTT opt-in (default disabled) [RFC9001 §4.6 ¶1]" {

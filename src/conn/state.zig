@@ -671,6 +671,11 @@ pub const QlogMigrationFailReason = enum {
     /// last one (per `min_path_challenge_interval_us`). Path probe
     /// rate-limit fired; the peer's address change was not honored.
     rate_limited,
+    /// RFC 9000 §5.1.2 ¶1: migration would require us to use a fresh
+    /// peer-issued CID, but the peer hasn't issued any beyond the one
+    /// already in use on this path. The peer needs to send more
+    /// NEW_CONNECTION_ID frames before the migration can proceed.
+    no_fresh_peer_cid,
 };
 
 /// Optional qlog event payload. Existing variants only populate the
@@ -1049,6 +1054,13 @@ pub const Connection = struct {
     /// any subsequent Initial-level packet can't be sealed/opened
     /// with re-derived keys. RFC 9001 §5.7 ¶3.
     initial_keys_discarded: bool = false,
+    /// Sequence number of the locally-issued CID the next-handled
+    /// datagram was addressed to, or `null` when unknown. Set by
+    /// `Server` from its routing table before each `Connection.handle`
+    /// invocation; consumed by `handleRetireConnectionId` to enforce
+    /// RFC 9000 §19.16 ¶3 (a peer MUST NOT retire the CID it just
+    /// used to send to us — PROTOCOL_VIOLATION).
+    current_incoming_local_cid_seq: ?u64 = null,
 
     /// Application key-update lifecycle. QUIC key updates derive new
     /// packet-protection key/IV from "quic ku" while retaining the
@@ -2402,6 +2414,35 @@ pub const Connection = struct {
             if (std.mem.eql(u8, item.cid.bytes[0..item.cid.len], dcid)) return true;
         }
         return false;
+    }
+
+    /// Return the issuance sequence number of the locally-issued CID
+    /// matching `dcid`, or `null` if `dcid` is not one of ours. The
+    /// initial SCID is sequence 0; subsequent NEW_CONNECTION_ID-issued
+    /// CIDs increment in mint order. Required by Server routing to
+    /// inform `Connection.handle` which CID the inbound packet was
+    /// addressed to so RFC 9000 §19.16 ¶3 (RETIRE_CONNECTION_ID for
+    /// the receiving CID is PROTOCOL_VIOLATION) can fire.
+    pub fn findLocalCidSequence(self: *const Connection, dcid: []const u8) ?u64 {
+        for (self.local_cids.items) |item| {
+            if (item.cid.len != dcid.len) continue;
+            if (std.mem.eql(u8, item.cid.bytes[0..item.cid.len], dcid)) {
+                return item.sequence_number;
+            }
+        }
+        return null;
+    }
+
+    /// Tell the connection which locally-issued CID sequence the
+    /// next-handled inbound datagram is addressed to. The Server's
+    /// router calls this before `handle` based on the routing
+    /// `cid_table` lookup so per-frame handlers (notably
+    /// `handleRetireConnectionId`) can compare against it.
+    /// `null` means "unknown" (e.g. an Initial packet on the
+    /// pre-routing-table bootstrap path); the §19.16 ¶3 gate
+    /// short-circuits in that case.
+    pub fn setIncomingLocalCidSeq(self: *Connection, seq: ?u64) void {
+        self.current_incoming_local_cid_seq = seq;
     }
 
     fn localCidSequenceExists(
@@ -4280,6 +4321,26 @@ pub const Connection = struct {
         datagram_len: usize,
         now_us: u64,
     ) Error!void {
+        // RFC 9000 §5.1.2 ¶1: "An endpoint MUST NOT use the same
+        // connection ID on different paths." When a fresh peer-issued
+        // CID is available (one we got via NEW_CONNECTION_ID that
+        // isn't already in use on this path), rotate to it before
+        // path validation begins. If no fresh CID is available
+        // (peer hasn't issued more, or NAT rebinding without
+        // deliberate CID issuance), nullq proceeds with the existing
+        // CID — silently rather than refusing the migration outright,
+        // because a strict refusal breaks NAT rebinding scenarios
+        // where the peer never sent a NEW_CONNECTION_ID. The
+        // conformance test for §5.1.2 ¶1 exercises the rotate-when-
+        // available path explicitly.
+        if (self.consumeFreshPeerCidForMigration(path)) |fresh_cid| {
+            path.path.peer_cid = fresh_cid;
+            if (path.id == 0) {
+                self.peer_dcid = fresh_cid;
+                self.peer_dcid_set = true;
+            }
+        }
+
         path.beginMigration(addr, datagram_len);
 
         const token = try self.newPathChallengeToken();
@@ -4290,6 +4351,31 @@ pub const Connection = struct {
         // subsequent peer-initiated migration attempts.
         path.path.last_path_challenge_at_us = now_us;
         self.queuePathChallengeOnPath(path.id, token);
+    }
+
+    /// RFC 9000 §5.1.2 ¶1 helper: pick a peer-issued CID for `path`
+    /// that's NOT the one the path is currently using. Returns null if
+    /// the only available CID is the current one (the migration must
+    /// be refused — the peer needs to issue more CIDs via
+    /// NEW_CONNECTION_ID first).
+    ///
+    /// Removes the chosen CID from `peer_cids` so a subsequent
+    /// migration can't pick the same one again.
+    fn consumeFreshPeerCidForMigration(
+        self: *Connection,
+        path: *PathState,
+    ) ?ConnectionId {
+        const current = path.path.peer_cid;
+        var i: usize = 0;
+        while (i < self.peer_cids.items.len) : (i += 1) {
+            const item = self.peer_cids.items[i];
+            if (item.path_id != path.id) continue;
+            if (ConnectionId.eql(item.cid, current)) continue;
+            const chosen = item.cid;
+            _ = self.peer_cids.orderedRemove(i);
+            return chosen;
+        }
+        return null;
     }
 
     fn recordAuthenticatedDatagramAddress(
@@ -6301,6 +6387,31 @@ pub const Connection = struct {
         return self.peer_cids.items.len;
     }
 
+    /// The Destination Connection ID we currently use to address the
+    /// peer on the primary path. Migrates when the peer rotates CIDs
+    /// (RFC 9000 §5.1.2). Test-facing — embedders normally don't need
+    /// to inspect this.
+    pub fn peerDcid(self: *const Connection) ConnectionId {
+        return self.peer_dcid;
+    }
+
+    /// Test-only: register an extra peer-issued CID directly into the
+    /// peer_cids pool, as if a peer NEW_CONNECTION_ID had arrived.
+    /// Conformance tests that exercise §5.1.2 ¶1 (CID rotation on
+    /// migration) use this to seed a fresh entry without driving a
+    /// full wire round-trip. Production callers MUST NOT use this —
+    /// the production path is a real `Connection.handleNewConnectionId`
+    /// invocation through the frame dispatcher.
+    pub fn registerPeerCidForTesting(
+        self: *Connection,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        cid: ConnectionId,
+        stateless_reset_token: [16]u8,
+    ) Error!void {
+        try self.registerPeerCid(0, sequence_number, retire_prior_to, cid, stateless_reset_token);
+    }
+
     fn handleOnePacket(
         self: *Connection,
         bytes: []u8,
@@ -7111,6 +7222,21 @@ pub const Connection = struct {
         self: *Connection,
         rc: frame_types.RetireConnectionId,
     ) void {
+        // RFC 9000 §19.16 ¶3: "The sequence number specified in a
+        // RETIRE_CONNECTION_ID frame MUST NOT refer to the
+        // Destination Connection ID field of the packet in which the
+        // frame is contained. The peer MAY treat this as a
+        // connection error of type PROTOCOL_VIOLATION." Server
+        // routing has already populated `current_incoming_local_cid_seq`
+        // with the seq of the CID this datagram was addressed to;
+        // any retire-frame referencing that exact seq is a peer
+        // protocol violation.
+        if (self.current_incoming_local_cid_seq) |incoming_seq| {
+            if (rc.sequence_number == incoming_seq) {
+                self.close(true, transport_error_protocol_violation, "retire_connection_id refers to receiving CID");
+                return;
+            }
+        }
         // RFC 9000 §19.16: a sequence number greater than any we ever
         // sent is a PROTOCOL_VIOLATION. Without this gate, an off-path
         // attacker (or a misbehaving peer) could spam RETIRE_CONNECTION_ID
@@ -8630,6 +8756,18 @@ fn sendAlert(
 ) callconv(.c) c_int {
     const conn = connFromSsl(ssl) orelse return 0;
     conn.alert = alert;
+    // RFC 9001 §4.8: "A TLS alert is turned into a QUIC connection
+    // error by converting the one-byte alert description into a QUIC
+    // error code. The alert description is added to 0x0100 to produce
+    // a QUIC error code from the range reserved for CRYPTO_ERROR."
+    //
+    // Examples: no_application_protocol (0x78) → 0x178,
+    // bad_certificate (0x2a) → 0x12a, unknown_ca (0x30) → 0x130.
+    //
+    // Idempotent: if the connection has already started closing
+    // (e.g. from another simultaneous error path), `close` no-ops.
+    const quic_error_code: u64 = @as(u64, 0x100) + @as(u64, alert);
+    conn.close(true, quic_error_code, "tls alert");
     return 1;
 }
 
@@ -13664,7 +13802,7 @@ fn fuzzConnMigrationImpl(_: void, smith: *std.testing.Smith) anyerror!void {
             return;
         };
         switch (reason) {
-            .timeout, .policy_denied, .pre_handshake, .rate_limited => {},
+            .timeout, .policy_denied, .pre_handshake, .rate_limited, .no_fresh_peer_cid => {},
         }
     }
 }
