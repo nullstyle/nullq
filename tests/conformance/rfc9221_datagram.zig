@@ -51,6 +51,7 @@ const std = @import("std");
 const nullq = @import("nullq");
 const frame = nullq.frame;
 const transport_params = nullq.tls.transport_params;
+const fixture = @import("_initial_fixture.zig");
 
 const Frame = frame.Frame;
 const Datagram = frame.types.Datagram;
@@ -311,23 +312,33 @@ test "skip_MUST NOT send a DATAGRAM exceeding the peer's advertised max_datagram
 
 // ---------------------------------------------------------------- §4 ¶3 encryption-level restriction
 
-test "skip_MUST close with PROTOCOL_VIOLATION on a DATAGRAM in an Initial or Handshake packet [RFC9221 §4 ¶3]" {
+test "MUST close with PROTOCOL_VIOLATION on a DATAGRAM in an Initial packet [RFC9221 §4 ¶3]" {
     // RFC 9221 §4 ¶3: DATAGRAM frames are only permitted in 0-RTT
     // and 1-RTT packets. A receiver that decodes one in an Initial
-    // or Handshake packet MUST close with PROTOCOL_VIOLATION — this
-    // is the RFC 9221 instance of the broader RFC 9000 §12.4 / §17.2
-    // "frame X allowed only at level Y" rule.
+    // packet MUST close with PROTOCOL_VIOLATION — this is the RFC
+    // 9221 instance of the broader RFC 9000 §12.4 / §17.2 "frame X
+    // allowed only at level Y" rule.
     //
-    // nullq's frame dispatcher (`Connection.dispatchFrames`,
-    // src/conn/state.zig:6651) does not consult a per-encryption-
-    // level allowed-frames table at all — it gates only the 0-RTT
-    // forbidden set (`frameAllowedInEarlyData`, line 6765) and the
-    // multipath subset. A peer-crafted Initial that decodes as a
-    // 0x30/0x31 byte sequence would currently fall through to
-    // `handleDatagram(.initial, ...)`, which checks size but not
-    // level. Visible debt: add the RFC 9000 §12.4 allowed-frames
-    // table to `dispatchFrames` and gate Initial / Handshake on it.
-    return error.SkipZigTest;
+    // The gate lives in `Connection.dispatchFrames` →
+    // `frameAllowedInInitialOrHandshake`, which whitelists exactly
+    // {PADDING, PING, ACK, CRYPTO, CONNECTION_CLOSE-0x1c}. DATAGRAM
+    // (0x30 / 0x31) is outside that set so the dispatcher closes
+    // with PROTOCOL_VIOLATION on the first iteration.
+    var srv = try fixture.buildServer();
+    defer srv.deinit();
+
+    const dcid = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    const scid = [_]u8{ 0xa0, 0xb0, 0xc0, 0xd0 };
+    // Hand-roll a DATAGRAM frame: type 0x31 (LEN flag set), length
+    // varint = 2, payload "hi". Length-prefixed so the iterator can
+    // step past it cleanly even though the gate fires immediately.
+    const payload = [_]u8{ 0x31, 0x02, 'h', 'i' };
+    const close_event = try fixture.feedAndExpectClose(&srv, &dcid, &scid, 0, &payload);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
 // ---------------------------------------------------------------- §5 reliability and congestion

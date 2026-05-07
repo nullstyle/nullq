@@ -106,6 +106,12 @@ pub const InitialSealOptions = struct {
     pad_to: usize = 0,
     /// Force a specific PN length (1..4). Must accommodate `pn`.
     pn_length_override: ?u8 = null,
+    /// Long-header Reserved Bits (bits 3-2 of the first byte). RFC
+    /// 9000 §17.2 says these MUST be 0 on transmit; the field exists
+    /// here ONLY so test fixtures can construct malicious-but-authentic
+    /// packets that exercise the receiver-side gate (§17.2.1 ¶17).
+    /// Defaults to 0 — production callers MUST NOT change it.
+    reserved_bits: u2 = 0,
 };
 
 /// Build a fully-protected Initial packet into `dst`. Returns total
@@ -180,7 +186,7 @@ pub fn sealInitial(dst: []u8, opts: InitialSealOptions) Error!usize {
         .pn_length = pn_length,
         .pn_truncated = truncated,
         .payload_length = length_field_value,
-        .reserved_bits = 0,
+        .reserved_bits = opts.reserved_bits,
     } });
     const pn_offset = hdr_len - pn_len;
 
@@ -228,6 +234,14 @@ pub const LongOpenResult = struct {
     /// Address-validation token, for Initial only. Empty for
     /// Handshake.
     token: []const u8,
+    /// Long-header Reserved Bits (bits 3-2 of the first byte after
+    /// header protection has been removed). Authentic only because
+    /// AEAD-open succeeded. RFC 9000 §17.2 says these bits MUST be 0
+    /// on transmit, and §17.2.1 ¶17 says receivers MUST treat a
+    /// non-zero value as a PROTOCOL_VIOLATION. The wire layer surfaces
+    /// the value here; the connection-level handler is responsible for
+    /// closing with the right error code.
+    reserved_bits: u2,
 };
 
 /// Inputs to `openInitial` / `openZeroRtt` / `openHandshake`. Same
@@ -567,6 +581,12 @@ fn openLongHeader(
         pt_dst,
     );
 
+    // Bits 3-2 of the post-HP first byte are the Reserved Bits per
+    // RFC 9000 §17.2. AEAD has just authenticated `src[0..pn_offset]`,
+    // so this read is now safe — a network attacker can't smuggle
+    // non-zero bits past us.
+    const reserved_bits: u2 = @intCast((src[0] >> 2) & 0x03);
+
     return .{
         .pn = full_pn,
         .payload = pt_dst[0..pt_len],
@@ -574,6 +594,7 @@ fn openLongHeader(
         .scid = scid,
         .dcid = dcid,
         .token = token,
+        .reserved_bits = reserved_bits,
     };
 }
 

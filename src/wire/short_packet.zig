@@ -429,6 +429,13 @@ pub const Open1RttResult = struct {
     /// Slice of the receiver's plaintext output buffer holding the
     /// decrypted frames.
     payload: []u8,
+    /// Short-header Reserved Bits (bits 4-3 of the first byte after
+    /// header protection has been removed). Authentic only because
+    /// AEAD-open succeeded. RFC 9000 §17.3 ¶3 says receivers MUST
+    /// treat a non-zero value as a PROTOCOL_VIOLATION. The wire layer
+    /// surfaces the value here; the connection-level handler is
+    /// responsible for closing with the right error code.
+    reserved_bits: u2,
 };
 
 /// Inputs to `open1Rtt`. The protected packet bytes in `src` are
@@ -496,7 +503,17 @@ pub fn open1Rtt(pt_dst: []u8, src: []u8, opts: OpenOptions) Error!Open1RttResult
         pt_dst,
     );
 
-    return .{ .pn = full_pn, .key_phase = key_phase, .payload = pt_dst[0..pt_len] };
+    // Bits 4-3 of the post-HP first byte are the Reserved Bits per
+    // RFC 9000 §17.3. AEAD just authenticated the AAD that derived
+    // from `first`, so this read is now safe.
+    const reserved_bits: u2 = @intCast((first >> 3) & 0x03);
+
+    return .{
+        .pn = full_pn,
+        .key_phase = key_phase,
+        .payload = pt_dst[0..pt_len],
+        .reserved_bits = reserved_bits,
+    };
 }
 
 fn packetNumberTruncated(pn: u64, pn_len: u8) u64 {

@@ -15,6 +15,8 @@
 //! ## Coverage
 //!
 //! Covered:
+//!   RFC9000 §7.3   ¶1   MUST     reject blob lacking initial_source_connection_id (both sides)
+//!   RFC9000 §7.3   ¶3   MUST     server includes retry_source_connection_id iff Retry was sent
 //!   RFC9000 §18    ¶3   MUST     emit each TP as id(varint)|len(varint)|value
 //!   RFC9000 §18    ¶3   MUST NOT include a duplicate parameter id
 //!   RFC9000 §18    ¶3   MUST NOT accept a value field longer than the buffer
@@ -25,35 +27,34 @@
 //!   RFC9000 §18.2  0x01 MUST     round-trip max_idle_timeout
 //!   RFC9000 §18.2  0x02 MUST     stateless_reset_token is exactly 16 bytes
 //!   RFC9000 §18.2  0x03 MUST     round-trip max_udp_payload_size
+//!   RFC9000 §18.2  0x03 ¶9 MUST     reject max_udp_payload_size < 1200 (universal floor)
 //!   RFC9000 §18.2  0x04 MUST     round-trip initial_max_data
 //!   RFC9000 §18.2  0x05 MUST     round-trip initial_max_stream_data_bidi_local
+//!   RFC9000 §18.2  0x08 ¶1 MUST NOT accept initial_max_streams_bidi > 2^60
+//!   RFC9000 §18.2  0x09 ¶1 MUST NOT accept initial_max_streams_uni > 2^60
 //!   RFC9000 §18.2  0x0a ¶1 MUST NOT accept ack_delay_exponent > 20
 //!   RFC9000 §18.2  0x0a ¶1 MUST     accept ack_delay_exponent boundary value 20
 //!   RFC9000 §18.2  0x0b ¶1 MUST NOT accept max_ack_delay >= 2^14
 //!   RFC9000 §18.2  0x0b ¶1 MUST     accept max_ack_delay boundary value 2^14 - 1
 //!   RFC9000 §18.2  0x0c ¶1 MUST NOT accept disable_active_migration with non-zero length
 //!   RFC9000 §18.2  0x0c ¶1 MUST     accept disable_active_migration as a zero-length flag
+//!   RFC9000 §18.2  0x0d ¶29 MUST    treat preferred_address authored by a client as TRANSPORT_PARAMETER_ERROR
 //!   RFC9000 §18.2  0x0e ¶1 MUST NOT accept active_connection_id_limit < 2
 //!   RFC9000 §18.2  0x0e ¶1 MUST     accept active_connection_id_limit boundary value 2
 //!   RFC9000 §18.2  0x0f    MUST     round-trip initial_source_connection_id (both endpoints)
 //!   RFC9000 §18.2  0x10    MUST     round-trip retry_source_connection_id (server-only)
+//!   RFC9000 §18.2  0x10 ¶35 MUST NOT accept retry_source_connection_id authored by a client
 //!
 //! Visible debt:
 //!   RFC9000 §7.3   MUST     server MUST send original_destination_connection_id matching client's first DCID
-//!   RFC9000 §7.3   MUST     server MUST send initial_source_connection_id matching its own SCID
-//!   RFC9000 §7.3   MUST     client MUST send initial_source_connection_id matching its own SCID
-//!   RFC9000 §7.3   MUST     server that sent Retry MUST send retry_source_connection_id
-//!   RFC9000 §18.2  0x0d ¶? MUST     client receiving preferred_address treats as TRANSPORT_PARAMETER_ERROR
-//!   RFC9000 §18.2  0x02    MUST     client receiving stateless_reset_token treats as TRANSPORT_PARAMETER_ERROR
-//!   RFC9000 §18.2  0x10    MUST     client receiving retry_source_connection_id treats as TRANSPORT_PARAMETER_ERROR
-//!   RFC9000 §18.2  0x03 ¶1 MUST     reject max_udp_payload_size < 1200
-//!   RFC9000 §18.2  0x08 ¶1 MUST     reject initial_max_streams_bidi > 2^60
-//!   RFC9000 §18.2  0x09 ¶1 MUST     reject initial_max_streams_uni > 2^60
-//!   These role-aware and bound-violation checks live above the
-//!   transport-params codec — they belong to the connection
-//!   state machine that knows whether it is acting as a client or a
-//!   server. The codec accepts the bytes today; the state machine
-//!   must reject them on the appropriate side.
+//!   RFC9000 §7.3   MUST     server MUST send initial_source_connection_id matching its own SCID (value match, not just presence)
+//!   RFC9000 §7.3   MUST     client MUST send initial_source_connection_id matching its own SCID (value match, not just presence)
+//!   These remaining gaps need cross-layer state (the actual SCID a
+//!   peer used in its first Initial) that the transport-params codec
+//!   does not have access to; they live in the connection state
+//!   machine integration tests rather than the codec conformance
+//!   suite. The role-aware presence/absence and universal-bound
+//!   checks above are now enforced inside `decodeAs`.
 //!
 //! Out of scope here (covered elsewhere):
 //!   RFC9000 §16    varint encoding rules                      → rfc9000_varint.zig
@@ -287,12 +288,32 @@ test "MUST round-trip max_udp_payload_size (id 0x03) [RFC9000 §18.2 ¶9]" {
     try std.testing.expectEqual(@as(u64, 1452), got.max_udp_payload_size);
 }
 
-test "skip_MUST reject max_udp_payload_size below the 1200-byte minimum [RFC9000 §18.2 ¶9]" {
-    // RFC 9000 §18.2 ¶9: "Values below 1200 are invalid." The codec
-    // currently accepts any varint without bound-checking against
-    // 1200 — the connection state machine must enforce the floor on
-    // ingress because the codec doesn't know which side is parsing.
-    return error.SkipZigTest;
+test "MUST reject max_udp_payload_size below the 1200-byte minimum [RFC9000 §18.2 ¶9]" {
+    // RFC 9000 §18.2 ¶9: "Values below 1200 are invalid." The bound
+    // is universal (binds both peers, regardless of role); the
+    // role-aware `decodeAs` rejects any blob whose value falls below
+    // the floor. 1199 is the smallest violation; 0 is also below the
+    // floor and must likewise be refused.
+    const cid = ConnectionId.fromSlice(&.{ 0xa0, 0xa1 });
+    const just_below: Params = .{
+        .max_udp_payload_size = 1199,
+        .initial_source_connection_id = cid,
+    };
+    var buf: [32]u8 = undefined;
+    var n = try just_below.encode(&buf);
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(buf[0..n], .{ .role = .client }),
+    );
+
+    // Boundary: exactly 1200 is the smallest legal value.
+    const at_floor: Params = .{
+        .max_udp_payload_size = 1200,
+        .initial_source_connection_id = cid,
+    };
+    n = try at_floor.encode(&buf);
+    const got = try transport_params.decodeAs(buf[0..n], .{ .role = .client });
+    try std.testing.expectEqual(@as(u64, 1200), got.max_udp_payload_size);
 }
 
 // ---------------------------------------------------------------- §18.2 0x04 initial_max_data
@@ -346,21 +367,42 @@ test "MUST round-trip initial_max_streams_bidi (id 0x08) [RFC9000 §18.2 ¶19]" 
     try std.testing.expectEqual(@as(u64, 100), got.initial_max_streams_bidi);
 }
 
-test "skip_MUST NOT accept initial_max_streams_bidi greater than 2^60 [RFC9000 §18.2 ¶19]" {
+test "MUST NOT accept initial_max_streams_bidi greater than 2^60 [RFC9000 §18.2 ¶19]" {
     // §18.2 ¶19: "If a max_streams transport parameter or a
     // MAX_STREAMS frame is received with a value greater than 2^60,
     // this would allow a maximum stream ID that cannot be expressed
-    // as a variable-length integer." The codec currently accepts any
-    // varint up to 2^62-1 — the cap belongs to the connection state
-    // machine's ingress validation.
-    return error.SkipZigTest;
+    // as a variable-length integer." The role-aware decoder rejects
+    // the over-cap blob with TRANSPORT_PARAMETER_ERROR.
+    const cid = ConnectionId.fromSlice(&.{ 0xa0, 0xa1 });
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    pos += try writeVarintParam(buf[pos..], Id.initial_max_streams_bidi, (1 << 60) + 1);
+    pos += try writeTriple(buf[pos..], Id.initial_source_connection_id, cid.slice());
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(buf[0..pos], .{ .role = .client }),
+    );
+
+    // Boundary: exactly 2^60 is legal.
+    pos = 0;
+    pos += try writeVarintParam(buf[pos..], Id.initial_max_streams_bidi, 1 << 60);
+    pos += try writeTriple(buf[pos..], Id.initial_source_connection_id, cid.slice());
+    const got = try transport_params.decodeAs(buf[0..pos], .{ .role = .client });
+    try std.testing.expectEqual(@as(u64, 1 << 60), got.initial_max_streams_bidi);
 }
 
-test "skip_MUST NOT accept initial_max_streams_uni greater than 2^60 [RFC9000 §18.2 ¶21]" {
+test "MUST NOT accept initial_max_streams_uni greater than 2^60 [RFC9000 §18.2 ¶21]" {
     // Companion to the bidi cap above: the same 2^60 limit binds the
-    // unidirectional stream count, and is likewise unenforced at the
-    // codec layer.
-    return error.SkipZigTest;
+    // unidirectional stream count.
+    const cid = ConnectionId.fromSlice(&.{ 0xa0, 0xa1 });
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    pos += try writeVarintParam(buf[pos..], Id.initial_max_streams_uni, (1 << 60) + 1);
+    pos += try writeTriple(buf[pos..], Id.initial_source_connection_id, cid.slice());
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(buf[0..pos], .{ .role = .client }),
+    );
 }
 
 // ---------------------------------------------------------------- §18.2 0x0a ack_delay_exponent
@@ -428,14 +470,31 @@ test "MUST NOT accept disable_active_migration with a non-zero length [RFC9000 �
 
 // ---------------------------------------------------------------- §18.2 0x0d preferred_address
 
-test "skip_MUST treat preferred_address received by a client-side peer as TRANSPORT_PARAMETER_ERROR [RFC9000 §18.2 ¶29]" {
+test "MUST treat preferred_address received by a client-side peer as TRANSPORT_PARAMETER_ERROR [RFC9000 §18.2 ¶29]" {
     // §18.2 ¶29: preferred_address is server-only; "A client MUST
     // NOT send a preferred_address transport parameter. A server MUST
     // treat the receipt of a preferred_address transport parameter as
     // a connection error of type TRANSPORT_PARAMETER_ERROR." The
-    // role-aware rejection is performed by the connection state
-    // machine on top of the codec; the codec accepts the bytes today.
-    return error.SkipZigTest;
+    // server invokes `decodeAs(.. .role = .client)` because the bytes
+    // were authored by the client side.
+    const cid = ConnectionId.fromSlice(&.{ 0xa0, 0xa1 });
+    const sent: Params = .{
+        .initial_source_connection_id = cid,
+        .preferred_address = .{},
+    };
+    var buf: [128]u8 = undefined;
+    const n = try sent.encode(&buf);
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(buf[0..n], .{ .role = .client }),
+    );
+
+    // Authored by the server, the same bytes are valid.
+    const ok = try transport_params.decodeAs(
+        buf[0..n],
+        .{ .role = .server, .server_sent_retry = false },
+    );
+    try std.testing.expect(ok.preferred_address != null);
 }
 
 // ---------------------------------------------------------------- §18.2 0x0e active_connection_id_limit
@@ -478,14 +537,31 @@ test "MUST round-trip initial_source_connection_id (id 0x0f) [RFC9000 §18.2 ¶3
     );
 }
 
-test "skip_MUST require initial_source_connection_id on every endpoint's transport params [RFC9000 §7.3 ¶1]" {
+test "MUST require initial_source_connection_id on every endpoint's transport params [RFC9000 §7.3 ¶1]" {
     // §7.3 ¶1: "Each endpoint includes the value of the Source
     // Connection ID field from the first Initial packet it sent in
-    // the initial_source_connection_id transport parameter". The
-    // codec accepts a blob without this id; the connection state
-    // machine must catch its absence and raise
-    // TRANSPORT_PARAMETER_ERROR.
-    return error.SkipZigTest;
+    // the initial_source_connection_id transport parameter". A blob
+    // missing this parameter is a TRANSPORT_PARAMETER_ERROR no matter
+    // which side authored it.
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += try writeVarintParam(buf[pos..], Id.initial_max_data, 1234);
+
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(buf[0..pos], .{ .role = .client }),
+    );
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(buf[0..pos], .{ .role = .server }),
+    );
+
+    // Once initial_source_connection_id is present, the same blob
+    // shape decodes successfully.
+    const cid = ConnectionId.fromSlice(&.{ 0xa0, 0xa1 });
+    pos += try writeTriple(buf[pos..], Id.initial_source_connection_id, cid.slice());
+    const got = try transport_params.decodeAs(buf[0..pos], .{ .role = .client });
+    try std.testing.expectEqual(@as(u64, 1234), got.initial_max_data);
 }
 
 // ---------------------------------------------------------------- §18.2 0x10 retry_source_connection_id
@@ -509,20 +585,64 @@ test "MUST round-trip retry_source_connection_id (id 0x10) [RFC9000 §18.2 ¶35]
     );
 }
 
-test "skip_MUST send retry_source_connection_id when (and only when) the server sent Retry [RFC9000 §7.3 ¶3]" {
+test "MUST send retry_source_connection_id when (and only when) the server sent Retry [RFC9000 §7.3 ¶3]" {
     // §7.3 ¶3: "If the server sent a Retry packet, but the client
     // did not present a valid token... the server MUST include the
-    // retry_source_connection_id transport parameter". This is a
-    // role-aware presence requirement enforced by the server-side
-    // connection state machine, not the codec.
-    return error.SkipZigTest;
+    // retry_source_connection_id transport parameter". The codec
+    // takes the Retry context as `server_sent_retry` and enforces
+    // both directions of the iff: present-with-retry-not-sent is
+    // rejected, absent-with-retry-sent is rejected.
+    const cid = ConnectionId.fromSlice(&.{ 0xb0, 0xb1, 0xb2 });
+
+    // Case A: server sent Retry but blob lacks retry_source_connection_id.
+    const without_rscid: Params = .{ .initial_source_connection_id = cid };
+    var buf: [64]u8 = undefined;
+    var n = try without_rscid.encode(&buf);
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(
+            buf[0..n],
+            .{ .role = .server, .server_sent_retry = true },
+        ),
+    );
+
+    // Case B: server did NOT send Retry but blob carries retry_source_connection_id.
+    const with_rscid: Params = .{
+        .initial_source_connection_id = cid,
+        .retry_source_connection_id = cid,
+    };
+    n = try with_rscid.encode(&buf);
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(
+            buf[0..n],
+            .{ .role = .server, .server_sent_retry = false },
+        ),
+    );
+
+    // Case C: matched presence (Retry sent + parameter present) is accepted.
+    const ok = try transport_params.decodeAs(
+        buf[0..n],
+        .{ .role = .server, .server_sent_retry = true },
+    );
+    try std.testing.expectEqualSlices(u8, cid.slice(), ok.retry_source_connection_id.?.slice());
 }
 
-test "skip_MUST NOT send retry_source_connection_id from a client [RFC9000 §18.2 ¶35]" {
+test "MUST NOT send retry_source_connection_id from a client [RFC9000 §18.2 ¶35]" {
     // §18.2 ¶35: retry_source_connection_id is a server-only
     // parameter; a client receiving one (or a server receiving one
     // from a client) MUST treat it as TRANSPORT_PARAMETER_ERROR.
-    return error.SkipZigTest;
+    const cid = ConnectionId.fromSlice(&.{ 0xc0, 0xc1 });
+    const sent: Params = .{
+        .initial_source_connection_id = cid,
+        .retry_source_connection_id = cid,
+    };
+    var buf: [64]u8 = undefined;
+    const n = try sent.encode(&buf);
+    try std.testing.expectError(
+        Error.TransportParameterError,
+        transport_params.decodeAs(buf[0..n], .{ .role = .client }),
+    );
 }
 
 // ---------------------------------------------------------------- §18 once-only rule

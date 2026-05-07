@@ -82,7 +82,11 @@ pub fn build(b: *std.Build) void {
     const conformance_filters: []const []const u8 =
         if (conformance_filter) |f| &.{f} else &.{};
     const conformance_mod = b.createModule(.{
-        .root_source_file = b.path("tests/conformance/root.zig"),
+        // Lives at tests/conformance.zig (sibling of tests/root.zig)
+        // so the package boundary is tests/. Suites that need the
+        // existing tests/data/test_cert.pem fixture for Server-level
+        // assertions can `@embedFile("../data/test_cert.pem")`.
+        .root_source_file = b.path("tests/conformance.zig"),
         .target = target,
         .optimize = optimize,
     });

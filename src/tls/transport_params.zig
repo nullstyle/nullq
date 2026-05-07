@@ -73,13 +73,53 @@ pub const Id = struct {
 /// representable varint range.
 /// `InvalidValue` — RFC-mandated bounds violated (e.g. `ack_delay_exponent > 20`,
 /// `active_connection_id_limit < 2`, malformed `preferred_address`).
+/// `TransportParameterError` — RFC 9000 §7.3 / §18.2 role-aware or
+/// universal-bound rejection raised by `decodeAs` (a peer's blob is
+/// well-formed on the wire but violates a presence / forbidden /
+/// bound rule that the role-agnostic `decode` cannot enforce on its
+/// own). Maps to QUIC transport error code TRANSPORT_PARAMETER_ERROR
+/// (0x08) when surfaced to a connection close.
 pub const Error = error{
     BufferTooSmall,
     DuplicateParameter,
     UnknownLength,
     ValueTooLarge,
     InvalidValue,
+    TransportParameterError,
 } || varint.Error;
+
+/// Identifies which side of the handshake authored a transport-
+/// parameter blob. Drives the §7.3 / §18.2 role gates in `decodeAs`:
+/// the *sender's* role determines which parameters are required,
+/// allowed, or forbidden. When a server parses the blob it received
+/// from the client, it parses with `Role.client` because the client
+/// authored those bytes.
+pub const Role = enum { client, server };
+
+/// Inputs to `decodeAs`. `role` selects the §7.3 / §18.2 gate set;
+/// `server_sent_retry` is consulted only when `role == .server` and
+/// drives the §7.3 ¶3 retry_source_connection_id presence check
+/// (server MUST include the parameter iff a Retry was sent).
+pub const DecodeOptions = struct {
+    role: Role,
+    /// Required only when `role == .server`: did this server send a
+    /// Retry to the client during the handshake? Drives the §7.3 ¶3
+    /// presence/absence check for retry_source_connection_id. Ignored
+    /// when `role == .client` (a client never sets this parameter).
+    server_sent_retry: bool = false,
+};
+
+/// RFC 9000 §18.2 ¶9: max_udp_payload_size values below 1200 are
+/// invalid. The minimum is universal (both peers must respect the
+/// floor); enforced inside `decodeAs` rather than `decode` because
+/// `decode` is the wire-shape primitive used by hand-built fixtures
+/// that intentionally drive the codec near its bounds.
+const min_max_udp_payload_size: u64 = 1200;
+
+/// RFC 9000 §18.2 ¶19 / ¶21: initial_max_streams_{bidi,uni} values
+/// above 2^60 would allow a stream id that cannot be expressed as a
+/// QUIC varint. Universal (role-independent) bound.
+const max_initial_max_streams: u64 = 1 << 60;
 
 /// Typed view of the QUIC transport parameters blob exchanged
 /// during the handshake (RFC 9000 §18, RFC 9221, draft-ietf-quic-multipath-21).
@@ -239,6 +279,94 @@ pub const Params = struct {
         return p;
     }
 };
+
+/// Role-aware decode. Calls `Params.decode` to parse the wire format,
+/// then applies the universal bound checks (RFC 9000 §18.2 ¶9, ¶19,
+/// ¶21) and the role-specific gates (RFC 9000 §7.3 + §18.2 ¶29 / ¶35
+/// + the server-only parameters listed in §18.2). Any role / bound
+/// violation is reported as `Error.TransportParameterError` so callers
+/// can map a single error variant to a TRANSPORT_PARAMETER_ERROR
+/// connection close.
+///
+/// The role argument identifies *the side that authored the bytes*.
+/// A server reading the client's blob calls this with `role = .client`
+/// because the client wrote the parameters; a client reading the
+/// server's blob calls with `role = .server`.
+///
+/// `opts.server_sent_retry` is consulted only for `role == .server`
+/// and drives the §7.3 ¶3 presence rule for `retry_source_connection_id`:
+///   * Retry was sent → the parameter MUST be present.
+///   * Retry was not sent → the parameter MUST be absent.
+pub fn decodeAs(blob: []const u8, opts: DecodeOptions) Error!Params {
+    const params = try Params.decode(blob);
+
+    // -- universal bound checks (role-independent §18.2 caps) --
+
+    // §18.2 ¶9: max_udp_payload_size values below 1200 are invalid.
+    // The wire codec accepts any varint here because it doesn't know
+    // whether the blob describes the local or peer endpoint; the role-
+    // aware path always rejects the under-floor case.
+    if (params.max_udp_payload_size < min_max_udp_payload_size) {
+        return Error.TransportParameterError;
+    }
+
+    // §18.2 ¶19 / ¶21: a max_streams value above 2^60 would name a
+    // stream id outside the QUIC varint range (62 bits). Both bidi
+    // and uni share the same cap.
+    if (params.initial_max_streams_bidi > max_initial_max_streams) {
+        return Error.TransportParameterError;
+    }
+    if (params.initial_max_streams_uni > max_initial_max_streams) {
+        return Error.TransportParameterError;
+    }
+
+    // -- role-specific gates --
+
+    // Both sides MUST advertise initial_source_connection_id (§7.3 ¶1)
+    // so the peer can detect off-path injection of the first Initial.
+    if (params.initial_source_connection_id == null) {
+        return Error.TransportParameterError;
+    }
+
+    switch (opts.role) {
+        .client => {
+            // §18.2 ¶29: preferred_address is server-only — a client
+            // MUST NOT send it; the receiving server treats receipt
+            // as TRANSPORT_PARAMETER_ERROR.
+            if (params.preferred_address != null) {
+                return Error.TransportParameterError;
+            }
+            // §18.2 ¶35: retry_source_connection_id is server-only.
+            if (params.retry_source_connection_id != null) {
+                return Error.TransportParameterError;
+            }
+            // original_destination_connection_id is the server's
+            // echo of the client's first DCID (§18.2 ¶3); a client-
+            // authored blob MUST NOT contain it.
+            if (params.original_destination_connection_id != null) {
+                return Error.TransportParameterError;
+            }
+            // stateless_reset_token is server-only (§18.2 ¶7); a
+            // client MUST NOT send one.
+            if (params.stateless_reset_token != null) {
+                return Error.TransportParameterError;
+            }
+        },
+        .server => {
+            // §7.3 ¶3: the server MUST include retry_source_connection_id
+            // iff it sent a Retry packet during the handshake.
+            const has_retry_scid = params.retry_source_connection_id != null;
+            if (opts.server_sent_retry and !has_retry_scid) {
+                return Error.TransportParameterError;
+            }
+            if (!opts.server_sent_retry and has_retry_scid) {
+                return Error.TransportParameterError;
+            }
+        },
+    }
+
+    return params;
+}
 
 /// Decoded `preferred_address` transport parameter (RFC 9000 §18.2).
 /// All six wire fields are preserved so embedders can advertise or
@@ -595,6 +723,155 @@ test "unknown-but-large id round-trips through varint" {
     pos += try varint.encode(buf[pos..], 0);
     const got = try Params.decode(buf[0..pos]);
     _ = got;
+}
+
+// -- decodeAs role gates -------------------------------------------------
+//
+// `decodeAs` layers RFC 9000 §7.3 / §18.2 role and bound rejections on
+// top of the wire codec. The cases below exercise each gate one at a
+// time; the conformance suite repeats the same shapes with their RFC
+// citations attached.
+
+const example_scid: ConnectionId = .{
+    .bytes = .{ 0xb0, 0xb1, 0xb2, 0xb3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .len = 4,
+};
+
+test "decodeAs rejects max_udp_payload_size below 1200 (universal §18.2 ¶9)" {
+    const sent: Params = .{
+        .max_udp_payload_size = 1199,
+        .initial_source_connection_id = example_scid,
+    };
+    var buf: [32]u8 = undefined;
+    const n = try sent.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .client }),
+    );
+}
+
+test "decodeAs rejects initial_max_streams_bidi above 2^60 (universal §18.2 ¶19)" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    pos += try writeVarint(&buf, pos, Id.initial_max_streams_bidi, (1 << 60) + 1);
+    pos += try writeBytes(&buf, pos, Id.initial_source_connection_id, example_scid.slice());
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..pos], .{ .role = .client }),
+    );
+}
+
+test "decodeAs rejects missing initial_source_connection_id on either side (§7.3 ¶1)" {
+    // Empty blob has every default and no initial_source_connection_id.
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(&.{}, .{ .role = .client }),
+    );
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(&.{}, .{ .role = .server }),
+    );
+}
+
+test "decodeAs rejects preferred_address authored by a client (§18.2 ¶29)" {
+    const sent: Params = .{
+        .initial_source_connection_id = example_scid,
+        .preferred_address = .{},
+    };
+    var buf: [128]u8 = undefined;
+    const n = try sent.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .client }),
+    );
+}
+
+test "decodeAs rejects retry_source_connection_id authored by a client (§18.2 ¶35)" {
+    const sent: Params = .{
+        .initial_source_connection_id = example_scid,
+        .retry_source_connection_id = example_scid,
+    };
+    var buf: [64]u8 = undefined;
+    const n = try sent.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .client }),
+    );
+}
+
+test "decodeAs rejects original_destination_connection_id and stateless_reset_token from a client" {
+    const odcid_sent: Params = .{
+        .initial_source_connection_id = example_scid,
+        .original_destination_connection_id = example_scid,
+    };
+    var buf: [64]u8 = undefined;
+    var n = try odcid_sent.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .client }),
+    );
+
+    const reset_tok: [16]u8 = @splat(0xaa);
+    const reset_sent: Params = .{
+        .initial_source_connection_id = example_scid,
+        .stateless_reset_token = reset_tok,
+    };
+    n = try reset_sent.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .client }),
+    );
+}
+
+test "decodeAs enforces server's retry_source_connection_id presence rule (§7.3 ¶3)" {
+    // Server sent Retry but blob is missing retry_source_connection_id.
+    const without_rscid: Params = .{
+        .initial_source_connection_id = example_scid,
+    };
+    var buf: [64]u8 = undefined;
+    var n = try without_rscid.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .server, .server_sent_retry = true }),
+    );
+
+    // Server did NOT send Retry but blob includes retry_source_connection_id.
+    const with_rscid: Params = .{
+        .initial_source_connection_id = example_scid,
+        .retry_source_connection_id = example_scid,
+    };
+    n = try with_rscid.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .server, .server_sent_retry = false }),
+    );
+
+    // Matching presence: both Retry-sent + parameter present is accepted.
+    const ok = try decodeAs(buf[0..n], .{ .role = .server, .server_sent_retry = true });
+    try testing.expect(ok.retry_source_connection_id != null);
+}
+
+test "decodeAs accepts a typical client blob and a typical server blob" {
+    // Client side: ISCID present, server-only fields absent.
+    const client_sent: Params = .{
+        .initial_source_connection_id = example_scid,
+        .max_idle_timeout_ms = 30_000,
+        .initial_max_data = 1 << 20,
+    };
+    var buf: [128]u8 = undefined;
+    var n = try client_sent.encode(&buf);
+    const got_client = try decodeAs(buf[0..n], .{ .role = .client });
+    try testing.expectEqual(@as(u64, 30_000), got_client.max_idle_timeout_ms);
+
+    // Server side without Retry: no retry_source_connection_id allowed.
+    const server_no_retry: Params = .{
+        .initial_source_connection_id = example_scid,
+        .original_destination_connection_id = example_scid,
+    };
+    n = try server_no_retry.encode(&buf);
+    const got_server = try decodeAs(buf[0..n], .{ .role = .server, .server_sent_retry = false });
+    try testing.expect(got_server.original_destination_connection_id != null);
+    try testing.expect(got_server.retry_source_connection_id == null);
 }
 
 // -- fuzz harness --------------------------------------------------------

@@ -78,6 +78,7 @@ const decode = frame.decode;
 const encode = frame.encode;
 const DecodeError = frame.DecodeError;
 const EncodeError = frame.EncodeError;
+const fixture = @import("_initial_fixture.zig");
 
 // ---------------------------------------------------------------- §19.1 PADDING
 
@@ -902,20 +903,43 @@ test "MUST NOT accept a NEW_TOKEN whose declared Length runs past the input [RFC
 
 // ---------------------------------------------------------------- §12.4 encryption-level allowed-frames table
 
-test "skip_NORMATIVE Initial / Handshake levels accept only ACK / CRYPTO / PADDING / PING / CONNECTION_CLOSE-0x1c [RFC9000 §12.4]" {
-    // §12.4 / §17.2: at Initial and Handshake encryption levels the
-    // only legal frames are ACK, CRYPTO, PADDING, PING, and
-    // CONNECTION_CLOSE of type 0x1c (transport). Any other frame at
-    // those levels is a PROTOCOL_VIOLATION. The wire decoder accepts
-    // every v1 frame regardless of level — the level filter is
-    // applied by the connection's per-level frame dispatcher.
-    return error.SkipZigTest;
+test "NORMATIVE Initial / Handshake levels reject frames outside {PADDING, PING, ACK, CRYPTO, CONNECTION_CLOSE-0x1c} [RFC9000 §12.4]" {
+    // §12.4 / §17.2 fix the per-level allowed-frames table. The
+    // receiver-side gate lives in `Connection.dispatchFrames` —
+    // when running at .initial or .handshake level, any frame
+    // outside the allowed list is treated as PROTOCOL_VIOLATION.
+    //
+    // We seal an authentic Initial whose payload is a STREAM frame
+    // (0x08, stream_id=0). STREAM is "_01" in RFC 9000 Table 3 — only
+    // legal at 0-RTT and 1-RTT, never at Initial. The dispatchFrames
+    // gate fires on the first iteration.
+    var srv = try fixture.buildServer();
+    defer srv.deinit();
+
+    const dcid = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    const scid = [_]u8{ 0xa0, 0xb0, 0xc0, 0xd0 };
+    // Hand-roll a STREAM frame: type 0x08 (no OFF, no LEN, no FIN),
+    // stream_id varint = 0, then implicit payload = remainder of the
+    // packet. The frame iterator will emit a single STREAM frame and
+    // dispatchFrames will reject it on the first iteration.
+    const payload = [_]u8{ 0x08, 0x00 };
+    const close_event = try fixture.feedAndExpectClose(&srv, &dcid, &scid, 0, &payload);
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
 test "skip_NORMATIVE 0-RTT level forbids ACK / NEW_TOKEN / HANDSHAKE_DONE [RFC9000 §12.4]" {
     // §12.4 / §17.2.3: 0-RTT permits stream data frames,
     // PATH_CHALLENGE, PADDING, PING, CONNECTION_CLOSE — but
-    // explicitly NOT ACK, NEW_TOKEN, or HANDSHAKE_DONE. Filter is
-    // applied at the connection layer, not the frame parser.
+    // explicitly NOT ACK, NEW_TOKEN, or HANDSHAKE_DONE. The
+    // connection-layer filter is implemented in
+    // `Connection.frameAllowedInEarlyData` (src/conn/state.zig) and
+    // verified by the in-source tests there. Conformance verification
+    // would need a 0-RTT-keys fixture (TLS resumption with a session
+    // ticket), which the conformance package's Server fixture cannot
+    // produce yet. Tracked for the next round of fixture work.
     return error.SkipZigTest;
 }

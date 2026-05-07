@@ -9,7 +9,81 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Hardening (security-relevant)
+
+- **§17.2.1 / §17.3 — Reserved Bits enforced on receive.**
+  `Connection.handleInitial` / `handleZeroRtt` / `handleHandshake` /
+  `handleShort` now close with `transport_error_protocol_violation`
+  when the post-HP first byte carries non-zero Reserved Bits — the
+  bits are surfaced through `LongOpenResult.reserved_bits` and
+  `Open1RttResult.reserved_bits` after AEAD authenticates the AAD.
+  RFC 9000 §17.2.1 ¶17 / §17.3 ¶3 explicitly require this gate;
+  previously the wire layer decoded the bits faithfully but no
+  caller acted on them.
+- **§12.4 — Per-encryption-level allowed-frames table at Initial /
+  Handshake.** New `frameAllowedInInitialOrHandshake` whitelist in
+  `Connection.dispatchFrames`: only PADDING, PING, ACK, CRYPTO, and
+  CONNECTION_CLOSE-0x1c (transport variant) are accepted; anything
+  else is treated as PROTOCOL_VIOLATION. Closes the broader RFC 9000
+  §12.4 / §17.2 gap that surfaced as the RFC 9221 §4 ¶3 instance
+  (DATAGRAM in Initial) plus other latent classes.
+- **§19.20 — HANDSHAKE_DONE role gate.** A server receiving
+  HANDSHAKE_DONE now closes with PROTOCOL_VIOLATION (the RFC says it
+  is a server-only frame; only clients ever legitimately receive it).
+- **§7.3 / §18.2 — Role-aware transport-parameter decode.** New
+  `transport_params.decodeAs(blob, .{ .role, .server_sent_retry })`
+  applies the §7.3 / §18.2 role gates on top of the existing wire
+  codec: rejects server-only TPs from a client peer
+  (`preferred_address`, `original_destination_connection_id`,
+  `retry_source_connection_id`, `stateless_reset_token`), enforces
+  `initial_source_connection_id` presence on every endpoint,
+  `retry_source_connection_id` presence iff the server actually sent
+  Retry, plus universal bound checks (max_udp_payload_size ≥ 1200,
+  initial_max_streams_{bidi,uni} ≤ 2^60). The role-agnostic `decode`
+  is unchanged for callers that legitimately need the codec primitive.
+
 ### Tests
+
+- **+10 conformance tests unskipped** (44 → 34 visible debt).
+  Enforcement for the four hardening items above is now exercised
+  from the auditor-facing conformance corpus, not just from src/
+  unit tests:
+    * §17.2.1 long-header Reserved Bits gate (live test)
+    * §12.4 Initial-level forbidden-frame gate (live test)
+    * RFC 9221 §4 ¶3 DATAGRAM-in-Initial gate (live test)
+    * 7 × §7.3 / §18.2 transport-parameter role / bound gates (live)
+  The remaining 34 skips are all visible-debt entries documenting
+  Connection-level requirements that need a paired-Connection
+  conformance fixture (handshake-confirmed, 1-RTT keys, 0-RTT keys);
+  none are real implementation gaps.
+- **Conformance entry point moved** from `tests/conformance/root.zig`
+  to `tests/conformance.zig` (sibling of `tests/root.zig`) so the
+  Zig package boundary widens to `tests/` — suites can now
+  `@embedFile("../data/test_cert.pem")` for Server-fixture tests.
+- **Shared fixture helper** at `tests/conformance/_initial_fixture.zig`
+  builds an authentic Initial packet (with caller-controlled Reserved
+  Bits and frame payload) and feeds it through `Server.feed`, used by
+  the §17.2.1 / §12.4 / RFC 9221 §4 ¶3 receiver-side tests.
+
+### API additions
+
+- `nullq.wire.long_packet.LongOpenResult` gains a `reserved_bits: u2`
+  field carrying the post-HP, post-AEAD authenticated bits 3-2 of the
+  long-header first byte.
+- `nullq.wire.short_packet.Open1RttResult` gains a `reserved_bits: u2`
+  field carrying the post-HP, post-AEAD authenticated bits 4-3 of the
+  short-header first byte.
+- `nullq.wire.long_packet.InitialSealOptions` gains a
+  `reserved_bits: u2 = 0` field. Default 0 — production callers
+  MUST NOT change it; the field exists only so test fixtures can
+  construct malicious-but-authentic packets that exercise the
+  receiver-side §17.2.1 ¶17 gate.
+- `nullq.tls.transport_params.Role`, `DecodeOptions`, `decodeAs`,
+  and `Error.TransportParameterError`. Role-aware decode primitive
+  for §7.3 / §18.2 validation; the existing role-agnostic `decode`
+  is unchanged.
+
+### Tests (continued — original conformance-suite scaffold)
 
 - **RFC-traceable conformance suite under `tests/conformance/`.** 11
   files (one per RFC area), 297 tests + 44 visible-debt skips = 341

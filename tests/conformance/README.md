@@ -62,21 +62,30 @@ Never use `skip_` to imply that an optional `MAY` feature is required.
 ## File layout
 
 ```
-tests/conformance/
-  root.zig                                   # glue (lists imports)
-  README.md                                  # this file
-  rfc8999_invariants.zig                     # canonical example
-  rfc9000_varint.zig                         # §16
-  rfc9000_packet_headers.zig                 # §17
-  rfc9000_transport_params.zig               # §18
-  rfc9000_frames.zig                         # §19
-  rfc9000_streams_flow.zig                   # §3, §4, §5, §10
-  rfc9000_negotiation_validation.zig         # §6, §8, §9
-  rfc9000_packetization.zig                  # §13, §14, §20
-  rfc9001_tls.zig                            # RFC 9001
-  rfc9002_loss_recovery.zig                  # RFC 9002
-  rfc9221_datagram.zig                       # RFC 9221
+tests/
+  conformance.zig                            # entry point (sibling of tests/root.zig)
+  conformance/
+    README.md                                # this file
+    _initial_fixture.zig                     # shared "send malicious Initial to a Server" helper
+    rfc8999_invariants.zig                   # canonical example
+    rfc9000_varint.zig                       # §16
+    rfc9000_packet_headers.zig               # §17
+    rfc9000_transport_params.zig             # §18
+    rfc9000_frames.zig                       # §19
+    rfc9000_streams_flow.zig                 # §3, §4, §5, §10
+    rfc9000_negotiation_validation.zig       # §6, §8, §9
+    rfc9000_packetization.zig                # §13, §14, §20
+    rfc9001_tls.zig                          # RFC 9001
+    rfc9002_loss_recovery.zig                # RFC 9002
+    rfc9221_datagram.zig                     # RFC 9221
 ```
+
+The entry point lives at `tests/conformance.zig` (one level up) instead
+of `tests/conformance/root.zig` so the Zig package boundary widens to
+`tests/`. Suites that need a real `Server` fixture (for receiver-side
+gates that fire post-AEAD, e.g. RFC 9000 §17.2.1 or §12.4) can then
+`@embedFile("../data/test_cert.pem")` cleanly. See
+`_initial_fixture.zig` for the shared Server-fixture helper.
 
 ## Suite skeleton
 

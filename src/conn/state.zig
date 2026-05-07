@@ -6381,6 +6381,15 @@ pub const Connection = struct {
         }
         const opened = open_result.opened;
 
+        // RFC 9000 §17.3 ¶3: short-header Reserved Bits MUST be 0 after
+        // header protection is removed. AEAD just authenticated the
+        // post-HP first byte (it's mixed into the AAD), so a non-zero
+        // value is a peer protocol violation.
+        if (opened.reserved_bits != 0) {
+            self.close(true, transport_error_protocol_violation, "non-zero short-header reserved bits");
+            return bytes.len;
+        }
+
         self.last_authenticated_path_id = app_path.id;
         recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
         self.qlog_packets_received +|= 1;
@@ -6506,6 +6515,15 @@ pub const Connection = struct {
             else => return e,
         };
 
+        // RFC 9000 §17.2.1 ¶17: long-header Reserved Bits MUST be 0
+        // after header protection is removed. AEAD has authenticated
+        // the post-HP first byte by now, so a non-zero value is a
+        // peer protocol violation.
+        if (opened.reserved_bits != 0) {
+            self.close(true, transport_error_protocol_violation, "non-zero long-header reserved bits");
+            return bytes.len;
+        }
+
         // Server side: discover peer's CIDs from the very first Initial.
         if (self.role == .server) {
             if (!self.peer_dcid_set) {
@@ -6609,6 +6627,12 @@ pub const Connection = struct {
             else => return e,
         };
 
+        // RFC 9000 §17.2.1 ¶17 long-header Reserved Bits gate.
+        if (opened.reserved_bits != 0) {
+            self.close(true, transport_error_protocol_violation, "non-zero long-header reserved bits");
+            return bytes.len;
+        }
+
         self.last_authenticated_path_id = app_path.id;
         recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload);
         self.qlog_packets_received +|= 1;
@@ -6639,6 +6663,12 @@ pub const Connection = struct {
             },
             else => return e,
         };
+
+        // RFC 9000 §17.2.1 ¶17 long-header Reserved Bits gate.
+        if (opened.reserved_bits != 0) {
+            self.close(true, transport_error_protocol_violation, "non-zero long-header reserved bits");
+            return bytes.len;
+        }
 
         self.last_authenticated_path_id = self.current_incoming_path_id;
         self.pnSpaceForLevel(.handshake).recordReceivedPacket(opened.pn, now_us / 1000, packetPayloadAckEliciting(opened.payload));
@@ -6680,8 +6710,27 @@ pub const Connection = struct {
                     else => |x| std.debug.print("{s} ", .{@tagName(x)}),
                 }
             }
+            // RFC 9000 §12.4 / Table 3: at the Initial and Handshake
+            // encryption levels the only legal frames are PADDING,
+            // PING, ACK, CRYPTO, and CONNECTION_CLOSE of type 0x1c
+            // (transport variant — application CONNECTION_CLOSE 0x1d
+            // is application-data only, hence 1-RTT only). Any other
+            // frame at those levels is a peer protocol violation.
+            if ((lvl == .initial or lvl == .handshake) and
+                !frameAllowedInInitialOrHandshake(f))
+            {
+                self.close(true, transport_error_protocol_violation, "forbidden frame at Initial/Handshake level");
+                return;
+            }
             if (lvl == .early_data and !frameAllowedInEarlyData(f)) {
                 self.close(true, transport_error_protocol_violation, "forbidden frame in 0-RTT");
+                return;
+            }
+            // RFC 9000 §19.20: HANDSHAKE_DONE is a server-only frame.
+            // "A server MUST treat receipt of a HANDSHAKE_DONE frame as
+            // a connection error of type PROTOCOL_VIOLATION."
+            if (f == .handshake_done and self.role == .server) {
+                self.close(true, transport_error_protocol_violation, "HANDSHAKE_DONE received by server");
                 return;
             }
             if (lvl != .application and isMultipathFrame(f)) {
@@ -6772,6 +6821,27 @@ pub const Connection = struct {
             .retire_connection_id,
             => false,
             else => true,
+        };
+    }
+
+    /// RFC 9000 §12.4 / Table 3: frames legal at the Initial or
+    /// Handshake encryption level. Both levels share the same allowed
+    /// list — PADDING, PING, ACK, CRYPTO, and the transport-variant
+    /// CONNECTION_CLOSE (frame type 0x1c).
+    ///
+    /// CONNECTION_CLOSE 0x1d (the application-error variant) is
+    /// 1-RTT-only because it carries an application-supplied error
+    /// code; emitting it before the handshake completes would expose
+    /// application semantics to an unauthenticated peer.
+    fn frameAllowedInInitialOrHandshake(f: frame_types.Frame) bool {
+        return switch (f) {
+            .padding,
+            .ping,
+            .ack,
+            .crypto,
+            => true,
+            .connection_close => |cc| cc.is_transport,
+            else => false,
         };
     }
 

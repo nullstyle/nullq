@@ -76,6 +76,7 @@ const nullq = @import("nullq");
 const wire = nullq.wire;
 const header = wire.header;
 const packet_number = wire.packet_number;
+const fixture = @import("_initial_fixture.zig");
 
 /// QUIC v1 wire-format version.
 const QUIC_V1: u32 = 0x00000001;
@@ -372,16 +373,31 @@ test "MUST set the Reserved Bits (bits 3-2) to 0 on an emitted 0-RTT packet [RFC
     try std.testing.expectEqual(@as(u8, 0), buf[0] & 0x0c);
 }
 
-test "skip_MUST treat non-zero long-header Reserved Bits as PROTOCOL_VIOLATION on receive [RFC9000 §17.2.1 ¶17]" {
-    // TODO(nullq#XXX): The wire layer faithfully decodes the reserved
-    // bits into Initial.reserved_bits / Handshake.reserved_bits /
-    // ZeroRtt.reserved_bits, but neither `long_packet.openInitial`
-    // (and friends) nor `conn/state.zig` currently raises a connection
-    // error when the post-HP value is non-zero. RFC 9000 §17.2.1 ¶17:
-    // "An endpoint MUST treat receipt of a packet that has a non-zero
-    // value for these bits after removing both packet and header
-    // protection as a connection error of type PROTOCOL_VIOLATION."
-    return error.SkipZigTest;
+test "MUST treat non-zero long-header Reserved Bits as PROTOCOL_VIOLATION on receive [RFC9000 §17.2.1 ¶17]" {
+    // RFC 9000 §17.2.1 ¶17: "An endpoint MUST treat receipt of a
+    // packet that has a non-zero value for these bits after removing
+    // both packet and header protection as a connection error of
+    // type PROTOCOL_VIOLATION."
+    //
+    // We seal an authentic Initial whose pre-HP first byte carries
+    // reserved_bits=0b10. After AEAD passes on the receiver,
+    // `Connection.handleInitial` reads bits 3-2 of the post-HP first
+    // byte and observes the non-zero value — close fires before
+    // dispatchFrames runs (so the payload itself doesn't matter; we
+    // pass empty bytes).
+    var srv = try fixture.buildServer();
+    defer srv.deinit();
+
+    const dcid = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    const scid = [_]u8{ 0xa0, 0xb0, 0xc0, 0xd0 };
+    // Empty payload — the reserved-bits gate fires before any frame
+    // is dispatched, so the payload contents are irrelevant.
+    const close_event = try fixture.feedAndExpectClose(&srv, &dcid, &scid, 0b10, &.{});
+    const ev = close_event orelse return error.NoCloseEventEmitted;
+
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
 // ---------------------------------------------------------------- §17.2.2 Initial
@@ -680,14 +696,24 @@ test "MUST encode the Short Header PN Length (bits 1-0) as (length - 1) [RFC9000
     try std.testing.expectEqual(@as(u2, 0b11), @as(u2, @intCast(buf[0] & 0x03)));
 }
 
+// The §17.3 short-header reserved-bit gate is implemented in
+// `Connection.handleShort` (src/conn/state.zig) — the gate fires on
+// the post-HP first byte after AEAD passes for a 1-RTT packet. We
+// can't yet exercise it from the conformance package because the
+// fixture only has Initial-level keys; producing a valid 1-RTT
+// packet requires a full TLS handshake. Tracked for the next
+// fixture round.
 test "skip_MUST treat non-zero short-header Reserved Bits as PROTOCOL_VIOLATION on receive [RFC9000 §17.3 ¶3]" {
-    // TODO(nullq#XXX): Same gap as the long-header reserved-bits debt
-    // entry — `header.parseShort` decodes bits 4-3 into
-    // OneRtt.reserved_bits, but no caller currently raises
-    // PROTOCOL_VIOLATION when the post-HP value is non-zero. RFC 9000
-    // §17.3 ¶3: "Reserved bits ... An endpoint MUST treat receipt of
-    // a packet that has a non-zero value for these bits, after
-    // removing both packet and header protection, as a connection
-    // error of type PROTOCOL_VIOLATION."
+    // The receiver-side gate is IMPLEMENTED in
+    // `Connection.handleShort` (src/conn/state.zig) — bits 4-3 of the
+    // post-HP first byte are surfaced via `Open1RttResult.reserved_bits`
+    // and the connection closes with PROTOCOL_VIOLATION on a non-zero
+    // value (mirrors the §17.2.1 long-header gate verified live above).
+    // What's missing is conformance-suite coverage: producing an
+    // authentic 1-RTT packet requires Application keys, which only
+    // exist after a real TLS handshake. The conformance fixture
+    // (`_initial_fixture.zig`) currently only carries Initial keys.
+    // Visible debt: extend the fixture to drive a paired Client +
+    // Server through the handshake to handshake-confirmed state.
     return error.SkipZigTest;
 }
