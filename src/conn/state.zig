@@ -40,6 +40,7 @@ pub const lifecycle_mod = @import("lifecycle.zig");
 pub const stateless_reset_mod = @import("stateless_reset.zig");
 pub const path_frame_queue = @import("path_frame_queue.zig");
 pub const _internal = @import("_internal.zig");
+const conn_recv_flow_handlers = @import("conn_recv_flow_handlers.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -2802,7 +2803,7 @@ pub const Connection = struct {
         return !streamIsBidi(id);
     }
 
-    fn streamIndex(id: u64) u64 {
+    pub fn streamIndex(id: u64) u64 {
         return id >> 2;
     }
 
@@ -2810,16 +2811,16 @@ pub const Connection = struct {
         return (id & 0b01) == 0;
     }
 
-    fn streamInitiatedByLocal(self: *const Connection, id: u64) bool {
+    pub fn streamInitiatedByLocal(self: *const Connection, id: u64) bool {
         return streamInitiatedByClient(id) == (self.role == .client);
     }
 
-    fn localMaySendOnStream(self: *const Connection, id: u64) bool {
+    pub fn localMaySendOnStream(self: *const Connection, id: u64) bool {
         if (streamIsBidi(id)) return true;
         return self.streamInitiatedByLocal(id);
     }
 
-    fn peerMaySendOnStream(self: *const Connection, id: u64) bool {
+    pub fn peerMaySendOnStream(self: *const Connection, id: u64) bool {
         if (streamIsBidi(id)) return true;
         return !self.streamInitiatedByLocal(id);
     }
@@ -2890,7 +2891,7 @@ pub const Connection = struct {
         return true;
     }
 
-    fn peerStreamWithinLocalLimit(self: *Connection, id: u64) bool {
+    pub fn peerStreamWithinLocalLimit(self: *Connection, id: u64) bool {
         const idx = streamIndex(id);
         if (idx >= max_stream_count_limit) {
             self.close(true, transport_error_frame_encoding, "stream id exceeds stream count space");
@@ -3223,7 +3224,7 @@ pub const Connection = struct {
         return @max(min_stream_credit_return_batch, current_limit / stream_credit_return_divisor);
     }
 
-    fn recordFlowBlockedEvent(self: *Connection, info: FlowBlockedInfo) void {
+    pub fn recordFlowBlockedEvent(self: *Connection, info: FlowBlockedInfo) void {
         for (self.flow_blocked_events.constSlice()) |existing| {
             if (existing.source == info.source and
                 existing.kind == info.kind and
@@ -7472,96 +7473,27 @@ pub const Connection = struct {
     }
 
     pub fn handleMaxData(self: *Connection, md: frame_types.MaxData) void {
-        if (md.maximum_data > self.peer_max_data) {
-            self.peer_max_data = md.maximum_data;
-            self.clearLocalDataBlocked(md.maximum_data);
-        }
+        return conn_recv_flow_handlers.handleMaxData(self, md);
     }
 
     pub fn handleMaxStreamData(self: *Connection, msd: frame_types.MaxStreamData) void {
-        if (!self.localMaySendOnStream(msd.stream_id)) {
-            self.close(true, transport_error_stream_state, "max stream data for receive-only stream");
-            return;
-        }
-        const s = self.streams.get(msd.stream_id) orelse return;
-        if (msd.maximum_stream_data > s.send_max_data) {
-            s.send_max_data = msd.maximum_stream_data;
-            self.clearLocalStreamDataBlocked(msd.stream_id, msd.maximum_stream_data);
-        }
+        return conn_recv_flow_handlers.handleMaxStreamData(self, msd);
     }
 
     pub fn handleMaxStreams(self: *Connection, ms: frame_types.MaxStreams) void {
-        if (ms.maximum_streams > max_stream_count_limit) {
-            self.close(true, transport_error_frame_encoding, "max streams exceeds stream id space");
-            return;
-        }
-        const bounded_maximum_streams = @min(ms.maximum_streams, max_streams_per_connection);
-        if (ms.bidi) {
-            if (bounded_maximum_streams > self.peer_max_streams_bidi) {
-                self.peer_max_streams_bidi = bounded_maximum_streams;
-                self.clearLocalStreamsBlocked(true, bounded_maximum_streams);
-            }
-        } else {
-            if (bounded_maximum_streams > self.peer_max_streams_uni) {
-                self.peer_max_streams_uni = bounded_maximum_streams;
-                self.clearLocalStreamsBlocked(false, bounded_maximum_streams);
-            }
-        }
+        return conn_recv_flow_handlers.handleMaxStreams(self, ms);
     }
 
     pub fn handleDataBlocked(self: *Connection, db: frame_types.DataBlocked) void {
-        self.peer_data_blocked_at = db.maximum_data;
-        self.recordFlowBlockedEvent(.{
-            .source = .peer,
-            .kind = .data,
-            .limit = db.maximum_data,
-        });
+        return conn_recv_flow_handlers.handleDataBlocked(self, db);
     }
 
     pub fn handleStreamDataBlocked(self: *Connection, sdb: frame_types.StreamDataBlocked) Error!void {
-        if (!self.peerMaySendOnStream(sdb.stream_id)) {
-            self.close(true, transport_error_stream_state, "stream data blocked for receive-only stream");
-            return;
-        }
-        const idx = streamIndex(sdb.stream_id);
-        if (idx >= max_stream_count_limit) {
-            self.close(true, transport_error_frame_encoding, "stream data blocked exceeds stream id space");
-            return;
-        }
-        const existing = self.streams.get(sdb.stream_id);
-        if (existing == null and self.streamInitiatedByLocal(sdb.stream_id)) return;
-        if (existing == null and !self.peerStreamWithinLocalLimit(sdb.stream_id)) return;
-        _ = upsertStreamBlocked(&self.peer_stream_data_blocked, self.allocator, sdb) catch |err| {
-            if (err == Error.StreamLimitExceeded) {
-                self.close(true, transport_error_protocol_violation, "stream data blocked tracking exhausted");
-                return;
-            }
-            return err;
-        };
-        self.recordFlowBlockedEvent(.{
-            .source = .peer,
-            .kind = .stream_data,
-            .limit = sdb.maximum_stream_data,
-            .stream_id = sdb.stream_id,
-        });
+        return conn_recv_flow_handlers.handleStreamDataBlocked(self, sdb);
     }
 
     pub fn handleStreamsBlocked(self: *Connection, sb: frame_types.StreamsBlocked) void {
-        if (sb.maximum_streams > max_stream_count_limit) {
-            self.close(true, transport_error_frame_encoding, "streams blocked exceeds stream id space");
-            return;
-        }
-        if (sb.bidi) {
-            self.peer_streams_blocked_bidi = sb.maximum_streams;
-        } else {
-            self.peer_streams_blocked_uni = sb.maximum_streams;
-        }
-        self.recordFlowBlockedEvent(.{
-            .source = .peer,
-            .kind = .streams,
-            .limit = sb.maximum_streams,
-            .bidi = sb.bidi,
-        });
+        return conn_recv_flow_handlers.handleStreamsBlocked(self, sb);
     }
 
     /// Apply a peer-sent DATAGRAM frame (RFC 9221) to the inbound queue.
