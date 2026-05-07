@@ -39,6 +39,7 @@ const pending_frames_mod = @import("pending_frames.zig");
 const lifecycle_mod = @import("lifecycle.zig");
 const stateless_reset_mod = @import("stateless_reset.zig");
 const path_frame_queue = @import("path_frame_queue.zig");
+const _internal = @import("_internal.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -196,7 +197,7 @@ pub const Stream = struct {
 /// mandates at least 1200 bytes path MTU; PMTU discovery (Phase 11)
 /// can lift this.
 pub const default_mtu: usize = 1200;
-const transport_error_protocol_violation: u64 = 0x0a;
+pub const transport_error_protocol_violation: u64 = 0x0a;
 const transport_error_flow_control: u64 = 0x03;
 const transport_error_stream_limit: u64 = 0x04;
 const transport_error_stream_state: u64 = 0x05;
@@ -2313,7 +2314,7 @@ pub const Connection = struct {
         }
         self.primaryPath().path.local_cid = self.local_scid;
         self.local_scid_set = true;
-        try self.rememberLocalCid(0, 0, 0, self.local_scid, @splat(0));
+        try _internal.rememberLocalCid(self,0, 0, 0, self.local_scid, @splat(0));
     }
 
     /// Length of the local SCID — also the length of the DCID the
@@ -2326,51 +2327,9 @@ pub const Connection = struct {
         return if (self.initial_source_cid_set) self.initial_source_cid else self.local_scid;
     }
 
-    pub fn rememberLocalCid(
-        self: *Connection,
-        path_id: u32,
-        sequence_number: u64,
-        retire_prior_to: u64,
-        cid: ConnectionId,
-        stateless_reset_token: [16]u8,
-    ) Error!void {
-        if (cid.len == 0) return;
-        if (retire_prior_to > sequence_number) {
-            self.close(true, transport_error_protocol_violation, "invalid retire_prior_to");
-            return;
-        }
-        try self.ensureLocalCidAvailable(path_id, sequence_number, cid);
-        for (self.local_cids.items) |*item| {
-            if (item.path_id == path_id and item.sequence_number == sequence_number) {
-                item.retire_prior_to = retire_prior_to;
-                item.cid = cid;
-                item.stateless_reset_token = stateless_reset_token;
-                return;
-            }
-        }
-        self.retireLocalCidsPriorTo(path_id, retire_prior_to);
-        try self.local_cids.append(self.allocator, .{
-            .path_id = path_id,
-            .sequence_number = sequence_number,
-            .retire_prior_to = retire_prior_to,
-            .cid = cid,
-            .stateless_reset_token = stateless_reset_token,
-        });
-        if (self.paths.get(path_id)) |path| {
-            if (path.path.local_cid.len == 0 or sequence_number == 0) {
-                path.path.local_cid = cid;
-                if (path_id == 0) self.local_scid = cid;
-            }
-            // Keep the per-path high watermark of issued CID sequences.
-            // RFC 9000 §19.16 requires us to reject RETIRE_CONNECTION_ID
-            // whose sequence is greater than any we ever assigned.
-            if (sequence_number >= path.next_local_cid_seq) {
-                path.next_local_cid_seq = sequence_number + 1;
-            }
-        }
-    }
-
-    fn retireLocalCidsPriorTo(
+    // INTERNAL: pub for refactor; not part of embedder API. Cascade
+    // dependency of `_internal.rememberLocalCid`.
+    pub fn retireLocalCidsPriorTo(
         self: *Connection,
         path_id: u32,
         retire_prior_to: u64,
@@ -2438,16 +2397,6 @@ pub const Connection = struct {
         self.pending_frames.removePathNewConnectionIdBySequence(path_id, sequence_number);
     }
 
-    pub fn nextLocalCidSequence(self: *const Connection, path_id: u32) u64 {
-        var next: u64 = 0;
-        for (self.local_cids.items) |item| {
-            if (item.path_id == path_id and item.sequence_number >= next) {
-                next = item.sequence_number + 1;
-            }
-        }
-        return next;
-    }
-
     /// Smallest sequence number still resident in `local_cids` for
     /// `path_id`, or null when the path has no local CIDs at all.
     /// Used by `handleRetireConnectionId` to short-circuit an
@@ -2468,7 +2417,7 @@ pub const Connection = struct {
     /// the embedder issues on `path_id`. Useful when minting CIDs
     /// outside of `replenishConnectionIds`.
     pub fn nextLocalConnectionIdSequence(self: *const Connection, path_id: u32) u64 {
-        return self.nextLocalCidSequence(path_id);
+        return _internal.nextLocalCidSequence(self,path_id);
     }
 
     /// Number of currently-active local SCIDs across all paths
@@ -2537,7 +2486,9 @@ pub const Connection = struct {
         self.current_incoming_local_cid_seq = seq;
     }
 
-    fn localCidSequenceExists(
+    // INTERNAL: pub for refactor; not part of embedder API. Cascade
+    // dependency of `_internal.ensureCanIssueLocalCid`.
+    pub fn localCidSequenceExists(
         self: *const Connection,
         path_id: u32,
         sequence_number: u64,
@@ -2548,22 +2499,6 @@ pub const Connection = struct {
             }
         }
         return false;
-    }
-
-    pub fn ensureLocalCidAvailable(
-        self: *const Connection,
-        path_id: u32,
-        sequence_number: u64,
-        cid: ConnectionId,
-    ) Error!void {
-        if (cid.len == 0) return;
-        for (self.local_cids.items) |item| {
-            if (item.path_id == path_id and item.sequence_number == sequence_number) {
-                if (!ConnectionId.eql(item.cid, cid)) return Error.ConnectionIdAlreadyInUse;
-                continue;
-            }
-            if (ConnectionId.eql(item.cid, cid)) return Error.ConnectionIdAlreadyInUse;
-        }
     }
 
     fn localCidForSequence(
@@ -2620,7 +2555,9 @@ pub const Connection = struct {
         return self.localConnectionIdIssueBudgetAfterRetirePriorTo(path_id, 0);
     }
 
-    fn localConnectionIdIssueBudgetAfterRetirePriorTo(
+    // INTERNAL: pub for refactor; not part of embedder API. Cascade
+    // dependency of `_internal.ensureCanIssueLocalCid`.
+    pub fn localConnectionIdIssueBudgetAfterRetirePriorTo(
         self: *const Connection,
         path_id: u32,
         retire_prior_to: u64,
@@ -2634,20 +2571,6 @@ pub const Connection = struct {
         const max_usize_as_u64: u64 = @intCast(std.math.maxInt(usize));
         if (remaining > max_usize_as_u64) return std.math.maxInt(usize);
         return @intCast(remaining);
-    }
-
-    pub fn ensureCanIssueLocalCid(
-        self: *Connection,
-        path_id: u32,
-        sequence_number: u64,
-        retire_prior_to: u64,
-        cid_len: usize,
-    ) Error!void {
-        if (cid_len == 0) return;
-        if (self.localCidSequenceExists(path_id, sequence_number)) return;
-        if (self.localConnectionIdIssueBudgetAfterRetirePriorTo(path_id, retire_prior_to) == 0) {
-            return Error.ConnectionIdLimitExceeded;
-        }
     }
 
     /// Server-side helper: peek the unprotected DCID + SCID out of
@@ -3331,7 +3254,9 @@ pub const Connection = struct {
         return self.connectionIdReplenishInfoFor(path_id, .retired, null);
     }
 
-    fn connectionIdReplenishInfoFor(
+    // INTERNAL: pub for refactor; not part of embedder API. Cascade
+    // dependency of `_internal.refreshConnectionIdEventsForPath`.
+    pub fn connectionIdReplenishInfoFor(
         self: *const Connection,
         path_id: u32,
         reason: ConnectionIdReplenishReason,
@@ -3343,7 +3268,7 @@ pub const Connection = struct {
             .active_count = self.localCidActiveCountForPath(path_id),
             .active_limit = self.peerActiveConnectionIdLimitUsize(),
             .issue_budget = self.localConnectionIdIssueBudget(path_id),
-            .next_sequence_number = self.nextLocalCidSequence(path_id),
+            .next_sequence_number = _internal.nextLocalCidSequence(self,path_id),
             .blocked_next_sequence_number = blocked_next_sequence_number,
         };
     }
@@ -3366,34 +3291,14 @@ pub const Connection = struct {
         self.connection_id_events.push(info);
     }
 
-    fn connectionIdEventStillNeeded(self: *const Connection, path_id: u32) bool {
+    // INTERNAL: pub for refactor; not part of embedder API. Cascade
+    // dependency of `_internal.refreshConnectionIdEventsForPath`.
+    pub fn connectionIdEventStillNeeded(self: *const Connection, path_id: u32) bool {
         if (self.localConnectionIdIssueBudget(path_id) > 0) return true;
         if (self.pendingPathCidsBlocked()) |blocked| {
             if (blocked.path_id == path_id) return true;
         }
         return false;
-    }
-
-    pub fn refreshConnectionIdEventsForPath(self: *Connection, path_id: u32) void {
-        var i: usize = 0;
-        while (i < self.connection_id_events.len) {
-            const slice = self.connection_id_events.slice();
-            if (slice[i].path_id != path_id) {
-                i += 1;
-                continue;
-            }
-            if (!self.connectionIdEventStillNeeded(path_id)) {
-                self.connection_id_events.removeAt(i);
-                continue;
-            }
-            const event = slice[i];
-            self.connection_id_events.slice()[i] = self.connectionIdReplenishInfoFor(
-                path_id,
-                event.reason,
-                event.blocked_next_sequence_number,
-            );
-            i += 1;
-        }
     }
 
     fn recordDatagramSendEvent(self: *Connection, event: StoredDatagramSendEvent) void {
@@ -3660,9 +3565,9 @@ pub const Connection = struct {
         stateless_reset_token: [16]u8,
     ) Error!void {
         if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
-        try self.ensureCanIssueLocalCid(0, sequence_number, retire_prior_to, cid.len);
+        try _internal.ensureCanIssueLocalCid(self,0, sequence_number, retire_prior_to, cid.len);
         const local_cid = ConnectionId.fromSlice(cid);
-        try self.ensureLocalCidAvailable(0, sequence_number, local_cid);
+        try _internal.ensureLocalCidAvailable(self,0, sequence_number, local_cid);
         for (self.pending_frames.new_connection_ids.items) |item| {
             if (item.sequence_number == sequence_number) {
                 if (!std.mem.eql(u8, item.connection_id.slice(), cid)) return Error.ConnectionIdAlreadyInUse;
@@ -3671,14 +3576,14 @@ pub const Connection = struct {
         }
         var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
         @memcpy(connection_id.bytes[0..cid.len], cid);
-        try self.rememberLocalCid(0, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
+        try _internal.rememberLocalCid(self,0, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
         try self.pending_frames.new_connection_ids.append(self.allocator, .{
             .sequence_number = sequence_number,
             .retire_prior_to = retire_prior_to,
             .connection_id = connection_id,
             .stateless_reset_token = stateless_reset_token,
         });
-        self.refreshConnectionIdEventsForPath(0);
+        _internal.refreshConnectionIdEventsForPath(self,0);
     }
 
     /// Queue a RETIRE_CONNECTION_ID frame asking the peer to drop a
@@ -3767,8 +3672,8 @@ pub const Connection = struct {
             }
             if (path_id > self.local_max_path_id) return Error.PathLimitExceeded;
             if (local_cid.len == 0 or peer_cid.len == 0) return Error.ConnectionIdRequired;
-            try self.ensureCanIssueLocalCid(path_id, 0, 0, local_cid.len);
-            try self.ensureLocalCidAvailable(path_id, 0, local_cid);
+            try _internal.ensureCanIssueLocalCid(self,path_id, 0, 0, local_cid.len);
+            try _internal.ensureLocalCidAvailable(self,path_id, 0, local_cid);
         }
         const opened_path_id = try self.paths.openPath(
             self.allocator,
@@ -3778,7 +3683,7 @@ pub const Connection = struct {
             peer_cid,
             .{ .max_datagram_size = self.mtu },
         );
-        try self.rememberLocalCid(opened_path_id, 0, 0, local_cid, @splat(0));
+        try _internal.rememberLocalCid(self,opened_path_id, 0, 0, local_cid, @splat(0));
         return opened_path_id;
     }
 
@@ -3930,18 +3835,8 @@ pub const Connection = struct {
         path_id: u32,
         provisions: []const ConnectionIdProvision,
     ) Error!usize {
-        try self.ensureCanIssueCidForPathId(path_id);
+        try _internal.ensureCanIssueCidForPathId(self,path_id);
         return self.replenishLocalConnectionIds(path_id, provisions);
-    }
-
-    pub fn ensureCanIssueCidForPathId(self: *const Connection, path_id: u32) Error!void {
-        if (path_id == 0) return;
-        if (self.multipathNegotiated() and path_id > self.local_max_path_id) {
-            return Error.PathLimitExceeded;
-        }
-        if (self.paths.getConst(path_id) != null) return;
-        if (self.multipathNegotiated()) return;
-        return Error.PathNotFound;
     }
 
     fn replenishLocalConnectionIds(
@@ -3953,7 +3848,7 @@ pub const Connection = struct {
         if (self.pendingPathCidsBlocked()) |blocked| {
             if (blocked.path_id == path_id) {
                 var seq = blocked.next_sequence_number;
-                const next = self.nextLocalCidSequence(path_id);
+                const next = _internal.nextLocalCidSequence(self,path_id);
                 while (seq < next) : (seq += 1) {
                     const issued = self.localCidForSequence(path_id, seq) orelse continue;
                     if (path_id == 0) {
@@ -3979,7 +3874,7 @@ pub const Connection = struct {
 
         for (provisions) |provision| {
             if (self.localConnectionIdIssueBudget(path_id) == 0) break;
-            const sequence_number = self.nextLocalCidSequence(path_id);
+            const sequence_number = _internal.nextLocalCidSequence(self,path_id);
             if (path_id == 0) {
                 try self.queueNewConnectionId(
                     sequence_number,
@@ -4001,7 +3896,7 @@ pub const Connection = struct {
 
         if (queued > 0) {
             path_frame_queue.clearSatisfiedPathCidsBlocked(self, path_id);
-            self.refreshConnectionIdEventsForPath(path_id);
+            _internal.refreshConnectionIdEventsForPath(self,path_id);
         }
         return queued;
     }
@@ -7236,7 +7131,7 @@ pub const Connection = struct {
             .paths_blocked => |pb| self.pathIdAllowedByLocalLimit(pb.maximum_path_id),
             .path_cids_blocked => |pcb| blk: {
                 if (!self.pathIdAllowedByLocalLimit(pcb.path_id)) break :blk false;
-                const next = self.nextLocalCidSequence(pcb.path_id);
+                const next = _internal.nextLocalCidSequence(self,pcb.path_id);
                 if (pcb.next_sequence_number > next) {
                     self.close(true, transport_error_protocol_violation, "path cids blocked skips local cid sequence");
                     break :blk false;
@@ -7557,7 +7452,7 @@ pub const Connection = struct {
 
     fn handlePathCidsBlocked(self: *Connection, pcb: frame_types.PathCidsBlocked) void {
         if (!self.pathIdAllowedByLocalLimit(pcb.path_id)) return;
-        const next = self.nextLocalCidSequence(pcb.path_id);
+        const next = _internal.nextLocalCidSequence(self,pcb.path_id);
         if (pcb.next_sequence_number > next) {
             self.close(true, transport_error_protocol_violation, "path cids blocked skips local cid sequence");
             return;

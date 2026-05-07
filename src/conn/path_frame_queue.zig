@@ -15,6 +15,7 @@ const max_supported_path_id = state_mod.max_supported_path_id;
 const path_mod = @import("path.zig");
 const ConnectionId = path_mod.ConnectionId;
 const frame_types = @import("../frame/types.zig");
+const _internal = @import("_internal.zig");
 
 /// Queue a PATH_ABANDON frame for the given multipath path. Coalesces
 /// repeated calls for the same `path_id` (last `error_code` wins).
@@ -75,10 +76,10 @@ pub fn queuePathNewConnectionId(
     stateless_reset_token: [16]u8,
 ) Error!void {
     if (cid.len > path_mod.max_cid_len) return Error.DcidTooLong;
-    try self.ensureCanIssueCidForPathId(path_id);
-    try self.ensureCanIssueLocalCid(path_id, sequence_number, retire_prior_to, cid.len);
+    try _internal.ensureCanIssueCidForPathId(self, path_id);
+    try _internal.ensureCanIssueLocalCid(self, path_id, sequence_number, retire_prior_to, cid.len);
     const local_cid = ConnectionId.fromSlice(cid);
-    try self.ensureLocalCidAvailable(path_id, sequence_number, local_cid);
+    try _internal.ensureLocalCidAvailable(self, path_id, sequence_number, local_cid);
     for (self.pending_frames.path_new_connection_ids.items) |item| {
         if (item.path_id == path_id and item.sequence_number == sequence_number) {
             if (!std.mem.eql(u8, item.connection_id.slice(), cid)) return Error.ConnectionIdAlreadyInUse;
@@ -87,7 +88,7 @@ pub fn queuePathNewConnectionId(
     }
     var connection_id: frame_types.ConnId = .{ .len = @intCast(cid.len) };
     @memcpy(connection_id.bytes[0..cid.len], cid);
-    try self.rememberLocalCid(path_id, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
+    try _internal.rememberLocalCid(self, path_id, sequence_number, retire_prior_to, local_cid, stateless_reset_token);
     try self.pending_frames.path_new_connection_ids.append(self.allocator, .{
         .path_id = path_id,
         .sequence_number = sequence_number,
@@ -95,7 +96,7 @@ pub fn queuePathNewConnectionId(
         .connection_id = connection_id,
         .stateless_reset_token = stateless_reset_token,
     });
-    self.refreshConnectionIdEventsForPath(path_id);
+    _internal.refreshConnectionIdEventsForPath(self, path_id);
 }
 
 /// Queue a PATH_RETIRE_CONNECTION_ID frame asking the peer to drop the
@@ -181,7 +182,7 @@ pub fn clearPendingPathCidsBlocked(
 pub fn clearSatisfiedPathCidsBlocked(self: *Connection, path_id: u32) void {
     const pending = pendingPathCidsBlocked(self) orelse return;
     if (pending.path_id != path_id) return;
-    if (self.nextLocalCidSequence(path_id) > pending.next_sequence_number) {
+    if (_internal.nextLocalCidSequence(self, path_id) > pending.next_sequence_number) {
         clearPendingPathCidsBlocked(self, path_id, pending.next_sequence_number);
     }
 }
