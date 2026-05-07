@@ -81,18 +81,38 @@ test "MUST encode (initiator, direction) in the low two bits of a stream id [RFC
     // RFC 9000 §2.1 ¶2 fixes the low-two-bit table:
     //   0 = client-initiated bidi, 1 = server-initiated bidi,
     //   2 = client-initiated uni,  3 = server-initiated uni.
-    // The receiver classifies incoming streams from these bits, and a
-    // peer that picks the wrong bits is creating a stream of the wrong
-    // role. Pure bit-test on the spec's mapping.
-    try std.testing.expectEqual(@as(u64, 0), 0 & 0b11); // client bidi
-    try std.testing.expectEqual(@as(u64, 1), 1 & 0b11); // server bidi
-    try std.testing.expectEqual(@as(u64, 2), 2 & 0b11); // client uni
-    try std.testing.expectEqual(@as(u64, 3), 3 & 0b11); // server uni
-    // Higher-numbered streams reuse the same low-bit pattern: stream 5
-    // is server-bidi, stream 6 is client-uni, stream 7 is server-uni.
-    try std.testing.expectEqual(@as(u64, 1), 5 & 0b11);
-    try std.testing.expectEqual(@as(u64, 2), 6 & 0b11);
-    try std.testing.expectEqual(@as(u64, 3), 7 & 0b11);
+    //
+    // Verified through nullq's `Connection.openBidi` / `openUni`:
+    // a CLIENT-role connection MUST accept stream IDs whose low bits
+    // mark them as client-initiated (0b00 for bidi, 0b10 for uni)
+    // and MUST reject IDs marked as server-initiated (0b01, 0b11).
+    // A SERVER-role connection accepts the inverse.
+    var pair = try fixture.HandshakePair.init(std.testing.allocator);
+    defer pair.deinit();
+    try pair.driveToHandshakeConfirmed();
+
+    const client = pair.clientConn();
+    const server = try pair.serverConn();
+
+    // Client opens a client-bidi stream (id 0, low bits 0b00) ✓
+    _ = try client.openBidi(0);
+    // Client opens a client-uni stream (id 2, low bits 0b10) ✓
+    _ = try client.openUni(2);
+    // Client tries to open a server-bidi stream (id 1, low bits 0b01) ✗
+    try std.testing.expectError(error.InvalidStreamId, client.openBidi(1));
+    // Client tries to open a server-uni stream (id 3, low bits 0b11) ✗
+    try std.testing.expectError(error.InvalidStreamId, client.openUni(3));
+    // Client passes a client-bidi id to openUni → wrong direction ✗
+    try std.testing.expectError(error.InvalidStreamId, client.openUni(0));
+    // Client passes a client-uni id to openBidi → wrong direction ✗
+    try std.testing.expectError(error.InvalidStreamId, client.openBidi(2));
+
+    // Server opens a server-bidi stream (id 1) ✓ — symmetric proof
+    // that the role check is enforced from both sides.
+    _ = try server.openBidi(1);
+    _ = try server.openUni(3);
+    try std.testing.expectError(error.InvalidStreamId, server.openBidi(0));
+    try std.testing.expectError(error.InvalidStreamId, server.openUni(2));
 }
 
 test "MUST reject a peer-initiated stream whose initiator bit conflicts with peer role [RFC9000 §2.1 ¶3]" {
@@ -862,31 +882,35 @@ test "MUST honour the smaller of local and peer idle_timeout values [RFC9000 §1
 
 test "MUST compare stateless reset tokens in constant time [RFC9000 §10.3 ¶17]" {
     // §10.3 ¶17 (last paragraph of §10.3): "An endpoint MUST NOT
-    // ... use any non-constant-time comparison." nullq's
-    // `Connection.tokenEql` wraps `std.crypto.timing_safe.eql` —
-    // verified directly in the developer test
-    // `tokenEql matches std.mem.eql across boundary cases`. This
-    // conformance test exercises a positional bit-flip across all
-    // 16 byte positions to confirm the function returns the same
-    // boolean answer as a non-constant-time `mem.eql`. The actual
-    // timing-safety property is only verifiable via the source-level
-    // commitment to `std.crypto.timing_safe.eql`; this test is the
-    // observable surface the spec requires.
-    const base: [16]u8 = .{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0 };
-    // Equal tokens compare equal.
-    try std.testing.expect(std.crypto.timing_safe.eql([16]u8, base, base));
+    // ... use any non-constant-time comparison." nullq routes
+    // every receive-path token compare through
+    // `nullq.conn.stateless_reset.eql` (Connection.tokenEql is a
+    // thin wrapper). This test exercises that exact public surface.
+    //
+    // The constant-time property itself is a source-level guarantee:
+    // `stateless_reset.eql` calls `std.crypto.timing_safe.eql`,
+    // which is volatile-loaded so the optimizer can't shortcut on
+    // a mismatching prefix. What an observable test CAN verify is
+    // (a) equal tokens compare equal, (b) every single-bit flip in
+    // every byte position compares not-equal, (c) the function's
+    // boolean output matches `std.mem.eql` (the non-constant-time
+    // reference) across all those cases.
+    const base: nullq.conn.stateless_reset.Token = .{
+        0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8,
+        0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0,
+    };
+    try std.testing.expect(nullq.conn.stateless_reset.eql(base, base));
 
-    // Bit-flip in every position must produce a "not equal" verdict.
     var pos: usize = 0;
     while (pos < 16) : (pos += 1) {
         var differ = base;
         differ[pos] ^= 0x01;
-        try std.testing.expect(!std.crypto.timing_safe.eql([16]u8, base, differ));
-        // Cross-check with the non-constant-time reference: same
-        // answer, just (claimed) constant-time path.
+        try std.testing.expect(!nullq.conn.stateless_reset.eql(base, differ));
+        // Cross-check: same answer as the non-constant-time reference
+        // — only the timing path differs.
         try std.testing.expectEqual(
             std.mem.eql(u8, &base, &differ),
-            std.crypto.timing_safe.eql([16]u8, base, differ),
+            nullq.conn.stateless_reset.eql(base, differ),
         );
     }
 }

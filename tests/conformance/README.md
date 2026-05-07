@@ -141,6 +141,19 @@ local helper fns and `defer` instead.
 - [ ] One observable behaviour per test.
 - [ ] `MUST NOT` tests assert rejection/absence/error — never just
       "did not crash".
+- [ ] **Test exercises a nullq surface — not stdlib arithmetic, not a
+      file-local helper standing in as the oracle.** Every non-skipped
+      conformance test must call into `nullq.*` (or a fixture that
+      does) at least once. If you find yourself asserting `5 & 0b11`
+      or `std.crypto.timing_safe.eql(...)` directly, you're testing
+      the spec table or the standard library, not nullq — route
+      through the relevant nullq function (`Connection.openBidi`,
+      `nullq.conn.stateless_reset.eql`, `header.encode`, etc.) or
+      add a small public wrapper to nullq if the path is currently
+      private. File-local raw-byte builders (e.g.
+      `rawLongHeaderInput` in `rfc8999_invariants.zig`) are fine
+      ONLY as parser-input fixtures — feed them to `header.parse`,
+      never assert against their own output.
 - [ ] Coverage block at the top lists Covered / Visible debt / Out of
       scope (where applicable).
 - [ ] Tests run cleanly: `zig build conformance`.

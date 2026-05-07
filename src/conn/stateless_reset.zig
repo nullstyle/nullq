@@ -97,6 +97,20 @@ pub fn generateKey() boringssl.crypto.rand.Error!Key {
     return key;
 }
 
+/// Constant-time equality for two stateless-reset tokens. RFC 9000
+/// §10.3 ¶17 (last paragraph): "An endpoint MUST NOT … use any
+/// non-constant-time comparison" when matching stateless-reset
+/// tokens, because a timing oracle on a partially-matching prefix
+/// would let an attacker incrementally guess the token.
+///
+/// `Connection` routes its receive-path token compare through this
+/// helper (see `Connection.tokenEql`). Conformance tests verify the
+/// observable property — equal tokens compare equal, and any
+/// single-bit flip in any position compares not-equal.
+pub fn eql(a: Token, b: Token) bool {
+    return std.crypto.timing_safe.eql(Token, a, b);
+}
+
 // -- tests ---------------------------------------------------------------
 
 const testing = std.testing;

@@ -40,10 +40,15 @@ const header = wire.header;
 /// version-specific but RFC 8999 §4 says the field is 4 bytes wide.
 const QUIC_V1: u32 = 0x00000001;
 
-/// Minimal long-header byte slab: 0xc0 | Version(4) | DCIDLEN | DCID | SCIDLEN | SCID | tail.
-/// Tail is whatever bytes follow the SCID (e.g. token-len varint for Initial,
-/// supported_versions list for VN).
-fn longHeader(
+/// Build raw long-header BYTES for parser-negative tests. This helper
+/// is **deliberately not** an oracle for the encode side — the
+/// encode-side §4 / §4.1 tests round-trip through `header.encode` to
+/// exercise nullq's encoder, not this fixture.
+///
+/// Use exclusively to feed `header.parse` with malformed-or-edge byte
+/// sequences (truncated CID-length, version=0, etc.); the conformance
+/// surface under test is the parser, not this builder.
+fn rawLongHeaderInput(
     out: []u8,
     first_byte: u8,
     version: u32,
@@ -80,7 +85,7 @@ test "MUST identify a long-header packet by the high bit of the first byte being
     const scid = [_]u8{ 9, 10, 11, 12 };
     // Initial-shaped tail: token-len=0, length=0, pn=0.
     const tail = [_]u8{ 0x00, 0x00, 0x00 };
-    const len = longHeader(&buf, 0xc0, QUIC_V1, &dcid, &scid, &tail);
+    const len = rawLongHeaderInput(&buf, 0xc0, QUIC_V1, &dcid, &scid, &tail);
 
     const parsed = try header.parse(buf[0..len], 0);
 
@@ -89,45 +94,69 @@ test "MUST identify a long-header packet by the high bit of the first byte being
 }
 
 test "MUST encode the QUIC Version as a 4-byte big-endian field at offset 1 [RFC8999 §4 ¶3]" {
-    // Pick a non-v1 sentinel so we can verify big-endian wiring
-    // unambiguously. Any 4-byte value works for an RFC 8999 syntactic
-    // check; semantic version-handling lives in RFC 9000 §6
-    // (negotiation_validation suite).
+    // Drive nullq's encoder (`header.encode`) with a non-v1 sentinel
+    // and verify the on-wire layout: bytes [1..5] are the version,
+    // big-endian. This is the encode-side test for §4 ¶3 — the parser
+    // round-trip is implicit in every other test that calls
+    // `header.parse`.
     const sentinel: u32 = 0xCAFEF00D;
+    const h = header.Initial{
+        .version = sentinel,
+        .dcid = try header.ConnId.fromSlice(&[_]u8{ 0x11, 0x22, 0x33, 0x44 }),
+        .scid = try header.ConnId.fromSlice(&[_]u8{ 0x55, 0x66 }),
+        .token = &.{},
+        .pn_length = .one,
+        .pn_truncated = 0,
+        .payload_length = 20,
+    };
     var buf: [64]u8 = undefined;
-    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
-    const scid = [_]u8{ 0x55, 0x66 };
-    const tail = [_]u8{ 0x00, 0x00, 0x00 };
-    _ = longHeader(&buf, 0xc0, sentinel, &dcid, &scid, &tail);
+    const written = try header.encode(&buf, .{ .initial = h });
+    try std.testing.expect(written >= 5);
 
-    // Wire-level check: bytes [1..5] are the version, big-endian.
     const on_wire = std.mem.readInt(u32, buf[1..5], .big);
     try std.testing.expectEqual(sentinel, on_wire);
 }
 
 test "MUST place the DCID Length octet immediately after the Version field [RFC8999 §4.1 ¶1]" {
+    // Encode-side: nullq's `header.encode` MUST place a single
+    // unsigned 8-bit DCIDLEN at byte 5, immediately after the
+    // 4-byte Version field. RFC 8999 §4.1 ¶1.
+    const dcid_bytes = [_]u8{ 0xaa, 0xbb, 0xcc };
+    const h = header.Initial{
+        .version = QUIC_V1,
+        .dcid = try header.ConnId.fromSlice(&dcid_bytes),
+        .scid = try header.ConnId.fromSlice(&[_]u8{0xdd}),
+        .token = &.{},
+        .pn_length = .one,
+        .pn_truncated = 0,
+        .payload_length = 20,
+    };
     var buf: [64]u8 = undefined;
-    const dcid = [_]u8{ 0xaa, 0xbb, 0xcc };
-    const scid = [_]u8{0xdd};
-    const tail = [_]u8{ 0x00, 0x00, 0x00 };
-    _ = longHeader(&buf, 0xc0, QUIC_V1, &dcid, &scid, &tail);
+    _ = try header.encode(&buf, .{ .initial = h });
 
-    // Byte 5 is DCIDLEN. RFC 8999 §4.1 ¶1: "The Length of the
-    // Destination Connection ID field, encoded as a single unsigned
-    // 8-bit integer."
-    try std.testing.expectEqual(@as(u8, dcid.len), buf[5]);
+    try std.testing.expectEqual(@as(u8, dcid_bytes.len), buf[5]);
 }
 
 test "MUST place the SCID Length octet immediately after DCID [RFC8999 §4.1 ¶2]" {
+    // Encode-side: nullq's `header.encode` MUST place an unsigned
+    // 8-bit SCIDLEN at offset 1 + 4 + 1 + dcid.len (right after the
+    // last DCID byte). RFC 8999 §4.1 ¶2.
+    const dcid_bytes = [_]u8{ 0xaa, 0xbb, 0xcc };
+    const scid_bytes = [_]u8{ 0xdd, 0xee };
+    const h = header.Initial{
+        .version = QUIC_V1,
+        .dcid = try header.ConnId.fromSlice(&dcid_bytes),
+        .scid = try header.ConnId.fromSlice(&scid_bytes),
+        .token = &.{},
+        .pn_length = .one,
+        .pn_truncated = 0,
+        .payload_length = 20,
+    };
     var buf: [64]u8 = undefined;
-    const dcid = [_]u8{ 0xaa, 0xbb, 0xcc };
-    const scid = [_]u8{ 0xdd, 0xee };
-    const tail = [_]u8{ 0x00, 0x00, 0x00 };
-    _ = longHeader(&buf, 0xc0, QUIC_V1, &dcid, &scid, &tail);
+    _ = try header.encode(&buf, .{ .initial = h });
 
-    // SCIDLEN sits at: 1 (first byte) + 4 (version) + 1 (DCIDLEN) + dcid.len.
-    const scid_len_offset: usize = 1 + 4 + 1 + dcid.len;
-    try std.testing.expectEqual(@as(u8, scid.len), buf[scid_len_offset]);
+    const scid_len_offset: usize = 1 + 4 + 1 + dcid_bytes.len;
+    try std.testing.expectEqual(@as(u8, scid_bytes.len), buf[scid_len_offset]);
 }
 
 test "MUST NOT accept a long header whose DCID Length exceeds the remaining buffer [RFC8999 §4.1 ¶1]" {
@@ -198,7 +227,7 @@ test "MUST mark a Version Negotiation packet with Version = 0x00000000 [RFC8999 
     // Tail = supported_versions list — single entry, v1, big-endian.
     var tail: [4]u8 = undefined;
     std.mem.writeInt(u32, tail[0..4], QUIC_V1, .big);
-    const len = longHeader(&buf, 0x80, 0x00000000, &dcid, &scid, &tail);
+    const len = rawLongHeaderInput(&buf, 0x80, 0x00000000, &dcid, &scid, &tail);
 
     const parsed = try header.parse(buf[0..len], 0);
 
@@ -216,7 +245,7 @@ test "MUST NOT accept a VN packet with an empty Supported Versions list [RFC8999
     const dcid = [_]u8{0xaa};
     const scid = [_]u8{0xbb};
     // No tail — versions_bytes will be zero-length.
-    const len = longHeader(&buf, 0x80, 0x00000000, &dcid, &scid, &[_]u8{});
+    const len = rawLongHeaderInput(&buf, 0x80, 0x00000000, &dcid, &scid, &[_]u8{});
 
     try std.testing.expectError(
         error.InvalidVersionNegotiation,
@@ -230,7 +259,7 @@ test "MUST NOT accept a VN packet whose Supported Versions length is not a multi
     const scid = [_]u8{0xbb};
     // 5 trailing bytes — not a multiple of 4.
     const tail = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0xff };
-    const len = longHeader(&buf, 0x80, 0x00000000, &dcid, &scid, &tail);
+    const len = rawLongHeaderInput(&buf, 0x80, 0x00000000, &dcid, &scid, &tail);
 
     try std.testing.expectError(
         error.InvalidVersionNegotiation,

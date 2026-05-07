@@ -37,6 +37,7 @@ const flow_control_mod = @import("flow_control.zig");
 const event_queue_mod = @import("event_queue.zig");
 const pending_frames_mod = @import("pending_frames.zig");
 const lifecycle_mod = @import("lifecycle.zig");
+const stateless_reset_mod = @import("stateless_reset.zig");
 
 /// Encryption level (Initial / Handshake / 0-RTT / 1-RTT) — RFC 9001 §2.1.
 pub const EncryptionLevel = level_mod.EncryptionLevel;
@@ -7039,7 +7040,10 @@ pub const Connection = struct {
         // RFC 9000 §10.3 — stateless reset tokens MUST be compared in
         // constant time. A peer that observes timing differences across
         // mismatching prefixes can incrementally guess valid tokens.
-        return std.crypto.timing_safe.eql([16]u8, a, b);
+        // Routes through `stateless_reset.eql` so the conformance
+        // suite can verify the property against the same code path
+        // production callers exercise.
+        return stateless_reset_mod.eql(a, b);
     }
 
     fn statelessResetTokenFromDatagram(bytes: []const u8) ?[16]u8 {
