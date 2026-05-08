@@ -4964,6 +4964,178 @@ test "migration callback: setMigrationCallback installs and clears the hook" {
     try std.testing.expect(conn.migration_user_data == null);
 }
 
+test "client active migration: rotates DCID, queues PATH_CHALLENGE, snapshots rollback" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // The migration gate enforces handshakeDone() before honoring an
+    // active migration request; flip the test-only override since we
+    // aren't driving a real TLS handshake here.
+    conn.test_only_force_handshake_for_migration = true;
+
+    try conn.setLocalScid(&.{0xa0});
+    try conn.setPeerDcid(&.{0xb0});
+    const server_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) };
+    const old_local = Address{ .bytes = .{ 1, 2, 3, 4 } ++ @as([18]u8, @splat(0)) };
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(server_addr);
+    path.setLocalAddress(old_local);
+    path.path.markValidated();
+    path.path.bytes_received = 12_345;
+    path.path.bytes_sent = 6_789;
+
+    // Need at least one peer-issued CID beyond the current one so the
+    // §5.1.2 ¶1 rotation step can succeed.
+    const fresh_cid = ConnectionId.fromSlice(&.{0xc1});
+    try conn.registerPeerCidForTesting(1, 0, fresh_cid, @splat(0));
+
+    try conn.beginClientActiveMigration(new_local, 1_000_000);
+
+    // DCID rotated to the fresh peer-issued CID.
+    try std.testing.expect(ConnectionId.eql(fresh_cid, path.path.peer_cid));
+    try std.testing.expect(ConnectionId.eql(fresh_cid, conn.peer_dcid));
+    try std.testing.expect(conn.peer_dcid_set);
+
+    // PATH_CHALLENGE queued on the active path; validator armed.
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expectEqual(@as(u32, 0), conn.pending_frames.path_challenge_path_id);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+    try std.testing.expectEqual(@as(?u64, 1_000_000), path.path.last_path_challenge_at_us);
+
+    // Local address bookkeeping updated; peer address untouched.
+    try std.testing.expect(Address.eql(new_local, path.path.local_addr));
+    try std.testing.expect(Address.eql(server_addr, path.path.peer_addr));
+
+    // Rollback snapshot retained so a validation timeout can revert.
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expect(path.migration_rollback != null);
+
+    // Counters NOT zeroed (anti-amp doesn't apply when only the local
+    // address changed and the peer was already validated). The path
+    // remains validated for outbound bytes; only the validator state
+    // tracks PATH_CHALLENGE in flight.
+    try std.testing.expectEqual(@as(u64, 12_345), path.path.bytes_received);
+    try std.testing.expectEqual(@as(u64, 6_789), path.path.bytes_sent);
+    try std.testing.expect(path.path.isValidated());
+}
+
+test "client active migration: refuses without a fresh peer CID" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.test_only_force_handshake_for_migration = true;
+    try conn.setLocalScid(&.{0xa0});
+    try conn.setPeerDcid(&.{0xb0});
+    // peer_dcid is registered as sequence 0; consumeFreshPeerCidForMigration
+    // skips the current cid, leaving no candidate.
+
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    try std.testing.expectError(
+        error.PathLimitExceeded,
+        conn.beginClientActiveMigration(new_local, 1_000_000),
+    );
+
+    // Nothing was mutated.
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+    try std.testing.expect(!conn.primaryPath().pending_migration_reset);
+    try std.testing.expect(conn.primaryPath().migration_rollback == null);
+
+    // qlog: migration_path_failed / no_fresh_peer_cid.
+    try std.testing.expect(recorder.contains(.migration_path_failed));
+    const evt = recorder.first(.migration_path_failed).?;
+    try std.testing.expectEqual(
+        @as(?QlogMigrationFailReason, .no_fresh_peer_cid),
+        evt.migration_fail_reason,
+    );
+}
+
+test "client active migration: refuses before handshake completion" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Note: NOT setting test_only_force_handshake_for_migration; the
+    // gate is what we're testing. handshakeDone() returns false on a
+    // freshly-initialized client.
+    try std.testing.expect(!conn.handshakeDone());
+
+    try conn.setLocalScid(&.{0xa0});
+    try conn.setPeerDcid(&.{0xb0});
+    const fresh_cid = ConnectionId.fromSlice(&.{0xc1});
+    try conn.registerPeerCidForTesting(1, 0, fresh_cid, @splat(0));
+
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    try std.testing.expectError(
+        error.PathLimitExceeded,
+        conn.beginClientActiveMigration(new_local, 1_000_000),
+    );
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+}
+
+test "client active migration: server-role connection is rejected" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    try std.testing.expectError(
+        error.NotClientContext,
+        conn.beginClientActiveMigration(new_local, 1_000_000),
+    );
+}
+
+test "client active migration: PATH_RESPONSE clears migration state and resets recovery" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.test_only_force_handshake_for_migration = true;
+    try conn.setLocalScid(&.{0xa0});
+    try conn.setPeerDcid(&.{0xb0});
+
+    const path = conn.primaryPath();
+    path.setPeerAddress(.{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) });
+    path.path.markValidated();
+    path.path.rtt.smoothed_rtt_us = 50_000;
+    path.path.cc.cwnd = 30_000;
+
+    const fresh_cid = ConnectionId.fromSlice(&.{0xc2});
+    try conn.registerPeerCidForTesting(1, 0, fresh_cid, @splat(0));
+
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    try conn.beginClientActiveMigration(new_local, 1_000_000);
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+
+    conn.recordPathResponse(0, path.path.validator.pending_token);
+
+    try std.testing.expect(!path.pending_migration_reset);
+    try std.testing.expect(path.migration_rollback == null);
+    try std.testing.expect(path.path.validator.isValidated());
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+    // RFC 9000 §9.4: RTT and CC reset to initial values after a
+    // successful migration.
+    try std.testing.expectEqual(rtt_mod.initial_rtt_us, path.path.rtt.smoothed_rtt_us);
+    const expected_cwnd = (congestion_mod.Config{ .max_datagram_size = default_mtu }).initialWindow();
+    try std.testing.expectEqual(expected_cwnd, path.path.cc.cwnd);
+}
+
 // -- Connection-level fuzz harnesses (hardening guide §11.1 #8 / #9 / #20) ----
 //
 // These sit one layer above the per-buffer fuzz harnesses landed in

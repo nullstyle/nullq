@@ -4266,6 +4266,133 @@ pub const Connection = struct {
         return null;
     }
 
+    /// Begin a client-initiated active connection migration to a new
+    /// local 4-tuple (RFC 9000 §9.2). Composes the existing migration
+    /// primitives — `consumeFreshPeerCidForMigration`,
+    /// `PathState.beginMigration`, `queuePathChallengeOnPath` — but
+    /// for the **client-side** case where the local endpoint chose
+    /// to move rather than reacting to a peer-initiated address change.
+    ///
+    /// Preconditions:
+    ///   - This is a client connection (`role == .client`).
+    ///   - Handshake is complete (RFC 9000 §9.6: migration is forbidden
+    ///     before handshake confirmation).
+    ///   - No migration is currently pending (PATH_CHALLENGE outstanding
+    ///     on the active path).
+    ///   - At least one peer-issued CID is available beyond the current
+    ///     one (so RFC 9000 §5.1.2 ¶1's CID-rotation requirement can
+    ///     be satisfied).
+    ///
+    /// Effect:
+    ///   - Snapshots current path state into `migration_rollback` so
+    ///     the path can revert if PATH_CHALLENGE times out.
+    ///   - Rotates the active path's `peer_cid` to a fresh peer-issued
+    ///     CID; updates `peer_dcid` to match (long-header packets
+    ///     during the validation window pick up the new SCID).
+    ///   - Updates the active path's `local_addr` to `new_local_addr`
+    ///     (informational on the embedder side; nothing in the core
+    ///     routes by local_addr).
+    ///   - Resets the path's anti-amp counters and validation state so
+    ///     unvalidated bytes are re-budgeted against the 3x cap.
+    ///   - Generates a fresh PATH_CHALLENGE token, arms the validator,
+    ///     and queues PATH_CHALLENGE for the next `poll`.
+    ///
+    /// The embedder is responsible for binding a new local UDP socket
+    /// (which provides `new_local_addr`) and routing all subsequent
+    /// outbound datagrams through it. The new local SCID is **not**
+    /// minted here — peers route inbound by DCID and the path's
+    /// existing `local_cid` continues to work; embedders that want a
+    /// fresh local SCID on the wire (RFC 9000 §5.1.2 ¶1 from our side)
+    /// should call `queueNewConnectionId` ahead of this and then drive
+    /// the peer through normal CID retirement/promotion.
+    ///
+    /// Returns `MigrationRefused` (encoded as `PathLimitExceeded` —
+    /// the closest existing variant for "I would migrate but can't")
+    /// when the precondition checks fail or no fresh peer CID is
+    /// available. The caller can retry once the peer has issued more
+    /// CIDs via NEW_CONNECTION_ID.
+    pub fn beginClientActiveMigration(
+        self: *Connection,
+        new_local_addr: Address,
+        now_us: u64,
+    ) Error!void {
+        if (self.role != .client) return Error.NotClientContext;
+        const handshake_complete = self.handshakeDone() or self.test_only_force_handshake_for_migration;
+        if (!handshake_complete) {
+            // Mirror the diagnostic the peer-driven gate emits: §9.6
+            // forbids migration before handshake confirmation. Even
+            // though this is a local trigger rather than a peer event,
+            // the wire effect is the same — we'd be sending PATH_CHALLENGE
+            // off an unauthenticated path.
+            self.emitQlog(.{
+                .name = .migration_path_failed,
+                .path_id = self.activePath().id,
+                .migration_fail_reason = .pre_handshake,
+            });
+            return Error.PathLimitExceeded;
+        }
+        const path = self.activePath();
+        if (path.path.validator.status == .pending) {
+            return Error.PathLimitExceeded;
+        }
+        const fresh_cid = self.consumeFreshPeerCidForMigration(path) orelse {
+            self.emitQlog(.{
+                .name = .migration_path_failed,
+                .path_id = path.id,
+                .migration_fail_reason = .no_fresh_peer_cid,
+            });
+            return Error.PathLimitExceeded;
+        };
+
+        // Snapshot rollback state before any mutation so a
+        // validation timeout can revert peer_cid / peer_dcid /
+        // local_addr cleanly.
+        if (path.migration_rollback == null) {
+            path.migration_rollback = .{
+                .peer_addr = path.path.peer_addr,
+                .peer_addr_set = path.peer_addr_set,
+                .validated = path.path.isValidated(),
+                .bytes_received = path.path.bytes_received,
+                .bytes_sent = path.path.bytes_sent,
+                .state = path.path.state,
+            };
+        }
+
+        // Rotate to the fresh peer CID per RFC 9000 §5.1.2 ¶1. The
+        // first short header we emit after this call carries the new
+        // DCID, which is exactly what the runner's connectionmigration
+        // check looks for in the client pcap.
+        path.path.peer_cid = fresh_cid;
+        if (path.id == 0) {
+            self.peer_dcid = fresh_cid;
+            self.peer_dcid_set = true;
+        }
+
+        // Update local address bookkeeping. We deliberately do NOT
+        // zero `bytes_received` / `bytes_sent` or flip `validated` to
+        // false (the way `beginMigration` does for peer-initiated
+        // migration). Rationale: §8.1 anti-amp protects an endpoint
+        // from sending to an unverified peer. The client's peer (the
+        // server) hasn't moved — only the client's own local address
+        // changed — so anti-amp is irrelevant here. Resetting the
+        // counters would clamp the next `poll`'s `max_payload` to 0
+        // and stall the transfer until PATH_RESPONSE returned, which
+        // is the wrong constraint to apply to client-initiated
+        // migration.
+        //
+        // The path validator still tracks PATH_CHALLENGE in flight so
+        // the embedder can observe migration progress; failure rolls
+        // back peer_cid via the rollback snapshot above.
+        path.setLocalAddress(new_local_addr);
+        path.pending_migration_reset = true;
+
+        const token = try self.newPathChallengeToken();
+        const timeout_us = saturatingMul(self.ptoDurationForApplicationPath(path), 3);
+        path.path.validator.beginChallenge(token, now_us, timeout_us);
+        path.path.last_path_challenge_at_us = now_us;
+        self.queuePathChallengeOnPath(path.id, token);
+    }
+
     pub fn recordAuthenticatedDatagramAddress(
         self: *Connection,
         path_id: u32,

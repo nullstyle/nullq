@@ -117,6 +117,18 @@ const ClientConnectionOptions = struct {
     /// embedder needs to *initiate* the update — there's no peer-side
     /// signal that triggers one. Set true for `TESTCASE=keyupdate`.
     request_key_update: bool = false,
+    /// Trigger one client-initiated active connection migration
+    /// (RFC 9000 §9.2) mid-transfer. The runner's `connectionmigration`
+    /// testcase tells the client `TESTCASE=transfer` (the migration
+    /// is meant to be transparent to the application) and discriminates
+    /// the test by its server hostname `server46`. The embedder
+    /// detects that hostname and sets this flag; `runClientConnection`
+    /// binds a fresh local UDP socket on a kernel-chosen ephemeral
+    /// port and calls `Connection.beginClientActiveMigration` once
+    /// the handshake has completed and at least one 1-RTT datagram
+    /// has flowed. Subsequent `poll` output and inbound recvs are
+    /// routed via the new socket.
+    request_active_migration: bool = false,
 };
 
 var keylog_io: ?std.Io = null;
@@ -825,6 +837,14 @@ fn runClient(
     defer new_tokens.deinit();
 
     const request_key_update = std.mem.eql(u8, opts.testcase, "keyupdate");
+    // The runner's `connectionmigration` testcase doesn't surface as
+    // a TESTCASE value on the client side (it sets `TESTCASE=transfer`).
+    // Instead the runner discriminates by giving the client a
+    // dual-stack hostname `server46:443`; transparent transfer tests
+    // use `server4` or `server6`. When we see `server46` in either
+    // the SERVER address or the SERVER_NAME env var, we know the
+    // client is expected to perform an active migration mid-transfer.
+    const request_active_migration = clientShouldActivelyMigrate(opts);
 
     switch (mode) {
         .normal => try runClientConnection(
@@ -839,6 +859,7 @@ fn runClient(
                 .qlog_sink = if (qlog_sink) |*sink| sink else null,
                 .new_token_store = &new_tokens,
                 .request_key_update = request_key_update,
+                .request_active_migration = request_active_migration,
             },
         ),
         .resumption, .zerortt => {
@@ -890,6 +911,18 @@ fn clientMode(testcase: []const u8) ClientMode {
     return .normal;
 }
 
+/// Decide whether this client run should perform a client-initiated
+/// active migration. The runner identifies the connectionmigration
+/// testcase by its dual-stack server hostname `server46`; we check
+/// either field in case the runner ever passes the hostname through
+/// just one of them. The TESTCASE env var is unreliable here because
+/// `TestCaseConnectionMigration.testname(CLIENT)` returns "transfer".
+fn clientShouldActivelyMigrate(opts: ClientOptions) bool {
+    if (std.mem.indexOf(u8, opts.server, "server46") != null) return true;
+    if (std.mem.indexOf(u8, opts.server_name, "server46") != null) return true;
+    return false;
+}
+
 fn qnsNowUs(io: std.Io, start: std.Io.Timestamp) u64 {
     const now = std.Io.Timestamp.now(io, .awake);
     const delta = start.durationTo(now).toMicroseconds();
@@ -912,11 +945,12 @@ fn runClientConnection(
         .ip4 => .{ .ip4 = Net.Ip4Address.unspecified(0) },
         .ip6 => .{ .ip6 = Net.Ip6Address.unspecified(0) },
     };
-    const sock = try Net.IpAddress.bind(&bind_addr, io, .{
+    var sock = try Net.IpAddress.bind(&bind_addr, io, .{
         .mode = .dgram,
         .protocol = .udp,
     });
-    defer sock.close(io);
+    var sock_owned = true;
+    defer if (sock_owned) sock.close(io);
 
     // Same rationale as runServer: grow OS buffers so bursty
     // server responses (e.g. the multiplexing test's 1999
@@ -972,6 +1006,19 @@ fn runClientConnection(
     var tx: [endpoint_udp_payload_size]u8 = undefined;
     var key_update_done = !conn_opts.request_key_update;
 
+    // Active migration plumbing: when `request_active_migration` is
+    // set, the loop binds a fresh local socket once a few 1-RTT
+    // datagrams have flowed and calls `Connection.beginClientActiveMigration`.
+    // Outbound is then routed via the new socket. The old socket is
+    // kept readable for an extra grace window so in-flight server
+    // datagrams already addressed to the old port aren't lost while
+    // the server's own migration handler swings to our new tuple.
+    var migration_pending = conn_opts.request_active_migration;
+    var datagrams_sent_since_handshake: u32 = 0;
+    var old_sock: ?Net.Socket = null;
+    var old_sock_close_deadline_us: ?u64 = null;
+    defer if (old_sock) |*s| s.close(io);
+
     while ((!allDownloadsComplete(downloads) or !ticketRequirementMet(conn_opts.wait_for_ticket)) and !conn.isClosed()) {
         var now_us = qnsNowUs(io, start);
         var progressed = false;
@@ -990,6 +1037,32 @@ fn runClientConnection(
         if (maybe_msg) |msg| {
             try conn.handle(msg.data, null, now_us);
             progressed = true;
+        }
+
+        // Drain any in-flight datagrams the server already addressed
+        // to our pre-migration socket. Closed below once the grace
+        // window passes.
+        if (old_sock) |*old| {
+            const maybe_old_msg = old.receiveTimeout(io, &rx, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(0),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => null,
+                else => null,
+            };
+            if (maybe_old_msg) |msg| {
+                try conn.handle(msg.data, null, qnsNowUs(io, start));
+                progressed = true;
+            }
+            if (old_sock_close_deadline_us) |deadline| {
+                if (now_us >= deadline) {
+                    old.close(io);
+                    old_sock = null;
+                    old_sock_close_deadline_us = null;
+                }
+            }
         }
 
         if (conn.handshakeDone() and !requests_enabled) {
@@ -1025,8 +1098,48 @@ fn runClientConnection(
             progressed = true;
         }
 
+        // RFC 9000 §9.2 client-initiated active migration. Trigger
+        // exactly once after the handshake is confirmed and a few
+        // 1-RTT datagrams have flowed (i.e. there's an actual transfer
+        // in progress for the runner's pcap to capture). We bind a
+        // fresh socket on a kernel-chosen ephemeral port; nullq core
+        // rotates the peer DCID and queues a PATH_CHALLENGE on the
+        // active path. Subsequent `poll` output and inbound recvs
+        // route through the new socket.
+        if (migration_pending and conn.handshakeDone() and datagrams_sent_since_handshake >= 8) migrate: {
+            const new_sock = Net.IpAddress.bind(&bind_addr, io, .{
+                .mode = .dgram,
+                .protocol = .udp,
+            }) catch |err| {
+                std.debug.print("active migration: bind failed ({s}); skipping\n", .{@errorName(err)});
+                migration_pending = false;
+                break :migrate;
+            };
+            tuneServerSocket(new_sock.handle);
+            const new_local_addr = sockaddrFromHandle(new_sock.handle);
+            conn.beginClientActiveMigration(new_local_addr, now_us) catch |err| {
+                std.debug.print("active migration: core refused ({s}); keeping original socket\n", .{@errorName(err)});
+                new_sock.close(io);
+                migration_pending = false;
+                break :migrate;
+            };
+            std.debug.print("nullq qns client active migration to fresh local socket\n", .{});
+            old_sock = sock;
+            // Hold the old socket readable for ~500 ms so server
+            // packets already in-flight to the old port still feed
+            // back into Connection.handle. Beyond that, the server's
+            // own migration handler will be sending exclusively to
+            // the new tuple.
+            old_sock_close_deadline_us = now_us +| 500_000;
+            sock = new_sock;
+            sock_owned = true;
+            migration_pending = false;
+            progressed = true;
+        }
+
         while (try conn.poll(&tx, now_us)) |n| {
             try sock.send(io, &server_addr, tx[0..n]);
+            if (conn.handshakeDone()) datagrams_sent_since_handshake +|= 1;
             progressed = true;
         }
         try conn.tick(now_us);
@@ -1335,6 +1448,26 @@ fn netAddressEql(a: Net.IpAddress, b: Net.IpAddress) bool {
             else => false,
         },
     };
+}
+
+fn sockaddrFromHandle(handle: std.posix.socket_t) nullq.conn.path.Address {
+    var sa: std.posix.sockaddr.storage = undefined;
+    var sa_len: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
+    if (std.c.getsockname(handle, @ptrCast(&sa), &sa_len) != 0) return .{};
+    var out: nullq.conn.path.Address = .{};
+    if (sa.family == std.posix.AF.INET) {
+        const v4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&sa));
+        out.bytes[0] = 4;
+        const ip_bytes: [4]u8 = @bitCast(v4.addr);
+        @memcpy(out.bytes[1..5], &ip_bytes);
+        std.mem.writeInt(u16, out.bytes[5..7], std.mem.bigToNative(u16, v4.port), .big);
+    } else if (sa.family == std.posix.AF.INET6) {
+        const v6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&sa));
+        out.bytes[0] = 6;
+        @memcpy(out.bytes[1..17], &v6.addr);
+        std.mem.writeInt(u16, out.bytes[17..19], std.mem.bigToNative(u16, v6.port), .big);
+    }
+    return out;
 }
 
 fn netAddressToPathAddress(addr: Net.IpAddress) nullq.conn.path.Address {
