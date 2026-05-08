@@ -1138,7 +1138,23 @@ fn runClientConnection(
         }
 
         while (try conn.poll(&tx, now_us)) |n| {
-            try sock.send(io, &server_addr, tx[0..n]);
+            const first_byte: u8 = if (n > 0) tx[0] else 0;
+            const long = (first_byte & 0x80) != 0;
+            const long_type: u2 = @intCast((first_byte >> 4) & 0x03);
+            const tag: []const u8 = if (!long) "1RTT" else switch (long_type) {
+                0 => "Init",
+                1 => "0RTT",
+                2 => "Hsk ",
+                3 => "Retr",
+            };
+            std.debug.print(
+                "[diag-send] t={d}us len={d} {s} b0=0x{x:0>2}\n",
+                .{ now_us, n, tag, first_byte },
+            );
+            sock.send(io, &server_addr, tx[0..n]) catch |err| {
+                std.debug.print("[diag-send] FAILED err={s}\n", .{@errorName(err)});
+                return err;
+            };
             if (conn.handshakeDone()) datagrams_sent_since_handshake +|= 1;
             progressed = true;
         }

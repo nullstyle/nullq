@@ -3939,9 +3939,36 @@ pub const Connection = struct {
             return;
         }
         try self.installPeerTransportStatelessResetToken();
+        try self.installPreferredAddressConnectionId();
         self.validatePeerTransportConnectionIds();
         // Successfully accepted — fire `parameters_set` once.
         self.emitPeerParametersSet();
+    }
+
+    /// RFC 9000 §5.1.1 / §18.2: a server's `preferred_address` transport
+    /// parameter carries a `connection_id` field that the client SHOULD
+    /// register as if it had arrived in a NEW_CONNECTION_ID frame with
+    /// sequence number 1. Some servers (notably ngtcp2) only ever
+    /// advertise CIDs through this channel — they never proactively
+    /// emit a NEW_CONNECTION_ID frame after the handshake, so missing
+    /// this registration leaves the client with exactly one peer CID
+    /// (the initial DCID) and a client-initiated active migration
+    /// fails to satisfy the §5.1.2 ¶1 rotation requirement.
+    ///
+    /// Server-only operation: clients are forbidden from sending
+    /// `preferred_address`; that's enforced upstream in
+    /// `validatePeerTransportRole`.
+    fn installPreferredAddressConnectionId(self: *Connection) Error!void {
+        if (self.role != .client) return;
+        const params = self.cached_peer_transport_params orelse return;
+        const pref = params.preferred_address orelse return;
+        if (pref.connection_id.len == 0) return;
+        // Idempotent: skip if the CID is already registered (e.g. a
+        // peer that also sends NEW_CONNECTION_ID for the same value).
+        for (self.peer_cids.items) |item| {
+            if (ConnectionId.eql(item.cid, pref.connection_id)) return;
+        }
+        try self.registerPeerCid(0, 1, 0, pref.connection_id, pref.stateless_reset_token);
     }
 
     pub fn validatePeerTransportLimits(self: *Connection) void {
