@@ -111,6 +111,12 @@ const ClientConnectionOptions = struct {
     /// in `resumption` / `zerortt` testcases skip the server's Retry
     /// round-trip when the peer issues NEW_TOKENs.
     initial_token: ?[]const u8 = null,
+    /// Drive a single application-key update mid-connection (RFC 9001
+    /// §6). The runner's `keyupdate` testcase observes the wire and
+    /// expects both endpoints to send packets at `key_phase=1`; the
+    /// embedder needs to *initiate* the update — there's no peer-side
+    /// signal that triggers one. Set true for `TESTCASE=keyupdate`.
+    request_key_update: bool = false,
 };
 
 var keylog_io: ?std.Io = null;
@@ -818,6 +824,8 @@ fn runClient(
     var new_tokens = NewTokenStore.init(allocator);
     defer new_tokens.deinit();
 
+    const request_key_update = std.mem.eql(u8, opts.testcase, "keyupdate");
+
     switch (mode) {
         .normal => try runClientConnection(
             allocator,
@@ -830,6 +838,7 @@ fn runClient(
             .{
                 .qlog_sink = if (qlog_sink) |*sink| sink else null,
                 .new_token_store = &new_tokens,
+                .request_key_update = request_key_update,
             },
         ),
         .resumption, .zerortt => {
@@ -961,6 +970,7 @@ fn runClientConnection(
     var last_progress_us = qnsNowUs(io, start);
     var rx: [64 * 1024]u8 = undefined;
     var tx: [endpoint_udp_payload_size]u8 = undefined;
+    var key_update_done = !conn_opts.request_key_update;
 
     while ((!allDownloadsComplete(downloads) or !ticketRequirementMet(conn_opts.wait_for_ticket)) and !conn.isClosed()) {
         var now_us = qnsNowUs(io, start);
@@ -990,6 +1000,25 @@ fn runClientConnection(
             if (try startClientRequests(allocator, &conn, downloads)) progressed = true;
             if (try drainClientResponses(allocator, &conn, downloads)) progressed = true;
             try writeCompletedDownloads(io, downloads_dir, downloads);
+        }
+
+        // RFC 9001 §6 application key update for the `keyupdate` testcase.
+        // Fire as soon as the handshake completes so all subsequent stream
+        // traffic rides key_phase=1 — the runner counts packets per phase
+        // and needs many on phase=1 from both sides to pass.
+        // `requestKeyUpdate` returns `KeyUpdateBlocked` if the prior update
+        // is still pending ack or the cooldown hasn't elapsed; treat that
+        // as "try again next tick" rather than fatal.
+        if (!key_update_done and conn.handshakeDone()) {
+            conn.requestKeyUpdate(now_us) catch |err| switch (err) {
+                error.KeyUpdateBlocked => {},
+                else => return err,
+            };
+            if (conn.keyUpdateStatus().write_key_phase) {
+                key_update_done = true;
+                std.debug.print("nullq qns client initiated key update\n", .{});
+                progressed = true;
+            }
         }
         if (!had_ticket and ticketRequirementMet(conn_opts.wait_for_ticket)) {
             std.debug.print("captured session ticket\n", .{});
