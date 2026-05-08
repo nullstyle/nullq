@@ -14,7 +14,7 @@
 //! socket setup for exactly this reason.
 //!
 //! This module provides small, platform-aware wrappers around
-//! `setsockopt` so any consumer of the nullq library — the QNS
+//! `setsockopt` so any consumer of the quic_zig library — the QNS
 //! endpoint, an embedded server, a load tester — can tune a freshly
 //! bound socket the same way.
 //!
@@ -161,7 +161,7 @@ fn setBufferImpl(handle: Handle, bytes: usize, dir: BufferDirection) SetBufferEr
     };
 }
 
-/// Apply nullq's recommended server-side tuning to a freshly bound
+/// Apply quic_zig's recommended server-side tuning to a freshly bound
 /// UDP socket. This is the one-shot helper an embedder calls right
 /// after `Net.IpAddress.bind`. Failures from the underlying
 /// `setsockopt` calls are returned so the caller can decide

@@ -2,7 +2,7 @@
 //!
 //! These invariants outlive any single QUIC version: a v1 endpoint and
 //! a hypothetical v3 endpoint that disagree on everything else still
-//! agree on these few framing rules. nullq's wire layer
+//! agree on these few framing rules. quic_zig's wire layer
 //! (`src/wire/header.zig`) implements them; this suite is the
 //! auditor-facing record.
 //!
@@ -31,8 +31,8 @@
 //!   none — every RFC 8999 invariant relevant to a v1 endpoint is exercised here.
 
 const std = @import("std");
-const nullq = @import("nullq");
-const wire = nullq.wire;
+const quic_zig = @import("quic_zig");
+const wire = quic_zig.wire;
 const header = wire.header;
 
 /// QUIC v1 wire-format version, per RFC 9000 §15. Used to construct
@@ -43,7 +43,7 @@ const QUIC_V1: u32 = 0x00000001;
 /// Build raw long-header BYTES for parser-negative tests. This helper
 /// is **deliberately not** an oracle for the encode side — the
 /// encode-side §4 / §4.1 tests round-trip through `header.encode` to
-/// exercise nullq's encoder, not this fixture.
+/// exercise quic_zig's encoder, not this fixture.
 ///
 /// Use exclusively to feed `header.parse` with malformed-or-edge byte
 /// sequences (truncated CID-length, version=0, etc.); the conformance
@@ -94,7 +94,7 @@ test "MUST identify a long-header packet by the high bit of the first byte being
 }
 
 test "MUST encode the QUIC Version as a 4-byte big-endian field at offset 1 [RFC8999 §4 ¶3]" {
-    // Drive nullq's encoder (`header.encode`) with a non-v1 sentinel
+    // Drive quic_zig's encoder (`header.encode`) with a non-v1 sentinel
     // and verify the on-wire layout: bytes [1..5] are the version,
     // big-endian. This is the encode-side test for §4 ¶3 — the parser
     // round-trip is implicit in every other test that calls
@@ -118,7 +118,7 @@ test "MUST encode the QUIC Version as a 4-byte big-endian field at offset 1 [RFC
 }
 
 test "MUST place the DCID Length octet immediately after the Version field [RFC8999 §4.1 ¶1]" {
-    // Encode-side: nullq's `header.encode` MUST place a single
+    // Encode-side: quic_zig's `header.encode` MUST place a single
     // unsigned 8-bit DCIDLEN at byte 5, immediately after the
     // 4-byte Version field. RFC 8999 §4.1 ¶1.
     const dcid_bytes = [_]u8{ 0xaa, 0xbb, 0xcc };
@@ -138,7 +138,7 @@ test "MUST place the DCID Length octet immediately after the Version field [RFC8
 }
 
 test "MUST place the SCID Length octet immediately after DCID [RFC8999 §4.1 ¶2]" {
-    // Encode-side: nullq's `header.encode` MUST place an unsigned
+    // Encode-side: quic_zig's `header.encode` MUST place an unsigned
     // 8-bit SCIDLEN at offset 1 + 4 + 1 + dcid.len (right after the
     // last DCID byte). RFC 8999 §4.1 ¶2.
     const dcid_bytes = [_]u8{ 0xaa, 0xbb, 0xcc };
@@ -293,7 +293,7 @@ test "NORMATIVE round-trip the unused first-byte bits of a Version Negotiation p
 test "MUST list at least one supported version in an emitted VN packet [RFC8999 §6 ¶3]" {
     // Symmetric encode-side check: the encoder rejects an empty
     // supported_versions list, ensuring an RFC 8999 §6 ¶3-conformant
-    // VN never leaves nullq.
+    // VN never leaves quic_zig.
     var buf: [16]u8 = undefined;
     const vn = header.VersionNegotiation{
         .dcid = try header.ConnId.fromSlice(&[_]u8{0xaa}),

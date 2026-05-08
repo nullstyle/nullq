@@ -20,7 +20,7 @@ const path_mod = @import("../conn/path.zig");
 /// just to construct a CID.
 pub const ConnectionId = path_mod.ConnectionId;
 
-/// Multipath QUIC draft version targeted by nullq's public API.
+/// Multipath QUIC draft version targeted by quic_zig's public API.
 pub const multipath_draft_version: u32 = 21;
 
 /// IANA Transport Parameter Registry — RFC 9000 §18.2 + RFC 9221.

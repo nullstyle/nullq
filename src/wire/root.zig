@@ -1,4 +1,4 @@
-//! nullq.wire — pure-Zig encoders and decoders for the QUIC wire format.
+//! quic_zig.wire — pure-Zig encoders and decoders for the QUIC wire format.
 //!
 //! Everything here is byte-slice in / byte-slice out and free of
 //! BoringSSL, I/O, or allocator dependencies. The few crypto-touching

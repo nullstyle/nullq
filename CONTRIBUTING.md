@@ -1,10 +1,10 @@
-# Contributing to nullq
+# Contributing to quic-zig
 
-Thanks for your interest in nullq.
+Thanks for your interest in quic-zig.
 
 ## Project status
 
-nullq is **pre-1.0**. It currently completes QUIC v1 handshakes and
+quic-zig is **pre-1.0**. It currently completes QUIC v1 handshakes and
 passes the official QUIC interop runner against `quic-go`, `quiche`,
 and `ngtcp2` for the handshake and transfer matrix, but the public
 API may still churn. Treat 0.x releases as potentially breaking.
@@ -15,7 +15,7 @@ the current external interop matrix.
 
 ## Building
 
-nullq pins its toolchain via [`mise`](https://mise.jdx.dev/). The
+quic-zig pins its toolchain via [`mise`](https://mise.jdx.dev/). The
 project file at [`mise.toml`](mise.toml) installs Zig 0.16.0,
 Python 3.12, `uv`, and `just`.
 
@@ -25,7 +25,7 @@ zig build
 ```
 
 `zig build` produces `qns-endpoint` (the QUIC interop-runner binary)
-and `nullq-external-interop` (the interop gate wrapper).
+and `quic-zig-external-interop` (the interop gate wrapper).
 
 ## Tests
 
@@ -42,10 +42,10 @@ reassembly.
 
 External interop runs the official
 [`quic-interop-runner`](https://github.com/quic-interop/quic-interop-runner)
-against the `nullq-qns` Docker image:
+against the `quic-zig-qns` Docker image:
 
 ```sh
-# Build the local Docker image (from sibling nullq-qns checkout):
+# Build the local Docker image (from sibling quic-zig-qns checkout):
 make build-local
 
 # Run the matrix (server role by default):

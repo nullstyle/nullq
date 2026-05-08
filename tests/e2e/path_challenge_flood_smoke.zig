@@ -39,7 +39,7 @@
 //! validator state machine into any state but `.idle`.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 const common = @import("common.zig");
 
@@ -51,12 +51,12 @@ const ClientScid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7 };
 const ServerScid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
 
 /// Drive a real Initial/Handshake/1-RTT exchange between two
-/// `nullq.Connection`s until both sides have application keys. Mirror
+/// `quic_zig.Connection`s until both sides have application keys. Mirror
 /// of the loop in `mock_transport_real_handshake.zig`. Returns the
 /// final `now_us` so the test body can keep monotonic time.
 fn driveHandshake(
-    client: *nullq.Connection,
-    server: *nullq.Connection,
+    client: *quic_zig.Connection,
+    server: *quic_zig.Connection,
     start_now_us: u64,
 ) !u64 {
     var buf_c2s: [2048]u8 = undefined;
@@ -87,8 +87,8 @@ fn buildPair(
     server_tls: *boringssl.tls.Context,
     client_tls: *boringssl.tls.Context,
 ) !struct {
-    client: *nullq.Connection,
-    server: *nullq.Connection,
+    client: *quic_zig.Connection,
+    server: *quic_zig.Connection,
 } {
     const protos = [_][]const u8{"hq-test"};
     server_tls.* = try boringssl.tls.Context.initServer(.{
@@ -106,14 +106,14 @@ fn buildPair(
         .alpn = &protos,
     });
 
-    const client = try allocator.create(nullq.Connection);
+    const client = try allocator.create(quic_zig.Connection);
     errdefer allocator.destroy(client);
-    client.* = try nullq.Connection.initClient(allocator, client_tls.*, "localhost");
+    client.* = try quic_zig.Connection.initClient(allocator, client_tls.*, "localhost");
     errdefer client.deinit();
 
-    const server = try allocator.create(nullq.Connection);
+    const server = try allocator.create(quic_zig.Connection);
     errdefer allocator.destroy(server);
-    server.* = try nullq.Connection.initServer(allocator, server_tls.*);
+    server.* = try quic_zig.Connection.initServer(allocator, server_tls.*);
     errdefer server.deinit();
 
     try client.bind();
@@ -124,7 +124,7 @@ fn buildPair(
     try client.setPeerDcid(&InitialDcid);
     try server.setLocalScid(&ServerScid);
 
-    const tp: nullq.tls.TransportParams = .{
+    const tp: quic_zig.tls.TransportParams = .{
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 1 << 18,
@@ -324,7 +324,7 @@ test "Stray PATH_RESPONSE absorbed without changing validator state (§4.8 / §1
     // the handshake. The test below asserts an unsolicited
     // PATH_RESPONSE leaves this status untouched.
     try std.testing.expectEqual(
-        nullq.conn.path_validator.Status.validated,
+        quic_zig.conn.path_validator.Status.validated,
         baseline_status,
     );
 

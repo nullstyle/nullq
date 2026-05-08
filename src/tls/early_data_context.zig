@@ -4,7 +4,7 @@
 //! tickets and compares it on resumption before accepting early data.
 //! The context must cover every transport or application setting that
 //! changes how 0-RTT bytes are interpreted. This module builds a stable
-//! SHA-256 digest from nullq's remembered transport parameters plus an
+//! SHA-256 digest from quic_zig's remembered transport parameters plus an
 //! opaque application context (for example HTTP/3 SETTINGS).
 
 const std = @import("std");
@@ -41,13 +41,13 @@ pub const Options = struct {
 pub const Error = boringssl.crypto.hash.Error;
 
 /// Build the SHA-256 0-RTT context digest for `opts`. The output is
-/// what nullq passes to `SSL_set_quic_early_data_context` so
+/// what quic_zig passes to `SSL_set_quic_early_data_context` so
 /// resumption only accepts early data when the same QUIC version,
 /// ALPN, replay-relevant transport params, and application context
 /// (e.g. HTTP/3 SETTINGS) are all in effect.
 pub fn build(opts: Options) Error!Digest {
     var h = try boringssl.crypto.hash.Sha256.init();
-    try h.update("nullq quic 0-rtt context v1");
+    try h.update("quic_zig quic 0-rtt context v1");
     try updateU32(&h, opts.quic_version);
     try updateBytes(&h, opts.alpn);
     try updateTransportParams(&h, opts.transport_params);

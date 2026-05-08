@@ -19,14 +19,14 @@
 //! to `tests/data/` cleanly.
 
 const std = @import("std");
-const nullq = @import("nullq");
-const wire = nullq.wire;
+const quic_zig = @import("quic_zig");
+const wire = quic_zig.wire;
 const long_packet = wire.long_packet;
 const initial = wire.initial;
 
 /// PROTOCOL_VIOLATION wire value (RFC 9000 §20.1). Asserted directly
 /// against close events so a conformance test ties the observed error
-/// code to the spec table, not to a private nullq constant.
+/// code to the spec table, not to a private quic_zig constant.
 pub const TRANSPORT_ERROR_PROTOCOL_VIOLATION: u64 = 0x0a;
 
 /// Test cert/key — same fixture used by tests/e2e/. Embedded here so
@@ -37,7 +37,7 @@ pub const test_key_pem = @embedFile("../data/test_key.pem");
 
 /// Server transport parameters used by every server-fixture test.
 /// Mirrors `tests/e2e/common.defaultParams()`.
-pub fn defaultParams() nullq.tls.TransportParams {
+pub fn defaultParams() quic_zig.tls.TransportParams {
     return .{
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = 1 << 20,
@@ -60,12 +60,12 @@ pub fn defaultParams() nullq.tls.TransportParams {
 /// same keys, so AEAD passes and the post-HP first byte is authentic.
 /// `pad_to` is forced to 1200 to clear the §14 size gate.
 pub fn feedAndExpectClose(
-    server: *nullq.Server,
+    server: *quic_zig.Server,
     dcid: []const u8,
     scid: []const u8,
     reserved_bits: u2,
     payload: []const u8,
-) !?nullq.CloseEvent {
+) !?quic_zig.CloseEvent {
     // Derive the client-side Initial AEAD keys from the DCID.
     const client_secret = try initial.deriveInitialKeys(dcid, false);
     const pkt_keys = try wire.short_packet.derivePacketKeys(.aes128_gcm_sha256, &client_secret.secret);
@@ -86,7 +86,7 @@ pub fn feedAndExpectClose(
 
     // Feed it. Use a stable address so the source-rate-limit gate
     // doesn't fire across consecutive tests in the same suite.
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0xfe) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0xfe) };
     _ = try server.feed(pkt[0..n], addr, 1_000);
 
     // The reserved-bits / forbidden-frame / DATAGRAM gates fire inside
@@ -106,7 +106,7 @@ pub fn feedAndExpectClose(
 /// tests that want a healthy-but-unvalidated server slot to inspect
 /// (e.g. the §8.1 anti-amp wire-cap test).
 pub fn feedInitial(
-    server: *nullq.Server,
+    server: *quic_zig.Server,
     dcid: []const u8,
     scid: []const u8,
     payload: []const u8,
@@ -125,15 +125,15 @@ pub fn feedInitial(
         .reserved_bits = 0,
     });
 
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0xfe) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0xfe) };
     _ = try server.feed(pkt[0..n], addr, 1_000);
 }
 
 /// Construct a fresh `Server` ready to receive Initials. The caller
 /// owns the returned value and `defer srv.deinit()`s it.
-pub fn buildServer() !nullq.Server {
+pub fn buildServer() !quic_zig.Server {
     const protos = [_][]const u8{"hq-test"};
-    return try nullq.Server.init(.{
+    return try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,

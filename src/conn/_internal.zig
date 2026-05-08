@@ -2,7 +2,7 @@
 //
 // **Not for embedders.** The leading underscore on the filename is a
 // convention signal: this module is internal to the conn/ subdirectory
-// and is not part of the nullq public API. Anything exported from here
+// and is not part of the quic_zig public API. Anything exported from here
 // may change in any release without notice.
 //
 // Entries belong here when:

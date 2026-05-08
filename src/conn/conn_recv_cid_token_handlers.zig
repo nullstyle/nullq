@@ -93,7 +93,7 @@ pub fn handleNewToken(self: *Connection, nt: frame_types.NewToken) void {
     }
     if (nt.token.len == 0) {
         // Zero-length NEW_TOKEN is FRAME_ENCODING_ERROR per
-        // §19.7. We could emit a more specific code; nullq
+        // §19.7. We could emit a more specific code; quic_zig
         // already wires PROTOCOL_VIOLATION for parse-shape
         // issues so reuse it.
         self.close(true, transport_error_frame_encoding, "zero-length new_token");

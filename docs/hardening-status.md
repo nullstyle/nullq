@@ -1,4 +1,4 @@
-# nullq hardening status against `hardening-guide.md`
+# quic-zig hardening status against `hardening-guide.md`
 
 Last refreshed: 2026-05-06.
 Scope: §3 (Zig), §4 (QUIC transport), §5 (TLS / 0-RTT), §8 (resource
@@ -50,7 +50,7 @@ The original 2026-05-06 audit body is preserved at
 ### §3.1 Build mode policy — COMPLETE
 
 `build.zig` carries the policy at the top of the file
-(`/Users/nullstyle/prj/ai-workspace/nullq/build.zig:1–23`): the default
+(`/Users/nullstyle/prj/ai-workspace/quic-zig/build.zig:1–23`): the default
 `-Doptimize=Debug` is fine for dev/test/interop, production /
 internet-facing builds MUST pass `-Doptimize=ReleaseSafe`, and
 `ReleaseFast` / `ReleaseSmall` are explicitly forbidden for the
@@ -167,7 +167,7 @@ client address / ODCID / Retry SCID, zero-padded to 68 bytes so every
 minted token is a uniformly random opaque blob — peers and on-path
 observers cannot infer when a token was issued or which fields it
 binds. Constant-time tag comparison via the AEAD; domain separator
-`"nullq retry token v2"`. Test `fuzz: retry_token validate never
+`"quic-zig retry token v2"`. Test `fuzz: retry_token validate never
 panics` in `src/conn/retry_token.zig:562`.
 `Server.applyRetryGate` refuses to allocate a `Connection` until a
 valid echoed token is presented; per-source `retry_state_table`
@@ -238,11 +238,11 @@ removal rationale.
 - `Key = [32]u8` — server-private HMAC-SHA256 key, documented "never
   share, never log, secureZero on free".
 - `derive(key, cid)` — first 16 bytes of `HMAC-SHA256(key,
-  "nullq stateless reset v1" || cid)`. Deterministic so the server
+  "quic-zig stateless reset v1" || cid)`. Deterministic so the server
   can re-derive after losing local state. Domain separator avoids
   collision with future HMAC primitives sharing the key.
 - `generateKey()` — fresh 32 bytes from BoringSSL CSPRNG.
-- Re-exported as `nullq.conn.stateless_reset`.
+- Re-exported as `quic-zig.conn.stateless_reset`.
 
 Embedders can keep using `ConnectionIdProvision.stateless_reset_token`
 with their own scheme (e.g. encrypted tokens that double as routing
@@ -320,7 +320,7 @@ and respects RFC bounds` at `src/tls/transport_params.zig:619`
 Unchanged from the original audit. All cryptography goes through
 `boringssl-zig` pinned via `build.zig.zon` (currently `c2218dd`,
 post-0.5.0; see commit `7fc58b6` for the most recent bump). TLS 1.3
-only. nullq does not implement its own AEAD, HKDF, or signature
+only. quic-zig does not implement its own AEAD, HKDF, or signature
 primitives.
 
 ### §5.2 0-RTT default + anti-replay — COMPLETE
@@ -344,7 +344,7 @@ follows `config.session_ticket != null` instead of always-on.
   `consumeUsingInternalClock(id)` — added in commit `7fc58b6` for
   callers (the BoringSSL trampoline) without a direct path to
   monotonic time.
-- Re-exported as `nullq.tls.AntiReplayTracker`.
+- Re-exported as `quic-zig.tls.AntiReplayTracker`.
 
 **TLS-pre-accept BoringSSL callback wiring** (commit `7fc58b6`) —
 0-RTT replay rejection moved from "embedder calls

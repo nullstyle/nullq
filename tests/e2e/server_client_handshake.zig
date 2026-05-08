@@ -1,6 +1,6 @@
 //! Hermetic in-process Server↔Client end-to-end QUIC handshake.
 //!
-//! `nullq.Server` and `nullq.Client` are both production-grade
+//! `quic_zig.Server` and `quic_zig.Client` are both production-grade
 //! convenience wrappers, but until now no test drove a real `Client`
 //! through a real `Server` without sockets. The full handshake was
 //! only exercised by the QNS Docker interop matrix, which means a
@@ -11,7 +11,7 @@
 //! This file closes that gap. The pattern mirrors
 //! `mock_transport_real_handshake.zig`'s "drive a real handshake
 //! without a socket" loop, but the server side here is the full
-//! `nullq.Server` wrapper — slot table, `feed` dispatch, stateless
+//! `quic_zig.Server` wrapper — slot table, `feed` dispatch, stateless
 //! response queue, CID-table resync, the works. Three scenarios:
 //!
 //!   1. Vanilla TLS-1.3 handshake completes via `Server.feed` and
@@ -26,7 +26,7 @@
 //!      handshake completes through the post-Retry slot.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const common = @import("common.zig");
 
 /// Drive an outbound packet from `src` straight into `dst.feed`.
@@ -34,10 +34,10 @@ const common = @import("common.zig");
 /// datagrams flowed). Wrapped in a helper so the three tests don't
 /// repeat the same pump-loop boilerplate.
 fn pumpClientToServer(
-    cli: *nullq.Client,
-    srv: *nullq.Server,
+    cli: *quic_zig.Client,
+    srv: *quic_zig.Server,
     rx: []u8,
-    addr: nullq.conn.path.Address,
+    addr: quic_zig.conn.path.Address,
     now_us: u64,
 ) !usize {
     var n: usize = 0;
@@ -53,8 +53,8 @@ fn pumpClientToServer(
 /// moving on so a slot that wants to emit Initial+Handshake on the
 /// same wakeup gets fully drained.
 fn pumpServerToClient(
-    srv: *nullq.Server,
-    cli: *nullq.Client,
+    srv: *quic_zig.Server,
+    cli: *quic_zig.Client,
     rx: []u8,
     now_us: u64,
 ) !usize {
@@ -72,7 +72,7 @@ test "Server <-> Client: full handshake completes through Server.feed" {
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = common.test_cert_pem,
         .tls_key_pem = common.test_key_pem,
@@ -81,7 +81,7 @@ test "Server <-> Client: full handshake completes through Server.feed" {
     });
     defer srv.deinit();
 
-    var cli = try nullq.Client.connect(.{
+    var cli = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "localhost",
         .alpn_protocols = &protos,
@@ -90,7 +90,7 @@ test "Server <-> Client: full handshake completes through Server.feed" {
     defer cli.deinit();
 
     var rx: [4096]u8 = undefined;
-    const peer_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xab) };
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xab) };
 
     // Kick the client so the very first Initial is in its outbox.
     // `Client.connect` deliberately leaves this to the embedder so
@@ -142,7 +142,7 @@ test "Server <-> Client: NEW_CONNECTION_ID rotates routing key in cid_table" {
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = common.test_cert_pem,
         .tls_key_pem = common.test_key_pem,
@@ -151,7 +151,7 @@ test "Server <-> Client: NEW_CONNECTION_ID rotates routing key in cid_table" {
     });
     defer srv.deinit();
 
-    var cli = try nullq.Client.connect(.{
+    var cli = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "localhost",
         .alpn_protocols = &protos,
@@ -160,7 +160,7 @@ test "Server <-> Client: NEW_CONNECTION_ID rotates routing key in cid_table" {
     defer cli.deinit();
 
     var rx: [4096]u8 = undefined;
-    const peer_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xcd) };
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xcd) };
     try cli.conn.advance();
 
     // Phase 1: get the handshake done. Same loop as the first test.
@@ -239,7 +239,7 @@ test "Server <-> Client: NEW_CONNECTION_ID rotates routing key in cid_table" {
             try std.testing.expect((rx[0] & 0x80) == 0); // short header
             try std.testing.expectEqualSlices(u8, &new_cid_bytes, rx[1 .. 1 + new_cid_bytes.len]);
             const outcome = try srv.feed(rx[0..len], peer_addr, now_us);
-            try std.testing.expectEqual(nullq.Server.FeedOutcome.routed, outcome);
+            try std.testing.expectEqual(quic_zig.Server.FeedOutcome.routed, outcome);
             routed_packets += 1;
         }
         try srv.tick(now_us);
@@ -267,14 +267,14 @@ test "Server <-> Client: handshake completes via Retry round-trip" {
     // Stable HMAC key — any 32 bytes work, the value just has to be
     // consistent across mint/validate. Mirrors the value used in
     // `server_smoke.zig`'s Retry test.
-    const retry_key: nullq.RetryTokenKey = .{
+    const retry_key: quic_zig.RetryTokenKey = .{
         0x86, 0x71, 0x15, 0x0d, 0x9a, 0x2c, 0x5e, 0x04,
         0x31, 0xa8, 0x6a, 0xf9, 0x18, 0x44, 0xbd, 0x2b,
         0x4d, 0xee, 0x90, 0x3f, 0xa7, 0x61, 0x0c, 0x55,
         0xf2, 0x83, 0x1d, 0xb6, 0x95, 0x77, 0x40, 0x29,
     };
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = common.test_cert_pem,
         .tls_key_pem = common.test_key_pem,
@@ -284,7 +284,7 @@ test "Server <-> Client: handshake completes via Retry round-trip" {
     });
     defer srv.deinit();
 
-    var cli = try nullq.Client.connect(.{
+    var cli = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "localhost",
         .alpn_protocols = &protos,
@@ -293,7 +293,7 @@ test "Server <-> Client: handshake completes via Retry round-trip" {
     defer cli.deinit();
 
     var rx: [4096]u8 = undefined;
-    const peer_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xef) };
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xef) };
     try cli.conn.advance();
 
     // Phase 1: client emits Initial #1. Server queues a Retry.
@@ -302,7 +302,7 @@ test "Server <-> Client: handshake completes via Retry round-trip" {
         const now_us: u64 = 1_000;
         const len = (try cli.conn.poll(&rx, now_us)).?;
         const outcome = try srv.feed(rx[0..len], peer_addr, now_us);
-        try std.testing.expectEqual(nullq.Server.FeedOutcome.retry_sent, outcome);
+        try std.testing.expectEqual(quic_zig.Server.FeedOutcome.retry_sent, outcome);
         try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
         try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
 

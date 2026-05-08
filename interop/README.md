@@ -1,6 +1,6 @@
-# nullq external interop gate
+# quic-zig external interop gate
 
-This directory contains the first nullq endpoint for the official
+This directory contains the first quic-zig endpoint for the official
 QUIC interop runner.
 
 ## Current gate
@@ -25,16 +25,16 @@ QUIC interop runner.
   because the server starts with a smaller bidirectional stream limit.
 - Honors the runner's `SSLKEYLOGFILE` and `QLOGDIR` environment
   variables. `SSLKEYLOGFILE` receives Wireshark-compatible TLS secrets;
-  `QLOGDIR` receives nullq qlog-style key lifecycle JSONL traces.
+  `QLOGDIR` receives quic-zig qlog-style key lifecycle JSONL traces.
 
-The default external matrix targets server-side nullq against the
+The default external matrix targets server-side quic-zig against the
 current official clients `quic-go`, `ngtcp2`, and `quiche`, using:
 
 ```sh
 zig build external-interop -- runner --build-image
 ```
 
-Client-side nullq can be exercised by selecting `--role client`, which
+Client-side quic-zig can be exercised by selecting `--role client`, which
 injects the local image as a runner client and pairs it with external
 servers:
 
@@ -56,17 +56,17 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
 
 ## Latest local results
 
-- `quic-go`, `ngtcp2`, and `quiche` all pass nullq-as-server
+- `quic-go`, `ngtcp2`, and `quiche` all pass quic-zig-as-server
   handshake and transfer: `✓(H,DC)`.
 - `quic-go` passes the feature matrix:
   `✓(H,DC,C20,S,R,Z,M)`.
-- `quic-go`, `ngtcp2`, and `quiche` all pass nullq-as-client
+- `quic-go`, `ngtcp2`, and `quiche` all pass quic-zig-as-client
   handshake and transfer: `✓(H,DC)`.
-- `quic-go` passes nullq-as-client feature coverage:
+- `quic-go` passes quic-zig-as-client feature coverage:
   `✓(H,DC,C20,S,R,Z,M)`. The `chacha20` client testcase uses the
   `boringssl-zig` AES-hardware testing override so BoringSSL prefers
   ChaCha on AES-capable hosts.
-- When both endpoints expose valid keylogs, nullq's wrapper merges them
+- When both endpoints expose valid keylogs, quic-zig's wrapper merges them
   in the throwaway runner overlay before trace analysis. This keeps
   0-RTT decryption clean when the selected client keylog lacks
   `CLIENT_EARLY_TRAFFIC_SECRET` but the server keylog has it.
@@ -79,7 +79,7 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
 - `mise install` from the repo root to provision Zig, Python 3.12, and
   `uv`.
 - Runner Python dependencies are managed by `uv run` inside the
-  official runner overlay. nullq's wrapper is Zig-native, but the
+  official runner overlay. quic-zig's wrapper is Zig-native, but the
   upstream runner itself still executes `run.py`. The wrapper defaults
   to `uv run --python 3.12` because the current pyshark stack is not yet
   clean under Python 3.14.
@@ -102,6 +102,6 @@ mise exec -- zig build external-interop -- runner --clients quic-go,ngtcp2,quich
 ```
 
 Runner logs land in `interop/logs/`; matrix JSON lands in
-`interop/results/nullq-server.json` or
-`interop/results/nullq-client.json`, depending on the selected role.
+`interop/results/quic-zig-server.json` or
+`interop/results/quic-zig-client.json`, depending on the selected role.
 Both are generated artifacts and are ignored by git.

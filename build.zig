@@ -31,28 +31,28 @@ pub fn build(b: *std.Build) void {
     });
     const boringssl_mod = boringssl_dep.module("boringssl");
 
-    const nullq_mod = b.addModule("nullq", .{
+    const quic_zig_mod = b.addModule("quic_zig", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    nullq_mod.addImport("boringssl", boringssl_mod);
+    quic_zig_mod.addImport("boringssl", boringssl_mod);
 
-    const test_step = b.step("test", "Run nullq tests");
+    const test_step = b.step("test", "Run quic_zig tests");
 
-    const unit_tests = b.addTest(.{ .root_module = nullq_mod });
+    const unit_tests = b.addTest(.{ .root_module = quic_zig_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
 
     // Cross-cutting integration tests live in tests/. They have
     // their own module so they can `@embedFile` test data without
-    // shipping it inside the published `nullq` package.
+    // shipping it inside the published `quic_zig` package.
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    tests_mod.addImport("nullq", nullq_mod);
+    tests_mod.addImport("quic_zig", quic_zig_mod);
     tests_mod.addImport("boringssl", boringssl_mod);
     const integration_tests = b.addTest(.{ .root_module = tests_mod });
     const run_integration_tests = b.addRunArtifact(integration_tests);
@@ -90,7 +90,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    conformance_mod.addImport("nullq", nullq_mod);
+    conformance_mod.addImport("quic_zig", quic_zig_mod);
     conformance_mod.addImport("boringssl", boringssl_mod);
     const conformance_tests = b.addTest(.{
         .root_module = conformance_mod,
@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
     test_step.dependOn(&run_conformance_tests.step);
 
-    const conformance_step = b.step("conformance", "Run nullq RFC-traceable conformance suites");
+    const conformance_step = b.step("conformance", "Run quic_zig RFC-traceable conformance suites");
     conformance_step.dependOn(&run_conformance_tests.step);
 
     const qns_mod = b.createModule(.{
@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    qns_mod.addImport("nullq", nullq_mod);
+    qns_mod.addImport("quic_zig", quic_zig_mod);
     qns_mod.addImport("boringssl", boringssl_mod);
 
     const qns_exe = b.addExecutable(.{
@@ -130,7 +130,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const interop_tool_exe = b.addExecutable(.{
-        .name = "nullq-external-interop",
+        .name = "quic-zig-external-interop",
         .root_module = interop_tool_mod,
     });
     b.installArtifact(interop_tool_exe);
@@ -148,7 +148,7 @@ pub fn build(b: *std.Build) void {
     // numbers are meaningless), regardless of the user's
     // -Doptimize choice for the rest of the tree.
     //
-    // We re-instantiate the nullq and boringssl modules under
+    // We re-instantiate the quic_zig and boringssl modules under
     // ReleaseFast because BoringSSL compiled in Debug links UBSan
     // runtime symbols that the ReleaseFast linker won't resolve.
     const bench_optimize: std.builtin.OptimizeMode = .ReleaseFast;
@@ -158,28 +158,28 @@ pub fn build(b: *std.Build) void {
     });
     const bench_boringssl_mod = bench_boringssl_dep.module("boringssl");
 
-    const bench_nullq_mod = b.createModule(.{
+    const bench_quic_zig_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = bench_optimize,
     });
-    bench_nullq_mod.addImport("boringssl", bench_boringssl_mod);
+    bench_quic_zig_mod.addImport("boringssl", bench_boringssl_mod);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
         .optimize = bench_optimize,
     });
-    bench_mod.addImport("nullq", bench_nullq_mod);
+    bench_mod.addImport("quic_zig", bench_quic_zig_mod);
     bench_mod.addImport("boringssl", bench_boringssl_mod);
 
     const bench_exe = b.addExecutable(.{
-        .name = "nullq-bench",
+        .name = "quic-zig-bench",
         .root_module = bench_mod,
     });
     const run_bench = b.addRunArtifact(bench_exe);
     if (b.args) |args| run_bench.addArgs(args);
-    const bench_step = b.step("bench", "Run nullq microbenchmarks");
+    const bench_step = b.step("bench", "Run quic_zig microbenchmarks");
     bench_step.dependOn(&run_bench.step);
 
     // Coverage-guided fuzzing of the wire / frame / server
@@ -209,7 +209,7 @@ pub fn build(b: *std.Build) void {
     //
     // Until then we expose every `std.testing.fuzz` site as its own
     // `addTest` filtered to that single test name. Each filtered
-    // binary links against the same `nullq_mod`, so Zig's compile
+    // binary links against the same `quic_zig_mod`, so Zig's compile
     // cache shares the underlying object across all link steps —
     // only linking is repeated. Running them under `-j` then gives
     // real parallelism:
@@ -272,7 +272,7 @@ pub fn build(b: *std.Build) void {
     for (fuzz_targets) |t| {
         const tst = b.addTest(.{
             .name = b.fmt("fuzz-{s}", .{t.label}),
-            .root_module = nullq_mod,
+            .root_module = quic_zig_mod,
             .filters = &.{t.filter},
         });
         const run_tst = b.addRunArtifact(tst);

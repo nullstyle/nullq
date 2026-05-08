@@ -309,7 +309,7 @@ pub const LifecycleState = struct {
     /// wait for a progressively increasing number of received packets
     /// or amount of time before responding to received packets."
     ///
-    /// nullq's policy: exponential time backoff. Wait at least
+    /// quic_zig's policy: exponential time backoff. Wait at least
     /// `base_interval_us << close_emit_count` before re-arming. The
     /// shift saturates at 16 (matching the loss-recovery PTO backoff
     /// cap) so the interval can't run away into u64 overflow.

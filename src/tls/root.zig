@@ -1,4 +1,4 @@
-//! nullq.tls — TLS handshake glue specific to QUIC.
+//! quic_zig.tls — TLS handshake glue specific to QUIC.
 //!
 //! Thin layer over `boringssl.tls` plus the QUIC-specific bits that
 //! don't belong in core TLS:

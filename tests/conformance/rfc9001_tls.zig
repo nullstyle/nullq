@@ -77,7 +77,7 @@
 //!   RFC9001 §4.8 ¶2   SHOULD   session ticket includes transport-parameter context
 //!                              — covered structurally below; full ticket round-trip is skip_.
 //!   RFC9001 §5.7 ¶3   MUST     discard Initial keys once Handshake keys are available
-//!                              — implementation gap: nullq derives Initial keys on
+//!                              — implementation gap: quic_zig derives Initial keys on
 //!                                demand and never clears them post-handshake; skip_
 //!                                until the discard hook lands in `Connection`.
 //!
@@ -87,16 +87,16 @@
 //!   RFC9001 PN truncation/recovery                           → rfc9000_packetization.zig
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const fixture = @import("_initial_fixture.zig");
 const handshake_fixture = @import("_handshake_fixture.zig");
 
-const initial = nullq.wire.initial;
-const protection = nullq.wire.protection;
-const long_packet = nullq.wire.long_packet;
-const anti_replay = nullq.tls.anti_replay;
-const early_data_context = nullq.tls.early_data_context;
-const level = nullq.tls.level;
+const initial = quic_zig.wire.initial;
+const protection = quic_zig.wire.protection;
+const long_packet = quic_zig.wire.long_packet;
+const anti_replay = quic_zig.tls.anti_replay;
+const early_data_context = quic_zig.tls.early_data_context;
+const level = quic_zig.tls.level;
 
 /// Comptime hex literal → fixed-size byte array. The standard fixture
 /// helper used elsewhere in the conformance suites.
@@ -273,7 +273,7 @@ test "MUST sample 16 ciphertext bytes starting at PN_offset + 4 [RFC9001 §5.4.2
 
 test "MUST NOT extract a sample when fewer than 20 bytes follow PN_offset [RFC9001 §5.4.2 ¶1]" {
     // §5.4.2 implicitly requires 4 + 16 = 20 bytes of post-PN
-    // ciphertext. nullq surfaces this as
+    // ciphertext. quic_zig surfaces this as
     // protection.Error.InsufficientCiphertext rather than reading
     // past the buffer.
     var packet: [22]u8 = undefined;
@@ -461,18 +461,18 @@ test "MUST NOT validate a Retry against a different Original DCID [RFC9001 §5.8
 
 test "MUST keep AES-GCM confidentiality limit at or below 2^23 packets [RFC9001 §6.6 ¶3]" {
     // §6.6: "For AEAD_AES_128_GCM and AEAD_AES_256_GCM, the
-    // confidentiality limit is 2^23 encrypted packets." nullq's
+    // confidentiality limit is 2^23 encrypted packets." quic_zig's
     // default `confidentiality_limit` must not exceed that floor.
-    const defaults: nullq.ApplicationKeyUpdateLimits = .{};
+    const defaults: quic_zig.ApplicationKeyUpdateLimits = .{};
     try std.testing.expect(defaults.confidentiality_limit <= (@as(u64, 1) << 23));
     try std.testing.expectEqual(@as(u64, 8388608), @as(u64, 1) << 23);
 }
 
 test "MUST keep proactive update threshold strictly below the hard confidentiality limit [RFC9001 §6.6 ¶3]" {
-    // §6: an endpoint MUST NOT send more than the limit. nullq
+    // §6: an endpoint MUST NOT send more than the limit. quic_zig
     // updates keys *before* the hard limit so the last legal packet
     // can carry CONNECTION_CLOSE if needed.
-    const defaults: nullq.ApplicationKeyUpdateLimits = .{};
+    const defaults: quic_zig.ApplicationKeyUpdateLimits = .{};
     try std.testing.expect(defaults.proactive_update_threshold < defaults.confidentiality_limit);
 }
 
@@ -480,8 +480,8 @@ test "MUST cap the integrity limit at the cross-suite floor of 2^36 [RFC9001 §6
     // §6.6: "For AEAD_AES_128_GCM and AEAD_AES_256_GCM, the integrity
     // limit is 2^52 invocations. … For AEAD_CHACHA20_POLY1305, the
     // integrity limit is 2^36 invocations." The cross-suite floor
-    // (and nullq's chosen default) is 2^36.
-    const defaults: nullq.ApplicationKeyUpdateLimits = .{};
+    // (and quic_zig's chosen default) is 2^36.
+    const defaults: quic_zig.ApplicationKeyUpdateLimits = .{};
     try std.testing.expect(defaults.integrity_limit <= (@as(u64, 1) << 36));
 }
 
@@ -492,7 +492,7 @@ test "MUST recognize exactly the three QUIC v1 TLS 1.3 cipher suites [RFC9001 §
     // and hash functions for these cipher suites: TLS_AES_128_GCM_
     // SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256."
     // IANA TLS Cipher Suite codes 0x1301..0x1303.
-    const Suite = nullq.wire.short_packet.Suite;
+    const Suite = quic_zig.wire.short_packet.Suite;
     try std.testing.expectEqual(Suite.aes128_gcm_sha256, Suite.fromProtocolId(0x1301).?);
     try std.testing.expectEqual(Suite.aes256_gcm_sha384, Suite.fromProtocolId(0x1302).?);
     try std.testing.expectEqual(Suite.chacha20_poly1305_sha256, Suite.fromProtocolId(0x1303).?);
@@ -507,7 +507,7 @@ test "MUST recognize exactly the three QUIC v1 TLS 1.3 cipher suites [RFC9001 §
 test "MUST bind the 0-RTT context digest to the transport parameters [RFC9001 §4.6.1 ¶3]" {
     // §4.6.1 ¶3: "The server MUST NOT … accept 0-RTT data that …
     // would result in different protocol behavior than the data
-    // being sent in 1-RTT." nullq enforces this by hashing every
+    // being sent in 1-RTT." quic_zig enforces this by hashing every
     // replay-relevant transport parameter into a single digest that
     // the BoringSSL session compares on resumption.
     const base = try early_data_context.build(.{
@@ -564,7 +564,7 @@ test "MUST close with CRYPTO_ERROR + no_application_protocol (0x178) on ALPN mis
     const client_protos = [_][]const u8{"hq-test"};
     const server_protos = [_][]const u8{"different-proto"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = handshake_fixture.test_cert_pem,
         .tls_key_pem = handshake_fixture.test_key_pem,
@@ -573,7 +573,7 @@ test "MUST close with CRYPTO_ERROR + no_application_protocol (0x178) on ALPN mis
     });
     defer srv.deinit();
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "localhost",
         .alpn_protocols = &client_protos,
@@ -583,7 +583,7 @@ test "MUST close with CRYPTO_ERROR + no_application_protocol (0x178) on ALPN mis
     try client.conn.advance();
 
     var rx: [4096]u8 = undefined;
-    const peer_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xab) };
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xab) };
     var iter: u32 = 0;
     while (iter < 32) : (iter += 1) {
         const now_us: u64 = @as(u64, iter) * 1_000;
@@ -602,21 +602,21 @@ test "MUST close with CRYPTO_ERROR + no_application_protocol (0x178) on ALPN mis
 
     const slot = if (srv.iterator().len > 0) srv.iterator()[0] else return error.NoServerSlot;
     const ev = slot.conn.closeEvent() orelse return error.NoCloseEventEmitted;
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     // 0x100 (CRYPTO_ERROR base) + 0x78 (no_application_protocol).
     try std.testing.expectEqual(@as(u64, 0x178), ev.error_code);
 }
 
 test "MUST keep 0-RTT opt-in (default disabled) [RFC9001 §4.6 ¶1]" {
     // §4.6 ¶1: "A server MUST NOT enable 0-RTT … unless it has been
-    // configured to do so." nullq exposes this knob as
+    // configured to do so." quic_zig exposes this knob as
     // `Server.Config.enable_0rtt`; the conformance guarantee is that
     // a Config built without explicitly opting in carries
     // `enable_0rtt = false`, so the Server starts up with early-data
     // disabled.
     const protos = [_][]const u8{"hq-test"};
-    const cfg: nullq.Server.Config = .{
+    const cfg: quic_zig.Server.Config = .{
         .allocator = std.testing.allocator,
         .tls_cert_pem = fixture.test_cert_pem,
         .tls_key_pem = fixture.test_key_pem,
@@ -629,7 +629,7 @@ test "MUST keep 0-RTT opt-in (default disabled) [RFC9001 §4.6 ¶1]" {
 test "MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶1]" {
     // §4.7 ¶1: "Authentication is performed by checking that the peer
     // is in possession of the private key … the client MUST verify
-    // the server's certificate chain." nullq delegates the chain
+    // the server's certificate chain." quic_zig delegates the chain
     // walk to BoringSSL via `boringssl.tls.VerifyMode`. The test
     // fixture's server uses a self-signed cert (data/test_cert.pem)
     // for "localhost"; a client that points BoringSSL at the system
@@ -648,7 +648,7 @@ test "MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶
     // / `handle` surface this as `error.PeerAlerted` — the
     // implementation's current proxy for "TLS rejected the peer".
     //
-    // (nullq does not yet translate `self.alert` into a
+    // (quic_zig does not yet translate `self.alert` into a
     // CRYPTO_ERROR-prefixed CloseEvent on the client side; that's a
     // separate wire-level concern. The §4.7 contract is the
     // verification *decision*, which this test pins to the alert
@@ -656,7 +656,7 @@ test "MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶
     const boringssl = @import("boringssl");
 
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = handshake_fixture.test_cert_pem,
         .tls_key_pem = handshake_fixture.test_key_pem,
@@ -679,7 +679,7 @@ test "MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶
     }) catch return error.SkipZigTest;
     defer tls_ctx.deinit();
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "localhost",
         .alpn_protocols = &protos,
@@ -701,7 +701,7 @@ test "MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶
     // proof that BoringSSL's chain check ran and failed.
     var rx: [4096]u8 = undefined;
     var iter: u32 = 0;
-    const peer_addr: nullq.conn.path.Address = .{ .bytes = @splat(0xab) };
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xab) };
     var saw_rejection = false;
     pump: while (iter < 32) : (iter += 1) {
         const now_us: u64 = @as(u64, iter) * 1_000;
@@ -758,7 +758,7 @@ test "MUST validate the server certificate chain at the client [RFC9001 §4.7 ¶
 test "MUST enforce per-key AEAD invocation limits at runtime [RFC9001 §5.5 ¶2]" {
     // §5.5 ¶2: "If the total number of encrypted packets with the same
     // key exceeds the confidentiality limit for the AEAD, the endpoint
-    // MUST stop using those keys." nullq enforces this in
+    // MUST stop using those keys." quic_zig enforces this in
     // `Connection.prepareApplicationWriteKeys` (src/conn/state.zig):
     // when `app_write_current.packets_protected` reaches
     // `app_key_update_limits.confidentiality_limit`, the connection
@@ -819,7 +819,7 @@ test "MUST enforce per-key AEAD invocation limits at runtime [RFC9001 §5.5 ¶2]
     // benign reordering between "set pending_close" and "emit
     // CONNECTION_CLOSE" still surfaces the close before we assert.
     const ping_frame = [_]u8{0x01};
-    var observed_close: ?nullq.CloseEvent = null;
+    var observed_close: ?quic_zig.CloseEvent = null;
     var i: u32 = 0;
     while (i < headroom + 1) : (i += 1) {
         observed_close = try pair.injectFrameAtServer(&ping_frame);
@@ -827,7 +827,7 @@ test "MUST enforce per-key AEAD invocation limits at runtime [RFC9001 §5.5 ¶2]
     }
 
     const ev = observed_close orelse return error.TestExpectedAeadLimitClose;
-    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(TRANSPORT_ERROR_AEAD_LIMIT_REACHED, ev.error_code);
 }
 
@@ -836,7 +836,7 @@ test "MUST discard Initial keys once Handshake keys are available [RFC9001 §5.7
     // sends a Handshake packet … a server MUST discard Initial keys
     // when it first successfully processes a Handshake packet."
     //
-    // nullq's `Connection.discardInitialKeys` (src/conn/state.zig)
+    // quic_zig's `Connection.discardInitialKeys` (src/conn/state.zig)
     // fires from the BoringSSL `setSecret` callback when Handshake
     // (or Application) secrets are installed. After
     // `driveToHandshakeConfirmed`, `initialKeysActive(.read)` and
@@ -858,7 +858,7 @@ test "MUST discard Initial keys once Handshake keys are available [RFC9001 §5.7
 
 test "MUST refuse the first key update before handshake confirmation [RFC9001 §6.1 ¶2]" {
     // §6.1 ¶2: "An endpoint MUST NOT initiate a key update prior to
-    // having confirmed the handshake." nullq surfaces this as
+    // having confirmed the handshake." quic_zig surfaces this as
     // `Connection.requestKeyUpdate` returning `Error.KeyUpdateBlocked`
     // when no application write epoch has been installed — which is
     // the gating precondition implied by the spec, since the
@@ -873,7 +873,7 @@ test "MUST refuse the first key update before handshake confirmation [RFC9001 §
     try std.testing.expect(!pair.clientConn().handshakeDone());
 
     try std.testing.expectError(
-        nullq.conn.state.Error.KeyUpdateBlocked,
+        quic_zig.conn.state.Error.KeyUpdateBlocked,
         pair.clientConn().requestKeyUpdate(0),
     );
 }
@@ -882,7 +882,7 @@ test "MUST refuse a second key update until the first is acknowledged [RFC9001 �
     // §6.5 ¶1: "An endpoint MUST NOT initiate a subsequent key
     // update unless it has received an acknowledgment for a packet
     // that was sent protected with keys from the current key phase."
-    // nullq enforces this via `app_write_update_pending_ack`: once
+    // quic_zig enforces this via `app_write_update_pending_ack`: once
     // `requestKeyUpdate` succeeds, a second invocation before the
     // matching ACK arrives must reject with
     // `Error.KeyUpdateBlocked`. We don't drive the ACK path here —
@@ -902,7 +902,7 @@ test "MUST refuse a second key update until the first is acknowledged [RFC9001 �
     try cli.requestKeyUpdate(now_us);
     // Second call before the ACK arrives must be rejected.
     try std.testing.expectError(
-        nullq.conn.state.Error.KeyUpdateBlocked,
+        quic_zig.conn.state.Error.KeyUpdateBlocked,
         cli.requestKeyUpdate(now_us + 1_000),
     );
 }

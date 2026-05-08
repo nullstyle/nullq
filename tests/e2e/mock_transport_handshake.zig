@@ -1,4 +1,4 @@
-//! Phase 4 acceptance: two `nullq.Connection`s complete a TLS 1.3
+//! Phase 4 acceptance: two `quic_zig.Connection`s complete a TLS 1.3
 //! handshake through a mock transport.
 //!
 //! No QUIC packet protection is involved — just CRYPTO bytes
@@ -6,14 +6,14 @@
 //! Connection ↔ BoringSSL bridge end-to-end.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 const common = @import("common.zig");
 
 const test_cert_pem = common.test_cert_pem;
 const test_key_pem = common.test_key_pem;
 
-test "two nullq.Connections handshake to TLS 1.3 finished with application keys" {
+test "two quic_zig.Connections handshake to TLS 1.3 finished with application keys" {
     const allocator = std.testing.allocator;
 
     const protos = [_][]const u8{"hq-test"};
@@ -35,9 +35,9 @@ test "two nullq.Connections handshake to TLS 1.3 finished with application keys"
     });
     defer client_tls.deinit();
 
-    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    var client = try quic_zig.Connection.initClient(allocator, client_tls, "localhost");
     defer client.deinit();
-    var server = try nullq.Connection.initServer(allocator, server_tls);
+    var server = try quic_zig.Connection.initServer(allocator, server_tls);
     defer server.deinit();
 
     // Bind after the Connection values are at their final stack
@@ -50,7 +50,7 @@ test "two nullq.Connections handshake to TLS 1.3 finished with application keys"
     server.peer = &client;
 
     // Both sides advertise typed transport parameters per RFC 9000 §18.
-    const params: nullq.tls.TransportParams = .{
+    const params: quic_zig.tls.TransportParams = .{
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 1 << 18,

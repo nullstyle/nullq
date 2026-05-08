@@ -28,11 +28,11 @@
 //! and pass `&pair` around.
 
 const std = @import("std");
-const nullq = @import("nullq");
-const wire = nullq.wire;
+const quic_zig = @import("quic_zig");
+const wire = quic_zig.wire;
 const short_packet = wire.short_packet;
 const long_packet = wire.long_packet;
-const conn_state = nullq.conn.state;
+const conn_state = quic_zig.conn.state;
 
 /// Test cert/key — same fixture used by tests/e2e/. Embedded here so
 /// the fixture can stand up a real Server alongside a real Client.
@@ -41,7 +41,7 @@ pub const test_key_pem = @embedFile("../data/test_key.pem");
 
 /// PROTOCOL_VIOLATION wire value (RFC 9000 §20.1). Asserted directly
 /// against close events so a conformance test ties the observed error
-/// code to the spec table, not to a private nullq constant.
+/// code to the spec table, not to a private quic_zig constant.
 pub const TRANSPORT_ERROR_PROTOCOL_VIOLATION: u64 = 0x0a;
 /// FRAME_ENCODING_ERROR wire value (RFC 9000 §20.1).
 pub const TRANSPORT_ERROR_FRAME_ENCODING_ERROR: u64 = 0x07;
@@ -53,7 +53,7 @@ pub const TRANSPORT_ERROR_STREAM_LIMIT_ERROR: u64 = 0x04;
 /// Default transport parameters used by every handshake-fixture test.
 /// Mirrors `tests/e2e/common.defaultParams()` so the shape stays in
 /// lockstep with the e2e harness.
-pub fn defaultParams() nullq.tls.TransportParams {
+pub fn defaultParams() quic_zig.tls.TransportParams {
     return .{
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = 1 << 20,
@@ -79,9 +79,9 @@ const default_alpn: []const []const u8 = &.{"hq-test"};
 /// location — no copying, no returning by value — and pair every
 /// `init` with a `defer pair.deinit()`.
 pub const HandshakePair = struct {
-    server: nullq.Server,
-    client: nullq.Client,
-    peer_addr: nullq.conn.path.Address,
+    server: quic_zig.Server,
+    client: quic_zig.Client,
+    peer_addr: quic_zig.conn.path.Address,
     now_us: u64,
     rx_buf: [4096]u8,
 
@@ -104,10 +104,10 @@ pub const HandshakePair = struct {
     /// to keep adversarial-frame fixtures small.
     pub fn initWith(
         allocator: std.mem.Allocator,
-        server_params: nullq.tls.TransportParams,
-        client_params: nullq.tls.TransportParams,
+        server_params: quic_zig.tls.TransportParams,
+        client_params: quic_zig.tls.TransportParams,
     ) !HandshakePair {
-        var server = try nullq.Server.init(.{
+        var server = try quic_zig.Server.init(.{
             .allocator = allocator,
             .tls_cert_pem = test_cert_pem,
             .tls_key_pem = test_key_pem,
@@ -116,7 +116,7 @@ pub const HandshakePair = struct {
         });
         errdefer server.deinit();
 
-        var client = try nullq.Client.connect(.{
+        var client = try quic_zig.Client.connect(.{
             .allocator = allocator,
             .server_name = "localhost",
             .alpn_protocols = default_alpn,
@@ -187,7 +187,7 @@ pub const HandshakePair = struct {
     /// the slot exists; errors with `error.NoServerSlot` otherwise.
     /// Callers should only invoke this after
     /// `driveToHandshakeConfirmed`.
-    pub fn serverConn(self: *HandshakePair) !*nullq.conn.Connection {
+    pub fn serverConn(self: *HandshakePair) !*quic_zig.conn.Connection {
         const slots = self.server.iterator();
         if (slots.len == 0) return error.NoServerSlot;
         return slots[0].conn;
@@ -197,7 +197,7 @@ pub const HandshakePair = struct {
     /// to keep call sites symmetrical with `serverConn`. Note that
     /// `Client.conn` is itself a `*Connection`, so we just hand the
     /// pointer through.
-    pub fn clientConn(self: *HandshakePair) *nullq.conn.Connection {
+    pub fn clientConn(self: *HandshakePair) *quic_zig.conn.Connection {
         return self.client.conn;
     }
 
@@ -208,11 +208,11 @@ pub const HandshakePair = struct {
     /// event snapshot, or null if the server did not close.
     ///
     /// `frame_bytes` is the raw QUIC frame payload — encode via
-    /// `nullq.frame.encode` (or hand-written bytes) before calling.
+    /// `quic_zig.frame.encode` (or hand-written bytes) before calling.
     pub fn injectFrameAtServer(
         self: *HandshakePair,
         frame_bytes: []const u8,
-    ) !?nullq.CloseEvent {
+    ) !?quic_zig.CloseEvent {
         const cli_conn = self.clientConn();
         const keys = (try cli_conn.packetKeys(.application, .write)) orelse
             return error.NoApplicationWriteKeys;
@@ -255,7 +255,7 @@ pub const HandshakePair = struct {
         self: *HandshakePair,
         frame_bytes: []const u8,
         reserved_bits: u2,
-    ) !?nullq.CloseEvent {
+    ) !?quic_zig.CloseEvent {
         const cli_conn = self.clientConn();
         const keys = (try cli_conn.packetKeys(.application, .write)) orelse
             return error.NoApplicationWriteKeys;
@@ -289,7 +289,7 @@ pub const HandshakePair = struct {
     pub fn injectFrameAtClient(
         self: *HandshakePair,
         frame_bytes: []const u8,
-    ) !?nullq.CloseEvent {
+    ) !?quic_zig.CloseEvent {
         const srv_conn = try self.serverConn();
         const keys = (try srv_conn.packetKeys(.application, .write)) orelse
             return error.NoApplicationWriteKeys;
@@ -322,7 +322,7 @@ pub const HandshakePair = struct {
     /// PROTOCOL_VIOLATION when the peer sends ACK / NEW_TOKEN /
     /// HANDSHAKE_DONE in a 0-RTT packet.
     ///
-    /// The high-level `nullq.Server` does NOT auto-wire
+    /// The high-level `quic_zig.Server` does NOT auto-wire
     /// `setEarlyDataContext` on freshly-accepted slots, so a real
     /// resumption flow at the public API would land BoringSSL on
     /// `earlyDataStatus() == .rejected` and the server would silently
@@ -348,7 +348,7 @@ pub const HandshakePair = struct {
     pub fn injectFrameAtServer0Rtt(
         self: *HandshakePair,
         frame_bytes: []const u8,
-    ) !?nullq.CloseEvent {
+    ) !?quic_zig.CloseEvent {
         // 32 zero bytes paired with `cipher_protocol_id = 0x1301`
         // (TLS_AES_128_GCM_SHA256) deterministically derives identical
         // PacketKeys on both sides — the in-source helpers
@@ -452,10 +452,10 @@ test "FIXTURE_SANITY HandshakePair: injectFrameAtServer round-trips a PING (no c
     // direction. Inject and confirm the server stays open.
     const ping_frame = [_]u8{0x01};
     const close_event = try pair.injectFrameAtServer(&ping_frame);
-    try std.testing.expectEqual(@as(?nullq.CloseEvent, null), close_event);
+    try std.testing.expectEqual(@as(?quic_zig.CloseEvent, null), close_event);
 
     // Belt-and-suspenders: the client should still be open too.
-    try std.testing.expectEqual(@as(?nullq.CloseEvent, null), pair.clientConn().closeEvent());
+    try std.testing.expectEqual(@as(?quic_zig.CloseEvent, null), pair.clientConn().closeEvent());
 }
 
 test "FIXTURE_SANITY HandshakePair: client-emitted HANDSHAKE_DONE closes the server with PROTOCOL_VIOLATION" {
@@ -472,6 +472,6 @@ test "FIXTURE_SANITY HandshakePair: client-emitted HANDSHAKE_DONE closes the ser
     const close_event = try pair.injectFrameAtServer(&handshake_done);
 
     const ev = close_event orelse return error.TestExpectedClose;
-    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }

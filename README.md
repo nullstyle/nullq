@@ -1,9 +1,9 @@
-# nullq
+# quic-zig
 
 A Zig-first IETF QUIC v1 implementation, built from RFCs 8999/9000/9001/9002,
 using [`boringssl-zig`](../boringssl-zig) for TLS 1.3 and AEAD/HKDF crypto.
 
-**Status: interop prototype, not production yet.** nullq now completes
+**Status: interop prototype, not production yet.** quic-zig now completes
 QUIC v1 handshakes, streams, DATAGRAMs, public send-side `streamReset`,
 CID issuance, PATH_CHALLENGE/PATH_RESPONSE, timer-driven loss/PTO
 recovery with NewReno feedback, path-aware `PathSet` recovery
@@ -39,7 +39,7 @@ go-quic-peer single-path, 0-RTT, and path-switch smoke tests are
 maintained as interop gates. The first official QUIC interop-runner
 gate is also scaffolded under `interop/`: `qns-endpoint` is a
 server-side HTTP/0.9 `hq-interop` endpoint with Docker/run-wrapper
-support for nullq-as-server testing against external clients. See
+support for quic-zig-as-server testing against external clients. See
 [INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification log
 and remaining production gaps.
 
@@ -48,11 +48,11 @@ mise install
 just test
 ```
 
-## Embed nullq as a server
+## Embed quic-zig as a server
 
-`nullq.Server` is the thinnest convenience wrapper that keeps the
+`quic-zig.Server` is the thinnest convenience wrapper that keeps the
 embedder in charge of the UDP socket and the wall clock while
-nullq owns the TLS context, the per-connection state, and the
+quic-zig owns the TLS context, the per-connection state, and the
 demultiplexing of incoming datagrams. The full lower-level
 `Connection` API is fully supported — `Server` just spares you the
 boilerplate of writing it yourself for the common case.
@@ -60,15 +60,15 @@ boilerplate of writing it yourself for the common case.
 ### One-liner: `transport.runUdpServer`
 
 The fastest path to a working QUIC server is the opinionated
-`std.Io`-based loop bundled with nullq. It binds the UDP socket,
+`std.Io`-based loop bundled with quic-zig. It binds the UDP socket,
 applies `SO_RCVBUF` / `SO_SNDBUF` tuning, drives a 5 ms
 receive/feed/poll/tick cadence, and exits cleanly when the supplied
-shutdown flag flips. Use this when you want nullq to "just run" and
+shutdown flag flips. Use this when you want quic-zig to "just run" and
 you don't need Retry, version negotiation, or deterministic CIDs.
 
 ```zig
 const std = @import("std");
-const nullq = @import("nullq");
+const quic-zig = @import("quic-zig");
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -79,7 +79,7 @@ pub fn run(
 ) !void {
     const protos = [_][]const u8{"hq-interop"};
 
-    var server = try nullq.Server.init(.{
+    var server = try quic-zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = cert_pem,
         .tls_key_pem = key_pem,
@@ -97,7 +97,7 @@ pub fn run(
     });
     defer server.deinit();
 
-    try nullq.transport.runUdpServer(&server, .{
+    try quic-zig.transport.runUdpServer(&server, .{
         .listen = "0.0.0.0:443",
         .io = io,
         .shutdown_flag = shutdown,
@@ -118,7 +118,7 @@ CIDs, batched I/O via `recvmmsg`, qlog file rotation — drive
 
 ```zig
 const std = @import("std");
-const nullq = @import("nullq");
+const quic-zig = @import("quic-zig");
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -128,7 +128,7 @@ pub fn run(
 ) !void {
     const protos = [_][]const u8{"hq-interop"};
 
-    var server = try nullq.Server.init(.{
+    var server = try quic-zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = cert_pem,
         .tls_key_pem = key_pem,
@@ -164,7 +164,7 @@ pub fn run(
         }
         for (server.iterator()) |slot| {
             // App work goes here: open streams, read data, send
-            // datagrams. `slot.conn` is the full `*nullq.Connection`.
+            // datagrams. `slot.conn` is the full `*quic-zig.Connection`.
             // `pollDatagram` returns the destination address with
             // each outgoing packet so multipath / migration work.
             while (try slot.conn.pollDatagram(&tx, now_us)) |out| {
@@ -185,9 +185,9 @@ Negotiation (RFC 9000 §6) is unconditional. For interop-specific
 behavior (deterministic CID prefix, per-testcase wiring), see
 `interop/qns_endpoint.zig`.
 
-## Embed nullq as a client
+## Embed quic-zig as a client
 
-`nullq.Client` is the mirror of `nullq.Server` for the dialing side.
+`quic-zig.Client` is the mirror of `quic-zig.Server` for the dialing side.
 It builds a client-mode TLS context, generates the random initial
 DCID and SCID per RFC 9000 §7.2, calls
 `bind`/`setLocalScid`/`setInitialDcid`/`setPeerDcid`/`setTransportParams`
@@ -197,7 +197,7 @@ the UDP socket, the wall clock, and the `Connection` lifecycle.
 
 ```zig
 const std = @import("std");
-const nullq = @import("nullq");
+const quic-zig = @import("quic-zig");
 
 pub fn dial(
     allocator: std.mem.Allocator,
@@ -207,7 +207,7 @@ pub fn dial(
 ) !void {
     const protos = [_][]const u8{"hq-interop"};
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic-zig.Client.connect(.{
         .allocator = allocator,
         .server_name = server_name,
         .alpn_protocols = &protos,
@@ -258,7 +258,7 @@ so the scheduler can emit application data on the first flight.
 ## 0-RTT Tickets
 
 Session tickets are owned by `boringssl-zig` and re-exported as
-`nullq.Session`. Capture them from the client TLS context, serialize
+`quic-zig.Session`. Capture them from the client TLS context, serialize
 with `Session.toBytes`, then parse with `Session.fromBytes` before the
 next client connection:
 
@@ -268,14 +268,14 @@ var client_ctx = try boringssl.tls.Context.initClient(.{
 });
 try client_ctx.setNewSessionCallback(onTicket, store_ptr);
 
-fn onTicket(user_data: ?*anyopaque, session: nullq.Session) void {
+fn onTicket(user_data: ?*anyopaque, session: quic-zig.Session) void {
     var owned = session;
     defer owned.deinit();
     const bytes = owned.toBytes(allocator) catch return;
     saveTicket(user_data, bytes);
 }
 
-var resumed = try nullq.Session.fromBytes(client_ctx, ticket_bytes);
+var resumed = try quic-zig.Session.fromBytes(client_ctx, ticket_bytes);
 defer resumed.deinit();
 try conn.setSession(resumed);
 conn.setEarlyDataEnabled(true);
@@ -295,7 +295,7 @@ _ = try server_conn.setEarlyDataContextForParams(
 ## Diagnostics
 
 TLS key logging is opt-in through `boringssl-zig` and re-exported as
-`nullq.KeylogCallback`:
+`quic-zig.KeylogCallback`:
 
 ```zig
 try tls_ctx.setKeylogCallback(onKeylogLine);
@@ -307,7 +307,7 @@ connection qlog-style callback:
 ```zig
 conn.setQlogCallback(onQlogEvent, app_state);
 
-fn onQlogEvent(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
+fn onQlogEvent(user_data: ?*anyopaque, event: quic-zig.QlogEvent) void {
     _ = user_data;
     if (event.name == .application_write_update_acked) {
         // Translate to qlog JSON, metrics, or test assertions.
@@ -317,11 +317,11 @@ fn onQlogEvent(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
 
 ## Production posture
 
-nullq ships secure-by-default for the `Server.Config` /
+quic-zig ships secure-by-default for the `Server.Config` /
 `Client.Config` knobs the hardening guide calls out, but a handful of
 production-grade limits are off by default so dev / interop / test
 runs aren't burdened with rate-limit tuning. This section lists what's
-on without config and what you need to wire up before pointing nullq
+on without config and what you need to wire up before pointing quic-zig
 at the open internet.
 
 ### On by default (no config required)
@@ -368,7 +368,7 @@ at the open internet.
 ### Off by default — opt in for production
 
 Each of these defaults to a value that's fine for `zig build test` /
-QNS interop but should be set explicitly before exposing nullq to
+QNS interop but should be set explicitly before exposing quic-zig to
 arbitrary peers. All are on `Server.Config` unless noted.
 
 - `max_initials_per_source_per_window: ?u32 = null` — per-source
@@ -427,7 +427,7 @@ Defaults can't fill these in for you — they're application policy:
   `Connection.setMigrationCallback`) if you want to allowlist peer
   addresses for migration. Without one, every probe that survives
   the pre-handshake / rate-limit gates earns a PATH_CHALLENGE.
-- An `AntiReplayTracker` (from `nullq.tls.AntiReplayTracker`) if you
+- An `AntiReplayTracker` (from `quic-zig.tls.AntiReplayTracker`) if you
   opt into 0-RTT, threaded through
   `Server.Config.early_data_anti_replay`.
 - A custom `boringssl.tls.Context` via
@@ -448,13 +448,13 @@ Defaults can't fill these in for you — they're application policy:
   citations). Run with `zig build conformance` or filter via
   `-Dconformance-filter='RFC9000 §17'`. 297 active tests + 44
   visible-debt skips across RFCs 8999 / 9000 / 9001 / 9002 / 9221.
-- `hardening-guide.md` — the canonical reference doc nullq is
+- `hardening-guide.md` — the canonical reference doc quic-zig is
   hardened against.
 
 ## What this is
 
 - The QUIC **transport**: streams, datagrams, packet protection, loss
-  recovery, congestion control. HTTP/3 is **not** part of nullq.
+  recovery, congestion control. HTTP/3 is **not** part of quic-zig.
 - I/O-decoupled state machine. The library does not own a socket or
   an event loop; the embedder drives `Connection.handle` /
   `Connection.poll` / `Connection.tick` against a monotonic clock.

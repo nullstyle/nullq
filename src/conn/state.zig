@@ -1,7 +1,7 @@
-//! nullq.Connection — per-connection state machine root.
+//! quic_zig.Connection — per-connection state machine root.
 //!
 //! The Connection wraps a `boringssl.tls.Conn` (the SSL object),
-//! installs nullq's `tls.quic.Method` callbacks, and exposes a
+//! installs quic_zig's `tls.quic.Method` callbacks, and exposes a
 //! deterministic `advance` driver that pulls peer-provided CRYPTO
 //! bytes through `provideQuicData` + `SSL_do_handshake` until the
 //! handshake completes. Once handshake is done it owns packet number
@@ -141,7 +141,7 @@ pub const Error = error{
     /// token, which RFC 9000 §19.7 forbids.
     ZeroLengthNewToken,
     /// `Connection.queueNewToken` was called with a token longer
-    /// than `pending_frames.NewTokenItem.max_len`. nullq mints
+    /// than `pending_frames.NewTokenItem.max_len`. quic_zig mints
     /// fixed-shape 96-byte tokens via `conn.new_token.mint`; only
     /// custom embedder formats can hit this.
     NewTokenTooLong,
@@ -298,7 +298,7 @@ pub const stream_credit_return_divisor: u64 = 1;
 pub const min_path_challenge_interval_us: u64 = 100_000;
 
 /// Implementation allocation policy. QUIC's wire limits are intentionally
-/// enormous; nullq caps the resources it advertises and tracks so peer input
+/// enormous; quic_zig caps the resources it advertises and tracks so peer input
 /// cannot force unbounded stream/path/CID state.
 pub const max_streams_per_connection: u64 = 4096;
 /// Largest QUIC multipath path identifier we accept (draft-ietf-quic-multipath-21).
@@ -315,7 +315,7 @@ pub const max_initial_stream_receive_window: u64 = recv_stream_mod.default_max_b
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 fn debugFrames() ?*const anyopaque {
-    return getenv("NULLQ_DEBUG_FRAMES");
+    return getenv("QUIC_ZIG_DEBUG_FRAMES");
 }
 
 /// One out-of-order CRYPTO fragment held in `crypto_pending[lvl]`
@@ -785,7 +785,7 @@ pub const QlogEvent = struct {
 pub const QlogCallback = *const fn (user_data: ?*anyopaque, event: QlogEvent) void;
 
 /// Allow / deny verdict returned by a `MigrationCallback`. The
-/// callback is consulted before nullq starts path validation on a
+/// callback is consulted before quic_zig starts path validation on a
 /// candidate 4-tuple (RFC 9000 §9). `.allow` proceeds with
 /// PATH_CHALLENGE; `.deny` skips validation entirely and keeps the
 /// existing path live.
@@ -799,7 +799,7 @@ pub const MigrationDecision = enum {
     deny,
 };
 
-/// Embedder policy hook consulted when nullq detects a peer migration
+/// Embedder policy hook consulted when quic_zig detects a peer migration
 /// candidate (RFC 9000 §9). Fires synchronously, **before** the
 /// PATH_CHALLENGE / PATH_RESPONSE round-trip — this lets the embedder
 /// short-circuit purely-address-based allowlists ("only accept
@@ -812,7 +812,7 @@ pub const MigrationDecision = enum {
 ///   `Connection.setMigrationCallback`.
 /// - `conn` — the live Connection, passed by const-pointer so the
 ///   callback can read state (e.g. role, peer SCID, scheduling
-///   policy) but cannot mutate it. nullq is single-threaded
+///   policy) but cannot mutate it. quic_zig is single-threaded
 ///   internally; the callback must not call back into this
 ///   Connection.
 /// - `candidate_addr` — the new peer 4-tuple address the datagram
@@ -1219,7 +1219,7 @@ pub const Connection = struct {
     peer_transport_reset_token_installed: bool = false,
     /// Per-connection opt-in for sending queued application bytes in
     /// 0-RTT packets. Session resumption can still happen when this is
-    /// false; nullq just waits for 1-RTT before emitting app data.
+    /// false; quic_zig just waits for 1-RTT before emitting app data.
     early_data_send_enabled: bool = false,
     /// Once BoringSSL reports rejection, every tracked 0-RTT packet is
     /// removed from flight and its STREAM bytes are put back on the
@@ -1582,7 +1582,7 @@ pub const Connection = struct {
         self.pending_frames.new_token = item;
     }
 
-    /// Per-connection 0-RTT toggle. This deliberately gates nullq's
+    /// Per-connection 0-RTT toggle. This deliberately gates quic_zig's
     /// packet scheduler as well as BoringSSL, so early application data
     /// is only sent after the caller opts in for this connection.
     pub fn setEarlyDataEnabled(self: *Connection, enabled: bool) void {
@@ -1612,7 +1612,7 @@ pub const Connection = struct {
         try self.inner.setQuicEarlyDataContext(ctx);
     }
 
-    /// Server convenience: build and install nullq's canonical replay
+    /// Server convenience: build and install quic_zig's canonical replay
     /// context from current transport parameters plus app-owned bytes.
     /// The returned digest is what callers should remember beside the
     /// issued ticket if they keep their own ticket metadata.
@@ -1655,7 +1655,7 @@ pub const Connection = struct {
     }
 
     /// Install an opt-in qlog-style callback for security/lifecycle
-    /// diagnostics. nullq never writes logs on its own; embedders can
+    /// diagnostics. quic_zig never writes logs on its own; embedders can
     /// translate these events into qlog JSON, metrics, or test probes.
     pub fn setQlogCallback(
         self: *Connection,
@@ -1932,7 +1932,7 @@ pub const Connection = struct {
 
     /// Cipher suite negotiated for the given encryption level, if
     /// the secret has been installed and the protocol-id is one we
-    /// support. RFC 9001 only permits TLS 1.3 cipher suites; nullq
+    /// support. RFC 9001 only permits TLS 1.3 cipher suites; quic_zig
     /// understands the three QUIC v1 suites.
     pub fn cipherSuite(
         self: *const Connection,
@@ -2443,7 +2443,7 @@ pub const Connection = struct {
     /// (initial SCID plus every still-unretired SCID issued via
     /// NEW_CONNECTION_ID). Used by embedders that maintain a
     /// CID-to-connection routing table outside the connection
-    /// (the canonical caller is `nullq.Server`).
+    /// (the canonical caller is `quic_zig.Server`).
     pub fn localScidCount(self: *const Connection) usize {
         return self.local_cids.items.len;
     }
@@ -2687,7 +2687,7 @@ pub const Connection = struct {
 
     /// Server-side helper: write a QUIC v1 Retry packet in response
     /// to `client_initial`. Token contents and validation remain
-    /// embedder-owned; nullq handles the Retry header and RFC 9001
+    /// embedder-owned; quic_zig handles the Retry header and RFC 9001
     /// integrity tag.
     pub fn writeRetry(
         self: *Connection,
@@ -2725,7 +2725,7 @@ pub const Connection = struct {
     }
 
     /// RFC 9001 §5.7 ¶3: "Endpoints MUST discard their Initial keys
-    /// when they first send a Handshake packet." nullq makes the call
+    /// when they first send a Handshake packet." quic_zig makes the call
     /// stricter: once Handshake-level secrets are installed (which
     /// means the TLS handshake has progressed past Initial) we drop
     /// Initial keys outright. Any further inbound Initial packet is
@@ -4242,7 +4242,7 @@ pub const Connection = struct {
         // isn't already in use on this path), rotate to it before
         // path validation begins. If no fresh CID is available
         // (peer hasn't issued more, or NAT rebinding without
-        // deliberate CID issuance), nullq proceeds with the existing
+        // deliberate CID issuance), quic_zig proceeds with the existing
         // CID — silently rather than refusing the migration outright,
         // because a strict refusal breaks NAT rebinding scenarios
         // where the peer never sent a NEW_CONNECTION_ID. The
@@ -7443,7 +7443,7 @@ pub const Connection = struct {
         // RFC 9001 §5.7 ¶3 / ¶4: discard Initial keys once handshake
         // confirms. The strict spec timing is "first Handshake packet
         // sent" (client) / "first Handshake packet processed" (server),
-        // but in nullq's flow the client's first Handshake send is
+        // but in quic_zig's flow the client's first Handshake send is
         // accompanied by an Initial-level ACK that's still needed by
         // the server, so we wait until handshake confirms — at which
         // point no further Initial activity is legitimate. Latched +
@@ -8248,7 +8248,7 @@ pub const Connection = struct {
 // -- tls.quic.Method bridge ---------------------------------------------
 //
 // Each callback recovers the *Connection from the SSL via ex-data,
-// then writes into nullq state. The trampolines stay in this module
+// then writes into quic_zig state. The trampolines stay in this module
 // because they reach into Connection's private fields directly.
 
 fn setReadSecret(

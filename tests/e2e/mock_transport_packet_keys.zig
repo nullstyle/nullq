@@ -4,7 +4,7 @@
 //! protected packet through `seal1Rtt` + `open1Rtt`.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 const common = @import("common.zig");
 
@@ -33,9 +33,9 @@ test "1-RTT keys derive cross-consistently and round-trip a packet" {
     });
     defer client_tls.deinit();
 
-    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    var client = try quic_zig.Connection.initClient(allocator, client_tls, "localhost");
     defer client.deinit();
-    var server = try nullq.Connection.initServer(allocator, server_tls);
+    var server = try quic_zig.Connection.initServer(allocator, server_tls);
     defer server.deinit();
 
     try client.bind();
@@ -43,7 +43,7 @@ test "1-RTT keys derive cross-consistently and round-trip a packet" {
     client.peer = &server;
     server.peer = &client;
 
-    const params: nullq.tls.TransportParams = .{
+    const params: quic_zig.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 1 << 20,
         .initial_max_stream_data_bidi_remote = 1 << 20,
@@ -78,11 +78,11 @@ test "1-RTT keys derive cross-consistently and round-trip a packet" {
 
     // Cipher-suite plumbing reports the same.
     try std.testing.expectEqual(
-        nullq.conn.state.Suite.aes128_gcm_sha256,
+        quic_zig.conn.state.Suite.aes128_gcm_sha256,
         client.cipherSuite(.application, .write).?,
     );
     try std.testing.expectEqual(
-        nullq.conn.state.Suite.aes128_gcm_sha256,
+        quic_zig.conn.state.Suite.aes128_gcm_sha256,
         server.cipherSuite(.application, .read).?,
     );
 
@@ -91,7 +91,7 @@ test "1-RTT keys derive cross-consistently and round-trip a packet" {
     const payload = "client says hello over 1-RTT — frames go here";
 
     var buf: [256]u8 = undefined;
-    const n = try nullq.wire.short_packet.seal1Rtt(&buf, .{
+    const n = try quic_zig.wire.short_packet.seal1Rtt(&buf, .{
         .dcid = &dcid,
         .pn = 1,
         .payload = payload,
@@ -99,7 +99,7 @@ test "1-RTT keys derive cross-consistently and round-trip a packet" {
     });
 
     var pt: [256]u8 = undefined;
-    const opened = try nullq.wire.short_packet.open1Rtt(&pt, buf[0..n], .{
+    const opened = try quic_zig.wire.short_packet.open1Rtt(&pt, buf[0..n], .{
         .dcid_len = dcid.len,
         .keys = &s_read,
         .largest_received = 0,
@@ -109,13 +109,13 @@ test "1-RTT keys derive cross-consistently and round-trip a packet" {
 
     // And the reverse direction.
     const reply = "server replies on 1-RTT";
-    const m = try nullq.wire.short_packet.seal1Rtt(&buf, .{
+    const m = try quic_zig.wire.short_packet.seal1Rtt(&buf, .{
         .dcid = &dcid,
         .pn = 1,
         .payload = reply,
         .keys = &s_write,
     });
-    const opened2 = try nullq.wire.short_packet.open1Rtt(&pt, buf[0..m], .{
+    const opened2 = try quic_zig.wire.short_packet.open1Rtt(&pt, buf[0..m], .{
         .dcid_len = dcid.len,
         .keys = &c_read,
         .largest_received = 0,
@@ -145,9 +145,9 @@ test "frames round-trip end-to-end through 1-RTT seal/open" {
     });
     defer client_tls.deinit();
 
-    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    var client = try quic_zig.Connection.initClient(allocator, client_tls, "localhost");
     defer client.deinit();
-    var server = try nullq.Connection.initServer(allocator, server_tls);
+    var server = try quic_zig.Connection.initServer(allocator, server_tls);
     defer server.deinit();
 
     try client.bind();
@@ -155,7 +155,7 @@ test "frames round-trip end-to-end through 1-RTT seal/open" {
     client.peer = &server;
     server.peer = &client;
 
-    const tp: nullq.tls.TransportParams = .{
+    const tp: quic_zig.tls.TransportParams = .{
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 1 << 20,
         .initial_max_stream_data_bidi_remote = 1 << 20,
@@ -177,9 +177,9 @@ test "frames round-trip end-to-end through 1-RTT seal/open" {
     // Build a payload: PING, MAX_DATA, STREAM(stream_id=4, "hello", FIN).
     var fbuf: [128]u8 = undefined;
     var fpos: usize = 0;
-    fpos += try nullq.frame.encode(fbuf[fpos..], .{ .ping = .{} });
-    fpos += try nullq.frame.encode(fbuf[fpos..], .{ .max_data = .{ .maximum_data = 1 << 20 } });
-    fpos += try nullq.frame.encode(fbuf[fpos..], .{ .stream = .{
+    fpos += try quic_zig.frame.encode(fbuf[fpos..], .{ .ping = .{} });
+    fpos += try quic_zig.frame.encode(fbuf[fpos..], .{ .max_data = .{ .maximum_data = 1 << 20 } });
+    fpos += try quic_zig.frame.encode(fbuf[fpos..], .{ .stream = .{
         .stream_id = 4,
         .data = "hello",
         .has_offset = false,
@@ -189,7 +189,7 @@ test "frames round-trip end-to-end through 1-RTT seal/open" {
 
     const dcid: [4]u8 = .{ 1, 2, 3, 4 };
     var pkt: [256]u8 = undefined;
-    const n = try nullq.wire.short_packet.seal1Rtt(&pkt, .{
+    const n = try quic_zig.wire.short_packet.seal1Rtt(&pkt, .{
         .dcid = &dcid,
         .pn = 7,
         .payload = fbuf[0..fpos],
@@ -197,7 +197,7 @@ test "frames round-trip end-to-end through 1-RTT seal/open" {
     });
 
     var pt: [256]u8 = undefined;
-    const opened = try nullq.wire.short_packet.open1Rtt(&pt, pkt[0..n], .{
+    const opened = try quic_zig.wire.short_packet.open1Rtt(&pt, pkt[0..n], .{
         .dcid_len = dcid.len,
         .keys = &s_read,
         .largest_received = 0,
@@ -210,7 +210,7 @@ test "frames round-trip end-to-end through 1-RTT seal/open" {
     var stream_payload: ?[]const u8 = null;
     var stream_fin = false;
 
-    var it = nullq.frame.iter(opened.payload);
+    var it = quic_zig.frame.iter(opened.payload);
     while (try it.next()) |f| switch (f) {
         .ping => saw_ping = true,
         .max_data => |md| saw_max_data = md.maximum_data,

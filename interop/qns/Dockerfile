@@ -18,17 +18,17 @@ RUN case "$TARGETPLATFORM" in \
 
 ENV PATH="/opt/zig:${PATH}"
 
-COPY nullq /src/nullq
+COPY quic-zig /src/quic-zig
 COPY boringssl-zig /src/boringssl-zig
 
-WORKDIR /src/nullq
+WORKDIR /src/quic-zig
 RUN zig build qns-endpoint -Doptimize=ReleaseSafe
 
 FROM martenseemann/quic-network-simulator-endpoint:latest
 
 WORKDIR /
-COPY --from=build /src/nullq/zig-out/bin/qns-endpoint /qns-endpoint
-COPY nullq/interop/qns/run_endpoint.sh /run_endpoint.sh
+COPY --from=build /src/quic-zig/zig-out/bin/qns-endpoint /qns-endpoint
+COPY quic-zig/interop/qns/run_endpoint.sh /run_endpoint.sh
 RUN chmod +x /run_endpoint.sh
 
 ENTRYPOINT ["/run_endpoint.sh"]

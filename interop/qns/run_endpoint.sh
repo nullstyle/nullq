@@ -7,7 +7,7 @@ case "${TESTCASE:-}" in
   ""|handshake|transfer|longrtt|chacha20|multiplexing|retry|resumption|zerortt|keyupdate|blackhole|handshakeloss|transferloss|handshakecorruption|transfercorruption|multiconnect)
     ;;
   *)
-    echo "nullq qns endpoint does not support TESTCASE=${TESTCASE:-unset}" >&2
+    echo "quic-zig qns endpoint does not support TESTCASE=${TESTCASE:-unset}" >&2
     exit 127
     ;;
 esac
@@ -32,7 +32,7 @@ case "${ROLE:-server}" in
     ;;
   client)
     if [ "${TESTCASE:-}" = "multiconnect" ]; then
-      echo "nullq qns client does not support TESTCASE=${TESTCASE}" >&2
+      echo "quic-zig qns client does not support TESTCASE=${TESTCASE}" >&2
       exit 127
     fi
     server_arg="${SERVER:-}"

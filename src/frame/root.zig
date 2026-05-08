@@ -1,4 +1,4 @@
-//! nullq.frame — QUIC frame encoders, decoders, and types (RFC 9000 §19).
+//! quic_zig.frame — QUIC frame encoders, decoders, and types (RFC 9000 §19).
 //!
 //! All v1 frame types are implemented: PADDING, PING, ACK (range-
 //! encoded with optional ECN counts), RESET_STREAM, STOP_SENDING,

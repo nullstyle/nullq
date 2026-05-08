@@ -34,7 +34,7 @@
 //! "frame", halving payload density without gaining coverage.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 const common = @import("common.zig");
 
@@ -46,13 +46,13 @@ const ClientScid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7 };
 const ServerScid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
 
 /// Drive a real Initial/Handshake/1-RTT exchange between two
-/// `nullq.Connection`s until both sides have application keys. Mirror
+/// `quic_zig.Connection`s until both sides have application keys. Mirror
 /// of the loop in `path_challenge_flood_smoke.zig` — kept inline so
 /// this file does not collide with parallel agents editing the
 /// existing e2e files.
 fn driveHandshake(
-    client: *nullq.Connection,
-    server: *nullq.Connection,
+    client: *quic_zig.Connection,
+    server: *quic_zig.Connection,
     start_now_us: u64,
 ) !u64 {
     var buf_c2s: [2048]u8 = undefined;
@@ -81,8 +81,8 @@ fn buildPair(
     server_tls: *boringssl.tls.Context,
     client_tls: *boringssl.tls.Context,
 ) !struct {
-    client: *nullq.Connection,
-    server: *nullq.Connection,
+    client: *quic_zig.Connection,
+    server: *quic_zig.Connection,
 } {
     const protos = [_][]const u8{"hq-test"};
     server_tls.* = try boringssl.tls.Context.initServer(.{
@@ -100,14 +100,14 @@ fn buildPair(
         .alpn = &protos,
     });
 
-    const client = try allocator.create(nullq.Connection);
+    const client = try allocator.create(quic_zig.Connection);
     errdefer allocator.destroy(client);
-    client.* = try nullq.Connection.initClient(allocator, client_tls.*, "localhost");
+    client.* = try quic_zig.Connection.initClient(allocator, client_tls.*, "localhost");
     errdefer client.deinit();
 
-    const server = try allocator.create(nullq.Connection);
+    const server = try allocator.create(quic_zig.Connection);
     errdefer allocator.destroy(server);
-    server.* = try nullq.Connection.initServer(allocator, server_tls.*);
+    server.* = try quic_zig.Connection.initServer(allocator, server_tls.*);
     errdefer server.deinit();
 
     try client.bind();
@@ -149,7 +149,7 @@ test "all-unknown-frames payload: Connection rejects with FRAME_ENCODING_ERROR (
     // server didn't slip into a zombie state after rejecting the
     // unknown-frames payload.
     const baseline_close = server.closeState();
-    try std.testing.expectEqual(nullq.CloseState.open, baseline_close);
+    try std.testing.expectEqual(quic_zig.CloseState.open, baseline_close);
 
     // Drain any handshake tail so the server's PN tracker is on a
     // settled application baseline before we inject the malicious
@@ -186,7 +186,7 @@ test "all-unknown-frames payload: Connection rejects with FRAME_ENCODING_ERROR (
 
     // Seal the malicious payload as a real protected 1-RTT packet.
     var packet_buf: [1500]u8 = undefined;
-    const packet_len = try nullq.wire.short_packet.seal1Rtt(&packet_buf, .{
+    const packet_len = try quic_zig.wire.short_packet.seal1Rtt(&packet_buf, .{
         .dcid = dcid,
         .pn = pn,
         .largest_acked = null,

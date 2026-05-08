@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to nullq are documented in this file.
+All notable changes to quic-zig are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
@@ -67,18 +67,18 @@ breaking changes; see notes per release.
 
 ### API additions
 
-- `nullq.wire.long_packet.LongOpenResult` gains a `reserved_bits: u2`
+- `quic-zig.wire.long_packet.LongOpenResult` gains a `reserved_bits: u2`
   field carrying the post-HP, post-AEAD authenticated bits 3-2 of the
   long-header first byte.
-- `nullq.wire.short_packet.Open1RttResult` gains a `reserved_bits: u2`
+- `quic-zig.wire.short_packet.Open1RttResult` gains a `reserved_bits: u2`
   field carrying the post-HP, post-AEAD authenticated bits 4-3 of the
   short-header first byte.
-- `nullq.wire.long_packet.InitialSealOptions` gains a
+- `quic-zig.wire.long_packet.InitialSealOptions` gains a
   `reserved_bits: u2 = 0` field. Default 0 — production callers
   MUST NOT change it; the field exists only so test fixtures can
   construct malicious-but-authentic packets that exercise the
   receiver-side §17.2.1 ¶17 gate.
-- `nullq.tls.transport_params.Role`, `DecodeOptions`, `decodeAs`,
+- `quic-zig.tls.transport_params.Role`, `DecodeOptions`, `decodeAs`,
   and `Error.TransportParameterError`. Role-aware decode primitive
   for §7.3 / §18.2 validation; the existing role-agnostic `decode`
   is unchanged.
@@ -181,7 +181,7 @@ inventory (now 19 coverage-guided harnesses).
   AES-GCM-256: 96-byte fixed wire size (12-byte nonce + 68-byte
   ciphertext + 16-byte tag); plaintext zero-padded so every minted
   token is a uniformly random opaque blob. Domain separator bumped
-  to `"nullq retry token v2"`. Plus `fuzz: retry_token validate
+  to `"quic-zig retry token v2"`. Plus `fuzz: retry_token validate
   never panics`. Commit `474a71b`.
 - §4.4 — Per-source Version Negotiation rate limit
   (`vn_count` / `vn_window_start_us`, default 8/window) on
@@ -191,10 +191,10 @@ inventory (now 19 coverage-guided harnesses).
 - §4.5 — Server / Retry SCIDs minted directly from BoringSSL CSPRNG
   (`boringssl.crypto.rand.fillBytes`); the seed-once
   `std.Random.DefaultPrng` ceremony is gone. Commit `2137f77`.
-- §4.5 — `nullq.conn.stateless_reset` default-safe HMAC-SHA256
+- §4.5 — `quic-zig.conn.stateless_reset` default-safe HMAC-SHA256
   derivation helper for stateless-reset tokens (Key /
   derive(key, cid) / generateKey()) with domain separator
-  `"nullq stateless reset v1"`. Commit `030b9fe`.
+  `"quic-zig stateless reset v1"`. Commit `030b9fe`.
 - §4.7 — Cap incoming ACK / PATH_ACK `range_count` at 256
   (`max_incoming_ack_ranges`) before iteration; new
   `Error.AckRangeCountTooLarge`. Commit `3a64820`.
@@ -209,7 +209,7 @@ inventory (now 19 coverage-guided harnesses).
   `Server.Config.enable_0rtt: bool = false`; client-side
   `early_data_enabled` follows `config.session_ticket != null`
   rather than always-on. Commit `0457262`.
-- §5.2 / RFC 9001 §5.6 — `nullq.tls.AntiReplayTracker` primitive:
+- §5.2 / RFC 9001 §5.6 — `quic-zig.tls.AntiReplayTracker` primitive:
   bounded LRU with time window (default 4096 entries / 10 minutes),
   `consume(id, now_us) → .fresh | .replay`, opaque
   `Id = [32]u8`. Commit `108180a`.
@@ -243,7 +243,7 @@ inventory (now 19 coverage-guided harnesses).
   `Server.Config.new_token_key` / `Server.Config.new_token_lifetime_us`
   (default 24h), `Client.Config.new_token` /
   `Client.Config.new_token_callback` / `new_token_user_data`,
-  `nullq.conn.new_token` module with AES-GCM-256-sealed token
+  `quic-zig.conn.new_token` module with AES-GCM-256-sealed token
   format (96-byte wire shape mirroring v2 Retry tokens with a
   distinct domain separator and address-only binding so tokens
   travel across connections). Server-side mints one NEW_TOKEN per
@@ -264,22 +264,22 @@ inventory (now 19 coverage-guided harnesses).
   against the existing path's anti-amp, and emits a
   `migration_path_failed` qlog event with reason `policy_denied`;
   the connection stays open on the original 4-tuple. Re-exported as
-  `nullq.MigrationCallback` / `nullq.MigrationDecision`.
+  `quic-zig.MigrationCallback` / `quic-zig.MigrationDecision`.
 - `QlogMigrationFailReason` enum (`timeout`, `policy_denied`) and
   matching optional `migration_fail_reason` field on `QlogEvent`.
   Existing `migration_path_failed` emit sites now populate
   `.timeout`; the new `policy_denied` value comes from the
   migration-callback deny path.
-- `nullq.Server.Slot` distributed-tracing surface for embedders
+- `quic-zig.Server.Slot` distributed-tracing surface for embedders
   building W3C tracecontext / OpenTelemetry pipelines. Each slot now
   carries a server-local monotonic `slot_id: u64` stamped at accept
   time (stable for the slot's lifetime, suitable as the primary key
   in operational logs without depending on peer-chosen CIDs), plus
   optional `trace_id: ?[16]u8` and `parent_span_id: ?[8]u8` fields
   the embedder attaches via the new `Slot.setTraceContext(trace_id,
-  parent_span_id)` method. nullq treats both as opaque metadata —
+  parent_span_id)` method. quic-zig treats both as opaque metadata —
   they are never read or forwarded into qlog or onto the wire.
-- `nullq.Server.replaceTlsContext` — graceful, hot-swappable TLS
+- `quic-zig.Server.replaceTlsContext` — graceful, hot-swappable TLS
   context reload. Accepts either fresh PEM bytes (rebuilt with the
   Server's existing ALPN preference list and TLS-1.3 defaults) or a
   caller-built `boringssl.tls.Context` via the new `Server.TlsReload`
@@ -295,7 +295,7 @@ inventory (now 19 coverage-guided harnesses).
   keys themselves and pass the rebuilt context via the `.override`
   variant. See `src/server.zig` and the tests in
   `tests/e2e/server_smoke.zig`.
-- `nullq.Server` operability surface: a structured logging hook
+- `quic-zig.Server` operability surface: a structured logging hook
   (`Config.log_callback` / `Config.log_user_data` plus `Server.LogEvent`
   / `Server.LogCallback`) emits one event per observable choice point
   (`connection_accepted`, `connection_closed`, `feed_rate_limited`,
@@ -391,8 +391,8 @@ interop matrix (`H, DC, C20, S, R, Z, M`); public Zig API is still
 expected to churn before `0.1.0` final.
 
 ### Added
-- `nullq.Server` production-grade convenience wrapper for embedding
-  nullq as a UDP server. Owns the TLS context and a CID-to-slot
+- `quic-zig.Server` production-grade convenience wrapper for embedding
+  quic-zig as a UDP server. Owns the TLS context and a CID-to-slot
   routing table; the embedder owns the socket and clock. Config /
   Slot / feed / poll / tick / reap / iterator. The router resyncs
   each slot's CID set from `Connection.localScids` after every
@@ -401,13 +401,13 @@ expected to churn before `0.1.0` final.
   Per-source-address Initial-acceptance rate limiter is opt-in via
   `Config.max_initials_per_source_per_window` and surfaces a
   distinct `FeedOutcome.rate_limited` variant. See `src/server.zig`
-  and the `README.md` "Embed nullq as a server" section.
-- `nullq.Server` Version Negotiation and stateless Retry gates,
+  and the `README.md` "Embed quic-zig as a server" section.
+- `quic-zig.Server` Version Negotiation and stateless Retry gates,
   surfaced through new `FeedOutcome.version_negotiated` /
   `FeedOutcome.retry_sent` variants and a new
   `Server.drainStatelessResponse` method. Version Negotiation is
   unconditional (RFC 9000 §6 / RFC 8999 §6) — any long-header
-  packet with version != `nullq.QUIC_VERSION_1` queues a VN
+  packet with version != `quic-zig.QUIC_VERSION_1` queues a VN
   response listing QUIC v1. Retry is opt-in via
   `Config.retry_token_key` (32-byte HMAC-SHA256 key); when set,
   the first Initial from a peer earns a stateless Retry packet
@@ -420,30 +420,30 @@ expected to churn before `0.1.0` final.
   legacy QNS endpoint loop at `interop/qns_endpoint.zig` retains
   its bespoke version of these flows for interop fixtures, but new
   embedders can rely on `Server` for both.
-- `nullq.Client` convenience wrapper for embedding nullq as a QUIC
-  client. Mirror to `nullq.Server`: builds a client-mode TLS
+- `quic-zig.Client` convenience wrapper for embedding quic-zig as a QUIC
+  client. Mirror to `quic-zig.Server`: builds a client-mode TLS
   context, generates the per-connection random initial DCID and
   SCID (RFC 9000 §7.2), and runs `bind` / `setLocalScid` /
   `setInitialDcid` / `setPeerDcid` / `setTransportParams` in the
   right order, returning a heap-allocated `*Connection` ready for
   the first `advance` / `poll`. Optional `Config.session_ticket`
   wires up resumption + 0-RTT in one step. See `src/client.zig` and
-  the `README.md` "Embed nullq as a client" section.
-- `nullq.transport.runUdpServer` — opinionated `std.Io`-based UDP
+  the `README.md` "Embed quic-zig as a client" section.
+- `quic-zig.transport.runUdpServer` — opinionated `std.Io`-based UDP
   server loop that binds the socket, applies `SO_RCVBUF` / `SO_SNDBUF`
   tuning, drives the `feed` / `pollDatagram` / `tick` / `reap`
   cadence on a 5 ms heartbeat, and shuts down cleanly when a
   caller-supplied `std.atomic.Value(bool)` flag flips. Intended as
-  the fastest path from `nullq.Server.init` to a working QUIC
+  the fastest path from `quic-zig.Server.init` to a working QUIC
   endpoint. The QNS endpoint and other embedders that need full
   control (Retry, version negotiation, deterministic CIDs) keep
   driving the I/O-agnostic Server interface directly. See
-  `src/transport/udp_server.zig` and the README "Embed nullq as a
+  `src/transport/udp_server.zig` and the README "Embed quic-zig as a
   server" section.
 - `Connection.localScidCount`, `Connection.localScids`, and
   `Connection.ownsLocalCid` for embedders that maintain a
   CID-to-connection routing table outside the connection
-  (`nullq.Server` is the canonical caller).
+  (`quic-zig.Server` is the canonical caller).
 - Public-API documentation pass: every `pub fn` / `pub const` /
   `pub var` in `src/conn/`, `src/frame/`, `src/tls/`, `src/transport/`,
   and `src/wire/` (713 declarations) now carries a 1-3 line `///`
@@ -474,7 +474,7 @@ expected to churn before `0.1.0` final.
 ### Changed
 - `boringssl-zig` is now a URL+hash dep pinned to a specific upstream
   commit (currently `8c47b6e`, post-v0.5.0). External consumers can
-  build nullq without a sibling boringssl-zig checkout. Bumping the
+  build quic-zig without a sibling boringssl-zig checkout. Bumping the
   pin is a `zig fetch <url>` + commit.
 - Stateless reset token comparison uses
   `std.crypto.timing_safe.eql` instead of `std.mem.eql`, closing
@@ -486,7 +486,7 @@ expected to churn before `0.1.0` final.
   None are peer-reachable.
 
 ### Notes
-- nullq remains pre-1.0 (`0.0.0` in `build.zig.zon`). The transport is
+- quic-zig remains pre-1.0 (`0.0.0` in `build.zig.zon`). The transport is
   feature-rich and passes a substantial QNS interop matrix (see
   `INTEROP_STATUS.md`), but the public Zig API is still expected to
   churn before the first tagged release.
@@ -542,7 +542,7 @@ commit. See `git log` for the full history.
 - **DATAGRAM extension.** Send/receive plumbing with ack and loss
   events exposed to embedders.
 - **Diagnostics.** TLS keylog re-export
-  (`nullq.KeylogCallback`) and qlog-style application key-update
+  (`quic-zig.KeylogCallback`) and qlog-style application key-update
   callbacks.
 - **Deterministic fuzz smokes.** `zig build test` now runs property
   smokes for varints, frames, transport parameters, packet headers,
@@ -584,5 +584,5 @@ adversarial peers and lossy paths. Notable items:
   draft converges with the RFC.
 - 0-RTT mismatch/loss hardening still has open work.
 
-[Unreleased]: https://github.com/nullstyle/nullq/compare/v0.0.0...HEAD
-[0.0.0]: https://github.com/nullstyle/nullq
+[Unreleased]: https://github.com/nullstyle/quic-zig/compare/v0.0.0...HEAD
+[0.0.0]: https://github.com/nullstyle/quic-zig

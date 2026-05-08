@@ -1,7 +1,7 @@
 //! QUIC encryption level (RFC 9001 §5).
 //!
 //! Mirrors `boringssl.tls.quic.EncryptionLevel` 1:1 but lives at the
-//! nullq abstraction so connection-state code doesn't have to import
+//! quic_zig abstraction so connection-state code doesn't have to import
 //! the boringssl namespace just to refer to a level.
 
 const boringssl = @import("boringssl");

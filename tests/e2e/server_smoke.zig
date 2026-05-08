@@ -1,12 +1,12 @@
-//! Smoke tests for the high-level `nullq.Server` convenience type.
+//! Smoke tests for the high-level `quic_zig.Server` convenience type.
 //!
 //! These run from the integration-test module so they can
 //! `@embedFile` the existing PEM fixtures under `tests/data/` —
 //! anything in `src/server.zig` itself can't reach those because
-//! they sit outside the published `nullq` package.
+//! they sit outside the published `quic_zig` package.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 const common = @import("common.zig");
 
@@ -48,7 +48,7 @@ fn buildOverrideTlsCtx(alpn: []const []const u8) !boringssl.tls.Context {
 test "Server.init + deinit on a real cert/key pair" {
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -63,7 +63,7 @@ test "Server.init + deinit on a real cert/key pair" {
 test "Server.feed drops non-Initial bytes silently" {
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -75,12 +75,12 @@ test "Server.feed drops non-Initial bytes silently" {
     // Random bytes that don't parse as a long-header Initial.
     var junk = [_]u8{ 0x40, 0xaa, 0xbb, 0xcc, 0xdd } ++ @as([32]u8, @splat(0));
     const outcome = try srv.feed(&junk, null, 0);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
 
     // Empty datagrams are also a no-op.
     var empty: [0]u8 = .{};
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, try srv.feed(&empty, null, 1));
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, try srv.feed(&empty, null, 1));
 
     // Calling shutdown / reap on an empty server is also a no-op.
     srv.shutdown(0, "");
@@ -90,7 +90,7 @@ test "Server.feed drops non-Initial bytes silently" {
 test "Server.feed drops QUIC v1 Initial datagrams below the 1200-byte minimum (RFC 9000 §14)" {
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -104,9 +104,9 @@ test "Server.feed drops QUIC v1 Initial datagrams below the 1200-byte minimum (R
     // 9000 §14 the server MUST discard it. The drop fires *before*
     // any Connection state is allocated, so no slot is created.
     var tiny_v1_initial = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x01) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x01) };
     const outcome = try srv.feed(&tiny_v1_initial, addr, 1_000);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
 
     // The drop is counted distinctly so ops can grep amplification
@@ -121,7 +121,7 @@ test "Server.feed drops QUIC v1 Initial datagrams below the 1200-byte minimum (R
     // VN, not §14). Also asserted: the size counter doesn't move.
     var tiny_unsupported_version = [_]u8{ 0xc0, 0xde, 0xad, 0xbe, 0xef, 4, 0xa, 0xb, 0xc, 0xd, 4, 0x1, 0x2, 0x3, 0x4 };
     const outcome2 = try srv.feed(&tiny_unsupported_version, addr, 2_000);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.version_negotiated, outcome2);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.version_negotiated, outcome2);
     const metrics2 = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), metrics2.feeds_initial_too_small);
 }
@@ -129,7 +129,7 @@ test "Server.feed drops QUIC v1 Initial datagrams below the 1200-byte minimum (R
 test "Server.feed rejects long-header packets when the table is full" {
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -143,13 +143,13 @@ test "Server.feed rejects long-header packets when the table is full" {
     // rejected because the cap is 0.
     var bytes = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 });
     const outcome = try srv.feed(&bytes, null, 0);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.table_full, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.table_full, outcome);
 }
 
 test "Server source rate limiter trips after the configured cap" {
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -166,32 +166,32 @@ test "Server source rate limiter trips after the configured cap" {
     // (21) exceeds the QUIC max of 20. The rate limiter still ticks
     // for each call.
     var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0xab) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0xab) };
 
     // First three from this source: each consumes a token, openSlot
     // fails internally, returns generic .dropped.
     for (0..3) |i| {
         const o = try srv.feed(&initial, addr, @intCast(i));
-        try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, o);
+        try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, o);
     }
 
     // Fourth call from same source: rate limiter fires before
     // openSlot is even attempted.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.rate_limited,
+        quic_zig.Server.FeedOutcome.rate_limited,
         try srv.feed(&initial, addr, 4),
     );
 
     // Different source: still has its own budget.
-    const other_addr = nullq.conn.path.Address{ .bytes = @splat(0xcd) };
+    const other_addr = quic_zig.conn.path.Address{ .bytes = @splat(0xcd) };
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.dropped,
+        quic_zig.Server.FeedOutcome.dropped,
         try srv.feed(&initial, other_addr, 5),
     );
 
     // After the window elapses, the original source's budget resets.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.dropped,
+        quic_zig.Server.FeedOutcome.dropped,
         try srv.feed(&initial, addr, 1_500_000),
     );
 }
@@ -199,7 +199,7 @@ test "Server source rate limiter trips after the configured cap" {
 test "Server.feed with unsupported version queues a Version Negotiation packet" {
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -221,10 +221,10 @@ test "Server.feed with unsupported version queues a Version Negotiation packet" 
         0xb0, 0xb1, 0xb2, 0xb3, // SCID
         0x00, 0x00, 0x00, // padding
     };
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x77) };
 
     const outcome = try srv.feed(&bytes, addr, 1000);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.version_negotiated, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.version_negotiated, outcome);
     try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
 
@@ -246,14 +246,14 @@ test "Server.feed with unsupported version queues a Version Negotiation packet" 
     // Parse the queued bytes back as a VN packet and verify the
     // CIDs are swapped (RFC 8999 §6) and the supported_versions
     // list contains exactly QUIC_VERSION_1.
-    const parsed = try nullq.wire.header.parse(wire_bytes, 0);
+    const parsed = try quic_zig.wire.header.parse(wire_bytes, 0);
     try std.testing.expect(parsed.header == .version_negotiation);
     const vn = parsed.header.version_negotiation;
     // The VN response sets DCID=client SCID and SCID=client DCID.
     try std.testing.expectEqualSlices(u8, &.{ 0xb0, 0xb1, 0xb2, 0xb3 }, vn.dcid.slice());
     try std.testing.expectEqualSlices(u8, &.{ 0xa0, 0xa1, 0xa2, 0xa3 }, vn.scid.slice());
     try std.testing.expectEqual(@as(usize, 1), vn.versionCount());
-    try std.testing.expectEqual(nullq.QUIC_VERSION_1, vn.version(0));
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, vn.version(0));
 
     // Layout sanity: 1 (first byte) + 4 (version=0) + 1 (dcid_len) +
     // 4 (dcid) + 1 (scid_len) + 4 (scid) + 4 (one supported version)
@@ -269,7 +269,7 @@ test "Server.feed with unsupported version queues a Version Negotiation packet" 
     try std.testing.expectEqual(wire_end, versions_end);
 
     // Drain returns null once the queue is empty.
-    try std.testing.expectEqual(@as(?nullq.Server.StatelessResponse, null), srv.drainStatelessResponse());
+    try std.testing.expectEqual(@as(?quic_zig.Server.StatelessResponse, null), srv.drainStatelessResponse());
 }
 
 test "Server VN per-source rate limiter caps VN responses (hardening guide §4.4)" {
@@ -281,7 +281,7 @@ test "Server VN per-source rate limiter caps VN responses (hardening guide §4.4
     // counter that gates Initial slot creation.
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -305,32 +305,32 @@ test "Server VN per-source rate limiter caps VN responses (hardening guide §4.4
         0xb0, 0xb1, 0xb2, 0xb3,
         0x00, 0x00, 0x00,
     };
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x77) };
 
     // First three probes from this source: each earns a VN response.
     for (0..3) |i| {
         try std.testing.expectEqual(
-            nullq.Server.FeedOutcome.version_negotiated,
+            quic_zig.Server.FeedOutcome.version_negotiated,
             try srv.feed(&probe, addr, @intCast(i)),
         );
     }
 
     // Fourth probe: rate-limited, no VN queued.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.dropped,
+        quic_zig.Server.FeedOutcome.dropped,
         try srv.feed(&probe, addr, 4),
     );
 
     // Different source from cleared address space: gets its own budget.
-    const other_addr = nullq.conn.path.Address{ .bytes = @splat(0x88) };
+    const other_addr = quic_zig.conn.path.Address{ .bytes = @splat(0x88) };
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.version_negotiated,
+        quic_zig.Server.FeedOutcome.version_negotiated,
         try srv.feed(&probe, other_addr, 5),
     );
 
     // After the window elapses, the original source's VN budget resets.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.version_negotiated,
+        quic_zig.Server.FeedOutcome.version_negotiated,
         try srv.feed(&probe, addr, 1_500_000),
     );
 
@@ -347,7 +347,7 @@ test "Server VN rate limit and Initial rate limit use independent counters" {
     // own count + window inside `SourceRateEntry`.
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -370,15 +370,15 @@ test "Server VN rate limit and Initial rate limit use independent counters" {
     };
     var v1_initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
 
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x99) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x99) };
 
     // Two VN probes — both earn responses, VN budget consumed.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.version_negotiated,
+        quic_zig.Server.FeedOutcome.version_negotiated,
         try srv.feed(&vn_probe, addr, 0),
     );
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.version_negotiated,
+        quic_zig.Server.FeedOutcome.version_negotiated,
         try srv.feed(&vn_probe, addr, 1),
     );
 
@@ -386,22 +386,22 @@ test "Server VN rate limit and Initial rate limit use independent counters" {
     // STILL FULL despite VN budget being exhausted. First two pass,
     // third rate-limits on the Initial side.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.dropped, // openSlot fails (DCID len 21), but rate-limit not yet hit
+        quic_zig.Server.FeedOutcome.dropped, // openSlot fails (DCID len 21), but rate-limit not yet hit
         try srv.feed(&v1_initial, addr, 2),
     );
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.dropped,
+        quic_zig.Server.FeedOutcome.dropped,
         try srv.feed(&v1_initial, addr, 3),
     );
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.rate_limited,
+        quic_zig.Server.FeedOutcome.rate_limited,
         try srv.feed(&v1_initial, addr, 4),
     );
 
     // VN budget on this address still empty: a third VN probe
     // rate-limits on the VN side, independently.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.dropped,
+        quic_zig.Server.FeedOutcome.dropped,
         try srv.feed(&vn_probe, addr, 5),
     );
 
@@ -414,7 +414,7 @@ test "Server VN rate limit and Initial rate limit use independent counters" {
 test "Server.feed without `from` drops unsupported-version packets" {
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -436,7 +436,7 @@ test "Server.feed without `from` drops unsupported-version packets" {
     // Without a destination, the server can't queue a VN — drop
     // per the documented pass-through behavior.
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.dropped,
+        quic_zig.Server.FeedOutcome.dropped,
         try srv.feed(&bytes, null, 0),
     );
     try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
@@ -445,14 +445,14 @@ test "Server.feed without `from` drops unsupported-version packets" {
 test "Server.feed with retry_token_key issues a Retry then drops a malformed echo" {
     const protos = [_][]const u8{"hq-test"};
 
-    const retry_key: nullq.RetryTokenKey = .{
+    const retry_key: quic_zig.RetryTokenKey = .{
         0x86, 0x71, 0x15, 0x0d, 0x9a, 0x2c, 0x5e, 0x04,
         0x31, 0xa8, 0x6a, 0xf9, 0x18, 0x44, 0xbd, 0x2b,
         0x4d, 0xee, 0x90, 0x3f, 0xa7, 0x61, 0x0c, 0x55,
         0xf2, 0x83, 0x1d, 0xb6, 0x95, 0x77, 0x40, 0x29,
     };
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -478,7 +478,7 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     // only reads up through token_length + token.
     var initial: [1200]u8 = @splat(0);
     initial[0] = 0xc0; // long header, type=Initial, PN-len bits=00
-    std.mem.writeInt(u32, initial[1..5], nullq.QUIC_VERSION_1, .big);
+    std.mem.writeInt(u32, initial[1..5], quic_zig.QUIC_VERSION_1, .big);
     initial[5] = odcid.len;
     @memcpy(initial[6..][0..odcid.len], &odcid);
     var pos: usize = 6 + odcid.len;
@@ -494,20 +494,20 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     pos += 1;
     initial[pos] = 0xff; // payload byte (irrelevant)
 
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x42) };
     const outcome1 = try srv.feed(&initial, addr, 1_000);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.retry_sent, outcome1);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.retry_sent, outcome1);
     try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
 
     const retry_resp = srv.drainStatelessResponse() orelse return error.NoRetryQueued;
     try std.testing.expect(addr.eql(retry_resp.dst));
-    const retry_parsed = try nullq.wire.header.parse(retry_resp.slice(), 0);
+    const retry_parsed = try quic_zig.wire.header.parse(retry_resp.slice(), 0);
     try std.testing.expect(retry_parsed.header == .retry);
     try std.testing.expectEqualSlices(u8, &client_scid, retry_parsed.header.retry.dcid.slice());
     // v2 (AES-GCM-256) tokens are 96 bytes wire-shape: 12 nonce + 68
     // ciphertext + 16 tag (was 53 bytes under the v1 HMAC-only format).
-    try std.testing.expectEqual(nullq.conn.retry_token.max_token_len, retry_parsed.header.retry.retry_token.len);
+    try std.testing.expectEqual(quic_zig.conn.retry_token.max_token_len, retry_parsed.header.retry.retry_token.len);
 
     // Second Initial: malformed token (4 bytes of garbage instead
     // of the canonical 96-byte token). The peer is addressing the
@@ -518,7 +518,7 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     // token_length + token only; trailing zeros are ignored.
     var bad_initial: [1200]u8 = @splat(0);
     bad_initial[0] = 0xc0;
-    std.mem.writeInt(u32, bad_initial[1..5], nullq.QUIC_VERSION_1, .big);
+    std.mem.writeInt(u32, bad_initial[1..5], quic_zig.QUIC_VERSION_1, .big);
     bad_initial[5] = @intCast(retry_scid_bytes.len);
     @memcpy(bad_initial[6..][0..retry_scid_bytes.len], retry_scid_bytes);
     var bp: usize = 6 + retry_scid_bytes.len;
@@ -538,7 +538,7 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
     bad_initial[bp] = 0xff;
 
     const outcome2 = try srv.feed(&bad_initial, addr, 2_000);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome2);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome2);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     // Crucially: a malformed echo does NOT mint a fresh Retry
     // (per the documented behavior — would amplify probing).
@@ -546,7 +546,7 @@ test "Server.feed with retry_token_key issues a Retry then drops a malformed ech
 }
 
 test "Server.feed Retry happy-path: client echoes a valid token and a slot opens" {
-    // Drive a real `nullq.Client` through the Retry round trip:
+    // Drive a real `quic_zig.Client` through the Retry round trip:
     //   1. Client emits Initial #1 (no token).
     //   2. Server queues Retry, returns `.retry_sent`.
     //   3. We hand the Retry to the Client; it captures the token,
@@ -562,14 +562,14 @@ test "Server.feed Retry happy-path: client echoes a valid token and a slot opens
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    const retry_key: nullq.RetryTokenKey = .{
+    const retry_key: quic_zig.RetryTokenKey = .{
         0x86, 0x71, 0x15, 0x0d, 0x9a, 0x2c, 0x5e, 0x04,
         0x31, 0xa8, 0x6a, 0xf9, 0x18, 0x44, 0xbd, 0x2b,
         0x4d, 0xee, 0x90, 0x3f, 0xa7, 0x61, 0x0c, 0x55,
         0xf2, 0x83, 0x1d, 0xb6, 0x95, 0x77, 0x40, 0x29,
     };
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -579,7 +579,7 @@ test "Server.feed Retry happy-path: client echoes a valid token and a slot opens
     });
     defer srv.deinit();
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -595,11 +595,11 @@ test "Server.feed Retry happy-path: client echoes a valid token and a slot opens
     const n1 = (try client.conn.poll(&initial1, 1_000)) orelse
         return error.NoInitialEmitted;
 
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x42) };
 
     // Step 2: feed Initial #1 to the server. Should trigger Retry.
     const outcome1 = try srv.feed(initial1[0..n1], addr, 1_000);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.retry_sent, outcome1);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.retry_sent, outcome1);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     try std.testing.expectEqual(@as(usize, 1), srv.statelessResponseCount());
 
@@ -608,15 +608,15 @@ test "Server.feed Retry happy-path: client echoes a valid token and a slot opens
         return error.NoRetryQueued;
     try std.testing.expect(addr.eql(retry_resp.dst));
 
-    const retry_parsed = try nullq.wire.header.parse(retry_resp.slice(), 0);
+    const retry_parsed = try quic_zig.wire.header.parse(retry_resp.slice(), 0);
     try std.testing.expect(retry_parsed.header == .retry);
     const retry = retry_parsed.header.retry;
-    try std.testing.expectEqual(nullq.QUIC_VERSION_1, retry.version);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, retry.version);
     // v2 (AES-GCM-256) Retry token: 12-byte nonce + 68-byte ciphertext
     // + 16-byte tag = 96 bytes. The §4.3 hardening pass moved off the
     // v1 53-byte HMAC-only format so the wire bytes are uniformly
     // random (no plaintext bound-field reveal).
-    try std.testing.expectEqual(nullq.conn.retry_token.max_token_len, retry.retry_token.len);
+    try std.testing.expectEqual(quic_zig.conn.retry_token.max_token_len, retry.retry_token.len);
 
     // Step 4: hand the Retry to the client. `Connection.handle`
     // accepts the Retry, swaps its peer/initial DCID to the server's
@@ -635,7 +635,7 @@ test "Server.feed Retry happy-path: client echoes a valid token and a slot opens
 
     // Sanity-check the echoed Initial before feeding it: parse it as
     // a long header and confirm the token is present and matches.
-    const echo_parsed = try nullq.wire.header.parse(initial2[0..n2], 0);
+    const echo_parsed = try quic_zig.wire.header.parse(initial2[0..n2], 0);
     try std.testing.expect(echo_parsed.header == .initial);
     try std.testing.expectEqualSlices(
         u8,
@@ -652,7 +652,7 @@ test "Server.feed Retry happy-path: client echoes a valid token and a slot opens
     // validates, a slot is allocated, and the per-source Retry state
     // is cleared.
     const outcome2 = try srv.feed(initial2[0..n2], addr, 2_500);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.accepted, outcome2);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.accepted, outcome2);
     try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
     // No new stateless response: a successful echo proceeds to slot
     // creation, it does not mint another Retry.
@@ -670,14 +670,14 @@ test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    const retry_key: nullq.RetryTokenKey = .{
+    const retry_key: quic_zig.RetryTokenKey = .{
         0x86, 0x71, 0x15, 0x0d, 0x9a, 0x2c, 0x5e, 0x04,
         0x31, 0xa8, 0x6a, 0xf9, 0x18, 0x44, 0xbd, 0x2b,
         0x4d, 0xee, 0x90, 0x3f, 0xa7, 0x61, 0x0c, 0x55,
         0xf2, 0x83, 0x1d, 0xb6, 0x95, 0x77, 0x40, 0x29,
     };
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -688,7 +688,7 @@ test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
     });
     defer srv.deinit();
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -702,9 +702,9 @@ test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
     const n1 = (try client.conn.poll(&initial1, 1_000)) orelse
         return error.NoInitialEmitted;
 
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x42) };
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.retry_sent,
+        quic_zig.Server.FeedOutcome.retry_sent,
         try srv.feed(initial1[0..n1], addr, 1_000),
     );
 
@@ -726,7 +726,7 @@ test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
     // to this `now_us`, so `validate` returns `.expired` and the
     // gate drops the datagram without minting a fresh Retry.
     const outcome = try srv.feed(initial2[0..n2], addr, 1_000_000);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome);
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
     try std.testing.expectEqual(@as(usize, 0), srv.statelessResponseCount());
 }
@@ -737,24 +737,24 @@ test "Server.feed Retry rejects an echoed token whose lifetime has elapsed" {
 // creation; embedders use it as the primary key in operational logs
 // and for trace correlation. `Slot.trace_id` / `Slot.parent_span_id`
 // are opaque W3C tracecontext bytes the embedder attaches via
-// `Slot.setTraceContext`. nullq does not interpret either.
+// `Slot.setTraceContext`. quic_zig does not interpret either.
 
-/// Drive a real `nullq.Client` through to the first Initial and feed
+/// Drive a real `quic_zig.Client` through to the first Initial and feed
 /// it to `srv` so a slot opens. Returns the freshly accepted slot
 /// pointer. The client is owned by the caller (deinit on cleanup).
 fn acceptOneSlot(
-    srv: *nullq.Server,
-    client: *nullq.Client,
-    addr: nullq.conn.path.Address,
+    srv: *quic_zig.Server,
+    client: *quic_zig.Client,
+    addr: quic_zig.conn.path.Address,
     now_us: u64,
-) !*nullq.Server.Slot {
+) !*quic_zig.Server.Slot {
     try client.conn.advance();
     var initial: [2048]u8 = undefined;
     const n = (try client.conn.poll(&initial, now_us)) orelse
         return error.NoInitialEmitted;
     const before = srv.connectionCount();
     const outcome = try srv.feed(initial[0..n], addr, now_us);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.accepted, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.accepted, outcome);
     try std.testing.expectEqual(before + 1, srv.connectionCount());
     return srv.iterator()[srv.iterator().len - 1];
 }
@@ -763,7 +763,7 @@ test "Slot.slot_id is stable across feeds for the same connection" {
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -772,7 +772,7 @@ test "Slot.slot_id is stable across feeds for the same connection" {
     });
     defer srv.deinit();
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -780,7 +780,7 @@ test "Slot.slot_id is stable across feeds for the same connection" {
     });
     defer client.deinit();
 
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x42) };
     const slot = try acceptOneSlot(&srv, &client, addr, 1_000);
     const first_id = slot.slot_id;
 
@@ -790,7 +790,7 @@ test "Slot.slot_id is stable across feeds for the same connection" {
     var follow: [2048]u8 = undefined;
     if (try client.conn.poll(&follow, 2_000)) |n| {
         const outcome = try srv.feed(follow[0..n], addr, 2_000);
-        try std.testing.expectEqual(nullq.Server.FeedOutcome.routed, outcome);
+        try std.testing.expectEqual(quic_zig.Server.FeedOutcome.routed, outcome);
         try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
         try std.testing.expectEqual(first_id, srv.iterator()[0].slot_id);
     }
@@ -800,7 +800,7 @@ test "Slot.slot_id is monotonic and unique across multiple accepts" {
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -809,7 +809,7 @@ test "Slot.slot_id is monotonic and unique across multiple accepts" {
     });
     defer srv.deinit();
 
-    var client_a = try nullq.Client.connect(.{
+    var client_a = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -817,7 +817,7 @@ test "Slot.slot_id is monotonic and unique across multiple accepts" {
     });
     defer client_a.deinit();
 
-    var client_b = try nullq.Client.connect(.{
+    var client_b = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -825,7 +825,7 @@ test "Slot.slot_id is monotonic and unique across multiple accepts" {
     });
     defer client_b.deinit();
 
-    var client_c = try nullq.Client.connect(.{
+    var client_c = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -833,9 +833,9 @@ test "Slot.slot_id is monotonic and unique across multiple accepts" {
     });
     defer client_c.deinit();
 
-    const addr_a = nullq.conn.path.Address{ .bytes = @splat(0xa0) };
-    const addr_b = nullq.conn.path.Address{ .bytes = @splat(0xb0) };
-    const addr_c = nullq.conn.path.Address{ .bytes = @splat(0xc0) };
+    const addr_a = quic_zig.conn.path.Address{ .bytes = @splat(0xa0) };
+    const addr_b = quic_zig.conn.path.Address{ .bytes = @splat(0xb0) };
+    const addr_c = quic_zig.conn.path.Address{ .bytes = @splat(0xc0) };
 
     const slot_a = try acceptOneSlot(&srv, &client_a, addr_a, 1_000);
     const id_a = slot_a.slot_id;
@@ -856,7 +856,7 @@ test "Slot.setTraceContext round-trips and defaults are null" {
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -865,7 +865,7 @@ test "Slot.setTraceContext round-trips and defaults are null" {
     });
     defer srv.deinit();
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -873,11 +873,11 @@ test "Slot.setTraceContext round-trips and defaults are null" {
     });
     defer client.deinit();
 
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x42) };
     const slot = try acceptOneSlot(&srv, &client, addr, 1_000);
 
     // Defaults: a freshly accepted slot has no trace metadata
-    // attached. nullq never sets these itself.
+    // attached. quic_zig never sets these itself.
     try std.testing.expectEqual(@as(?[16]u8, null), slot.trace_id);
     try std.testing.expectEqual(@as(?[8]u8, null), slot.parent_span_id);
 
@@ -905,7 +905,7 @@ test "Server.replaceTlsContext on an empty server swaps the current context and 
     // (the leak detector catches the failure mode).
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -958,7 +958,7 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -970,7 +970,7 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     const old_inner = srv.tls_ctx.inner;
 
     // -- step 1: open slot #1 against the original context --
-    var client1 = try nullq.Client.connect(.{
+    var client1 = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -983,9 +983,9 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     const n1 = (try client1.conn.poll(&initial_buf1, 1_000)) orelse
         return error.NoInitialEmitted;
 
-    const addr1 = nullq.conn.path.Address{ .bytes = @splat(0x11) };
+    const addr1 = quic_zig.conn.path.Address{ .bytes = @splat(0x11) };
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.accepted,
+        quic_zig.Server.FeedOutcome.accepted,
         try srv.feed(initial_buf1[0..n1], addr1, 1_000),
     );
     try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
@@ -1007,7 +1007,7 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     try std.testing.expectEqual(@as(u32, 0), srv.slots.items[0].tls_generation);
 
     // -- step 3: open slot #2 against the new context --
-    var client2 = try nullq.Client.connect(.{
+    var client2 = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -1020,9 +1020,9 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     const n2 = (try client2.conn.poll(&initial_buf2, 2_000)) orelse
         return error.NoInitialEmitted;
 
-    const addr2 = nullq.conn.path.Address{ .bytes = @splat(0x22) };
+    const addr2 = quic_zig.conn.path.Address{ .bytes = @splat(0x22) };
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.accepted,
+        quic_zig.Server.FeedOutcome.accepted,
         try srv.feed(initial_buf2[0..n2], addr2, 2_000),
     );
     try std.testing.expectEqual(@as(usize, 2), srv.connectionCount());
@@ -1043,8 +1043,8 @@ test "Server.replaceTlsContext while a slot is live drains the old context and r
     // -- step 4: close both slots and reap --
     // Close the gen-1 slot first so we can confirm that reaping it
     // does NOT touch the draining entry (current generation).
-    var gen_0_slot: *nullq.Server.Slot = undefined;
-    var gen_1_slot: *nullq.Server.Slot = undefined;
+    var gen_0_slot: *quic_zig.Server.Slot = undefined;
+    var gen_1_slot: *quic_zig.Server.Slot = undefined;
     for (srv.slots.items) |slot| {
         if (slot.tls_generation == 0) gen_0_slot = slot;
         if (slot.tls_generation == 1) gen_1_slot = slot;
@@ -1089,7 +1089,7 @@ test "Server.deinit after replaceTlsContext cleans up unreaped draining contexts
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1097,7 +1097,7 @@ test "Server.deinit after replaceTlsContext cleans up unreaped draining contexts
         .transport_params = defaultParams(),
     });
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -1109,9 +1109,9 @@ test "Server.deinit after replaceTlsContext cleans up unreaped draining contexts
     var initial_buf: [2048]u8 = undefined;
     const n = (try client.conn.poll(&initial_buf, 1_000)) orelse
         return error.NoInitialEmitted;
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x42) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x42) };
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.accepted,
+        quic_zig.Server.FeedOutcome.accepted,
         try srv.feed(initial_buf[0..n], addr, 1_000),
     );
 
@@ -1142,10 +1142,10 @@ test "Server.deinit after replaceTlsContext cleans up unreaped draining contexts
 /// `ArrayList` so tests can drive a few `feed` calls and then
 /// pattern-match the captured stream.
 const LogSink = struct {
-    events: std.ArrayList(nullq.Server.LogEvent) = .empty,
+    events: std.ArrayList(quic_zig.Server.LogEvent) = .empty,
     allocator: std.mem.Allocator,
 
-    fn cb(user_data: ?*anyopaque, ev: nullq.Server.LogEvent) void {
+    fn cb(user_data: ?*anyopaque, ev: quic_zig.Server.LogEvent) void {
         const self: *LogSink = @ptrCast(@alignCast(user_data.?));
         self.events.append(self.allocator, ev) catch {};
     }
@@ -1160,7 +1160,7 @@ test "Server log_callback fires for table_full" {
     var sink: LogSink = .{ .allocator = std.testing.allocator };
     defer sink.deinit();
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1173,9 +1173,9 @@ test "Server log_callback fires for table_full" {
     defer srv.deinit();
 
     var bytes = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 });
-    const peer = nullq.conn.path.Address{ .bytes = @splat(0x55) };
+    const peer = quic_zig.conn.path.Address{ .bytes = @splat(0x55) };
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.table_full,
+        quic_zig.Server.FeedOutcome.table_full,
         try srv.feed(&bytes, peer, 0),
     );
 
@@ -1191,7 +1191,7 @@ test "Server log_callback fires for rate_limited and version_negotiated" {
     var sink: LogSink = .{ .allocator = std.testing.allocator };
     defer sink.deinit();
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1211,7 +1211,7 @@ test "Server log_callback fires for rate_limited and version_negotiated" {
         0x04, 0xb0, 0xb1, 0xb2, 0xb3,
         0x00,
     };
-    const vn_peer = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+    const vn_peer = quic_zig.conn.path.Address{ .bytes = @splat(0x77) };
     _ = try srv.feed(&vn_bytes, vn_peer, 1000);
 
     // Rate-limit: long-header v1 Initial that fails openSlot but
@@ -1219,11 +1219,11 @@ test "Server log_callback fires for rate_limited and version_negotiated" {
     // return InvalidConfig (DCID > 20). The first two attempts get .dropped
     // (each consuming a token); the third is rate-limited.
     var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
-    const rl_peer = nullq.conn.path.Address{ .bytes = @splat(0xab) };
+    const rl_peer = quic_zig.conn.path.Address{ .bytes = @splat(0xab) };
     _ = try srv.feed(&initial, rl_peer, 0);
     _ = try srv.feed(&initial, rl_peer, 1);
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.rate_limited,
+        quic_zig.Server.FeedOutcome.rate_limited,
         try srv.feed(&initial, rl_peer, 2),
     );
 
@@ -1251,7 +1251,7 @@ test "Server log_callback fires for rate_limited and version_negotiated" {
 
 test "Server metricsSnapshot tracks counters across feed outcomes" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1280,12 +1280,12 @@ test "Server metricsSnapshot tracks counters across feed outcomes" {
         0x04, 0xb0, 0xb1, 0xb2, 0xb3,
         0x00,
     };
-    const vn_peer = nullq.conn.path.Address{ .bytes = @splat(0x77) };
+    const vn_peer = quic_zig.conn.path.Address{ .bytes = @splat(0x77) };
     _ = try srv.feed(&vn_bytes, vn_peer, 100);
 
     // Rate-limit hit. Two attempts at the cap, then over.
     var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
-    const rl_peer = nullq.conn.path.Address{ .bytes = @splat(0xab) };
+    const rl_peer = quic_zig.conn.path.Address{ .bytes = @splat(0xab) };
     _ = try srv.feed(&initial, rl_peer, 0);
     _ = try srv.feed(&initial, rl_peer, 1);
     _ = try srv.feed(&initial, rl_peer, 2);
@@ -1302,7 +1302,7 @@ test "Server metricsSnapshot tracks counters across feed outcomes" {
 
 test "Server rateLimitSnapshot reports top offender after cap is hit" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1314,13 +1314,13 @@ test "Server rateLimitSnapshot reports top offender after cap is hit" {
     defer srv.deinit();
 
     var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
-    const heavy_peer = nullq.conn.path.Address{ .bytes = @splat(0xaa) };
-    const light_peer = nullq.conn.path.Address{ .bytes = @splat(0x11) };
+    const heavy_peer = quic_zig.conn.path.Address{ .bytes = @splat(0xaa) };
+    const light_peer = quic_zig.conn.path.Address{ .bytes = @splat(0x11) };
 
     // Heavy peer: 3 attempts then 1 rate-limited (count stays at cap=3).
     for (0..3) |i| _ = try srv.feed(&initial, heavy_peer, @intCast(i));
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.rate_limited,
+        quic_zig.Server.FeedOutcome.rate_limited,
         try srv.feed(&initial, heavy_peer, 4),
     );
     // Light peer: 1 attempt only.
@@ -1341,7 +1341,7 @@ test "Server rateLimitSnapshot reports top offender after cap is hit" {
 
 test "Server metricsSnapshot stateless_queue_high_water is sticky across drains" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1357,7 +1357,7 @@ test "Server metricsSnapshot stateless_queue_high_water is sticky across drains"
         0x04, 0xb0, 0xb1, 0xb2, 0xb3,
         0x00,
     };
-    const peers = [_]nullq.conn.path.Address{
+    const peers = [_]quic_zig.conn.path.Address{
         .{ .bytes = @splat(0x01) },
         .{ .bytes = @splat(0x02) },
         .{ .bytes = @splat(0x03) },
@@ -1390,7 +1390,7 @@ test "Connection rejects CRYPTO bytes that would exceed max_connection_memory" {
     var ctx = try boringssl.tls.Context.initClient(.{});
     defer ctx.deinit();
 
-    var conn = try nullq.Connection.initClient(allocator, ctx, "x");
+    var conn = try quic_zig.Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
     conn.max_connection_memory = 1024;
 
@@ -1402,7 +1402,7 @@ test "Connection rejects CRYPTO bytes that would exceed max_connection_memory" {
 
     const ev = conn.closeEvent() orelse return error.TestExpectedClose;
     try std.testing.expectEqual(
-        nullq.conn.state.transport_error_excessive_load,
+        quic_zig.conn.state.transport_error_excessive_load,
         ev.error_code,
     );
 }
@@ -1415,7 +1415,7 @@ test "Stream recv reassembly past max_connection_memory closes the connection" {
     var ctx = try boringssl.tls.Context.initClient(.{});
     defer ctx.deinit();
 
-    var conn = try nullq.Connection.initClient(allocator, ctx, "x");
+    var conn = try quic_zig.Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
     conn.max_connection_memory = 1024;
     // Allow the stream + connection-level data to land — flow control
@@ -1439,7 +1439,7 @@ test "Stream recv reassembly past max_connection_memory closes the connection" {
 
     const ev = conn.closeEvent() orelse return error.TestExpectedClose;
     try std.testing.expectEqual(
-        nullq.conn.state.transport_error_excessive_load,
+        quic_zig.conn.state.transport_error_excessive_load,
         ev.error_code,
     );
 }
@@ -1454,7 +1454,7 @@ test "Frees release resident bytes so the cap is reusable" {
     var ctx = try boringssl.tls.Context.initClient(.{});
     defer ctx.deinit();
 
-    var conn = try nullq.Connection.initClient(allocator, ctx, "x");
+    var conn = try quic_zig.Connection.initClient(allocator, ctx, "x");
     defer conn.deinit();
     conn.max_connection_memory = 800;
 
@@ -1476,7 +1476,7 @@ test "Frees release resident bytes so the cap is reusable" {
     // draining, the budget recovers.
     const ev1 = conn.closeEvent() orelse return error.TestExpectedClose;
     try std.testing.expectEqual(
-        nullq.conn.state.transport_error_excessive_load,
+        quic_zig.conn.state.transport_error_excessive_load,
         ev1.error_code,
     );
 
@@ -1492,7 +1492,7 @@ test "Frees release resident bytes so the cap is reusable" {
 
 test "Server listener rate limit drops datagrams past cap" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1509,7 +1509,7 @@ test "Server listener rate limit drops datagrams past cap" {
     // .dropped *because of the rate limit* — surfaced via the new
     // `feeds_listener_rate_limited` counter.
     var junk = [_]u8{ 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x10) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x10) };
 
     // First three: passes the listener gate (each then drops because
     // the bytes don't parse as a valid Initial).
@@ -1521,7 +1521,7 @@ test "Server listener rate limit drops datagrams past cap" {
 
     // Fourth: trips the listener rate limit before any other gate.
     const outcome = try srv.feed(&junk, addr, 4);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome);
 
     const after = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), after.feeds_listener_rate_limited);
@@ -1530,7 +1530,7 @@ test "Server listener rate limit drops datagrams past cap" {
 
 test "Server listener rate limit window resets after elapsed" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1542,7 +1542,7 @@ test "Server listener rate limit window resets after elapsed" {
     defer srv.deinit();
 
     var junk = [_]u8{ 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x20) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x20) };
 
     // First window: fill it (2 calls), then over-cap at the 3rd.
     _ = try srv.feed(&junk, addr, 0);
@@ -1563,7 +1563,7 @@ test "Server listener rate limit window resets after elapsed" {
 
 test "Server listener rate limit is null-by-default" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1574,7 +1574,7 @@ test "Server listener rate limit is null-by-default" {
     defer srv.deinit();
 
     var junk = [_]u8{ 0x40, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x30) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x30) };
 
     // Flood with 100 datagrams; none should hit the listener limit.
     for (0..100) |i| {
@@ -1587,7 +1587,7 @@ test "Server listener rate limit is null-by-default" {
 
 test "Server.init rejects max_datagrams_per_window=0" {
     const protos = [_][]const u8{"hq-test"};
-    try std.testing.expectError(nullq.Server.Error.InvalidConfig, nullq.Server.init(.{
+    try std.testing.expectError(quic_zig.Server.Error.InvalidConfig, quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1604,7 +1604,7 @@ test "Server log rate limiter drops events past cap from one source" {
     var sink: LogSink = .{ .allocator = std.testing.allocator };
     defer sink.deinit();
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1623,7 +1623,7 @@ test "Server log rate limiter drops events past cap from one source" {
     defer srv.deinit();
 
     var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x40) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x40) };
 
     // Each call from the same source emits exactly one log event:
     //   call 1: openSlot fails internally → `.dropped` (no log)
@@ -1654,7 +1654,7 @@ test "Server log rate limiter is per-source (different sources get fresh budgets
     var sink: LogSink = .{ .allocator = std.testing.allocator };
     defer sink.deinit();
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1669,8 +1669,8 @@ test "Server log rate limiter is per-source (different sources get fresh budgets
     defer srv.deinit();
 
     var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
-    const peer_a = nullq.conn.path.Address{ .bytes = @splat(0x51) };
-    const peer_b = nullq.conn.path.Address{ .bytes = @splat(0x52) };
+    const peer_a = quic_zig.conn.path.Address{ .bytes = @splat(0x51) };
+    const peer_b = quic_zig.conn.path.Address{ .bytes = @splat(0x52) };
 
     // Each peer sees: call 1 → drop with no log, call 2+ → first
     // call past the Initial cap fires one log, subsequent are
@@ -1695,7 +1695,7 @@ test "Server log rate limit window resets after elapsed" {
     var sink: LogSink = .{ .allocator = std.testing.allocator };
     defer sink.deinit();
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1710,7 +1710,7 @@ test "Server log rate limit window resets after elapsed" {
     defer srv.deinit();
 
     var initial = padInitial(&.{ 0xc0, 0x00, 0x00, 0x00, 0x01, 21, 0 });
-    const peer = nullq.conn.path.Address{ .bytes = @splat(0x60) };
+    const peer = quic_zig.conn.path.Address{ .bytes = @splat(0x60) };
 
     // Burn the cap inside the first window.
     for (0..5) |i| _ = try srv.feed(&initial, peer, @intCast(i));
@@ -1738,7 +1738,7 @@ test "Server log rate limit doesn't block log events for from=null paths" {
     var sink: LogSink = .{ .allocator = std.testing.allocator };
     defer sink.deinit();
 
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1759,7 +1759,7 @@ test "Server log rate limit doesn't block log events for from=null paths" {
     // logs because the limiter doesn't apply when source is null.
     for (0..5) |i| {
         const outcome = try srv.feed(&bytes, null, @intCast(i));
-        try std.testing.expectEqual(nullq.Server.FeedOutcome.table_full, outcome);
+        try std.testing.expectEqual(quic_zig.Server.FeedOutcome.table_full, outcome);
     }
 
     var table_full_count: usize = 0;
@@ -1777,7 +1777,7 @@ test "Server log rate limit doesn't block log events for from=null paths" {
 
 test "Server listener byte rate limit drops datagrams past byte cap" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1793,7 +1793,7 @@ test "Server listener byte rate limit drops datagrams past byte cap" {
     // *first*, before any of those.
     var buf: [800]u8 = @splat(0);
     buf[0] = 0x40;
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x40) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x40) };
 
     // First 800-byte feed: bytes_in_window = 800 ≤ 1500. Pass.
     _ = try srv.feed(&buf, addr, 0);
@@ -1803,7 +1803,7 @@ test "Server listener byte rate limit drops datagrams past byte cap" {
     // Second 800-byte feed: bytes_in_window = 1600 > 1500. Drop on
     // the byte cap.
     const outcome = try srv.feed(&buf, addr, 1);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome);
     m = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), m.feeds_listener_byte_rate_limited);
     try std.testing.expect(m.feeds_dropped >= 1);
@@ -1815,7 +1815,7 @@ test "Server listener byte and packet caps are independently enforced" {
     // Phase 1: byte-cap=1500, packet-cap=null. Spray many tiny
     // datagrams — total bytes stay under the cap, none drop.
     {
-        var srv = try nullq.Server.init(.{
+        var srv = try quic_zig.Server.init(.{
             .allocator = std.testing.allocator,
             .tls_cert_pem = test_cert_pem,
             .tls_key_pem = test_key_pem,
@@ -1827,7 +1827,7 @@ test "Server listener byte and packet caps are independently enforced" {
         defer srv.deinit();
 
         var one: [1]u8 = .{0x40};
-        const addr = nullq.conn.path.Address{ .bytes = @splat(0x50) };
+        const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x50) };
 
         // 1000 single-byte feeds — total 1000 bytes, well under 1500.
         for (0..1000) |i| {
@@ -1842,7 +1842,7 @@ test "Server listener byte and packet caps are independently enforced" {
     // Phase 2: packet-cap=2, byte-cap=null. Spray small datagrams —
     // the third drops on packet count even though bytes are minimal.
     {
-        var srv = try nullq.Server.init(.{
+        var srv = try quic_zig.Server.init(.{
             .allocator = std.testing.allocator,
             .tls_cert_pem = test_cert_pem,
             .tls_key_pem = test_key_pem,
@@ -1854,7 +1854,7 @@ test "Server listener byte and packet caps are independently enforced" {
         defer srv.deinit();
 
         var one: [1]u8 = .{0x40};
-        const addr = nullq.conn.path.Address{ .bytes = @splat(0x60) };
+        const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x60) };
 
         _ = try srv.feed(&one, addr, 0);
         _ = try srv.feed(&one, addr, 1);
@@ -1865,7 +1865,7 @@ test "Server listener byte and packet caps are independently enforced" {
 
         // Third feed: trips the packet cap.
         const outcome = try srv.feed(&one, addr, 2);
-        try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+        try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome);
         m = srv.metricsSnapshot();
         try std.testing.expectEqual(@as(u64, 1), m.feeds_listener_rate_limited);
         try std.testing.expectEqual(@as(u64, 0), m.feeds_listener_byte_rate_limited);
@@ -1874,7 +1874,7 @@ test "Server listener byte and packet caps are independently enforced" {
 
 test "Server listener byte rate limit window resets after elapsed" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1887,7 +1887,7 @@ test "Server listener byte rate limit window resets after elapsed" {
 
     var buf: [800]u8 = @splat(0);
     buf[0] = 0x40;
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0x70) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0x70) };
 
     // First window: two 800-byte feeds → bytes_in_window=1600 > 1500
     // on the second. Counter bumps to 1 here.
@@ -1914,7 +1914,7 @@ test "Server listener byte rate limit window resets after elapsed" {
 
 test "Server.init rejects max_bytes_per_window=0" {
     const protos = [_][]const u8{"hq-test"};
-    try std.testing.expectError(nullq.Server.Error.InvalidConfig, nullq.Server.init(.{
+    try std.testing.expectError(quic_zig.Server.Error.InvalidConfig, quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1928,7 +1928,7 @@ test "Server.init rejects max_bytes_per_window=0" {
 
 test "Server per-source bandwidth shaper drops datagrams when bucket is empty" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1944,12 +1944,12 @@ test "Server per-source bandwidth shaper drops datagrams when bucket is empty" {
 
     var buf: [2000]u8 = @splat(0);
     buf[0] = 0x40;
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0xa1) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0xa1) };
 
     // First 2000-byte datagram at t=0: bucket starts full at 4096
     // tokens, debit drops it to ~2096. Pass.
     var outcome = try srv.feed(&buf, addr, 0);
-    try std.testing.expect(outcome != nullq.Server.FeedOutcome.dropped or true); // could drop on later gates, what matters is the bandwidth counter
+    try std.testing.expect(outcome != quic_zig.Server.FeedOutcome.dropped or true); // could drop on later gates, what matters is the bandwidth counter
     var m = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 0), m.feeds_source_bandwidth_limited);
 
@@ -1962,7 +1962,7 @@ test "Server per-source bandwidth shaper drops datagrams when bucket is empty" {
     // Third 2000-byte datagram 1 us later: bucket has ~100 tokens,
     // 2000 > 100, drop on the per-source bandwidth gate.
     outcome = try srv.feed(&buf, addr, 1_001);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, outcome);
     m = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
     try std.testing.expect(m.feeds_dropped >= 1);
@@ -1970,7 +1970,7 @@ test "Server per-source bandwidth shaper drops datagrams when bucket is empty" {
 
 test "Server per-source bandwidth shaper refills on idle" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -1982,7 +1982,7 @@ test "Server per-source bandwidth shaper refills on idle" {
 
     var buf: [2000]u8 = @splat(0);
     buf[0] = 0x40;
-    const addr = nullq.conn.path.Address{ .bytes = @splat(0xa2) };
+    const addr = quic_zig.conn.path.Address{ .bytes = @splat(0xa2) };
 
     // Drain the bucket quickly: three 2000-byte datagrams at
     // t=0/1/2 us. Total charge = 6000 bytes vs starting bucket of
@@ -1990,7 +1990,7 @@ test "Server per-source bandwidth shaper refills on idle" {
     _ = try srv.feed(&buf, addr, 0);
     _ = try srv.feed(&buf, addr, 1);
     const drop_outcome = try srv.feed(&buf, addr, 2);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, drop_outcome);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, drop_outcome);
     var m = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
 
@@ -2006,7 +2006,7 @@ test "Server per-source bandwidth shaper refills on idle" {
 
 test "Server per-source bandwidth shaper is per-source" {
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -2018,15 +2018,15 @@ test "Server per-source bandwidth shaper is per-source" {
 
     var buf: [2000]u8 = @splat(0);
     buf[0] = 0x40;
-    const peer_a = nullq.conn.path.Address{ .bytes = @splat(0xb1) };
-    const peer_b = nullq.conn.path.Address{ .bytes = @splat(0xb2) };
+    const peer_a = quic_zig.conn.path.Address{ .bytes = @splat(0xb1) };
+    const peer_b = quic_zig.conn.path.Address{ .bytes = @splat(0xb2) };
 
     // Drain peer_a's bucket: three 2000-byte datagrams at t=0/1/2.
     // Third trips the gate.
     _ = try srv.feed(&buf, peer_a, 0);
     _ = try srv.feed(&buf, peer_a, 1);
     const a_third = try srv.feed(&buf, peer_a, 2);
-    try std.testing.expectEqual(nullq.Server.FeedOutcome.dropped, a_third);
+    try std.testing.expectEqual(quic_zig.Server.FeedOutcome.dropped, a_third);
 
     var m = srv.metricsSnapshot();
     try std.testing.expectEqual(@as(u64, 1), m.feeds_source_bandwidth_limited);
@@ -2047,7 +2047,7 @@ test "Server per-source bandwidth shaper is per-source" {
 
 test "Server.init rejects max_bytes_per_source_per_second=0" {
     const protos = [_][]const u8{"hq-test"};
-    try std.testing.expectError(nullq.Server.Error.InvalidConfig, nullq.Server.init(.{
+    try std.testing.expectError(quic_zig.Server.Error.InvalidConfig, quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,

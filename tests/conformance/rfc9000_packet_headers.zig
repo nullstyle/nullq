@@ -66,8 +66,8 @@
 //!                   width, DCID/SCID Length octets) → rfc8999_invariants.zig
 
 const std = @import("std");
-const nullq = @import("nullq");
-const wire = nullq.wire;
+const quic_zig = @import("quic_zig");
+const wire = quic_zig.wire;
 const header = wire.header;
 const packet_number = wire.packet_number;
 const fixture = @import("_initial_fixture.zig");
@@ -390,8 +390,8 @@ test "MUST treat non-zero long-header Reserved Bits as PROTOCOL_VIOLATION on rec
     const close_event = try fixture.feedAndExpectClose(&srv, &dcid, &scid, 0b10, &.{});
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -714,7 +714,7 @@ test "MUST treat non-zero short-header Reserved Bits as PROTOCOL_VIOLATION on re
     const close_event = try pair.injectFrameAtServerWithReservedBits(&ping_frame, 0b10);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }

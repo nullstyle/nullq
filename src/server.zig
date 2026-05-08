@@ -1,5 +1,5 @@
-//! nullq.Server — production-grade convenience wrapper for embedding
-//! nullq as a QUIC server.
+//! quic_zig.Server — production-grade convenience wrapper for embedding
+//! quic_zig as a QUIC server.
 //!
 //! `Connection` is intentionally I/O-agnostic: it consumes incoming
 //! UDP datagrams via `handle()` and produces outgoing ones via
@@ -44,7 +44,7 @@
 //!    is allocated. Set this to gate the 3x amplification window
 //!    behind a proof-of-address round trip.
 //! 3. Long-header packets carrying any version other than
-//!    `nullq.QUIC_VERSION_1` always trigger a Version Negotiation
+//!    `quic_zig.QUIC_VERSION_1` always trigger a Version Negotiation
 //!    response (RFC 9000 §6 / RFC 8999 §6); this is unconditional
 //!    and requires no `Config` opt-in.
 //!
@@ -66,13 +66,13 @@
 //!
 //! For a hand-rolled loop, see the README. Embedders that just want
 //! "bind a socket and serve QUIC" should reach for
-//! `nullq.transport.runUdpServer` instead — it owns the
+//! `quic_zig.transport.runUdpServer` instead — it owns the
 //! `std.Io`-based bind / tune / receive / feed / poll / tick / reap
 //! cadence. The QNS endpoint at `interop/qns_endpoint.zig` keeps its
 //! own bespoke loop because it has interop-specific quirks
 //! (deterministic CID prefix, per-testcase wiring); general-purpose
 //! embedders should reach for `Server` (server side) or
-//! `nullq.Client` (client side) first.
+//! `quic_zig.Client` (client side) first.
 
 const std = @import("std");
 const boringssl = @import("boringssl");
@@ -350,7 +350,7 @@ const RetryStateEntry = struct {
 };
 
 /// Maximum number of routing CIDs a slot tracks at once. Bounded
-/// by the peer's `active_connection_id_limit` (default 8 in nullq);
+/// by the peer's `active_connection_id_limit` (default 8 in quic_zig);
 /// 32 leaves headroom for embedders that lift the limit and for
 /// in-flight retires, while keeping the router a fixed, alloc-free
 /// slot footprint. If a `Connection` ever issues more than this
@@ -569,7 +569,7 @@ const ConfigImpl = struct {
     /// 0-RTT is replayable and unsuitable for state-changing requests
     /// without an application-level anti-replay mechanism (RFC 9001
     /// §5.6 / RFC 8446 §8). Embedders that want 0-RTT must opt in
-    /// here AND wire a `nullq.tls.AntiReplayTracker` (or equivalent)
+    /// here AND wire a `quic_zig.tls.AntiReplayTracker` (or equivalent)
     /// into their server loop so duplicate early-data is rejected;
     /// see that type's module docstring for the recommended
     /// workflow. The transport ships the data structure but the
@@ -620,7 +620,7 @@ const ConfigImpl = struct {
 
     /// Number of ack-eliciting application packets the server requires
     /// before forcing an immediate ACK (RFC 9000 §13.2.1 ¶2). Default
-    /// matches `nullq.conn.state.application_ack_eliciting_threshold`.
+    /// matches `quic_zig.conn.state.application_ack_eliciting_threshold`.
     /// Lower this to 1 for low-RTT links where every packet should be
     /// ACKed; raise it to amortize ACK overhead at the cost of more
     /// peer PTOs. Threaded onto every Connection at slot-open time.
@@ -755,7 +755,7 @@ const SlotImpl = struct {
     slot_id: u64,
     /// W3C traceparent trace-id (16 bytes), or null if the embedder
     /// has not associated a trace with this slot. Embedders set via
-    /// `setTraceContext`; nullq itself never reads it.
+    /// `setTraceContext`; quic_zig itself never reads it.
     trace_id: ?[16]u8 = null,
     /// W3C traceparent parent-span-id (8 bytes), or null.
     parent_span_id: ?[8]u8 = null,
@@ -775,7 +775,7 @@ const SlotImpl = struct {
 
     /// Attach a W3C tracecontext to this slot. Embedders typically
     /// call this after `Server.feed` returns `.accepted` and the
-    /// upstream service has assigned trace identifiers. nullq does
+    /// upstream service has assigned trace identifiers. quic_zig does
     /// not interpret these bytes — they are pure metadata for
     /// embedder-side correlation.
     pub fn setTraceContext(
@@ -837,7 +837,7 @@ const FeedOutcomeImpl = enum {
     /// reaped.
     table_full,
     /// The datagram carried a long-header packet with a version
-    /// other than `nullq.QUIC_VERSION_1`. A Version Negotiation
+    /// other than `quic_zig.QUIC_VERSION_1`. A Version Negotiation
     /// response was queued for the embedder to drain via
     /// `drainStatelessResponse`. No `Connection` was created.
     /// RFC 9000 §6 / RFC 8999 §6.

@@ -1,7 +1,7 @@
 //! RFC 9002 — QUIC Loss Detection and Congestion Control.
 //!
-//! These tests pin the small RFC 9002 primitives that nullq exposes
-//! under `nullq.conn`: the §5 RTT estimator (`rtt.RttEstimator`), the
+//! These tests pin the small RFC 9002 primitives that quic_zig exposes
+//! under `quic_zig.conn`: the §5 RTT estimator (`rtt.RttEstimator`), the
 //! §6 ACK processing and loss-detection helpers (`loss_recovery`),
 //! and the §7 / Appendix B NewReno congestion controller
 //! (`congestion.NewReno`). The connection-level orchestration that
@@ -58,29 +58,29 @@
 //!                              tested in the integration corpus.
 //!
 //! Out of scope here:
-//!   RFC9002 §7.7      Pacing — not implemented by design; nullq leaves
+//!   RFC9002 §7.7      Pacing — not implemented by design; quic_zig leaves
 //!                     pacing to the embedder via `sendAllowance`.
 //!   RFC9002 §6.3      Probe packets / PTO firing path — driven by
 //!                     `state.zig`'s timer subsystem; tested at the
 //!                     connection level.
 
 const std = @import("std");
-const nullq = @import("nullq");
-const rtt = nullq.conn.rtt;
-const loss_recovery = nullq.conn.loss_recovery;
-const congestion = nullq.conn.congestion;
-const sent_packets = nullq.conn.sent_packets;
+const quic_zig = @import("quic_zig");
+const rtt = quic_zig.conn.rtt;
+const loss_recovery = quic_zig.conn.loss_recovery;
+const congestion = quic_zig.conn.congestion;
+const sent_packets = quic_zig.conn.sent_packets;
 const fixture = @import("_initial_fixture.zig");
 const handshake_fixture = @import("_handshake_fixture.zig");
 
-const RttEstimator = nullq.conn.RttEstimator;
-const SentPacketTracker = nullq.conn.SentPacketTracker;
-const PnSpace = nullq.conn.PnSpace;
-const NewReno = nullq.conn.NewReno;
+const RttEstimator = quic_zig.conn.RttEstimator;
+const SentPacketTracker = quic_zig.conn.SentPacketTracker;
+const PnSpace = quic_zig.conn.PnSpace;
+const NewReno = quic_zig.conn.NewReno;
 const ms = rtt.ms;
 
 // Helper: build a minimal `frame.Ack` covering [largest - first_range, largest].
-fn buildAck(largest: u64, first_range: u64) nullq.frame.types.Ack {
+fn buildAck(largest: u64, first_range: u64) quic_zig.frame.types.Ack {
     return .{
         .largest_acked = largest,
         .ack_delay = 0,
@@ -182,7 +182,7 @@ test "MUST hold kInitialRtt at 333 ms [RFC9002 §6.2.2 ¶1]" {
 
 test "MUST set kPacketThreshold to 3 [RFC9002 §6.1.1 ¶3]" {
     // §6.1.1 ¶3: "kPacketThreshold = 3 ... is the RECOMMENDED initial
-    // value." We pin nullq's compile-time constant to that value.
+    // value." We pin quic_zig's compile-time constant to that value.
     try std.testing.expectEqual(@as(u64, 3), loss_recovery.packet_threshold);
 }
 
@@ -327,7 +327,7 @@ test "MUST use kGranularity as the variance term when 4*RTTVar is smaller [RFC90
 
 test "MUST double the PTO on each subsequent firing [RFC9002 §6.2.1 ¶?]" {
     // §6.2.1: "When a PTO timer expires, the PTO timer MUST be set
-    // to a value larger than its current value." nullq implements
+    // to a value larger than its current value." quic_zig implements
     // this via `backoffDuration(base, count) = base << count` in
     // `state.zig`, observable through `Connection.ptoMicros()`
     // (returns base << pto_count) and `Connection.ptoCount()`. Drive
@@ -391,7 +391,7 @@ test "MUST double the PTO on each subsequent firing [RFC9002 §6.2.1 ¶?]" {
 test "MUST report whether the largest acked packet was ack-eliciting [RFC9002 §A.7]" {
     // §A.7 / §5.1: "An endpoint generates an RTT sample on receiving
     // an ACK frame that meets the following two conditions: ... the
-    // newly acknowledged packet was ack-eliciting." nullq exposes
+    // newly acknowledged packet was ack-eliciting." quic_zig exposes
     // this via `AckProcessing.largest_acked_ack_eliciting` so the
     // connection knows when to skip the RTT update.
     var tr: SentPacketTracker = .{};
@@ -419,7 +419,7 @@ test "MUST report whether the largest acked packet was ack-eliciting [RFC9002 §
 
 test "MUST flag any newly-acked ack-eliciting packet for PTO-count reset [RFC9002 §A.7]" {
     // §6.2.1: "An endpoint resets its PTO backoff factor on receiving
-    // acknowledgments." nullq exposes this via
+    // acknowledgments." quic_zig exposes this via
     // `AckProcessing.any_ack_eliciting_newly_acked` so the caller can
     // gate the reset on at least one ack-eliciting newly-acked packet.
     var tr: SentPacketTracker = .{};
@@ -453,7 +453,7 @@ test "MUST close the connection when an ACK acks an unsent packet [RFC9002 §A.3
     defer srv.deinit();
 
     var payload_buf: [32]u8 = undefined;
-    const payload_len = try nullq.frame.encode(&payload_buf, .{ .ack = .{
+    const payload_len = try quic_zig.frame.encode(&payload_buf, .{ .ack = .{
         .largest_acked = 100,
         .ack_delay = 0,
         .first_range = 0,
@@ -474,8 +474,8 @@ test "MUST close the connection when an ACK acks an unsent packet [RFC9002 §A.3
     );
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -610,7 +610,7 @@ test "MUST detect persistent congestion across 2+ ack-eliciting losses spanning 
     // ack-eliciting packet between them being acknowledged, trigger
     // the cwnd reset.
     //
-    // nullq splits this across primitives + the connection orchestrator:
+    // quic_zig splits this across primitives + the connection orchestrator:
     // `loss_recovery.detectLosses` declares the losses, `state.zig`
     // measures the span and decides whether persistent congestion
     // applies, and `congestion.NewReno.onPersistentCongestion` does the

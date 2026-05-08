@@ -19,8 +19,8 @@
 //! embedder doesn't have to roll their own:
 //!
 //! ```zig
-//! const key = try nullq.conn.stateless_reset.Key.generate();
-//! const token = try nullq.conn.stateless_reset.derive(&key, cid_bytes);
+//! const key = try quic_zig.conn.stateless_reset.Key.generate();
+//! const token = try quic_zig.conn.stateless_reset.derive(&key, cid_bytes);
 //! try connection.provideConnectionId(.{
 //!     .connection_id = cid_bytes,
 //!     .stateless_reset_token = token,
@@ -56,12 +56,12 @@ pub const Token = [token_len]u8;
 
 /// Domain-separator label baked into the HMAC input. Prevents the
 /// same `Key` from accidentally producing a colliding HMAC value if
-/// the key is reused for an unrelated nullq HMAC primitive in the
+/// the key is reused for an unrelated quic_zig HMAC primitive in the
 /// future.
-const domain_separator: []const u8 = "nullq stateless reset v1";
+const domain_separator: []const u8 = "quic_zig stateless reset v1";
 
 /// Errors that `derive` can surface. Currently the only failure mode
-/// is an HMAC primitive failure from BoringSSL; nullq's own input
+/// is an HMAC primitive failure from BoringSSL; quic_zig's own input
 /// validation never rejects a CID here (any byte string is a valid
 /// CID input — the standards-required CID-length cap is enforced by
 /// the caller's `ConnectionId` type).
@@ -69,7 +69,7 @@ pub const Error = boringssl.crypto.hmac.Error;
 
 /// Derive the 16-byte stateless-reset token for `connection_id` under
 /// `key`. The token is the first 16 bytes of
-/// `HMAC-SHA256(key, "nullq stateless reset v1" || connection_id)`.
+/// `HMAC-SHA256(key, "quic_zig stateless reset v1" || connection_id)`.
 ///
 /// Same `(key, connection_id)` pair always returns the same token
 /// (deterministic — that's the point: the server can re-derive the

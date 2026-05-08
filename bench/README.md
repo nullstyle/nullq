@@ -1,4 +1,4 @@
-# nullq microbenchmarks
+# quic-zig microbenchmarks
 
 Wire/frame-level microbenchmarks for the hot paths every QUIC packet
 exercises. Built and run via:

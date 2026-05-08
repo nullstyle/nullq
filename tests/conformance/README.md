@@ -1,4 +1,4 @@
-# nullq RFC-traceable conformance suites
+# quic-zig RFC-traceable conformance suites
 
 These suites are **conformance** tests, not behaviour tests. Each test
 asserts a specific normative requirement from an RFC, named with the
@@ -110,7 +110,7 @@ the citation in the test name itself for grouping.
 //!   RFC9000 §6  negotiation lives in rfc9000_negotiation_validation.zig
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic-zig = @import("quic-zig");
 
 // ---------------------------------------------------------------- §17.2 long header
 
@@ -141,15 +141,15 @@ local helper fns and `defer` instead.
 - [ ] One observable behaviour per test.
 - [ ] `MUST NOT` tests assert rejection/absence/error — never just
       "did not crash".
-- [ ] **Test exercises a nullq surface — not stdlib arithmetic, not a
+- [ ] **Test exercises a quic-zig surface — not stdlib arithmetic, not a
       file-local helper standing in as the oracle.** Every non-skipped
-      conformance test must call into `nullq.*` (or a fixture that
+      conformance test must call into `quic-zig.*` (or a fixture that
       does) at least once. If you find yourself asserting `5 & 0b11`
       or `std.crypto.timing_safe.eql(...)` directly, you're testing
-      the spec table or the standard library, not nullq — route
-      through the relevant nullq function (`Connection.openBidi`,
-      `nullq.conn.stateless_reset.eql`, `header.encode`, etc.) or
-      add a small public wrapper to nullq if the path is currently
+      the spec table or the standard library, not quic-zig — route
+      through the relevant quic-zig function (`Connection.openBidi`,
+      `quic-zig.conn.stateless_reset.eql`, `header.encode`, etc.) or
+      add a small public wrapper to quic-zig if the path is currently
       private. File-local raw-byte builders (e.g.
       `rawLongHeaderInput` in `rfc8999_invariants.zig`) are fine
       ONLY as parser-input fixtures — feed them to `header.parse`,

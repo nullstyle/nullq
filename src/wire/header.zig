@@ -10,7 +10,7 @@
 //!
 //! Connection IDs are capped at 20 bytes here (the QUIC v1 limit per
 //! RFC 9000 §17.2). RFC 8999 invariants allow up to 255-byte CIDs in
-//! version-negotiation contexts; nullq does not interop with such
+//! version-negotiation contexts; quic_zig does not interop with such
 //! peers in v0.1.
 
 const std = @import("std");

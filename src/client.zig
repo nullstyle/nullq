@@ -1,4 +1,4 @@
-//! nullq.Client — convenience wrapper for embedding nullq as a
+//! quic_zig.Client — convenience wrapper for embedding quic_zig as a
 //! QUIC client.
 //!
 //! `Connection.initClient` is intentionally low-level: the embedder
@@ -115,7 +115,7 @@ const ConfigImpl = struct {
 
     /// Number of ack-eliciting application packets the client requires
     /// before forcing an immediate ACK (RFC 9000 §13.2.1 ¶2). Default
-    /// matches `nullq.conn.state.application_ack_eliciting_threshold`.
+    /// matches `quic_zig.conn.state.application_ack_eliciting_threshold`.
     /// Lower this to 1 for low-RTT links where every packet should be
     /// ACKed; raise it to amortize ACK overhead at the cost of more
     /// peer PTOs.
@@ -270,7 +270,7 @@ pub const Client = struct {
 
         // NEW_TOKEN replay on the first Initial — RFC 9000 §8.1.3
         // lets a returning client present a previously-issued
-        // token in the Initial's long-header Token field. nullq
+        // token in the Initial's long-header Token field. quic_zig
         // reuses the `retry_token` storage on Connection because
         // the wire mechanism is identical (Token field on
         // long-header Initial). The Server's gate distinguishes

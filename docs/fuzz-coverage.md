@@ -1,6 +1,6 @@
 # Fuzz and negative-test coverage audit
 
-This document audits nullq against §11 of the security hardening guide.
+This document audits quic-zig against §11 of the security hardening guide.
 It enumerates every `std.testing.fuzz` site in `src/`, maps the §11.1
 required fuzz targets and §11.2 regression classes onto the codebase,
 and records the gaps that remain (very few, after the recent hardening
@@ -11,13 +11,13 @@ removed in commit `52abdd9`).
 
 Scope notes:
 
-- nullq is QUIC v1 transport only. There is no HTTP/3 layer and no
+- quic-zig is QUIC v1 transport only. There is no HTTP/3 layer and no
   QPACK layer in this tree (a one-line search confirms: the only
   `qpack`/`http`/`h3` mentions are documentation strings about ALPN).
   Rows in §11.1 / §11.2 that depend on those layers are tagged
   **MISSING (no impl)** to distinguish them from "implementation
   exists but no test".
-- nullq uses Zig 0.15.x's structured fuzzer (`std.testing.Smith` +
+- quic-zig uses Zig 0.15.x's structured fuzzer (`std.testing.Smith` +
   `std.testing.fuzz`), not raw libFuzzer. Existing harnesses double as
   unit tests so they always run under `zig build test`; `zig build
   fuzz` runs them under coverage feedback as a per-callsite parallel
@@ -33,7 +33,7 @@ Scope notes:
 
 ## 1. Inventory of `std.testing.fuzz` sites
 
-Verified via `rg "std.testing.fuzz" /Users/nullstyle/prj/ai-workspace/nullq/src`.
+Verified via `rg "std.testing.fuzz" /Users/nullstyle/prj/ai-workspace/quic-zig/src`.
 34 in-source harnesses across the tree (the table below lists the original
 nineteen; the additional sites land via the lift in commit `52abdd9` — see
 the `fuzz_targets` list in `build.zig` for the full set):
@@ -82,7 +82,7 @@ Status legend:
 - **PARTIAL** — touched indirectly (e.g. through a higher-level
   harness), but no dedicated coverage-guided harness.
 - **MISSING** — no fuzz harness, but the implementation exists.
-- **MISSING (no impl)** — code path doesn't exist in nullq yet.
+- **MISSING (no impl)** — code path doesn't exist in quic-zig yet.
 
 | § | Target | Status | Citation / notes |
 |---|---|---|---|
@@ -95,13 +95,13 @@ Status legend:
 | 7 | ACK frame parser | COVERED | The ACK frame is decoded inside `frame.decode` (covered). The ACK *range tracker* has a coverage-guided harness at `src/conn/ack_tracker.zig:512` `fuzz: ack_tracker range-list invariants` — drives `add` / `addPacket` / `addPacketDelayed` / `markAckSent` / `promoteDelayedAck` / `toAckFrameLimitedRanges` with arbitrary u64 PNs; asserts sorted-disjoint range list, `range_count <= max_ranges`, `largest >= smallest` per interval, no overlap. Plus `decode rejects ACK with overlapping ranges` at `src/frame/decode.zig:751` (commit `0baa170`) and the `max_incoming_ack_ranges = 256` cap at `src/frame/decode.zig:64` (commit `3a64820`). |
 | 8 | CRYPTO frame reassembly | COVERED | `src/conn/state.zig:13193` `fuzz: Connection.handleCrypto reassembly invariants` (commit `9fb1142`) — drives `Connection.handleCrypto` via `dispatchFrames` with arbitrary offsets / lengths / PN-spaces under a tight `max_connection_memory = 1024` cap; asserts no panic, `bytes_resident` cap, monotonic `crypto_recv_offset[idx]` per level, duplicate offsets don't push residency higher. Reassembly unit tests at `src/conn/state.zig:8667, 8711, 8735` retained. |
 | 9 | STREAM frame parser | COVERED | The frame-level decoder is in `src/frame/decode.zig` (covered). `src/conn/state.zig:13285` `fuzz: Connection.handleStream reassembly invariants` (commit `9fb1142`) drives `Connection.handleStream` with fuzzer-chosen stream IDs / offsets / lengths / FIN flag; asserts `bytes_resident` cap, monotonic `read_offset`, well-formed send-side state after RESET_STREAM, `final_size` invariants. The former `tests/fuzz_smoke.zig` shuffle test was lifted into the recv_stream in-source fuzz callback (commit `52abdd9`); offset/overlap unit tests in `src/conn/recv_stream.zig` retained. |
-| 10 | HTTP/3 frame parser | MISSING (no impl) | nullq has no HTTP/3 layer. |
-| 11 | HTTP/3 SETTINGS parser | MISSING (no impl) | nullq has no HTTP/3 layer. |
-| 12 | HTTP/3 request field validator | MISSING (no impl) | nullq has no HTTP/3 layer. |
-| 13 | QPACK integer / string / Huffman decoder | MISSING (no impl) | nullq has no QPACK layer. |
-| 14 | QPACK encoder stream parser | MISSING (no impl) | nullq has no QPACK layer. |
-| 15 | QPACK decoder stream parser | MISSING (no impl) | nullq has no QPACK layer. |
-| 16 | QPACK field section decoder | MISSING (no impl) | nullq has no QPACK layer. |
+| 10 | HTTP/3 frame parser | MISSING (no impl) | quic-zig has no HTTP/3 layer. |
+| 11 | HTTP/3 SETTINGS parser | MISSING (no impl) | quic-zig has no HTTP/3 layer. |
+| 12 | HTTP/3 request field validator | MISSING (no impl) | quic-zig has no HTTP/3 layer. |
+| 13 | QPACK integer / string / Huffman decoder | MISSING (no impl) | quic-zig has no QPACK layer. |
+| 14 | QPACK encoder stream parser | MISSING (no impl) | quic-zig has no QPACK layer. |
+| 15 | QPACK decoder stream parser | MISSING (no impl) | quic-zig has no QPACK layer. |
+| 16 | QPACK field section decoder | MISSING (no impl) | quic-zig has no QPACK layer. |
 | 17 | Flow-control state machine | COVERED | `src/conn/flow_control.zig:264` `fuzz: flow_control ConnectionData state-machine invariants` — drives `recordSent` / `recordPeerSent` / `weCanSend` / `onMaxData` / `raiseLocalMax` with arbitrary u64s; asserts no overflow trap, monotonic limits, post-state invariants. Plus the deterministic `src/conn/flow_control.zig:198–246` happy-path tests and the connection-level integration coverage at `src/conn/state.zig:10309–10523`. |
 | 18 | Stream lifecycle state machine | COVERED | `src/conn/send_stream.zig:815` `fuzz: send_stream lifecycle invariants` and `src/conn/recv_stream.zig:617` `fuzz: recv_stream reassembly invariants` drive randomized op sequences across the full per-stream state machine and assert structural invariants (offset monotonicity, range-list bounds, terminal-state coherence). Connection-level reassembly fuzz adds end-to-end coverage at `src/conn/state.zig:13285`. Deterministic happy-path coverage retained at `src/conn/recv_stream.zig:379–599` and `src/conn/send_stream.zig:441–797`. |
 | 19 | Connection ID lifecycle | COVERED | `src/conn/state.zig:13548` `fuzz: Connection NEW_CONNECTION_ID / RETIRE_CONNECTION_ID lifecycle invariants` drives smith-chosen interleavings of `handleNewConnectionId` / `handleRetireConnectionId` / `handlePathNewConnectionId` (path_id=0) with fuzzer-chosen sequence numbers, retire_prior_to, CID bytes (len 0..20), and stateless-reset tokens; asserts the `peer_cids` cap, per-path sequence-number uniqueness, post-RETIRE removal from `local_cids`, active-CID coherence with `peer_cids`, and that any close code is one of `{protocol_violation, frame_encoding, excessive_load}`. Deterministic coverage retained at `src/conn/state.zig:11487–11904`. |
@@ -113,23 +113,23 @@ Status legend matches §2.
 
 | § | Class | Status | Citation / notes |
 |---|---|---|---|
-| 1 | QPACK header-block expansion DoS | MISSING (no impl) | No QPACK in nullq. |
+| 1 | QPACK header-block expansion DoS | MISSING (no impl) | No QPACK in quic-zig. |
 | 2 | ACK for unsent packet numbers | COVERED | `src/conn/state.zig:9125 ACK with largest_acked >= next_pn is a PROTOCOL_VIOLATION` and `:9179 == next_pn`. Implementation gate at `src/conn/state.zig:7088, 7172`. |
 | 3 | Excessive / overlapping ACK ranges | COVERED | Output side: `src/conn/state.zig:11026 pollLevel caps ACK ranges to packet budget` and `:11059 application ACK ranges use bounded emission budget`. Input side: `max_incoming_ack_ranges = 256` cap (commit `3a64820`) at `src/frame/decode.zig:64,142,203` plus tests at `src/frame/decode.zig:703,719,737`; overlap detection (commit `0baa170`) tested at `src/frame/decode.zig:751`. |
-| 4 | Duplicate SETTINGS | MISSING (no impl) | No HTTP/3 SETTINGS in nullq. (QUIC transport-parameter duplication *is* covered: `src/tls/transport_params.zig:521 decode rejects duplicate transport parameters`.) |
-| 5 | SETTINGS not first on control stream | MISSING (no impl) | No HTTP/3 SETTINGS in nullq. |
-| 6 | HTTP/2-only settings sent in HTTP/3 | MISSING (no impl) | No HTTP/3 SETTINGS in nullq. |
+| 4 | Duplicate SETTINGS | MISSING (no impl) | No HTTP/3 SETTINGS in quic-zig. (QUIC transport-parameter duplication *is* covered: `src/tls/transport_params.zig:521 decode rejects duplicate transport parameters`.) |
+| 5 | SETTINGS not first on control stream | MISSING (no impl) | No HTTP/3 SETTINGS in quic-zig. |
+| 6 | HTTP/2-only settings sent in HTTP/3 | MISSING (no impl) | No HTTP/3 SETTINGS in quic-zig. |
 | 7 | Frame type sent on invalid stream type | MISSING (no impl) | The HTTP/3 framing requirement does not apply; QUIC-level "forbidden frame in 0-RTT" is covered: `src/conn/state.zig:10959 server rejects forbidden frames in 0-RTT`. |
-| 8 | HEADERS after trailers | MISSING (no impl) | No HTTP/3 in nullq. |
-| 9 | DATA before HEADERS | MISSING (no impl) | No HTTP/3 in nullq. |
-| 10 | Duplicate pseudo-headers | MISSING (no impl) | No HTTP/3 in nullq. |
-| 11 | Uppercase field names | MISSING (no impl) | No HTTP/3 in nullq. |
-| 12 | Forbidden `Connection` header | MISSING (no impl) | No HTTP/3 in nullq. |
-| 13 | Invalid `Content-Length` | MISSING (no impl) | No HTTP/3 in nullq. |
+| 8 | HEADERS after trailers | MISSING (no impl) | No HTTP/3 in quic-zig. |
+| 9 | DATA before HEADERS | MISSING (no impl) | No HTTP/3 in quic-zig. |
+| 10 | Duplicate pseudo-headers | MISSING (no impl) | No HTTP/3 in quic-zig. |
+| 11 | Uppercase field names | MISSING (no impl) | No HTTP/3 in quic-zig. |
+| 12 | Forbidden `Connection` header | MISSING (no impl) | No HTTP/3 in quic-zig. |
+| 13 | Invalid `Content-Length` | MISSING (no impl) | No HTTP/3 in quic-zig. |
 | 14 | Excessive unknown frames | COVERED | `tests/e2e/unknown_frames_smoke.zig` drives a real handshake to completion, then hand-seals a 1-RTT packet whose decrypted payload is ~1000 single-byte unknown-type varints (`0x21`); `Connection.handle` returns `error.UnknownFrameType` (surfaced from `frame.decode` on the very first byte), the server's PN tracker advanced (so the error is at the frame layer, not AEAD/PN), and the connection is *not* pushed into a zombie state — the next `poll` succeeds. Plus the original frame-level coverage: `src/frame/decode.zig:679 decode rejects unknown frame type` and the drain-loop fuzz at `:655` capping iterations at 16k. The Connection-level CRYPTO/STREAM reassembly fuzzes (`src/conn/state.zig:13193,13285`) also drive randomized frame sequences through `dispatchFrames`. |
 | 15 | Excessive unknown settings | MISSING (no impl) | HTTP/3 layer absent; transport-parameter unknowns are silently skipped as required (`src/tls/transport_params.zig:563 decode skips unknown ids`). |
-| 16 | Excessive blocked QPACK streams | MISSING (no impl) | No QPACK in nullq. |
-| 17 | Dynamic table refs beyond known insert count | MISSING (no impl) | No QPACK in nullq. |
+| 16 | Excessive blocked QPACK streams | MISSING (no impl) | No QPACK in quic-zig. |
+| 17 | Dynamic table refs beyond known insert count | MISSING (no impl) | No QPACK in quic-zig. |
 | 18 | Retry token random garbage | COVERED | `tests/e2e/server_smoke.zig:254 Server.feed with retry_token_key issues a Retry then drops a malformed echo` plus negative cases at `src/conn/retry_token.zig:230` (malformed prefix, single-byte flip, wrong tag prefix) and the new `fuzz: retry_token validate never panics` at `src/conn/retry_token.zig:562`. |
 | 19 | Version Negotiation flood | COVERED | `tests/e2e/vn_spoofed_source_smoke.zig` (commit `512d1c3`): 200 distinct fake source addresses each send one VN-eligible probe; per-source rate table tracks each independently; global stateless-response queue caps at 64 entries; eviction counter ticks once per overflowed entry. Companion test pins the 65th distinct source triggering the first global eviction. Plus the per-source VN rate limit (commit `b22ebee`) and `Server VN per-source rate limiter caps VN responses` in `tests/e2e/server_smoke.zig`. |
 | 20 | PATH_CHALLENGE flood | COVERED | `tests/e2e/path_challenge_flood_smoke.zig` (commit `512d1c3`): 64 PATH_CHALLENGE frames flow into the server; each prompts exactly one PATH_RESPONSE drained off `pending_frames`; the server's primary-path validator never transitions away from its post-handshake baseline (`.validated`) and never enters `.pending`. Companion test pins the `recordPathResponse → .NotPending` swallow path. Plus the per-path PATH_CHALLENGE rate limit (`min_path_challenge_interval_us = 100 ms`, commit `a4b2a3b`). |
@@ -138,13 +138,13 @@ Status legend matches §2.
 
 ## 4. Remaining gaps
 
-Every §11.1 / §11.2 row that has a corresponding nullq implementation
+Every §11.1 / §11.2 row that has a corresponding quic-zig implementation
 is now flipped to COVERED. Out-of-scope rows (HTTP/3, QPACK) are
 tracked for when those layers are added — see the appendix.
 
 ## Appendix: out-of-scope rows
 
-The following §11 rows depend on layers that nullq has not implemented
+The following §11 rows depend on layers that quic-zig has not implemented
 yet and are tracked here only so the audit is exhaustive:
 
 - HTTP/3 frame parser, SETTINGS parser, request field validator

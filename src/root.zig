@@ -1,4 +1,4 @@
-//! nullq — a Zig-first IETF QUIC v1 implementation.
+//! quic_zig — a Zig-first IETF QUIC v1 implementation.
 //!
 //! This module is the public API surface. It re-exports the namespace
 //! modules (`wire`, `frame`, `tls`, `conn`, `transport`) plus the
@@ -31,12 +31,12 @@ pub const frame = @import("frame/root.zig");
 pub const tls = @import("tls/root.zig");
 
 /// Per-connection state machine: streams, paths, congestion control,
-/// loss recovery, key updates, multipath. The bulk of nullq lives
+/// loss recovery, key updates, multipath. The bulk of quic_zig lives
 /// here.
 pub const conn = @import("conn/root.zig");
 
 /// Stateless Retry token HMAC helpers. Re-exported under
-/// `nullq.retry_token` for embedders that want address-bound Retry
+/// `quic_zig.retry_token` for embedders that want address-bound Retry
 /// validation without writing the token format themselves.
 pub const retry_token = conn.retry_token;
 
@@ -44,12 +44,12 @@ pub const retry_token = conn.retry_token;
 /// I/O and path-tracking helpers later.
 pub const transport = @import("transport/root.zig");
 
-/// High-level convenience wrapper for embedding nullq as a QUIC
+/// High-level convenience wrapper for embedding quic_zig as a QUIC
 /// server. Owns the TLS context and a connection table; the
 /// embedder still owns the UDP socket and the clock.
 pub const Server = @import("server.zig").Server;
 
-/// High-level convenience wrapper for embedding nullq as a QUIC
+/// High-level convenience wrapper for embedding quic_zig as a QUIC
 /// client. Mirror to `Server` — owns the TLS context and per-Initial
 /// random DCID/SCID generation; the embedder still owns the UDP
 /// socket, the clock, and the returned `Connection` lifecycle.
@@ -106,7 +106,7 @@ pub const QlogCallback = conn.QlogCallback;
 /// One qlog-style observable event delivered through `QlogCallback`.
 pub const QlogEvent = conn.QlogEvent;
 
-/// The set of qlog event names nullq currently emits.
+/// The set of qlog event names quic_zig currently emits.
 pub const QlogEventName = conn.QlogEventName;
 
 /// Packet number space for qlog events.
@@ -194,7 +194,7 @@ test {
 
 test "phase 0: builds and links against boringssl-zig" {
     // Touch boringssl so the link path is exercised.
-    const digest = try boringssl.crypto.hash.Sha256.hash("nullq");
+    const digest = try boringssl.crypto.hash.Sha256.hash("quic_zig");
     try std.testing.expectEqual(@as(usize, 32), digest.len);
 
     try std.testing.expectEqualStrings("0.0.0", version());

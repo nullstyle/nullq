@@ -1,9 +1,9 @@
-//! Smoke tests for the high-level `nullq.Client` convenience type.
+//! Smoke tests for the high-level `quic_zig.Client` convenience type.
 //!
 //! Mirror to `tests/e2e/server_smoke.zig`. These run from the
 //! integration-test module so they can construct real TLS contexts
 //! against the boringssl-zig dependency without polluting the
-//! published `nullq` package's test surface.
+//! published `quic_zig` package's test surface.
 //!
 //! Like the server smoke, we don't try to drive a full handshake —
 //! that would require an actual peer. We do verify that
@@ -11,7 +11,7 @@
 //! transport params set, and is ready to be ticked.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const common = @import("common.zig");
 
 const defaultParams = common.defaultParams;
@@ -19,7 +19,7 @@ const defaultParams = common.defaultParams;
 test "Client.connect succeeds and yields a tickable Connection" {
     const protos = [_][]const u8{"hq-test"};
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -43,7 +43,7 @@ test "Client.connect succeeds and yields a tickable Connection" {
 test "Client.connect drives the first Initial out via poll" {
     const protos = [_][]const u8{"hq-test"};
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -67,7 +67,7 @@ test "Client.connect drives the first Initial out via poll" {
 
 test "Client.connect rejects empty SNI" {
     const protos = [_][]const u8{"hq-test"};
-    try std.testing.expectError(nullq.Client.Error.InvalidConfig, nullq.Client.connect(.{
+    try std.testing.expectError(quic_zig.Client.Error.InvalidConfig, quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "",
         .alpn_protocols = &protos,
@@ -76,7 +76,7 @@ test "Client.connect rejects empty SNI" {
 }
 
 test "Client.connect rejects empty ALPN" {
-    try std.testing.expectError(nullq.Client.Error.InvalidConfig, nullq.Client.connect(.{
+    try std.testing.expectError(quic_zig.Client.Error.InvalidConfig, quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &.{},
@@ -88,7 +88,7 @@ test "Client.connect rejects invalid CID lengths" {
     const protos = [_][]const u8{"hq-test"};
 
     // initial_dcid_len < 8 violates RFC 9000 §7.2.
-    try std.testing.expectError(nullq.Client.Error.InvalidConfig, nullq.Client.connect(.{
+    try std.testing.expectError(quic_zig.Client.Error.InvalidConfig, quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -97,7 +97,7 @@ test "Client.connect rejects invalid CID lengths" {
     }));
 
     // initial_dcid_len > 20 violates RFC 9000 §17.2.
-    try std.testing.expectError(nullq.Client.Error.InvalidConfig, nullq.Client.connect(.{
+    try std.testing.expectError(quic_zig.Client.Error.InvalidConfig, quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -108,7 +108,7 @@ test "Client.connect rejects invalid CID lengths" {
     // local_cid_len = 0 is allowed by RFC 9000 generally but the
     // wrapper rejects it because `Client.connect` follows the QNS
     // canonical pattern of CID-based routing.
-    try std.testing.expectError(nullq.Client.Error.InvalidConfig, nullq.Client.connect(.{
+    try std.testing.expectError(quic_zig.Client.Error.InvalidConfig, quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -117,7 +117,7 @@ test "Client.connect rejects invalid CID lengths" {
     }));
 
     // local_cid_len > 20 violates RFC 9000.
-    try std.testing.expectError(nullq.Client.Error.InvalidConfig, nullq.Client.connect(.{
+    try std.testing.expectError(quic_zig.Client.Error.InvalidConfig, quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,
@@ -134,7 +134,7 @@ test "Client.connect honours transport params (ISCID is auto-filled)" {
     // should do it from the freshly-minted client SCID.
     params.initial_source_connection_id = .{};
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = std.testing.allocator,
         .server_name = "example.com",
         .alpn_protocols = &protos,

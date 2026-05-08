@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a defect in nullq
+about: Report a defect in quic-zig
 labels: bug
 ---
 
@@ -16,16 +16,16 @@ labels: bug
 
 ## Expected behavior
 
-<!-- What you expected nullq to do, and the RFC reference if relevant. -->
+<!-- What you expected quic-zig to do, and the RFC reference if relevant. -->
 
 ## Actual behavior
 
-<!-- What nullq actually did. Logs, qlog excerpts, or panic traces
+<!-- What quic-zig actually did. Logs, qlog excerpts, or panic traces
      are very helpful. -->
 
 ## Environment
 
-- nullq commit / version:
+- quic-zig commit / version:
 - Zig version (`zig version`):
 - OS / arch:
 - Peer (e.g. `quic-go`, `quiche`, `ngtcp2`, browser, custom):

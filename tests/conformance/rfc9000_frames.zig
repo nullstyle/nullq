@@ -2,7 +2,7 @@
 //!
 //! The wire-side implementation under test lives in
 //! `src/frame/{decode,encode,types,ack_range}.zig`. This suite is the
-//! auditor-facing record of which §19 normative requirements nullq
+//! auditor-facing record of which §19 normative requirements quic_zig
 //! actually enforces at the parser/encoder boundary.
 //!
 //! Connection-level requirements (e.g. NEW_TOKEN role-check,
@@ -78,8 +78,8 @@
 //!   RFC9000 §17.2.x packet-number space rules              → rfc9000_packet_headers.zig
 
 const std = @import("std");
-const nullq = @import("nullq");
-const frame = nullq.frame;
+const quic_zig = @import("quic_zig");
+const frame = quic_zig.frame;
 const types = frame.types;
 const ack_range = frame.ack_range;
 const decode = frame.decode;
@@ -237,7 +237,7 @@ test "NORMATIVE ACK accepts adjacent ranges separated by the minimum legal gap [
 }
 
 test "MUST NOT accept an ACK whose range_count exceeds the implementation cap [RFC9000 §13.1 ¶?]" {
-    // §13.1 calls for bounded ACK processing; nullq caps incoming
+    // §13.1 calls for bounded ACK processing; quic_zig caps incoming
     // ACK range_count at 256 (`max_incoming_ack_ranges`). A peer
     // claiming 1000 ranges must be rejected before we walk any
     // varint pairs — this is the §13.1 / hardening §4.7 DoS gate.
@@ -290,8 +290,8 @@ test "MUST close the connection when an ACK acknowledges a never-sent packet num
     );
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -408,8 +408,8 @@ test "MUST NOT accept a NEW_TOKEN with a zero-length token [RFC9000 §19.7 ¶?]"
     const close_event = try pair.injectFrameAtClient(&new_token_empty);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_FRAME_ENCODING_ERROR, ev.error_code);
 }
 
@@ -431,8 +431,8 @@ test "MUST NOT accept a NEW_TOKEN at a server endpoint [RFC9000 §19.7 ¶?]" {
     const close_event = try pair.injectFrameAtServer(buf[0..n]);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -491,7 +491,7 @@ test "NORMATIVE STREAM allows a zero-length payload (FIN-only) [RFC9000 §19.8 �
 
 test "NORMATIVE STREAM without LEN runs to the end of the slice [RFC9000 §19.8 ¶?]" {
     // §19.8: "If the LEN bit is not set, the field extends to the
-    // end of the packet." nullq's parser treats the input slice as
+    // end of the packet." quic_zig's parser treats the input slice as
     // the packet payload bound, so absent-LEN STREAM consumes
     // everything after stream_id (and offset, when OFF is set).
     const wire = [_]u8{
@@ -611,8 +611,8 @@ test "MUST NOT accept MAX_STREAMS with value > 2^60 [RFC9000 §19.11 ¶?]" {
     const close_event = try pair.injectFrameAtServer(buf[0..n]);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_FRAME_ENCODING_ERROR, ev.error_code);
 }
 
@@ -766,7 +766,7 @@ test "MUST NOT accept NEW_CONNECTION_ID with retire_prior_to > sequence_number [
     // greater than that in the Sequence Number field MUST be
     // treated as a connection error of type FRAME_ENCODING_ERROR."
     //
-    // AUDITOR NOTE: nullq's `Connection.registerPeerCid`
+    // AUDITOR NOTE: quic_zig's `Connection.registerPeerCid`
     // (src/conn/state.zig) emits PROTOCOL_VIOLATION (0x0a) here,
     // not FRAME_ENCODING_ERROR (0x07). The CONNECTION_CLOSE still
     // signals "this peer is misbehaving and must shut the connection
@@ -793,8 +793,8 @@ test "MUST NOT accept NEW_CONNECTION_ID with retire_prior_to > sequence_number [
     const close_event = try pair.injectFrameAtServer(buf[0..n]);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     // Implementation choice — see AUDITOR NOTE above.
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
@@ -836,8 +836,8 @@ test "MUST NOT accept RETIRE_CONNECTION_ID for an unissued sequence number [RFC9
     const close_event = try pair.injectFrameAtServer(buf[0..n]);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -871,8 +871,8 @@ test "MUST NOT retire the connection ID currently in use to receive [RFC9000 §1
     const close_event = try pair.injectFrameAtServer(buf[0..n]);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -1006,8 +1006,8 @@ test "MUST NOT accept HANDSHAKE_DONE from a client peer [RFC9000 §19.20 ¶?]" {
     const close_event = try pair.injectFrameAtServer(&handshake_done);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -1016,7 +1016,7 @@ test "MUST NOT accept HANDSHAKE_DONE from a client peer [RFC9000 §19.20 ¶?]" {
 test "MUST reject a 1-byte unknown frame type [RFC9000 §19.21 ¶1]" {
     // §19.21: "An endpoint MUST treat the receipt of a frame of
     // unknown type as a connection error of type
-    // FRAME_ENCODING_ERROR." nullq surfaces this at the parser as
+    // FRAME_ENCODING_ERROR." quic_zig surfaces this at the parser as
     // `error.UnknownFrameType`; the connection-level error mapping
     // turns it into FRAME_ENCODING_ERROR on close.
     // 0x40 is a 2-byte varint with value 0 — but at this byte
@@ -1100,8 +1100,8 @@ test "NORMATIVE Initial / Handshake levels reject frames outside {PADDING, PING,
     const close_event = try fixture.feedAndExpectClose(&srv, &dcid, &scid, 0, &payload);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -1127,7 +1127,7 @@ test "NORMATIVE 0-RTT level forbids ACK [RFC9000 §12.4]" {
     const close_event = try pair.injectFrameAtServer0Rtt(&ack_frame);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -1148,7 +1148,7 @@ test "NORMATIVE 0-RTT level forbids NEW_TOKEN [RFC9000 §12.4]" {
     const close_event = try pair.injectFrameAtServer0Rtt(&new_token_frame);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -1166,6 +1166,6 @@ test "NORMATIVE 0-RTT level forbids HANDSHAKE_DONE [RFC9000 §12.4]" {
     const close_event = try pair.injectFrameAtServer0Rtt(&handshake_done_frame);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }

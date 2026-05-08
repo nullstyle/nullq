@@ -33,7 +33,7 @@
 //! path for normal addresses, but we keep one for forward-compatibility
 //! if `path.Address` ever grows.
 //!
-//! Domain separator: `"nullq new_token v1"` — distinct from the
+//! Domain separator: `"quic_zig new_token v1"` — distinct from the
 //! Retry-token domain separator so a Retry token presented in the
 //! Initial-token field cannot be mistaken for a NEW_TOKEN (and vice
 //! versa). The server's gate tries NEW_TOKEN.validate first; on
@@ -93,7 +93,7 @@ pub const Token = [max_token_len]u8;
 
 /// Domain separator. Mixed into the AEAD AAD; replaying a Retry token
 /// blob through NEW_TOKEN.validate (or vice versa) returns `.malformed`.
-const domain_separator = "nullq new_token v1";
+const domain_separator = "quic_zig new_token v1";
 
 /// Errors raised by `mint` (and surfaced as `.malformed` from
 /// `validate`).

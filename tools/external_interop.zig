@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const default_image = "nullq-interop:local";
+const default_image = "quic-zig-interop:local";
 const default_zig_version = "0.16.0";
 const default_runner_python = "3.12";
-const default_wireshark_image = "nullq-interop-wireshark:local";
+const default_wireshark_image = "quic-zig-interop-wireshark:local";
 
 const case_aliases = [_]CaseAlias{
     .{ .short = "H", .long = "handshake" },
@@ -106,9 +106,9 @@ pub fn main(init: std.process.Init) !void {
 fn usage() void {
     std.debug.print(
         \\usage:
-        \\  zig build external-interop -- preflight [--image nullq-interop:local] [--dry-run]
-        \\  zig build external-interop -- build-image [--image nullq-interop:local] [--zig-version 0.16.0] [--dry-run]
-        \\  zig build external-interop -- runner [--role server|client] [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--servers quic-go,ngtcp2,quiche] [--tests core+retry] [--scenario "drop-rate ..."] [--python 3.12] [--wireshark-image nullq-interop-wireshark:local] [--dry-run]
+        \\  zig build external-interop -- preflight [--image quic-zig-interop:local] [--dry-run]
+        \\  zig build external-interop -- build-image [--image quic-zig-interop:local] [--zig-version 0.16.0] [--dry-run]
+        \\  zig build external-interop -- runner [--role server|client] [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--servers quic-go,ngtcp2,quiche] [--tests core+retry] [--scenario "drop-rate ..."] [--python 3.12] [--wireshark-image quic-zig-interop-wireshark:local] [--dry-run]
         \\
     , .{});
 }
@@ -224,8 +224,8 @@ fn parseRole(role: []const u8) ?RunnerRole {
 
 fn defaultRunnerJsonName(role: RunnerRole) []const u8 {
     return switch (role) {
-        .server => "nullq-server.json",
-        .client => "nullq-client.json",
+        .server => "quic-zig-server.json",
+        .client => "quic-zig-client.json",
     };
 }
 
@@ -261,7 +261,7 @@ fn preflight(allocator: std.mem.Allocator, io: std.Io, cfg: Config, runner: bool
             try runAndRequireZero(allocator, io, &.{ "uv", "--version" }, null);
         }
     }
-    std.debug.print("tools ok; nullq image tag will be {s}\n", .{cfg.image});
+    std.debug.print("tools ok; quic-zig image tag will be {s}\n", .{cfg.image});
 }
 
 fn buildImage(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
@@ -269,9 +269,9 @@ fn buildImage(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     const docker_context = try std.fs.path.join(allocator, &.{ cfg.repo, ".zig-cache", "interop-docker-context" });
     try recreateDir(io, docker_context);
 
-    const staged_nullq = try std.fs.path.join(allocator, &.{ docker_context, "nullq" });
+    const staged_quic_zig = try std.fs.path.join(allocator, &.{ docker_context, "quic-zig" });
     const staged_boringssl = try std.fs.path.join(allocator, &.{ docker_context, "boringssl-zig" });
-    try copyTree(allocator, io, cfg.repo, staged_nullq);
+    try copyTree(allocator, io, cfg.repo, staged_quic_zig);
     try copyTree(allocator, io, try std.fs.path.join(allocator, &.{ cfg.workspace, "boringssl-zig" }), staged_boringssl);
 
     const cmd = [_][]const u8{
@@ -280,7 +280,7 @@ fn buildImage(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
         "--build-arg",
         try std.fmt.allocPrint(allocator, "ZIG_VERSION={s}", .{cfg.zig_version}),
         "-f",
-        "nullq/interop/qns/Dockerfile",
+        "quic-zig/interop/qns/Dockerfile",
         "-t",
         cfg.image,
         ".",
@@ -298,7 +298,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     try copyTree(allocator, io, runner_dir, overlay);
     try patchRunnerKeylogSelection(allocator, io, overlay);
     if (cfg.scenario != null) try patchRunnerScenarioOverride(allocator, io, overlay);
-    try injectNullqImplementation(allocator, io, overlay, cfg.image, @tagName(cfg.role));
+    try injectQuicZigImplementation(allocator, io, overlay, cfg.image, @tagName(cfg.role));
     const trace_tools_dir = try prepareTraceTools(allocator, io, cfg, overlay);
 
     const tests = try expandCases(allocator, cfg.tests);
@@ -317,7 +317,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
             try cmd.append(allocator, env_path);
         }
         if (cfg.scenario) |scenario| {
-            try cmd.append(allocator, try std.fmt.allocPrint(allocator, "NULLQ_INTEROP_SCENARIO={s}", .{scenario}));
+            try cmd.append(allocator, try std.fmt.allocPrint(allocator, "QUIC_ZIG_INTEROP_SCENARIO={s}", .{scenario}));
         }
     }
     try cmd.appendSlice(allocator, &.{ "uv", "run", "--python", cfg.runner_python });
@@ -332,7 +332,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     switch (cfg.role) {
         .server => try cmd.appendSlice(allocator, &.{
             "-s",
-            "nullq",
+            "quic-zig",
             "-c",
             cfg.clients,
         }),
@@ -340,7 +340,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
             "-s",
             cfg.servers,
             "-c",
-            "nullq",
+            "quic-zig",
         }),
     }
     try cmd.appendSlice(allocator, &.{
@@ -352,7 +352,7 @@ fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
         cfg.json_path.?,
         "-m",
         "-i",
-        "nullq",
+        "quic-zig",
     });
     try runCommand(io, cmd.items, overlay, cfg.dry_run);
 }
@@ -365,7 +365,7 @@ fn prepareTraceTools(allocator: std.mem.Allocator, io: std.Io, cfg: Config, over
     std.debug.print("host tshark/editcap not found; using Docker Wireshark tools image {s}\n", .{cfg.wireshark_image});
     try ensureWiresharkImage(allocator, io, cfg);
 
-    const bin_dir = try std.fs.path.join(allocator, &.{ overlay, ".nullq-tools-bin" });
+    const bin_dir = try std.fs.path.join(allocator, &.{ overlay, ".quic-zig-tools-bin" });
     if (cfg.dry_run) return bin_dir;
 
     try std.Io.Dir.cwd().createDirPath(io, bin_dir);
@@ -490,7 +490,7 @@ fn ignoreCopyPath(path: []const u8) bool {
     return false;
 }
 
-fn injectNullqImplementation(
+fn injectQuicZigImplementation(
     allocator: std.mem.Allocator,
     io: std.Io,
     overlay: []const u8,
@@ -505,11 +505,11 @@ fn injectNullqImplementation(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidImplementationsJson;
 
-    var nullq = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try nullq.put(allocator, "image", .{ .string = image });
-    try nullq.put(allocator, "url", .{ .string = "https://github.com/nullstyle/nullq" });
-    try nullq.put(allocator, "role", .{ .string = role });
-    try parsed.value.object.put(allocator, "nullq", .{ .object = nullq });
+    var quic_zig = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try quic_zig.put(allocator, "image", .{ .string = image });
+    try quic_zig.put(allocator, "url", .{ .string = "https://github.com/nullstyle/quic-zig" });
+    try quic_zig.put(allocator, "role", .{ .string = role });
+    try parsed.value.object.put(allocator, "quic-zig", .{ .object = quic_zig });
 
     const rendered = try std.fmt.allocPrint(allocator, "{f}\n", .{std.json.fmt(parsed.value, .{ .whitespace = .indent_2 })});
     defer allocator.free(rendered);
@@ -592,7 +592,7 @@ fn patchRunnerScenarioOverride(
         \\        ).format(test.scenario())
     ;
     const replacement =
-        \\        ).format(os.environ.get("NULLQ_INTEROP_SCENARIO", test.scenario()))
+        \\        ).format(os.environ.get("QUIC_ZIG_INTEROP_SCENARIO", test.scenario()))
     ;
     if (std.mem.indexOf(u8, bytes, replacement) != null) return;
     const idx = std.mem.indexOf(u8, bytes, needle) orelse return error.UnsupportedRunnerScenarioFormat;
@@ -723,7 +723,7 @@ test "case expansion supports presets and aliases" {
 test "runner paths are normalized to absolute paths" {
     const allocator = std.testing.allocator;
     var cfg = Config{
-        .repo = "/tmp/nullq",
+        .repo = "/tmp/quic_zig",
         .workspace = "/tmp",
     };
     const args = [_][]const u8{
@@ -753,7 +753,7 @@ test "runner paths are normalized to absolute paths" {
 test "runner client role defaults to client result path" {
     const allocator = std.testing.allocator;
     var cfg = Config{
-        .repo = "/tmp/nullq",
+        .repo = "/tmp/quic_zig",
         .workspace = "/tmp",
     };
     const args = [_][]const u8{
@@ -769,7 +769,7 @@ test "runner client role defaults to client result path" {
 
     try std.testing.expectEqual(RunnerRole.client, cfg.role);
     try std.testing.expectEqualStrings("quic-go", cfg.servers);
-    try std.testing.expect(std.mem.endsWith(u8, cfg.json_path.?, "interop/results/nullq-client.json"));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.json_path.?, "interop/results/quic-zig-client.json"));
 }
 
 test "copy ignore filters generated trees" {

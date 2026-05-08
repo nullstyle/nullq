@@ -10,7 +10,7 @@
 //! ecosystem can introduce new parameters without breaking interop.
 //!
 //! The implementation under test lives in `src/tls/transport_params.zig`,
-//! exposed publicly as `nullq.tls.transport_params`.
+//! exposed publicly as `quic_zig.tls.transport_params`.
 //!
 //! ## Coverage
 //!
@@ -65,9 +65,9 @@
 //!   here, either as a positive round-trip or as a bound-rejection test.
 
 const std = @import("std");
-const nullq = @import("nullq");
-const transport_params = nullq.tls.transport_params;
-const varint = nullq.wire.varint;
+const quic_zig = @import("quic_zig");
+const transport_params = quic_zig.tls.transport_params;
+const varint = quic_zig.wire.varint;
 
 const Params = transport_params.Params;
 const Id = transport_params.Id;
@@ -650,7 +650,7 @@ test "MUST NOT send retry_source_connection_id from a client [RFC9000 §18.2 ¶3
 test "MUST NOT accept a duplicate transport parameter id [RFC9000 §18 ¶3]" {
     // §18 ¶3: "An endpoint SHOULD treat receipt of duplicate
     // transport parameters as a connection error of type
-    // TRANSPORT_PARAMETER_ERROR." nullq elevates this to a hard
+    // TRANSPORT_PARAMETER_ERROR." quic_zig elevates this to a hard
     // reject in the codec. Two id=0x04 (initial_max_data) entries
     // back-to-back must be rejected.
     const blob = [_]u8{

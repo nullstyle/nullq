@@ -467,7 +467,7 @@ test "encode rejects buffer too small" {
 // -- fuzz harness --------------------------------------------------------
 //
 // Build a `Frame` from corpus bytes (covering all 33 wire-shape
-// variants nullq parses or emits: PADDING, PING, HANDSHAKE_DONE,
+// variants quic_zig parses or emits: PADDING, PING, HANDSHAKE_DONE,
 // RESET_STREAM, STOP_SENDING, CRYPTO, NEW_TOKEN, two STREAM shapes
 // (LEN-prefixed and implicit-tail), two ACK shapes (with/without
 // ECN), MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS, DATA_BLOCKED,

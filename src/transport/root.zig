@@ -1,6 +1,6 @@
-//! nullq.transport — UDP socket plumbing.
+//! quic_zig.transport — UDP socket plumbing.
 //!
-//! nullq is transport-agnostic at the protocol layer: connections
+//! quic_zig is transport-agnostic at the protocol layer: connections
 //! consume and produce datagrams, and *something* shuttles those
 //! datagrams to a UDP socket. This module collects helpers for
 //! that "something" — for now, just socket-option tuning that any

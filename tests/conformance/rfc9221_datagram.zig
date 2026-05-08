@@ -3,7 +3,7 @@
 //! RFC 9221 negotiates DATAGRAM service at the transport layer with a
 //! single transport parameter (`max_datagram_frame_size`, id 0x20) and
 //! adds two frame types — 0x30 (no LEN) and 0x31 (LEN-prefixed) — that
-//! ride inside ordinary 0-RTT and 1-RTT packets. nullq's
+//! ride inside ordinary 0-RTT and 1-RTT packets. quic_zig's
 //! `src/frame/{encode,decode,types}.zig` and
 //! `src/tls/transport_params.zig` carry the wire codec; this suite
 //! locks those bits down.
@@ -43,9 +43,9 @@
 //!                   transitively by the RFC 9000 suites.
 
 const std = @import("std");
-const nullq = @import("nullq");
-const frame = nullq.frame;
-const transport_params = nullq.tls.transport_params;
+const quic_zig = @import("quic_zig");
+const frame = quic_zig.frame;
+const transport_params = quic_zig.tls.transport_params;
 const fixture = @import("_initial_fixture.zig");
 const handshake_fixture = @import("_handshake_fixture.zig");
 
@@ -78,7 +78,7 @@ test "NORMATIVE max_datagram_frame_size = 0 (default) is omitted from the encode
     // RFC 9221 §3 ¶2: a value of 0 indicates the endpoint does NOT
     // support DATAGRAMs. A QUIC transport-parameter blob omits
     // defaults (RFC 9000 §18 ¶2 — "Each transport parameter ... can
-    // appear at most once"); nullq's encoder elides default-valued
+    // appear at most once"); quic_zig's encoder elides default-valued
     // parameters so the absence and the explicit-zero cases are
     // wire-equivalent.
     const default_only: transport_params.Params = .{};
@@ -99,7 +99,7 @@ test "NORMATIVE absent max_datagram_frame_size decodes to 0 (DATAGRAM disabled) 
     // frames does not include this transport parameter ..." A
     // receiver that doesn't see the parameter MUST treat the peer as
     // having no DATAGRAM support, which the codec models as the zero
-    // default — `nullq.conn` then refuses outbound DATAGRAMs via
+    // default — `quic_zig.conn` then refuses outbound DATAGRAMs via
     // `Error.DatagramUnavailable` (covered in src/conn unit tests).
     const empty_blob = try transport_params.Params.decode(&[_]u8{});
     try std.testing.expectEqual(@as(u64, 0), empty_blob.max_datagram_frame_size);
@@ -306,13 +306,13 @@ test "MUST close with PROTOCOL_VIOLATION on a DATAGRAM larger than max_datagram_
 
     const close_event = try pair.injectFrameAtServer(frame_buf[0..frame_len]);
     const ev = close_event orelse return error.NoCloseEventEmitted;
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(handshake_fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
 test "MUST NOT send a DATAGRAM exceeding the peer's advertised max_datagram_frame_size [RFC9221 §4 ¶7]" {
-    // Sender-side mirror: RFC 9221 §4 ¶7. nullq enforces this in
+    // Sender-side mirror: RFC 9221 §4 ¶7. quic_zig enforces this in
     // `Connection.maxOutboundDatagramPayload` — `sendDatagram`
     // returns `Error.DatagramTooLarge` up front when the application
     // payload exceeds the cached peer transport parameter, before
@@ -368,8 +368,8 @@ test "MUST close with PROTOCOL_VIOLATION on a DATAGRAM in an Initial packet [RFC
     const close_event = try fixture.feedAndExpectClose(&srv, &dcid, &scid, 0, &payload);
     const ev = close_event orelse return error.NoCloseEventEmitted;
 
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseSource.local, ev.source);
-    try std.testing.expectEqual(nullq.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseSource.local, ev.source);
+    try std.testing.expectEqual(quic_zig.conn.lifecycle.CloseErrorSpace.transport, ev.error_space);
     try std.testing.expectEqual(fixture.TRANSPORT_ERROR_PROTOCOL_VIOLATION, ev.error_code);
 }
 
@@ -377,7 +377,7 @@ test "MUST close with PROTOCOL_VIOLATION on a DATAGRAM in an Initial packet [RFC
 
 test "NORMATIVE the SentPacket frame catalog has no entry for DATAGRAM retransmission [RFC9221 §5.1]" {
     // RFC 9221 §5.1: "DATAGRAM frames are not retransmitted upon
-    // loss detection." nullq encodes that policy structurally:
+    // loss detection." quic_zig encodes that policy structurally:
     // `SentPacket.retransmit_frames` (src/conn/sent_packets.zig)
     // intentionally omits DATAGRAM from its `RetransmitFrame`
     // tagged union — there is no variant the loss-recovery path

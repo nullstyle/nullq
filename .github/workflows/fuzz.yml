@@ -24,7 +24,7 @@ jobs:
     env:
       ITERS: ${{ github.event.inputs.iterations || '100K' }}
     steps:
-      - name: Checkout nullq
+      - name: Checkout quic-zig
         uses: actions/checkout@v4
 
       - name: Set up mise (zig master + project tools)

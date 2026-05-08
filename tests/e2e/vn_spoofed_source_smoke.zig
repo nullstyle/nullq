@@ -46,7 +46,7 @@
 //! how many distinct addresses the attacker rotates through.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const common = @import("common.zig");
 
 const test_cert_pem = common.test_cert_pem;
@@ -82,7 +82,7 @@ test "VN-flood across spoofed sources: per-source table tracks each address inde
     // 64-entry stateless-response queue, which evicts oldest VN
     // entries on overflow.
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -111,7 +111,7 @@ test "VN-flood across spoofed sources: per-source table tracks each address inde
         addr_bytes[0] = @intCast(source_idx & 0xff);
         addr_bytes[1] = @intCast((source_idx >> 8) & 0xff);
         addr_bytes[2] = 0x42;
-        const addr: nullq.conn.path.Address = .{ .bytes = addr_bytes };
+        const addr: quic_zig.conn.path.Address = .{ .bytes = addr_bytes };
         // `now_us` ticks forward by 1 µs per probe. Far below the
         // 1-second window, so all 200 probes land in the same window
         // (and the per-source counter rolls forward without resetting).
@@ -125,7 +125,7 @@ test "VN-flood across spoofed sources: per-source table tracks each address inde
         // feed's perspective — the eviction is queue-internal, not
         // per-feed. (The eviction counter ticks instead.)
         try std.testing.expectEqual(
-            nullq.Server.FeedOutcome.version_negotiated,
+            quic_zig.Server.FeedOutcome.version_negotiated,
             outcome,
         );
     }
@@ -223,7 +223,7 @@ test "VN-flood: 65th distinct source triggers the first global eviction (§4.4 /
     // sure the boundary at `stateless_response_queue_capacity` is
     // exact, not off by one. Companion to the bulk test above.
     const protos = [_][]const u8{"hq-test"};
-    var srv = try nullq.Server.init(.{
+    var srv = try quic_zig.Server.init(.{
         .allocator = std.testing.allocator,
         .tls_cert_pem = test_cert_pem,
         .tls_key_pem = test_key_pem,
@@ -243,9 +243,9 @@ test "VN-flood: 65th distinct source triggers the first global eviction (§4.4 /
         addr_bytes[0] = @intCast(i & 0xff);
         addr_bytes[1] = @intCast((i >> 8) & 0xff);
         addr_bytes[2] = 0x77;
-        const addr: nullq.conn.path.Address = .{ .bytes = addr_bytes };
+        const addr: quic_zig.conn.path.Address = .{ .bytes = addr_bytes };
         try std.testing.expectEqual(
-            nullq.Server.FeedOutcome.version_negotiated,
+            quic_zig.Server.FeedOutcome.version_negotiated,
             try srv.feed(&probe, addr, @intCast(i)),
         );
     }
@@ -264,10 +264,10 @@ test "VN-flood: 65th distinct source triggers the first global eviction (§4.4 /
     addr_bytes_65[0] = 0x65;
     addr_bytes_65[1] = 0x65;
     addr_bytes_65[2] = 0x77;
-    const addr_65: nullq.conn.path.Address = .{ .bytes = addr_bytes_65 };
+    const addr_65: quic_zig.conn.path.Address = .{ .bytes = addr_bytes_65 };
     var probe_65 = buildVnProbe();
     try std.testing.expectEqual(
-        nullq.Server.FeedOutcome.version_negotiated,
+        quic_zig.Server.FeedOutcome.version_negotiated,
         try srv.feed(&probe_65, addr_65, 64),
     );
 

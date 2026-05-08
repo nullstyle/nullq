@@ -7,7 +7,7 @@ check-tools:
     @command -v zig >/dev/null || { echo "missing zig"; exit 1; }
     @echo "tools ok: $(zig version)"
 
-# Run the full nullq test suite (currently: smoke).
+# Run the full quic-zig test suite (currently: smoke).
 test:
     zig build test
 

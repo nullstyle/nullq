@@ -1,5 +1,5 @@
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 
 const Net = std.Io.net;
@@ -32,7 +32,7 @@ const retry_token_lifetime_us: u64 = 30_000_000;
 // the interop reproducibility posture of `retry_token_key`: the
 // official QUIC interop runner spawns a fresh server process per
 // scenario, so per-process random keys would break cross-test reuse
-// of NEW_TOKENs even within a single run. Operators deploying nullq
+// of NEW_TOKENs even within a single run. Operators deploying quic_zig
 // outside the interop runner should generate a key with
 // `boringssl.crypto.rand.fillBytes` and persist it across restarts —
 // the per-process choice here is interop-test territory only.
@@ -141,7 +141,7 @@ const QlogSink = struct {
     fn init(io: std.Io, dir: []const u8, role: []const u8) !QlogSink {
         try std.Io.Dir.cwd().createDirPath(io, dir);
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "{s}/nullq-{s}.jsonl", .{ dir, role });
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/quic-zig-{s}.jsonl", .{ dir, role });
         const file = try createTraceFile(io, path, true);
         return .{ .io = io, .file = file };
     }
@@ -151,12 +151,12 @@ const QlogSink = struct {
         self.* = undefined;
     }
 
-    fn callback(user_data: ?*anyopaque, event: nullq.QlogEvent) void {
+    fn callback(user_data: ?*anyopaque, event: quic_zig.QlogEvent) void {
         const self: *QlogSink = @ptrCast(@alignCast(user_data.?));
         self.write(event) catch {};
     }
 
-    fn write(self: *QlogSink, event: nullq.QlogEvent) !void {
+    fn write(self: *QlogSink, event: quic_zig.QlogEvent) !void {
         const key_epoch: i128 = if (event.key_epoch) |v| @intCast(v) else -1;
         const key_phase: i8 = if (event.key_phase) |v| if (v) 1 else 0 else -1;
         const packet_number: i128 = if (event.packet_number) |v| @intCast(v) else -1;
@@ -215,7 +215,7 @@ const TicketStore = struct {
 /// Process-local capture store for NEW_TOKEN bytes received on a
 /// client-mode connection. The `resumption` and `zerortt` interop
 /// scenarios open two back-to-back connections to the same server;
-/// when nullq pairs with itself or with a peer that issues NEW_TOKEN,
+/// when quic_zig pairs with itself or with a peer that issues NEW_TOKEN,
 /// we capture the token on the first connection and replay it on
 /// the second via `Connection.setInitialToken`. The bytes are
 /// borrowed-only inside the callback (per
@@ -305,7 +305,7 @@ const Http09App = struct {
         self.www_dir.close(self.io);
     }
 
-    fn process(self: *Http09App, conn: *nullq.Connection) !void {
+    fn process(self: *Http09App, conn: *quic_zig.Connection) !void {
         var it = conn.streamIterator();
         while (it.next()) |entry| {
             try self.processStream(conn, entry.key_ptr.*);
@@ -318,7 +318,7 @@ const Http09App = struct {
         return gop.value_ptr;
     }
 
-    fn processStream(self: *Http09App, conn: *nullq.Connection, stream_id: u64) !void {
+    fn processStream(self: *Http09App, conn: *quic_zig.Connection, stream_id: u64) !void {
         const state = try self.stateFor(stream_id);
         if (state.responded) return;
 
@@ -369,12 +369,12 @@ const Http09App = struct {
 };
 
 const ServerConn = struct {
-    conn: nullq.Connection,
+    conn: quic_zig.Connection,
     app: Http09App,
     peer: Net.IpAddress,
     transport_params_set: bool = false,
     retry_sent: bool = false,
-    retry_original_dcid: nullq.conn.path.ConnectionId = .{},
+    retry_original_dcid: quic_zig.conn.path.ConnectionId = .{},
     retry_source_cid: [server_cid_len]u8,
     initial_server_cid: [server_cid_len]u8,
     /// DCID the peer put on the first Initial we accepted on this
@@ -385,7 +385,7 @@ const ServerConn = struct {
     /// as a brand-new connection just because the source 4-tuple
     /// changed and the wire DCID is still the peer-chosen pre-handshake
     /// one rather than `initial_server_cid`.
-    client_initial_dcid: nullq.conn.path.ConnectionId = .{},
+    client_initial_dcid: quic_zig.conn.path.ConnectionId = .{},
     next_cid_seq: u8 = 1,
     last_activity_us: u64,
     /// Latches once we've minted and queued a NEW_TOKEN on this
@@ -408,7 +408,7 @@ const ServerConn = struct {
         errdefer allocator.destroy(self);
         self.* = undefined;
 
-        self.conn = try nullq.Connection.initServer(allocator, server_tls);
+        self.conn = try quic_zig.Connection.initServer(allocator, server_tls);
         errdefer self.conn.deinit();
 
         self.app = Http09App.init(allocator, io, try openDir(io, www));
@@ -619,7 +619,7 @@ fn runServer(
     if (opts.qlog_dir) |dir| qlog_sink = try QlogSink.init(io, dir, "server");
     defer if (qlog_sink) |*sink| sink.deinit();
 
-    std.debug.print("nullq qns endpoint listening on {f} www={s} retry={}\n", .{ bind_addr, opts.www, opts.retry });
+    std.debug.print("quic_zig qns endpoint listening on {f} www={s} retry={}\n", .{ bind_addr, opts.www, opts.retry });
 
     var conns: std.ArrayList(*ServerConn) = .empty;
     defer {
@@ -650,8 +650,8 @@ fn runServer(
                 const ids = peekLongHeaderIds(msg.data) orelse {
                     continue;
                 };
-                if (ids.version != nullq.QUIC_VERSION_1) {
-                    const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
+                if (ids.version != quic_zig.QUIC_VERSION_1) {
+                    const n = try writeVersionNegotiation(&tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
                     try sock.send(io, &msg.from, tx[0..n]);
                     continue;
                 }
@@ -682,8 +682,8 @@ fn runServer(
                 const ids = peekLongHeaderIds(msg.data) orelse {
                     continue;
                 };
-                if (ids.version != nullq.QUIC_VERSION_1) {
-                    const n = try writeVersionNegotiation(&tx, msg.data, &.{nullq.QUIC_VERSION_1});
+                if (ids.version != quic_zig.QUIC_VERSION_1) {
+                    const n = try writeVersionNegotiation(&tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
                     try sock.send(io, &msg.from, tx[0..n]);
                     continue;
                 }
@@ -706,7 +706,7 @@ fn runServer(
                 };
 
                 if (opts.retry and !sc.retry_sent and !new_token_validated) {
-                    sc.retry_original_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
+                    sc.retry_original_dcid = quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
                     const token = try retryToken(msg.from, now_us, ids.dcid, &sc.retry_source_cid);
                     const n = try sc.conn.writeRetry(&tx, msg.data, &sc.retry_source_cid, &token);
                     try sock.send(io, &msg.from, tx[0..n]);
@@ -714,7 +714,7 @@ fn runServer(
                     continue;
                 }
 
-                const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
+                const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
                 // Pin the wire DCID we're about to accept so future
                 // Initial retransmits from any peer 4-tuple route here.
                 // Pre-Retry: peer-chosen random. Post-Retry:
@@ -722,9 +722,9 @@ fn runServer(
                 // but storing it is harmless and keeps the field
                 // semantically meaningful: "the DCID the peer is
                 // currently addressing on the Initial wire").
-                sc.client_initial_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
-                const retry_source: ?nullq.conn.path.ConnectionId = if (sc.retry_sent)
-                    nullq.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
+                sc.client_initial_dcid = quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
+                const retry_source: ?quic_zig.conn.path.ConnectionId = if (sc.retry_sent)
+                    quic_zig.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
                 else
                     null;
                 if (sc.retry_sent) {
@@ -736,9 +736,9 @@ fn runServer(
                     }
                 }
 
-                const params: nullq.tls.TransportParams = .{
+                const params: quic_zig.tls.TransportParams = .{
                     .original_destination_connection_id = original_dcid,
-                    .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
+                    .initial_source_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
                     .retry_source_connection_id = retry_source,
                     .max_idle_timeout_ms = 30_000,
                     .initial_max_data = endpoint_connection_receive_window,
@@ -751,7 +751,7 @@ fn runServer(
                     .active_connection_id_limit = endpoint_active_connection_id_limit,
                 };
                 try sc.conn.acceptInitial(msg.data, params);
-                _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "nullq qns endpoint v1");
+                _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "quic_zig qns endpoint v1");
                 sc.transport_params_set = true;
             }
             try sc.conn.handle(msg.data, netAddressToPathAddress(msg.from), now_us);
@@ -815,7 +815,7 @@ fn runClient(
     defer allocator.free(server_name_z);
 
     const mode = clientMode(opts.testcase);
-    std.debug.print("nullq qns client connecting to {f} testcase={s} requests={d}\n", .{
+    std.debug.print("quic_zig qns client connecting to {f} testcase={s} requests={d}\n", .{
         server_addr,
         if (opts.testcase.len == 0) "default" else opts.testcase,
         downloads.len,
@@ -972,7 +972,7 @@ fn runClientConnection(
     // arrived. No counter increments anywhere — purely a
     // bridge-layer race.
     //
-    // nullq is unusual in starting the handshake within microseconds
+    // quic_zig is unusual in starting the handshake within microseconds
     // of process start, so its first PTO retransmit (RFC 9002 default
     // PTO = 333+4*166.5 = 999ms) lands smack in the bad window. The
     // longrtt testcase asserts ≥2 ClientHellos on the wire; when the
@@ -992,7 +992,7 @@ fn runClientConnection(
     // sleep can be deleted.
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(750), .awake) catch {};
 
-    var conn = try nullq.Connection.initClient(allocator, client_tls, server_name_z);
+    var conn = try quic_zig.Connection.initClient(allocator, client_tls, server_name_z);
     defer conn.deinit();
     if (conn_opts.qlog_sink) |sink| conn.setQlogCallback(QlogSink.callback, sink);
     if (conn_opts.session) |session| try conn.setSession(session);
@@ -1013,8 +1013,8 @@ fn runClientConnection(
     try conn.setInitialDcid(&initial_dcid);
     try conn.setPeerDcid(&initial_dcid);
 
-    const params: nullq.tls.TransportParams = .{
-        .initial_source_connection_id = nullq.conn.path.ConnectionId.fromSlice(&client_scid),
+    const params: quic_zig.tls.TransportParams = .{
+        .initial_source_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&client_scid),
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = endpoint_connection_receive_window,
         .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
@@ -1123,7 +1123,7 @@ fn runClientConnection(
             };
             if (conn.keyUpdateStatus().write_key_phase) {
                 key_update_done = true;
-                std.debug.print("nullq qns client initiated key update\n", .{});
+                std.debug.print("quic_zig qns client initiated key update\n", .{});
                 progressed = true;
             }
         }
@@ -1136,7 +1136,7 @@ fn runClientConnection(
         // exactly once after the handshake is confirmed and a few
         // 1-RTT datagrams have flowed (i.e. there's an actual transfer
         // in progress for the runner's pcap to capture). We bind a
-        // fresh socket on a kernel-chosen ephemeral port; nullq core
+        // fresh socket on a kernel-chosen ephemeral port; quic_zig core
         // rotates the peer DCID and queues a PATH_CHALLENGE on the
         // active path. Subsequent `poll` output and inbound recvs
         // route through the new socket.
@@ -1157,7 +1157,7 @@ fn runClientConnection(
                 migration_pending = false;
                 break :migrate;
             };
-            std.debug.print("nullq qns client active migration to fresh local socket\n", .{});
+            std.debug.print("quic_zig qns client active migration to fresh local socket\n", .{});
             old_sock = sock;
             // Hold the old socket readable for ~500 ms so server
             // packets already in-flight to the old port still feed
@@ -1330,7 +1330,7 @@ fn parsePort(bytes: []const u8) !u16 {
 
 fn startClientRequests(
     allocator: std.mem.Allocator,
-    conn: *nullq.Connection,
+    conn: *quic_zig.Connection,
     downloads: []ClientDownload,
 ) !bool {
     var progressed = false;
@@ -1353,7 +1353,7 @@ fn startClientRequests(
 
 fn drainClientResponses(
     allocator: std.mem.Allocator,
-    conn: *nullq.Connection,
+    conn: *quic_zig.Connection,
     downloads: []ClientDownload,
 ) !bool {
     var progressed = false;
@@ -1433,20 +1433,20 @@ fn readWholeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
 }
 
-/// Apply nullq's recommended UDP buffer tuning to a freshly bound
+/// Apply quic_zig's recommended UDP buffer tuning to a freshly bound
 /// socket. Errors are reported but not fatal — a tiny CI box that
 /// rejects 4 MiB buffers can still run the QNS endpoint, just with
 /// the OS-default risk of receive-buffer overflow during bursts.
 fn tuneServerSocket(handle: std.posix.socket_t) void {
-    nullq.transport.applyServerTuning(handle, .{}) catch |err| {
+    quic_zig.transport.applyServerTuning(handle, .{}) catch |err| {
         std.debug.print(
             "warning: could not tune QNS UDP socket buffers ({s}); falling back to OS defaults\n",
             .{@errorName(err)},
         );
         return;
     };
-    if (nullq.transport.getRecvBufferSize(handle)) |rcv| {
-        if (nullq.transport.getSendBufferSize(handle)) |snd| {
+    if (quic_zig.transport.getRecvBufferSize(handle)) |rcv| {
+        if (quic_zig.transport.getSendBufferSize(handle)) |snd| {
             std.debug.print(
                 "tuned QNS UDP socket: SO_RCVBUF={} bytes, SO_SNDBUF={} bytes\n",
                 .{ rcv, snd },
@@ -1500,11 +1500,11 @@ fn netAddressEql(a: Net.IpAddress, b: Net.IpAddress) bool {
     };
 }
 
-fn sockaddrFromHandle(handle: std.posix.socket_t) nullq.conn.path.Address {
+fn sockaddrFromHandle(handle: std.posix.socket_t) quic_zig.conn.path.Address {
     var sa: std.posix.sockaddr.storage = undefined;
     var sa_len: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
     if (std.c.getsockname(handle, @ptrCast(&sa), &sa_len) != 0) return .{};
-    var out: nullq.conn.path.Address = .{};
+    var out: quic_zig.conn.path.Address = .{};
     if (sa.family == std.posix.AF.INET) {
         const v4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&sa));
         out.bytes[0] = 4;
@@ -1520,8 +1520,8 @@ fn sockaddrFromHandle(handle: std.posix.socket_t) nullq.conn.path.Address {
     return out;
 }
 
-fn netAddressToPathAddress(addr: Net.IpAddress) nullq.conn.path.Address {
-    var out: nullq.conn.path.Address = .{};
+fn netAddressToPathAddress(addr: Net.IpAddress) quic_zig.conn.path.Address {
+    var out: quic_zig.conn.path.Address = .{};
     switch (addr) {
         .ip4 => |ip4| {
             out.bytes[0] = 4;
@@ -1553,9 +1553,9 @@ fn writeVersionNegotiation(
         std.mem.writeInt(u32, versions_bytes[i * 4 ..][0..4], version, .big);
     }
 
-    return try nullq.wire.header.encode(dst, .{ .version_negotiation = .{
-        .dcid = try nullq.wire.header.ConnId.fromSlice(ids.scid),
-        .scid = try nullq.wire.header.ConnId.fromSlice(ids.dcid),
+    return try quic_zig.wire.header.encode(dst, .{ .version_negotiation = .{
+        .dcid = try quic_zig.wire.header.ConnId.fromSlice(ids.scid),
+        .scid = try quic_zig.wire.header.ConnId.fromSlice(ids.dcid),
         .versions_bytes = versions_bytes[0 .. supported_versions.len * 4],
     } });
 }
@@ -1568,7 +1568,7 @@ fn randomServerCid(io: std.Io) [server_cid_len]u8 {
 }
 
 fn queueServerConnectionIds(
-    conn: *nullq.Connection,
+    conn: *quic_zig.Connection,
     next_seq: *u8,
     desired_last_seq: u8,
     base_cid: *const [server_cid_len]u8,
@@ -1577,7 +1577,7 @@ fn queueServerConnectionIds(
     if (budget == 0 or next_seq.* > desired_last_seq) return;
 
     var cid_storage: [8][server_cid_len]u8 = undefined;
-    var provisions: [8]nullq.ConnectionIdProvision = undefined;
+    var provisions: [8]quic_zig.ConnectionIdProvision = undefined;
     var count: usize = 0;
     var seq = next_seq.*;
     while (seq <= desired_last_seq and count < provisions.len and count < budget) {
@@ -1613,10 +1613,10 @@ fn retryToken(
     now_us: u64,
     original_dcid: []const u8,
     retry_scid: []const u8,
-) !nullq.RetryToken {
+) !quic_zig.RetryToken {
     var addr_buf: [32]u8 = undefined;
     const client_address = retryAddressContext(&addr_buf, peer);
-    return try nullq.retry_token.minted(.{
+    return try quic_zig.retry_token.minted(.{
         .key = &retry_token_key,
         .now_us = now_us,
         .lifetime_us = retry_token_lifetime_us,
@@ -1648,10 +1648,10 @@ fn retryTokenValidationResult(
     original_dcid: []const u8,
     retry_scid: []const u8,
     token: []const u8,
-) nullq.RetryTokenValidationResult {
+) quic_zig.RetryTokenValidationResult {
     var addr_buf: [32]u8 = undefined;
     const client_address = retryAddressContext(&addr_buf, peer);
-    return nullq.retry_token.validate(token, .{
+    return quic_zig.retry_token.validate(token, .{
         .key = &retry_token_key,
         .now_us = now_us,
         .client_address = client_address,
@@ -1686,16 +1686,16 @@ fn retryAddressContext(dst: []u8, peer: Net.IpAddress) []const u8 {
 }
 
 /// Mint a NEW_TOKEN bound to `peer`. The address-binding shape mirrors
-/// `nullq.Server.addressContext` (the full 22-byte `path.Address`
+/// `quic_zig.Server.addressContext` (the full 22-byte `path.Address`
 /// buffer) so a NEW_TOKEN minted by the QNS endpoint round-trips
 /// identically through `Server.applyRetryGate`'s NEW_TOKEN path on a
 /// follow-up connection — useful when the interop runner pairs a
-/// nullq server with a third-party client that simply echoes the
+/// quic_zig server with a third-party client that simply echoes the
 /// token bytes verbatim.
-fn newToken(peer: Net.IpAddress, now_us: u64) !nullq.conn.NewTokenBlob {
+fn newToken(peer: Net.IpAddress, now_us: u64) !quic_zig.conn.NewTokenBlob {
     const addr = netAddressToPathAddress(peer);
-    var token: nullq.conn.NewTokenBlob = undefined;
-    _ = try nullq.conn.new_token.mint(&token, .{
+    var token: quic_zig.conn.NewTokenBlob = undefined;
+    _ = try quic_zig.conn.new_token.mint(&token, .{
         .key = &new_token_key,
         .now_us = now_us,
         .lifetime_us = new_token_lifetime_us,
@@ -1712,9 +1712,9 @@ fn newTokenValidationResult(
     peer: Net.IpAddress,
     now_us: u64,
     token: []const u8,
-) nullq.conn.NewTokenValidationResult {
+) quic_zig.conn.NewTokenValidationResult {
     const addr = netAddressToPathAddress(peer);
-    return nullq.conn.new_token.validate(token, .{
+    return quic_zig.conn.new_token.validate(token, .{
         .key = &new_token_key,
         .now_us = now_us,
         .client_address = &addr.bytes,
@@ -1739,7 +1739,7 @@ fn maybeIssueNewToken(sc: *ServerConn, now_us: u64) void {
 }
 
 fn peekInitialToken(bytes: []const u8) ?[]const u8 {
-    const parsed = nullq.wire.header.parse(bytes, 0) catch return null;
+    const parsed = quic_zig.wire.header.parse(bytes, 0) catch return null;
     return switch (parsed.header) {
         .initial => |initial| initial.token,
         else => null,
@@ -1760,28 +1760,28 @@ test "Retry-token endpoint validation rejects malformed and replayed probes" {
         &retry_scid,
         &token,
     ));
-    try std.testing.expectEqual(nullq.RetryTokenValidationResult.malformed, retryTokenValidationResult(
+    try std.testing.expectEqual(quic_zig.RetryTokenValidationResult.malformed, retryTokenValidationResult(
         peer,
         2_000_000,
         &original_dcid,
         &retry_scid,
         token[0 .. token.len - 1],
     ));
-    try std.testing.expectEqual(nullq.RetryTokenValidationResult.invalid, retryTokenValidationResult(
+    try std.testing.expectEqual(quic_zig.RetryTokenValidationResult.invalid, retryTokenValidationResult(
         replay_peer,
         2_000_000,
         &original_dcid,
         &retry_scid,
         &token,
     ));
-    try std.testing.expectEqual(nullq.RetryTokenValidationResult.invalid, retryTokenValidationResult(
+    try std.testing.expectEqual(quic_zig.RetryTokenValidationResult.invalid, retryTokenValidationResult(
         peer,
         2_000_000,
         &.{ 1, 2, 3, 4, 5, 6, 7, 9 },
         &retry_scid,
         &token,
     ));
-    try std.testing.expectEqual(nullq.RetryTokenValidationResult.expired, retryTokenValidationResult(
+    try std.testing.expectEqual(quic_zig.RetryTokenValidationResult.expired, retryTokenValidationResult(
         peer,
         1_000_000 + retry_token_lifetime_us + 1,
         &original_dcid,
@@ -1799,7 +1799,7 @@ test "Retry-token endpoint validation rejects malformed and replayed probes" {
     // match `opts.quic_version`, so the validator returns
     // `.wrong_version` exactly as the §4.3 path is documented to.
     var addr_buf2: [32]u8 = undefined;
-    const wrong_version_token = try nullq.retry_token.minted(.{
+    const wrong_version_token = try quic_zig.retry_token.minted(.{
         .key = &retry_token_key,
         .now_us = 1_000_000,
         .lifetime_us = retry_token_lifetime_us,
@@ -1808,7 +1808,7 @@ test "Retry-token endpoint validation rejects malformed and replayed probes" {
         .retry_scid = &retry_scid,
         .quic_version = 0x6b3343cf,
     });
-    try std.testing.expectEqual(nullq.RetryTokenValidationResult.wrong_version, retryTokenValidationResult(
+    try std.testing.expectEqual(quic_zig.RetryTokenValidationResult.wrong_version, retryTokenValidationResult(
         peer,
         2_000_000,
         &original_dcid,
@@ -1827,26 +1827,26 @@ test "NEW_TOKEN endpoint validation accepts a fresh token, rejects expired, reje
     // Same peer, well within the lifetime window: .valid.
     try std.testing.expect(validNewToken(peer, 2_000_000, &token));
     try std.testing.expectEqual(
-        nullq.conn.NewTokenValidationResult.valid,
+        quic_zig.conn.NewTokenValidationResult.valid,
         newTokenValidationResult(peer, 2_000_000, &token),
     );
 
     // Different source address (different port — `path.Address.bytes`
     // includes the port at offset 5..7 for IPv4) -> .invalid.
     try std.testing.expectEqual(
-        nullq.conn.NewTokenValidationResult.invalid,
+        quic_zig.conn.NewTokenValidationResult.invalid,
         newTokenValidationResult(wrong_peer, 2_000_000, &token),
     );
 
     // Past the issuance lifetime -> .expired.
     try std.testing.expectEqual(
-        nullq.conn.NewTokenValidationResult.expired,
+        quic_zig.conn.NewTokenValidationResult.expired,
         newTokenValidationResult(peer, 1_000_000 + new_token_lifetime_us + 1, &token),
     );
 
     // Truncating the wire blob breaks the fixed-length gate -> .malformed.
     try std.testing.expectEqual(
-        nullq.conn.NewTokenValidationResult.malformed,
+        quic_zig.conn.NewTokenValidationResult.malformed,
         newTokenValidationResult(peer, 2_000_000, token[0 .. token.len - 1]),
     );
 
@@ -1863,8 +1863,8 @@ test "NEW_TOKEN endpoint validation accepts a fresh token, rejects expired, reje
     // v1-only validator (NEW_TOKEN binds the version inside the AEAD
     // plaintext, not the on-wire format).
     const addr = netAddressToPathAddress(peer);
-    var v2_token: nullq.conn.NewTokenBlob = undefined;
-    _ = try nullq.conn.new_token.mint(&v2_token, .{
+    var v2_token: quic_zig.conn.NewTokenBlob = undefined;
+    _ = try quic_zig.conn.new_token.mint(&v2_token, .{
         .key = &new_token_key,
         .now_us = 1_000_000,
         .lifetime_us = new_token_lifetime_us,
@@ -1872,7 +1872,7 @@ test "NEW_TOKEN endpoint validation accepts a fresh token, rejects expired, reje
         .quic_version = 0x6b3343cf,
     });
     try std.testing.expectEqual(
-        nullq.conn.NewTokenValidationResult.wrong_version,
+        quic_zig.conn.NewTokenValidationResult.wrong_version,
         newTokenValidationResult(peer, 2_000_000, &v2_token),
     );
 }

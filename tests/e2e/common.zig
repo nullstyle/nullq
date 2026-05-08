@@ -10,7 +10,7 @@
 //! own inline literal — `defaultParams` is only the baseline, not
 //! a constraint.
 
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 
 /// Self-signed test certificate. Loaded via `@embedFile` so it ships
 /// with the test binary instead of being read at runtime.
@@ -22,7 +22,7 @@ pub const test_key_pem = @embedFile("../data/test_key.pem");
 /// Reasonable defaults for smoke tests that don't care about
 /// specific transport-parameter shapes. Mirrors the values the
 /// QNS endpoint advertises by default.
-pub fn defaultParams() nullq.tls.TransportParams {
+pub fn defaultParams() quic_zig.tls.TransportParams {
     return .{
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = 1 << 20,

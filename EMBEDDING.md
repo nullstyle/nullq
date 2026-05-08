@@ -1,6 +1,6 @@
-# Embedding nullq
+# Embedding quic-zig
 
-nullq is a Zig-first IETF QUIC v1 transport library. This guide shows the two
+quic-zig is a Zig-first IETF QUIC v1 transport library. This guide shows the two
 common embed paths (server / client) and the raw `Connection` API for
 embedders writing custom event loops.
 
@@ -21,7 +21,7 @@ thread that walks `server.iterator()`, or hand-roll the loop (next section).
 
 ```zig
 const std = @import("std");
-const nullq = @import("nullq");
+const quic-zig = @import("quic-zig");
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -32,10 +32,10 @@ pub fn run(
 ) !void {
     const protos = [_][]const u8{"h3"};
 
-    var retry_key: nullq.RetryTokenKey = undefined;
+    var retry_key: quic-zig.RetryTokenKey = undefined;
     try std.crypto.random.bytes(&retry_key); // see "Production checklist"
 
-    var server = try nullq.Server.init(.{
+    var server = try quic-zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = cert_pem,
         .tls_key_pem = key_pem,
@@ -59,7 +59,7 @@ pub fn run(
     // Application logic runs in a separate worker that walks
     // server.iterator() each tick. See "Roll your own loop" if you want
     // ingress and app logic on the same thread.
-    try nullq.transport.runUdpServer(&server, .{
+    try quic-zig.transport.runUdpServer(&server, .{
         .listen = "0.0.0.0:443",
         .io = io,
         .shutdown_flag = shutdown,
@@ -76,7 +76,7 @@ a `*Connection` ready for the first `advance()`. There is no
 
 ```zig
 const std = @import("std");
-const nullq = @import("nullq");
+const quic-zig = @import("quic-zig");
 
 pub fn dial(
     allocator: std.mem.Allocator,
@@ -86,7 +86,7 @@ pub fn dial(
 ) !void {
     const protos = [_][]const u8{"h3"};
 
-    var client = try nullq.Client.connect(.{
+    var client = try quic-zig.Client.connect(.{
         .allocator = allocator,
         .server_name = server_name,
         .alpn_protocols = &protos,
@@ -198,7 +198,7 @@ deployment:
   chain + matching private key. Owned by the caller; outlive the server.
 - **`alpn_protocols`** — required (QUIC mandates ALPN per RFC 9001 §8.1).
   Set per peer expectations, e.g. `&.{ "h3" }` for HTTP/3.
-- **`transport_params.max_idle_timeout_ms`** — set explicitly. nullq's
+- **`transport_params.max_idle_timeout_ms`** — set explicitly. quic-zig's
   default `0` means no idle timeout, which is rarely what you want;
   30_000 (30 s) is a sensible production value.
 - **`retry_token_key: ?RetryTokenKey`** — 32-byte HMAC key for stateless
@@ -222,11 +222,11 @@ without the steps below is a **known security hole** per RFC 9001 §5.6 /
 RFC 8446 §8.
 
 - **Instantiate `tls.AntiReplayTracker`** and wire it via
-  `Server.Config.early_data_anti_replay`. nullq installs the BoringSSL
+  `Server.Config.early_data_anti_replay`. quic-zig installs the BoringSSL
   `allow_early_data` callback automatically when both `enable_0rtt` and
   this field are set. See `src/tls/anti_replay.zig` for sizing
   (`max_entries`, `max_age_us`).
-- **Verify request idempotency at the application layer.** nullq labels
+- **Verify request idempotency at the application layer.** quic-zig labels
   bytes via `Connection.streamArrivedInEarlyData(id)`; treat any non-GET
   / non-idempotent request that arrives `true` as suspect.
 - **Persist session tickets only when replay protection is active.** A
@@ -263,9 +263,9 @@ RFC 8446 §8.
 
 ## What's not in this guide
 
-- **HTTP/3 / QPACK.** Out of scope — nullq is transport-only. Layer your
+- **HTTP/3 / QPACK.** Out of scope — quic-zig is transport-only. Layer your
   own H3 implementation on top of `Connection` streams.
-- **Multipath QUIC.** nullq tracks `draft-ietf-quic-multipath-21`; expect
+- **Multipath QUIC.** quic-zig tracks `draft-ietf-quic-multipath-21`; expect
   API churn until the spec is published as an RFC.
 - **Tuning recv/send buffers for 100k+ connections.** Not yet documented;
   the `transport.ServerTuning` defaults (4 MiB each) target a 10k-conn

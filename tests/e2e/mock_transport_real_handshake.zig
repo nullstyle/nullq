@@ -1,6 +1,6 @@
 //! Phase 5b acceptance: the QUIC handshake completes by exchanging
 //! real Initial/Handshake/1-RTT datagrams between two
-//! `nullq.Connection`s — no `peer.inbox` shortcut. CRYPTO frames
+//! `quic_zig.Connection`s — no `peer.inbox` shortcut. CRYPTO frames
 //! flow through `poll` (CRYPTO frame inside Initial/Handshake long-
 //! header packets) and `handle` (decrypt → dispatch CRYPTO → feed
 //! TLS via `provideQuicData`).
@@ -9,7 +9,7 @@
 //! with us over UDP — the in-process pipe is no longer load-bearing.
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 const common = @import("common.zig");
 
@@ -42,9 +42,9 @@ test "client + server handshake via real datagram exchange" {
     });
     defer client_tls.deinit();
 
-    var client = try nullq.Connection.initClient(allocator, client_tls, "localhost");
+    var client = try quic_zig.Connection.initClient(allocator, client_tls, "localhost");
     defer client.deinit();
-    var server = try nullq.Connection.initServer(allocator, server_tls);
+    var server = try quic_zig.Connection.initServer(allocator, server_tls);
     defer server.deinit();
 
     try client.bind();
@@ -65,7 +65,7 @@ test "client + server handshake via real datagram exchange" {
     // peer_dcid + initial_dcid from the first incoming Initial.
     try server.setLocalScid(&ServerScid);
 
-    const tp: nullq.tls.TransportParams = .{
+    const tp: quic_zig.tls.TransportParams = .{
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = 1 << 20,
         .initial_max_stream_data_bidi_local = 1 << 18,

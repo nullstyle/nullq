@@ -21,26 +21,26 @@ on:
 # (test.yml) is the actual CI gate.
 jobs:
   qns-server:
-    name: QNS interop (nullq as server)
+    name: QNS interop (quic-zig as server)
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 90
     env:
-      NULLQ_IMAGE: nullq-qns:local
+      QUIC_ZIG_IMAGE: quic-zig-qns:local
       TESTS: ${{ github.event.inputs.tests || 'H,DC,M' }}
       CLIENTS: ${{ github.event.inputs.clients || 'quic-go,quiche,ngtcp2' }}
     steps:
-      - name: Checkout nullq
+      - name: Checkout quic-zig
         uses: actions/checkout@v4
         with:
-          path: nullq
+          path: quic-zig
 
-      - name: Checkout nullq-qns
+      - name: Checkout quic-zig-qns
         uses: actions/checkout@v4
         with:
-          repository: nullstyle/nullq-qns
+          repository: nullstyle/quic-zig-qns
           ref: main
-          path: nullq-qns
+          path: quic-zig-qns
 
       - name: Checkout quic-interop-runner
         uses: actions/checkout@v4
@@ -54,7 +54,7 @@ jobs:
         with:
           install: true
           cache: true
-          working_directory: nullq
+          working_directory: quic-zig
 
       - name: Install runner deps
         working-directory: quic-interop-runner
@@ -63,27 +63,27 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build nullq-qns image
-        working-directory: nullq-qns
+      - name: Build quic-zig-qns image
+        working-directory: quic-zig-qns
         env:
-          NULLQ_DIR: ${{ github.workspace }}/nullq
+          QUIC_ZIG_DIR: ${{ github.workspace }}/quic-zig
         run: |
-          # `make build-local` archives nullq and feeds it in as a
-          # Docker build context (see nullq-qns/Makefile and
+          # `make build-local` archives quic-zig and feeds it in as a
+          # Docker build context (see quic-zig-qns/Makefile and
           # Dockerfile.local). Zig fetches boringssl-zig from the
-          # URL+hash pin in nullq's build.zig.zon during the
-          # in-Docker build. LOCALTAG=local matches NULLQ_IMAGE.
+          # URL+hash pin in quic-zig's build.zig.zon during the
+          # in-Docker build. LOCALTAG=local matches QUIC_ZIG_IMAGE.
           make build-local LOCALTAG=local
 
       - name: Run QNS interop (server role)
-        working-directory: nullq
+        working-directory: quic-zig
         env:
           RUNNER_DIR: ${{ github.workspace }}/quic-interop-runner
         run: |
           zig build external-interop -- runner \
             --role server \
             --runner-dir "${RUNNER_DIR}" \
-            --image "${NULLQ_IMAGE}" \
+            --image "${QUIC_ZIG_IMAGE}" \
             --clients "${CLIENTS}" \
             --tests "${TESTS}" \
             --log-dir "${{ github.workspace }}/interop-logs" \

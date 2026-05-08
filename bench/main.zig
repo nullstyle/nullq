@@ -1,4 +1,4 @@
-//! nullq microbenchmarks.
+//! quic_zig microbenchmarks.
 //!
 //! Wire/frame-level only. We measure the hot codecs that every
 //! sent or received packet exercises:
@@ -24,12 +24,12 @@
 //!  - TLS handshake throughput
 
 const std = @import("std");
-const nullq = @import("nullq");
+const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
 
-const varint = nullq.wire.varint;
-const header = nullq.wire.header;
-const frame = nullq.frame;
+const varint = quic_zig.wire.varint;
+const header = quic_zig.wire.header;
+const frame = quic_zig.frame;
 const frame_types = frame.types;
 const ack_range = frame.ack_range;
 
@@ -331,7 +331,7 @@ fn runCidGenerate(ctx: CidCtx, iters: u64) u64 {
 // -- entry point ---------------------------------------------------------
 
 pub fn main() !void {
-    std.debug.print("nullq microbenchmarks (target ~{d}ms each, ReleaseFast)\n", .{
+    std.debug.print("quic_zig microbenchmarks (target ~{d}ms each, ReleaseFast)\n", .{
         target_ns / std.time.ns_per_ms,
     });
     std.debug.print("---------------------------------------------------------------\n", .{});
