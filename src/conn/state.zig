@@ -5142,7 +5142,17 @@ pub const Connection = struct {
             if (packet_capacity <= overhead) break :blk 0;
             break :blk @min(default_mtu, packet_capacity - overhead);
         };
-        if (max_payload == 0) return Error.OutputTooSmall;
+        // `dst[pos..]` arrived too small to seal even an empty packet. This
+        // is the routine "no room left in this datagram" outcome — the same
+        // back-pressure signal the unvalidated branch above returns when its
+        // anti-amp budget is spent. Caller (`pollDatagram` and the embedder
+        // poll loop) treats `null` as "nothing to add at this level, move
+        // on / try again next tick." Returning `Error.OutputTooSmall` here
+        // would escape through `poll` and abort the entire endpoint —
+        // particularly hot once the anti-amp fix forces real validation
+        // and the validated path's first 1-RTT poll runs against a tiny
+        // residual after Initial+Handshake have filled most of the MTU.
+        if (max_payload == 0) return null;
         const congestion_blocked = self.congestionBlockedOnPath(lvl, app_path);
         const path_response_addr_overrides_current = blk: {
             if (lvl != .application) break :blk false;
