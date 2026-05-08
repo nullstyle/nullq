@@ -958,6 +958,40 @@ fn runClientConnection(
     // them.
     tuneServerSocket(sock.handle);
 
+    // Workaround for a quic-interop-runner harness flakiness, not a
+    // QUIC- or transport-layer issue. The runner places client / sim
+    // / server in three Docker containers wired through ns-3
+    // (`martenseemann/quic-network-simulator`). The sim's `eth0` is
+    // put in promiscuous mode and ns-3's `EmuFdNetDeviceHelper`
+    // grabs the interface; while ns-3 is still finishing its boot
+    // (gratuitous-ARP storm visible at sim_t≈1.4-1.5s in
+    // `trace_node_left.pcap`), packets arriving from the client veth
+    // get silently dropped by the host bridge before reaching sim's
+    // `eth0`. tcpdump inside the client container confirms the
+    // kernel did transmit; dumpcap on sim's `eth0` shows nothing
+    // arrived. No counter increments anywhere — purely a
+    // bridge-layer race.
+    //
+    // nullq is unusual in starting the handshake within microseconds
+    // of process start, so its first PTO retransmit (RFC 9002 default
+    // PTO = 333+4*166.5 = 999ms) lands smack in the bad window. The
+    // longrtt testcase asserts ≥2 ClientHellos on the wire; when the
+    // PTO retx is the dropped packet, only one shows up and the test
+    // fails. Other implementations have enough socket-setup latency
+    // that their retx misses the window.
+    //
+    // 750ms of warmup is enough to push the first CH (and therefore
+    // the +999ms PTO retx) past the bad window in every run we
+    // tested. 100ms is not enough; we did not narrow the lower bound
+    // beyond that. This delay is harmless for non-longrtt tests:
+    // their RTT is 30ms, so adding 750ms to handshake start adds
+    // 750ms to total runtime — well within test timeouts.
+    //
+    // If/when the simulator harness is fixed (see
+    // https://github.com/marten-seemann/quic-network-simulator), this
+    // sleep can be deleted.
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(750), .awake) catch {};
+
     var conn = try nullq.Connection.initClient(allocator, client_tls, server_name_z);
     defer conn.deinit();
     if (conn_opts.qlog_sink) |sink| conn.setQlogCallback(QlogSink.callback, sink);
