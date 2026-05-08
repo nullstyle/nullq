@@ -5658,8 +5658,24 @@ pub const Connection = struct {
         //     RFC 9000 §19.17/19.18). PATH_RESPONSE has the highest
         //     priority on the application path so we don't make the
         //     peer wait through a stream-data backlog.
+        // RFC 9000 §8.2.1 + §9.4: PATH_CHALLENGE / PATH_RESPONSE are
+        // probing frames that exist precisely to validate (or echo
+        // validation on) a path whose congestion state we don't know
+        // yet. Gating them on the *old* path's `congestion_blocked`
+        // creates a deadlock at migration time: the file transfer
+        // saturates the old cwnd, the address rebinds, the cwnd
+        // (still old) rejects the PATH_CHALLENGE that's needed to
+        // validate the new path, and the migration never completes.
+        // The runner's rebind-addr verifier catches this directly:
+        // it requires the FIRST server packet on a new client path to
+        // contain a PATH_CHALLENGE frame. The 9-byte probe is small
+        // enough that letting it past the CC limit is harmless; the
+        // anti-amp `max_payload` clamp on unvalidated paths is the
+        // real ceiling. A subsequent PATH_RESPONSE arrival resets the
+        // path's CC to initial values via
+        // `resetPathRecoveryAfterMigration`.
         var path_response_used_addr_override = false;
-        if (!congestion_blocked and lvl == .application and self.pending_frames.path_response != null and
+        if (lvl == .application and self.pending_frames.path_response != null and
             self.pending_frames.path_response_path_id == app_path.id and pl_pos + 9 <= max_payload)
         {
             if (self.pending_frames.path_response_addr) |addr| {
@@ -5679,7 +5695,7 @@ pub const Connection = struct {
             ack_eliciting = true;
         }
         if (!path_response_used_addr_override and
-            !congestion_blocked and lvl == .application and self.pending_frames.path_challenge != null and
+            lvl == .application and self.pending_frames.path_challenge != null and
             self.pending_frames.path_challenge_path_id == app_path.id and pl_pos + 9 <= max_payload)
         {
             const tok = self.pending_frames.path_challenge.?;
