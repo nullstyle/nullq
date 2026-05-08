@@ -68,7 +68,12 @@ const max_qns_server_connections = 128;
 const qns_time_base_us: u64 = 1_000_000;
 
 const ServerOptions = struct {
-    listen: []const u8 = "0.0.0.0:443",
+    // Dual-stack: an IPv6 wildcard socket on Linux (the deployment OS for
+    // the official quic-interop-runner) also accepts IPv4 traffic via
+    // mapped addresses, since `/proc/sys/net/ipv6/bindv6only` is `0` by
+    // default. The runner's `ipv6` testcase needs this — `0.0.0.0:443`
+    // wouldn't see a single v6 datagram.
+    listen: []const u8 = "[::]:443",
     www: []const u8 = "/www",
     cert: []const u8 = "/certs/cert.pem",
     key: []const u8 = "/certs/priv.key",
@@ -354,6 +359,15 @@ const ServerConn = struct {
     retry_original_dcid: nullq.conn.path.ConnectionId = .{},
     retry_source_cid: [server_cid_len]u8,
     initial_server_cid: [server_cid_len]u8,
+    /// DCID the peer put on the first Initial we accepted on this
+    /// connection. We use it as a routing key in `ownsServerCid` so
+    /// that an Initial retransmit from the same peer (e.g. after a
+    /// NAT rebinding mid-handshake — see the rebind-addr test) can be
+    /// dispatched to this `ServerConn` instead of being misidentified
+    /// as a brand-new connection just because the source 4-tuple
+    /// changed and the wire DCID is still the peer-chosen pre-handshake
+    /// one rather than `initial_server_cid`.
+    client_initial_dcid: nullq.conn.path.ConnectionId = .{},
     next_cid_seq: u8 = 1,
     last_activity_us: u64,
     /// Latches once we've minted and queued a NEW_TOKEN on this
@@ -386,6 +400,7 @@ const ServerConn = struct {
         self.transport_params_set = false;
         self.retry_sent = false;
         self.retry_original_dcid = .{};
+        self.client_initial_dcid = .{};
         self.initial_server_cid = randomServerCid(io);
         self.retry_source_cid = retrySourceCid(&self.initial_server_cid);
         self.next_cid_seq = 1;
@@ -408,6 +423,14 @@ const ServerConn = struct {
     fn ownsServerCid(self: *const ServerConn, cid: []const u8) bool {
         if (std.mem.eql(u8, cid, &self.initial_server_cid)) return true;
         if (self.retry_sent and std.mem.eql(u8, cid, &self.retry_source_cid)) return true;
+        // Match Initial-flight retransmits whose wire DCID is still the
+        // peer-chosen one (pre-handshake the client hasn't yet switched
+        // to using `initial_server_cid`). Without this, a rebind during
+        // handshake — same DCID, new 4-tuple — falls through to
+        // `findServerConn`'s peer-addr fallback, doesn't match anyone,
+        // and spawns a duplicate `ServerConn` that completes a second
+        // handshake on top of the first.
+        if (self.client_initial_dcid.len > 0 and std.mem.eql(u8, cid, self.client_initial_dcid.slice())) return true;
 
         var seq: u8 = 1;
         while (seq < self.next_cid_seq) : (seq += 1) {
@@ -497,7 +520,7 @@ pub fn main(init: std.process.Init) !void {
 fn usage() void {
     std.debug.print(
         \\usage:
-        \\  qns-endpoint server [-listen 0.0.0.0:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-keylog-file path] [-qlog-dir dir] [-retry]
+        \\  qns-endpoint server [-listen [::]:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-keylog-file path] [-qlog-dir dir] [-retry]
         \\  qns-endpoint client [-server server:443] [-server-name server] [-downloads /downloads] [-requests "$REQUESTS"] [-testcase "$TESTCASE"] [-keylog-file path] [-qlog-dir dir]
         \\
     , .{});
@@ -674,6 +697,14 @@ fn runServer(
                 }
 
                 const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
+                // Pin the wire DCID we're about to accept so future
+                // Initial retransmits from any peer 4-tuple route here.
+                // Pre-Retry: peer-chosen random. Post-Retry:
+                // `retry_source_cid` (already covered by `ownsServerCid`,
+                // but storing it is harmless and keeps the field
+                // semantically meaningful: "the DCID the peer is
+                // currently addressing on the Initial wire").
+                sc.client_initial_dcid = nullq.conn.path.ConnectionId.fromSlice(ids.dcid);
                 const retry_source: ?nullq.conn.path.ConnectionId = if (sc.retry_sent)
                     nullq.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
                 else
