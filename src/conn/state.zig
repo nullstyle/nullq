@@ -1168,6 +1168,15 @@ pub const Connection = struct {
     /// a different salt).
     version: u32 = quic_version_1,
 
+    /// RFC 9368 §6 compatible-version-negotiation upgrade target,
+    /// stashed by the server's `Server.preparseUpgradeTarget` and
+    /// applied by the server's `dispatchToSlot` after the first
+    /// `handleWithEcn` consumes the wire-version Initial under
+    /// wire-version keys. `null` means no upgrade is pending.
+    /// Server-side only; clients leave this null. See
+    /// `setPendingVersionUpgrade` / `applyPendingVersionUpgrade`.
+    pending_version_upgrade: ?u32 = null,
+
     /// Client side: the random DCID it sent on the very first Initial.
     /// Server side: same value, recovered from that incoming Initial.
     initial_dcid: ConnectionId = .{},
@@ -2966,6 +2975,40 @@ pub const Connection = struct {
         if (self.initial_keys_write) |*k| std.crypto.secureZero(u8, std.mem.asBytes(k));
         self.initial_keys_read = null;
         self.initial_keys_write = null;
+    }
+
+    /// RFC 9368 §6 server-side hook: stash an upgrade target so a
+    /// later call to `applyPendingVersionUpgrade` can flip the active
+    /// version after the first wire-version Initial has been consumed
+    /// under its wire-version keys. The actual flip lives in the
+    /// server's `dispatchToSlot`, just after `handleWithEcn` returns
+    /// and before the embedder's `poll` would seal the EE-bearing
+    /// response under what would otherwise still be the wire-version
+    /// keys. Calling with `null` clears the pending upgrade. Idempotent.
+    pub fn setPendingVersionUpgrade(self: *Connection, version: ?u32) void {
+        self.pending_version_upgrade = version;
+    }
+
+    /// Returns the currently-pending upgrade target, or `null` if
+    /// none was stashed via `setPendingVersionUpgrade`.
+    pub fn pendingVersionUpgrade(self: *const Connection) ?u32 {
+        return self.pending_version_upgrade;
+    }
+
+    /// Apply any RFC 9368 §6 pending version upgrade. The wire-
+    /// version Initial keys are zeroed (via `setVersion`) so any
+    /// retransmitted wire-version Initial that arrives after this
+    /// point will be dropped at decrypt; the spec allows that —
+    /// once the server has chosen to upgrade, the original wire-
+    /// version stream is discarded. Returns `true` when a flip
+    /// happened (so the caller can emit observability), `false`
+    /// otherwise.
+    pub fn applyPendingVersionUpgrade(self: *Connection) bool {
+        const target = self.pending_version_upgrade orelse return false;
+        self.pending_version_upgrade = null;
+        if (target == self.version) return false;
+        self.setVersion(target);
+        return true;
     }
 
     /// Open a new bidirectional stream with the given id. The id

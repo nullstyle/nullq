@@ -28,6 +28,10 @@ pub const protection = @import("protection.zig");
 pub const short_packet = @import("short_packet.zig");
 /// Initial / 0-RTT / Handshake / Retry long-header packet seal/open.
 pub const long_packet = @import("long_packet.zig");
+/// RFC 9368 §5/§6 server-side pre-parse helpers used to decide a
+/// compatible-version-negotiation upgrade before the ClientHello is
+/// handed to BoringSSL.
+pub const vneg_preparse = @import("vneg_preparse.zig");
 
 test {
     _ = varint;
@@ -37,4 +41,5 @@ test {
     _ = protection;
     _ = short_packet;
     _ = long_packet;
+    _ = vneg_preparse;
 }

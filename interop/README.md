@@ -161,6 +161,22 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   `src/conn/_state_tests.zig` pin the new ordering and the
   non-migration packet-size invariant. **Re-running the interop
   matrix is needed to confirm the cell actually flips PASS.**
+- **Server `versionnegotiation`** — fix landed on
+  `followup-vneg-upgrade` (2026-05-09): the library now implements
+  the RFC 9368 §6 compatible-version-negotiation upgrade on the
+  server side. An embedder that configures
+  `Server.Config.versions = [QUIC_VERSION_2, QUIC_VERSION_1]`
+  will now have the server pre-parse each inbound Initial under
+  wire-version keys, find the client's `version_information`
+  transport parameter, intersect with the configured preference
+  list, and (if the highest-priority overlap differs from the
+  wire version) flip the connection to the upgrade target so the
+  EE BoringSSL produces and the server's first Initial response
+  go out under the chosen version. The wire codec was already in
+  place; this completes the decision logic. **Wiring the qns
+  endpoint to opt in to multi-version is a separate change**;
+  the cell will only flip in interop once `qns_endpoint.zig` adds
+  a `versions` Server.Config override for `TESTCASE=versionnegotiation`.
 
 **Build infra note**: the qns Dockerfile (`interop/qns/Dockerfile`)
 is now pinned to `ARG ZIG_VERSION=0.17.0-dev.269+ebff43698`, matching
