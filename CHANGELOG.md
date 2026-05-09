@@ -9,6 +9,34 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Added
+
+- **Server-side RFC 9368 §6 compatible-version-negotiation upgrade** —
+  a multi-version `Server.Config.versions` (e.g. `[QUIC_VERSION_2,
+  QUIC_VERSION_1]`) now drives an upgrade decision per inbound Initial
+  rather than committing unconditionally to the wire version. New
+  `wire/vneg_preparse.zig` helpers decrypt a private copy of the
+  Initial under wire-version keys, reassemble the single-Initial
+  ClientHello from CRYPTO frames, walk TLS extensions for
+  `quic_transport_parameters` (codepoint 0x39), pull the
+  `version_information` (codepoint 0x11) entry, and intersect the
+  client's `available_versions` with `Config.versions` to pick the
+  highest-priority overlap. The chosen version is then advertised as
+  `chosen_version` in the outbound transport_params (so the EE
+  BoringSSL produces during the handshake matches §5), and
+  `Connection.applyPendingVersionUpgrade` flips the active version
+  after the first wire-version Initial has been opened — so the
+  server's first Initial response is sealed under the chosen-version
+  keys. Defensive throughout: any pre-parse failure (decrypt auth,
+  malformed/fragmented ClientHello, missing extension) falls back to
+  the wire version, which is always spec-compliant. Replaces the
+  prior `// TODO(B3-followup):` placeholder in
+  `src/server.zig:openSlotFromInitial`. New unit tests in
+  `src/wire/vneg_preparse.zig` (parser-level coverage) and
+  `tests/e2e/quic_v2_handshake.zig` (a `[v2,v1]` server flips to v2
+  for a v1-wire ClientHello carrying `version_information=[v1,v2]`,
+  and stays on v1 for a legacy v1-only client).
+
 ### Fixed
 
 - **Interop server × `connectionmigration` × {quic-go, ngtcp2, quiche}** —

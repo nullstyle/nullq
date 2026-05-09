@@ -1,0 +1,491 @@
+//! RFC 9368 §5/§6 server-side pre-parse helpers for compatible-version
+//! negotiation upgrade.
+//!
+//! When a server is configured with multiple wire versions (e.g.
+//! `versions = [v2, v1]`), it can choose to upgrade an incoming wire-
+//! version-v1 ClientHello to v2 if the client advertises v2 in its
+//! `version_information` transport parameter (RFC 9368 §5). The
+//! decision MUST be made before BoringSSL produces the EE message,
+//! because §5 requires the EE's `chosen_version` to match the version
+//! of the packet carrying it (and the EE's transport_parameters embed
+//! the server's chosen_version).
+//!
+//! That means the server has to:
+//!   1. Decrypt the client's Initial under wire-version keys.
+//!   2. Reassemble the ClientHello from the decrypted CRYPTO frames
+//!      (single-Initial only; fragmented ClientHellos fall back to
+//!      "no upgrade" — spec-compliant via §6 graceful degradation).
+//!   3. Walk the ClientHello extensions to find
+//!      `quic_transport_parameters` (codepoint 0x39).
+//!   4. Decode the `version_information` (codepoint 0x11) entry from
+//!      that blob and intersect with the server's preference list.
+//!
+//! This module owns steps 2-4. Step 1 stays in the server (it already
+//! decrypts the Initial via `long_packet.openInitial`); step 5 — the
+//! actual `setVersion` + outbound transport-params rebuild — happens
+//! in `Server.openSlotFromInitial` because it has the Connection
+//! handle and the configured `Server.versions` list.
+//!
+//! Defensive posture: every parser here returns `null` on malformed or
+//! unexpected input rather than erroring. The server treats a `null`
+//! result as "no upgrade — use the wire version", which is always
+//! spec-compliant. We never reject a connection because pre-parse
+//! failed.
+
+const std = @import("std");
+const varint = @import("varint.zig");
+const frame_decode = @import("../frame/decode.zig");
+const transport_params = @import("../tls/transport_params.zig");
+
+/// TLS Handshake message type for ClientHello (RFC 8446 §4).
+const tls_msg_type_client_hello: u8 = 0x01;
+
+/// TLS extension codepoint for `quic_transport_parameters`
+/// (RFC 9001 §8.2). Both endpoints use this on wire under the modern
+/// codepoint; some legacy stacks used `0xffa5` — accept both for the
+/// pre-parse since this is purely advisory and the upgrade-decision
+/// path falls back gracefully on failure.
+const tls_ext_quic_transport_params: u16 = 0x0039;
+const tls_ext_quic_transport_params_legacy: u16 = 0xffa5;
+
+/// Maximum cumulative ClientHello bytes we are willing to assemble
+/// from CRYPTO frames in a single Initial. The pre-parse only needs
+/// to look at the first ClientHello bytes; this cap keeps the
+/// reassembly fixed-stack with no allocator.
+pub const max_client_hello_bytes: usize = 4096;
+
+/// Maximum number of versions we extract from the client's
+/// `version_information` transport parameter. Mirrors
+/// `transport_params.max_compatible_versions`.
+pub const max_versions: usize = 16;
+
+/// Result of a successful version_information decode.
+pub const ClientVersionInfo = struct {
+    /// Number of valid entries in `buf`. The first entry is the
+    /// client's chosen version (the one its outer Initial is sent
+    /// under); the remainder are the compatibility set in client
+    /// preference order.
+    count: u8,
+    buf: [max_versions]u32,
+
+    /// Borrowed view of the active entries.
+    pub fn slice(self: *const ClientVersionInfo) []const u32 {
+        return self.buf[0..self.count];
+    }
+
+    /// The client's `available_versions` per RFC 9368 §5: every
+    /// entry from the wire blob (chosen + remaining), since the
+    /// client implicitly considers its own chosen version available.
+    /// This is what the server's intersection logic walks.
+    pub fn available(self: *const ClientVersionInfo) []const u32 {
+        return self.buf[0..self.count];
+    }
+};
+
+/// Reassemble the ClientHello bytes from a decrypted Initial payload.
+/// Walks the frame stream looking for CRYPTO frames; collects them by
+/// offset; returns the contiguous slice covering `[0, total_len)`.
+///
+/// Single-Initial ClientHellos are the overwhelming common case (and
+/// the hard requirement here). When the ClientHello is fragmented
+/// across multiple Initials — or when the frame stream is malformed,
+/// has overlapping fragments, or starts with a gap at offset > 0 —
+/// the function returns `null`. The caller treats `null` as "skip the
+/// upgrade and continue with the wire version", which is spec-
+/// compliant via §6's graceful-fallback clause.
+///
+/// `dst` must be at least `max_client_hello_bytes` long. The returned
+/// slice borrows into `dst`.
+pub fn reassembleClientHello(dst: []u8, payload: []const u8) ?[]const u8 {
+    if (dst.len < max_client_hello_bytes) return null;
+
+    // Track which bytes of the prefix have been written. We only care
+    // about the contiguous prefix starting at offset 0; once the
+    // contiguous frontier covers enough bytes to hold the declared
+    // ClientHello length, we return that prefix.
+    var contig_end: usize = 0;
+    var have_first_frame = false;
+    var declared_len: ?usize = null;
+
+    var pos: usize = 0;
+    while (pos < payload.len) {
+        const decoded = frame_decode.decode(payload[pos..]) catch return null;
+        pos += decoded.bytes_consumed;
+        switch (decoded.frame) {
+            .crypto => |cr| {
+                const off: u64 = cr.offset;
+                const data = cr.data;
+                if (data.len == 0) continue;
+                // Bound check: refuse to grow beyond `dst`.
+                const end_off = std.math.add(u64, off, @intCast(data.len)) catch return null;
+                if (end_off > @as(u64, dst.len)) return null;
+                const off_usize: usize = @intCast(off);
+                @memcpy(dst[off_usize .. off_usize + data.len], data);
+                if (off == 0) have_first_frame = true;
+                // Advance the contiguous frontier.
+                if (off <= contig_end and end_off > contig_end) {
+                    contig_end = @intCast(end_off);
+                }
+                // Once we have enough bytes to read the TLS Handshake
+                // length prefix, lock in the declared length.
+                if (declared_len == null and have_first_frame and contig_end >= 4) {
+                    if (dst[0] != tls_msg_type_client_hello) return null;
+                    const u24_len = (@as(usize, dst[1]) << 16) |
+                        (@as(usize, dst[2]) << 8) |
+                        @as(usize, dst[3]);
+                    const total = u24_len + 4;
+                    if (total > dst.len) return null;
+                    declared_len = total;
+                }
+            },
+            // Initials carry CRYPTO + ACK + PING + PADDING. Any of
+            // those are fine to skip.
+            .padding, .ping, .ack, .path_ack => {},
+            // Any other frame type in an Initial is a peer protocol
+            // violation; the proper handler will catch it. We just
+            // bail out of the pre-parse so the upgrade falls back.
+            else => return null,
+        }
+    }
+
+    if (!have_first_frame) return null;
+    const want = declared_len orelse return null;
+    if (contig_end < want) return null;
+    return dst[0..want];
+}
+
+/// Walk a TLS ClientHello (including the outer Handshake header) and
+/// return the bytes of the `quic_transport_parameters` extension
+/// value. Returns `null` on any malformation or if the extension is
+/// absent.
+///
+/// `client_hello` is the full TLS Handshake record:
+///   { type=1, length:u24, ClientHello body }
+pub fn findQuicTransportParamsExt(client_hello: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    if (pos + 4 > client_hello.len) return null;
+    if (client_hello[pos] != tls_msg_type_client_hello) return null;
+    const body_len = (@as(usize, client_hello[pos + 1]) << 16) |
+        (@as(usize, client_hello[pos + 2]) << 8) |
+        @as(usize, client_hello[pos + 3]);
+    pos += 4;
+    if (pos + body_len > client_hello.len) return null;
+    const body_end = pos + body_len;
+
+    // legacy_version: 2 bytes; random: 32 bytes
+    if (pos + 2 + 32 > body_end) return null;
+    pos += 2 + 32;
+
+    // legacy_session_id: u8-len-prefix
+    if (pos + 1 > body_end) return null;
+    const sid_len: usize = client_hello[pos];
+    pos += 1;
+    if (pos + sid_len > body_end) return null;
+    pos += sid_len;
+
+    // cipher_suites: u16-len-prefix
+    if (pos + 2 > body_end) return null;
+    const cs_len = (@as(usize, client_hello[pos]) << 8) | @as(usize, client_hello[pos + 1]);
+    pos += 2;
+    if (pos + cs_len > body_end) return null;
+    pos += cs_len;
+
+    // legacy_compression_methods: u8-len-prefix
+    if (pos + 1 > body_end) return null;
+    const cm_len: usize = client_hello[pos];
+    pos += 1;
+    if (pos + cm_len > body_end) return null;
+    pos += cm_len;
+
+    // extensions: u16-len-prefix
+    if (pos + 2 > body_end) return null;
+    const exts_len = (@as(usize, client_hello[pos]) << 8) | @as(usize, client_hello[pos + 1]);
+    pos += 2;
+    if (pos + exts_len > body_end) return null;
+    const exts_end = pos + exts_len;
+
+    while (pos < exts_end) {
+        if (pos + 4 > exts_end) return null;
+        const ext_type = (@as(u16, client_hello[pos]) << 8) | @as(u16, client_hello[pos + 1]);
+        const ext_len = (@as(usize, client_hello[pos + 2]) << 8) | @as(usize, client_hello[pos + 3]);
+        pos += 4;
+        if (pos + ext_len > exts_end) return null;
+        if (ext_type == tls_ext_quic_transport_params or
+            ext_type == tls_ext_quic_transport_params_legacy)
+        {
+            return client_hello[pos .. pos + ext_len];
+        }
+        pos += ext_len;
+    }
+    return null;
+}
+
+/// Find the `version_information` (codepoint 0x11) parameter inside a
+/// QUIC transport-parameters blob and decode it into a
+/// `ClientVersionInfo`. Returns `null` if the parameter is absent or
+/// the blob is malformed.
+///
+/// We deliberately do NOT call `transport_params.Params.decode`: that
+/// path enforces invariants (e.g. role-aware checks via `decodeAs`)
+/// that don't all apply to a pre-handshake sniff. Walking the blob
+/// directly keeps the pre-parse defensive — anything other than a
+/// well-formed `version_information` parameter falls through to
+/// `null` and the upgrade is skipped.
+pub fn findVersionInformation(tp_blob: []const u8) ?ClientVersionInfo {
+    var pos: usize = 0;
+    while (pos < tp_blob.len) {
+        const id_d = varint.decode(tp_blob[pos..]) catch return null;
+        pos += id_d.bytes_read;
+        const len_d = varint.decode(tp_blob[pos..]) catch return null;
+        pos += len_d.bytes_read;
+        const value_len: usize = std.math.cast(usize, len_d.value) orelse return null;
+        if (pos + value_len > tp_blob.len) return null;
+        if (id_d.value == transport_params.Id.version_information) {
+            // Value: N x 4 bytes, big-endian. First entry is chosen
+            // version; remainder is the compatibility set.
+            if (value_len == 0 or value_len % 4 != 0) return null;
+            const count = value_len / 4;
+            if (count > max_versions) return null;
+            var info: ClientVersionInfo = .{ .count = @intCast(count), .buf = @splat(0) };
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                info.buf[i] = std.mem.readInt(u32, tp_blob[pos + i * 4 ..][0..4], .big);
+            }
+            return info;
+        }
+        pos += value_len;
+    }
+    return null;
+}
+
+/// RFC 9368 §5 upgrade decision: pick the first server-preferred
+/// version that ALSO appears in the client's `available_versions`.
+/// Returns `null` if there is no overlap (the server should keep the
+/// wire version and continue the handshake under it; if neither side
+/// can agree, the connection fails normally).
+pub fn chooseUpgradeVersion(
+    server_versions: []const u32,
+    client_available: []const u32,
+) ?u32 {
+    for (server_versions) |sv| {
+        for (client_available) |cv| {
+            if (sv == cv) return sv;
+        }
+    }
+    return null;
+}
+
+// -- tests ---------------------------------------------------------------
+
+test "chooseUpgradeVersion picks highest-priority overlap" {
+    const v1: u32 = 0x00000001;
+    const v2: u32 = 0x6b3343cf;
+
+    // Server prefers v2; client offers [v1, v2] → upgrade to v2.
+    try std.testing.expectEqual(
+        @as(?u32, v2),
+        chooseUpgradeVersion(&.{ v2, v1 }, &.{ v1, v2 }),
+    );
+
+    // Server prefers v2; client offers only [v1] → fall back to v1.
+    try std.testing.expectEqual(
+        @as(?u32, v1),
+        chooseUpgradeVersion(&.{ v2, v1 }, &.{v1}),
+    );
+
+    // No overlap.
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        chooseUpgradeVersion(&.{0xdeadbeef}, &.{ v1, v2 }),
+    );
+
+    // Empty client list (parameter absent or malformed) → no choice.
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        chooseUpgradeVersion(&.{ v2, v1 }, &.{}),
+    );
+}
+
+test "findVersionInformation extracts a 2-version blob" {
+    var buf: [256]u8 = undefined;
+    var params: transport_params.Params = .{};
+    const v1: u32 = 0x00000001;
+    const v2: u32 = 0x6b3343cf;
+    try params.setCompatibleVersions(&.{ v1, v2 });
+    const n = try params.encode(&buf);
+
+    const info = findVersionInformation(buf[0..n]) orelse return error.TestExpectedSome;
+    try std.testing.expectEqual(@as(u8, 2), info.count);
+    try std.testing.expectEqual(v1, info.buf[0]);
+    try std.testing.expectEqual(v2, info.buf[1]);
+}
+
+test "findVersionInformation returns null when parameter absent" {
+    var buf: [256]u8 = undefined;
+    const params: transport_params.Params = .{
+        .max_idle_timeout_ms = 30_000,
+        .initial_source_connection_id = transport_params.ConnectionId.fromSlice(&[_]u8{ 1, 2, 3, 4 }),
+    };
+    const n = try params.encode(&buf);
+    try std.testing.expectEqual(@as(?ClientVersionInfo, null), findVersionInformation(buf[0..n]));
+}
+
+test "findVersionInformation rejects malformed payload" {
+    // Codepoint 0x11 with length 3 (not multiple of 4).
+    const blob = [_]u8{ 0x11, 0x03, 0x00, 0x00, 0x01 };
+    try std.testing.expectEqual(@as(?ClientVersionInfo, null), findVersionInformation(&blob));
+}
+
+test "findQuicTransportParamsExt extracts the QTP payload" {
+    // Build a minimal but valid TLS ClientHello with a single
+    // `quic_transport_parameters` (codepoint 0x39) extension whose
+    // value is `payload`. We only need the structural shape — the
+    // pre-parse never inspects ciphersuites, session id, etc.
+    var buf: [256]u8 = undefined;
+    const payload = [_]u8{ 0xab, 0xcd, 0xef };
+    var pos: usize = 0;
+
+    // Handshake type + length placeholder.
+    buf[pos] = 0x01;
+    pos += 1;
+    pos += 3; // u24 length, fill later
+
+    const body_start = pos;
+    // legacy_version
+    buf[pos] = 0x03;
+    buf[pos + 1] = 0x03;
+    pos += 2;
+    // random (32 zero bytes)
+    @memset(buf[pos .. pos + 32], 0);
+    pos += 32;
+    // legacy_session_id (empty)
+    buf[pos] = 0x00;
+    pos += 1;
+    // cipher_suites: 2 bytes len + 1 suite TLS_AES_128_GCM_SHA256 (0x1301)
+    buf[pos] = 0x00;
+    buf[pos + 1] = 0x02;
+    buf[pos + 2] = 0x13;
+    buf[pos + 3] = 0x01;
+    pos += 4;
+    // legacy_compression_methods: 1 byte len + 1 byte null compression
+    buf[pos] = 0x01;
+    buf[pos + 1] = 0x00;
+    pos += 2;
+    // extensions: u16 length + one extension.
+    const ext_len_pos = pos;
+    pos += 2;
+    const ext_start = pos;
+    // ext type 0x0039
+    buf[pos] = 0x00;
+    buf[pos + 1] = 0x39;
+    pos += 2;
+    // ext data length
+    buf[pos] = 0x00;
+    buf[pos + 1] = @intCast(payload.len);
+    pos += 2;
+    // ext data
+    @memcpy(buf[pos .. pos + payload.len], &payload);
+    pos += payload.len;
+    const exts_total = pos - ext_start;
+    buf[ext_len_pos] = @intCast((exts_total >> 8) & 0xff);
+    buf[ext_len_pos + 1] = @intCast(exts_total & 0xff);
+    const body_total = pos - body_start;
+    buf[1] = @intCast((body_total >> 16) & 0xff);
+    buf[2] = @intCast((body_total >> 8) & 0xff);
+    buf[3] = @intCast(body_total & 0xff);
+
+    const got = findQuicTransportParamsExt(buf[0..pos]) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, &payload, got);
+}
+
+test "findQuicTransportParamsExt returns null on truncated header" {
+    const buf = [_]u8{ 0x01, 0x00, 0x00 }; // missing length octet
+    try std.testing.expectEqual(@as(?[]const u8, null), findQuicTransportParamsExt(&buf));
+}
+
+test "findQuicTransportParamsExt rejects non-ClientHello message type" {
+    const buf = [_]u8{ 0x02, 0x00, 0x00, 0x00 };
+    try std.testing.expectEqual(@as(?[]const u8, null), findQuicTransportParamsExt(&buf));
+}
+
+test "reassembleClientHello: single-frame at offset 0" {
+    // Build a minimal ClientHello (8 bytes of body content, body_len = 8).
+    // Outer header: 4 bytes (type + u24 len). Total = 12 bytes.
+    const body_len: u8 = 8;
+    var ch: [12]u8 = .{ 0x01, 0x00, 0x00, body_len, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22 };
+
+    // Frame: type=0x06 (CRYPTO), offset=0, length=12, data=ch.
+    var payload_buf: [32]u8 = undefined;
+    var p: usize = 0;
+    payload_buf[p] = 0x06; // varint 0x06
+    p += 1;
+    payload_buf[p] = 0x00; // varint offset = 0
+    p += 1;
+    payload_buf[p] = ch.len; // varint length = 12 (single-byte varint)
+    p += 1;
+    @memcpy(payload_buf[p .. p + ch.len], &ch);
+    p += ch.len;
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    const got = reassembleClientHello(&dst, payload_buf[0..p]) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, &ch, got);
+}
+
+test "reassembleClientHello: returns null when first byte is wrong" {
+    // CRYPTO frame whose data starts with 0x02 (ServerHello tag).
+    const body: [4]u8 = .{ 0x02, 0x00, 0x00, 0x00 };
+    var payload_buf: [16]u8 = undefined;
+    payload_buf[0] = 0x06;
+    payload_buf[1] = 0x00;
+    payload_buf[2] = body.len;
+    @memcpy(payload_buf[3 .. 3 + body.len], &body);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        reassembleClientHello(&dst, payload_buf[0 .. 3 + body.len]),
+    );
+}
+
+test "reassembleClientHello: tolerates leading PADDING and trailing PADDING" {
+    const body_len: u8 = 4;
+    const ch: [8]u8 = .{ 0x01, 0x00, 0x00, body_len, 0xaa, 0xbb, 0xcc, 0xdd };
+
+    // [PADDING][CRYPTO offset=0 data=ch][PADDING]
+    var payload_buf: [64]u8 = undefined;
+    var p: usize = 0;
+    @memset(payload_buf[p .. p + 4], 0); // 4 bytes of PADDING
+    p += 4;
+    payload_buf[p] = 0x06;
+    p += 1;
+    payload_buf[p] = 0x00; // offset = 0
+    p += 1;
+    payload_buf[p] = ch.len;
+    p += 1;
+    @memcpy(payload_buf[p .. p + ch.len], &ch);
+    p += ch.len;
+    @memset(payload_buf[p .. p + 8], 0); // trailing PADDING
+    p += 8;
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    const got = reassembleClientHello(&dst, payload_buf[0..p]) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, &ch, got);
+}
+
+test "reassembleClientHello: bails on missing offset 0 frame (fragmented)" {
+    // Single CRYPTO frame at offset 100 — looks like a fragmented
+    // ClientHello where the prefix ended up in a different Initial.
+    const body: [4]u8 = .{ 0xaa, 0xbb, 0xcc, 0xdd };
+    var payload_buf: [16]u8 = undefined;
+    payload_buf[0] = 0x06; // type
+    payload_buf[1] = 0x40; // varint two-byte prefix: 0x4064 = 100
+    payload_buf[2] = 0x64;
+    payload_buf[3] = body.len; // length
+    @memcpy(payload_buf[4 .. 4 + body.len], &body);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        reassembleClientHello(&dst, payload_buf[0 .. 4 + body.len]),
+    );
+}

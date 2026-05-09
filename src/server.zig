@@ -2279,52 +2279,45 @@ pub const Server = struct {
         if (retry_ctx) |_| {
             params.retry_source_connection_id = ConnectionId.fromSlice(local_scid);
         }
-        // RFC 9368 §5: when the embedder configured more than one
-        // version, advertise the full set as `version_information`.
-        // The chosen version (first entry) is the peer's declared
-        // version — we already gated on `versionAccepted` upstream,
-        // so it's guaranteed to be in our configured list. Build the
-        // list with the chosen version first, followed by every
-        // other configured version in preference order.
+        // RFC 9368 §5/§6: pre-parse the inbound Initial under wire-
+        // version keys to extract the client's `version_information`
+        // (codepoint 0x11) transport parameter, and intersect with
+        // our configured `versions` list. The first server-preferred
+        // version that also appears in the client's
+        // `available_versions` is our `chosen_version`; if it differs
+        // from the wire version, we upgrade.
         //
-        // TODO(B3-followup): RFC 9368 §6 compatible-version-negotiation
-        // upgrade. The wire codec is here, but the choice of upgrade
-        // target has to happen BEFORE BoringSSL produces the EE
-        // (which embeds our transport_parameters) — and §5 forces
-        // `chosen_version` in that EE to match the version of the
-        // packet carrying it. So the upgrade decision must complete
-        // BEFORE the server hands the ClientHello to BoringSSL.
+        // The pre-parse is purely advisory — any failure (auth fail,
+        // fragmented ClientHello, missing extension, malformed
+        // payload) returns `null` and we fall back to "use the wire
+        // version", which is always spec-compliant. We never refuse a
+        // connection because pre-parse failed.
         //
-        // The client's `version_information` transport parameter
-        // (the input to that decision) is INSIDE the ClientHello
-        // we're about to feed BoringSSL. To upgrade spec-compliantly
-        // we need to:
-        //   (a) decrypt the client's Initial under wire-version keys
-        //       (we already do this in `handleInitial`),
-        //   (b) parse the CRYPTO frames out of the decrypted payload
-        //       and reassemble the ClientHello,
-        //   (c) walk TLS extensions to find `quic_transport_parameters`
-        //       (codepoint 0x39),
-        //   (d) decode `version_information` (codepoint 0x11) out of
-        //       that and intersect with `Server.Config.versions`,
-        //   (e) call `setVersion(chosen)` on the Connection BEFORE
-        //       feeding the ClientHello to BoringSSL,
-        //   (f) re-set our outbound transport params with the
-        //       upgraded `chosen_version`.
-        //
-        // The "easier" path of always committing to `versions[0]`
-        // breaks v1-only clients who happen to handshake against a
-        // `versions = [v2, v1]` server, so it's not a viable
-        // shortcut. Standalone v2 (this commit) covers the common
-        // case where embedders configure clients and servers in
-        // matched pairs; the upgrade path is genuinely a focused
-        // session of work and lives in a follow-up.
+        // The decision MUST land BEFORE BoringSSL produces the EE
+        // (which embeds our transport_parameters): RFC 9368 §5
+        // requires `chosen_version` in the EE to match the version
+        // of the server's first Initial response carrying it, so the
+        // outbound transport_params must already say chosen=v_upgrade
+        // when BoringSSL serializes the EE. We arrange that by:
+        //   (a) running the pre-parse here, before `acceptInitial`,
+        //   (b) building `params.compatibleVersions = [chosen, ...]`
+        //       so the EE points at the upgrade target,
+        //   (c) calling `acceptInitial`, which pushes those params to
+        //       BoringSSL and (separately) sets `self.version` to the
+        //       wire version so `handleInitial` opens this datagram
+        //       under wire-version keys,
+        //   (d) flipping `self.version` to `chosen` AFTER the first
+        //       `handleWithEcn` returns (in `dispatchToSlot`), so
+        //       outbound packets sealed by `poll` go out under the
+        //       upgrade-target keys.
+        const upgrade_target = self.preparseUpgradeTarget(bytes, ids.version);
+        const chosen_version: u32 = upgrade_target orelse ids.version;
         if (self.versions.len > 1) {
             var ordered: [16]u32 = undefined;
-            ordered[0] = ids.version;
+            ordered[0] = chosen_version;
             var n: usize = 1;
             for (self.versions) |v| {
-                if (v == ids.version) continue;
+                if (v == chosen_version) continue;
                 if (n >= ordered.len) break;
                 ordered[n] = v;
                 n += 1;
@@ -2332,6 +2325,14 @@ pub const Server = struct {
             try params.setCompatibleVersions(ordered[0..n]);
         }
         try conn_ptr.acceptInitial(bytes, params);
+        // Stash the upgrade target so `dispatchToSlot` can flip
+        // `self.version` after the first `handleWithEcn` consumes the
+        // wire-version Initial under wire-version keys.
+        if (upgrade_target) |upgraded| {
+            if (upgraded != ids.version) {
+                conn_ptr.setPendingVersionUpgrade(upgraded);
+            }
+        }
 
         slot.* = .{
             .conn = conn_ptr,
@@ -2389,6 +2390,16 @@ pub const Server = struct {
                 }
             },
         };
+        // RFC 9368 §6 compatible-version-negotiation upgrade: the
+        // wire-version Initial has now been opened under wire-version
+        // keys and BoringSSL has consumed the ClientHello (producing
+        // an EE that already embeds our chosen-version transport
+        // params, since `openSlotFromInitial` set those before the
+        // handshake advanced). Flip `self.version` to the upgrade
+        // target so the next `poll` seals the response Initial under
+        // the upgrade-target keys. Idempotent / no-op when no
+        // upgrade was pending.
+        _ = slot.conn.applyPendingVersionUpgrade();
     }
 
     /// Diff the slot's currently-tracked CIDs against the
@@ -2722,6 +2733,87 @@ pub const Server = struct {
             if (v == version) return true;
         }
         return false;
+    }
+
+    /// RFC 9368 §5/§6 server-side pre-parse: decide whether to
+    /// upgrade this incoming Initial from `wire_version` to a
+    /// different chosen version.
+    ///
+    /// Decrypts a private copy of the Initial under wire-version
+    /// keys, walks the resulting CRYPTO frames to assemble the
+    /// ClientHello, looks for `quic_transport_parameters` and inside
+    /// that for `version_information` (codepoint 0x11). Intersects
+    /// the client's advertised `available_versions` with the server's
+    /// configured `Config.versions` and returns the first server-
+    /// preferred entry that also appears in the client's list.
+    ///
+    /// Returns:
+    ///   - `null` when the pre-parse failed at any step (decrypt
+    ///     auth, malformed/fragmented ClientHello, missing extension,
+    ///     no overlap with the client's list). The caller falls back
+    ///     to the wire version, which is always spec-compliant.
+    ///   - `wire_version` when the decision is "no upgrade" (the
+    ///     wire version is the highest-priority overlap). Cheap to
+    ///     handle as a no-op upstream.
+    ///   - The upgrade target version when the decision is to
+    ///     upgrade. The caller MUST advertise this as `chosen_version`
+    ///     in the outbound transport_params and (after the first
+    ///     wire-version Initial is processed) flip the connection's
+    ///     active version to it for outbound packet protection.
+    ///
+    /// Defensive posture: any error path returns `null`. The pre-
+    /// parse never closes the connection or surfaces an error to the
+    /// caller — it is purely advisory.
+    fn preparseUpgradeTarget(self: *const Server, bytes: []const u8, wire_version: u32) ?u32 {
+        // Multi-version mode is the only case where an upgrade is
+        // possible. With a single configured version there is nothing
+        // to choose between.
+        if (self.versions.len <= 1) return null;
+        // Only Initial-key-derivable wire versions support compatible
+        // version negotiation. Higher layers reject everything else
+        // via `versionAccepted` upstream, but stay defensive.
+        if (!wire.initial.isSupportedVersion(wire_version)) return null;
+
+        const ids = peekLongHeaderIds(bytes) orelse return null;
+
+        // Make a private copy of the inbound bytes — `openInitial`
+        // strips header protection in-place, and the caller will
+        // re-decrypt the same buffer through the normal
+        // `handleInitial` flow.
+        var pkt_copy: [conn_mod.state.max_recv_plaintext]u8 = undefined;
+        if (bytes.len > pkt_copy.len) return null;
+        @memcpy(pkt_copy[0..bytes.len], bytes);
+
+        // Derive client-direction Initial keys for the wire version.
+        // `ensureInitialKeys` does the same dance internally (HKDF
+        // extract under the version-keyed salt, then `derivePacketKeys`
+        // off the per-direction secret), so we get bit-for-bit the
+        // same keys the connection will derive when it processes this
+        // Initial through `handleInitial`.
+        const init_keys = wire.initial.deriveInitialKeysFor(wire_version, ids.dcid, false) catch return null;
+        const r_keys = wire.short_packet.derivePacketKeys(.aes128_gcm_sha256, &init_keys.secret) catch return null;
+
+        var pt_buf: [conn_mod.state.max_recv_plaintext]u8 = undefined;
+        const opened = wire.long_packet.openInitial(&pt_buf, pkt_copy[0..bytes.len], .{
+            .keys = &r_keys,
+            .largest_received = 0,
+        }) catch return null;
+
+        // Reassemble the ClientHello bytes from the decrypted
+        // payload's CRYPTO frames. Single-Initial only — fragmented
+        // ClientHellos are intentionally not handled here (the §6
+        // graceful-fallback path is "use the wire version").
+        var ch_buf: [wire.vneg_preparse.max_client_hello_bytes]u8 = undefined;
+        const ch = wire.vneg_preparse.reassembleClientHello(&ch_buf, opened.payload) orelse return null;
+
+        // Walk the TLS extensions to find `quic_transport_parameters`.
+        const qtp = wire.vneg_preparse.findQuicTransportParamsExt(ch) orelse return null;
+
+        // Look for `version_information` (codepoint 0x11) inside.
+        const info = wire.vneg_preparse.findVersionInformation(qtp) orelse return null;
+
+        // Intersect with our configured preference list.
+        return wire.vneg_preparse.chooseUpgradeVersion(self.versions, info.available());
     }
 
     /// Encode a Version Negotiation packet into the response queue.

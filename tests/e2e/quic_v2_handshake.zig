@@ -297,3 +297,91 @@ test "v1+v2 client advertises version_information transport parameter [RFC9368 �
     try std.testing.expect(server_advertised.len >= 1);
     try std.testing.expectEqual(QUIC_V1, server_advertised[0]);
 }
+
+test "[v2,v1] server upgrades a v1-wire ClientHello that lists v2 [RFC9368 §6]" {
+    // RFC 9368 §6 compatible-version-negotiation upgrade. The client
+    // sends its ClientHello inside a wire-version-v1 Initial but
+    // advertises `version_information = [v1, v2]` in its transport
+    // parameters; the server is configured `versions = [v2, v1]`,
+    // so the highest-priority overlap is v2 and the server upgrades.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+    const srv_versions = [_]u32{ QUIC_V2, QUIC_V1 };
+    const cli_compat = [_]u32{QUIC_V2}; // wire=v1, available=[v1, v2]
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = common.test_cert_pem,
+        .tls_key_pem = common.test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+        .versions = &srv_versions,
+    });
+    defer srv.deinit();
+
+    var cli = try quic_zig.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+        .preferred_version = QUIC_V1,
+        .compatible_versions = &cli_compat,
+    });
+    defer cli.deinit();
+
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xab) };
+    // Drive at least one client→server pump so the server has
+    // observed the v1-wire Initial and committed to its upgrade
+    // decision. The full handshake won't finish here because the
+    // client side doesn't yet respond to the server's upgrade signal
+    // (that path is tracked on the client follow-up); the upgrade
+    // assertion lives on the server side.
+    var rx: [4096]u8 = undefined;
+    try cli.conn.advance();
+    _ = try pumpClientToServer(&cli, &srv, &rx, peer_addr, 0);
+
+    // The server should now have a slot whose connection version is
+    // the upgrade target (v2), and the outbound transport_params
+    // should advertise chosen=v2 first.
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+    const slot = srv.iterator()[0];
+    try std.testing.expectEqual(QUIC_V2, slot.conn.version);
+}
+
+test "[v2,v1] server with v1-only client commits to v1, no upgrade [RFC9368 §6]" {
+    // The mirror of the upgrade test: same server config, but the
+    // client doesn't advertise version_information at all (it only
+    // knows v1). The intersection between server's [v2, v1] and the
+    // client's "implicit available = [wire]" is just v1, so the
+    // chosen version is the wire version (v1) — no upgrade.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+    const srv_versions = [_]u32{ QUIC_V2, QUIC_V1 };
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = common.test_cert_pem,
+        .tls_key_pem = common.test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+        .versions = &srv_versions,
+    });
+    defer srv.deinit();
+
+    var cli = try quic_zig.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+        .preferred_version = QUIC_V1,
+        // No `compatible_versions` — the client behaves like a
+        // legacy v1-only stack that never sends version_information.
+    });
+    defer cli.deinit();
+
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xcd) };
+    const outcome = try driveHandshake(&cli, &srv, peer_addr, 32);
+    try std.testing.expect(outcome.completed);
+    try std.testing.expectEqual(QUIC_V1, cli.conn.version);
+    try std.testing.expectEqual(QUIC_V1, srv.iterator()[0].conn.version);
+}
