@@ -88,10 +88,8 @@ breaking changes; see notes per release.
   slot ends up with ≥2 local SCIDs after `openSlotFromInitial`).
   `tests/e2e/server_loop_smoke.zig` covers the alt-listener bind via
   the existing shutdown-flag-already-set pattern. The qns embedder
-  (`interop/qns_endpoint.zig`) keeps its bespoke deterministic-CID
-  derivation in this PR; refactoring it onto the public API is a
-  follow-up because it would change on-wire CID values across the
-  interop matrix.
+  (`interop/qns_endpoint.zig`) is refactored onto the same public
+  primitives in the follow-up entry below.
 
 - **Server-side RFC 9368 §6 compatible-version-negotiation upgrade** —
   a multi-version `Server.Config.versions` (e.g. `[QUIC_VERSION_2,
@@ -164,6 +162,42 @@ breaking changes; see notes per release.
   ClientHello carrying `version_information=[v1,v2]` to a `[v2,v1]`
   server and asserting the slot upgrades to v2 only after the
   second Initial arrives.
+
+### Changed
+
+- **qns endpoint adopts the public-API `PreferredAddressConfig`
+  + `conn.stateless_reset.derive`** — `interop/qns_endpoint.zig`
+  no longer rolls its own deterministic seq-1 alt-CID + XOR-shaped
+  stateless-reset-token derivation for the `connectionmigration`
+  testcase. The bespoke `buildPreferredAddress(initial_cid, alt_port)`
+  helper that constructed the alt-CID via `cid[7] +%= 1` and the
+  per-byte `seq ^ (i * 17) ^ cid[i % cid.len]` token is replaced
+  by a thin projection of `quic_zig.PreferredAddressConfig` (built
+  once in `runServer` from the runner-bridge IPv4/IPv6 constants)
+  plus a per-connection seq-1 CID drawn from the CSPRNG and a
+  matching token from `quic_zig.conn.stateless_reset.derive` keyed
+  on a new module-level 32-byte `stateless_reset_key`. The seq-1
+  alt-CID is cached on `ServerConn.pa_alt_cid` /
+  `pa_alt_token` so `queueServerConnectionIds` and the per-Initial
+  transport-parameter advertise read from the same source of truth
+  (matching what `Server.openSlotFromInitial` does for
+  `Server.Config.preferred_address`); the seq-1+ deterministic CID
+  branch — used by every non-PA testcase — keeps the
+  `cid[7] +%= seq` shape but now derives its stateless-reset token
+  via the public HMAC helper too. The single-flag CLI shape
+  `-pref-addr [::]:444` is retained: only the literal's port is
+  consumed; the v4/v6 advertise + bind addresses come from
+  `interop_runner_server_ipv4` / `_ipv6` and the loop binds one
+  alt-listener per family (mirroring `runUdpServer`'s pattern in
+  `src/transport/udp_server.zig`). The alt-CID changes from a
+  deterministic seq-1 byte to CSPRNG, but the runner reads the
+  alt-CID off the `preferred_address` transport parameter and
+  reuses it as the migration DCID — so the on-wire bytes vary
+  across runs without affecting the testcase outcome. New / updated
+  unit tests in `interop/qns_endpoint.zig` cover the
+  `buildPreferredAddress` projection, RFC 9000 §18.2 sentinel
+  semantics for v4-only / v6-only configs, and the codec round-trip
+  through `Params.encode` / `Params.decode`.
 
 ### Fixed
 
