@@ -6791,3 +6791,174 @@ test "monotonicity tracker shares the sequence space across V4 and V6" {
     try std.testing.expect(conn.pollEvent() == null);
     try std.testing.expectEqual(@as(?u64, 2), conn.highestAlternativeAddressSequenceSeen());
 }
+
+// -- RFC 9368 §6 client-side compatible-version-negotiation upgrade --
+
+const quic_version_2 = initial_keys_mod.quic_version_2;
+
+test "clientAcceptCompatibleVersion flips to an advertised candidate [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // The client-style local transport params advertise both the
+    // wire version (v1) and a compatible upgrade target (v2).
+    var params: TransportParams = .{};
+    try params.setCompatibleVersions(&.{ quic_version_1, quic_version_2 });
+    conn.local_transport_params = params;
+
+    try std.testing.expect(conn.clientAcceptCompatibleVersion(quic_version_2));
+    try std.testing.expectEqual(quic_version_2, conn.version);
+}
+
+test "clientAcceptCompatibleVersion rejects a candidate not on the client's list [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Client only advertises v1; the server choosing v2 is unsolicited
+    // and MUST be ignored (the inbound packet then fails AEAD auth
+    // under wire-version keys, which is the spec-compliant fallback).
+    var params: TransportParams = .{};
+    try params.setCompatibleVersions(&.{quic_version_1});
+    conn.local_transport_params = params;
+
+    try std.testing.expect(!conn.clientAcceptCompatibleVersion(quic_version_2));
+    try std.testing.expectEqual(quic_version_1, conn.version);
+}
+
+test "clientAcceptCompatibleVersion is a no-op for the active version [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var params: TransportParams = .{};
+    try params.setCompatibleVersions(&.{ quic_version_1, quic_version_2 });
+    conn.local_transport_params = params;
+
+    // Same-version flip returns false — nothing to do, no observability.
+    try std.testing.expect(!conn.clientAcceptCompatibleVersion(quic_version_1));
+    try std.testing.expectEqual(quic_version_1, conn.version);
+}
+
+test "clientAcceptCompatibleVersion rejects unknown wire versions [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var params: TransportParams = .{};
+    try params.setCompatibleVersions(&.{ quic_version_1, 0xdeadbeef });
+    conn.local_transport_params = params;
+
+    // Even if the client misconfigured itself with a version we
+    // can't derive Initial keys for, the upgrade hook silently
+    // declines so the connection just falls back to wire-version
+    // AEAD auth (which will fail and the packet is dropped).
+    try std.testing.expect(!conn.clientAcceptCompatibleVersion(0xdeadbeef));
+    try std.testing.expectEqual(quic_version_1, conn.version);
+}
+
+test "clientAcceptCompatibleVersion rejects upgrade after Initial keys discarded [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    var params: TransportParams = .{};
+    try params.setCompatibleVersions(&.{ quic_version_1, quic_version_2 });
+    conn.local_transport_params = params;
+    // Simulate Initial-keys discard (post-handshake-complete state).
+    conn.initial_keys_discarded = true;
+
+    try std.testing.expect(!conn.clientAcceptCompatibleVersion(quic_version_2));
+    try std.testing.expectEqual(quic_version_1, conn.version);
+}
+
+test "clientAcceptCompatibleVersion is server-role inert [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    // Build a server connection — it has no local transport params
+    // advertising compatible_versions, but even if it did the hook
+    // is client-only.
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    var params: TransportParams = .{};
+    try params.setCompatibleVersions(&.{ quic_version_1, quic_version_2 });
+    conn.local_transport_params = params;
+
+    try std.testing.expect(!conn.clientAcceptCompatibleVersion(quic_version_2));
+    try std.testing.expectEqual(quic_version_1, conn.version);
+}
+
+test "validatePeerTransportRole closes when chosen_version mismatches wire [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Active wire version is v1, but the (forged) peer params
+    // advertise chosen_version=v2 first. Per RFC 9368 §6 ¶6/¶7
+    // this is a downgrade attack and the connection MUST close.
+    var peer_params: TransportParams = .{};
+    try peer_params.setCompatibleVersions(&.{ quic_version_2, quic_version_1 });
+    peer_params.initial_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+    conn.cached_peer_transport_params = peer_params;
+
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    const pending = conn.lifecycle.pending_close.?;
+    try std.testing.expect(pending.is_transport);
+    try std.testing.expectEqual(transport_error_transport_parameter, pending.error_code);
+}
+
+test "validatePeerTransportRole accepts matching chosen_version [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Active wire version is v1 and the server's chosen_version
+    // matches — the §6 downgrade guard is silent.
+    var peer_params: TransportParams = .{};
+    try peer_params.setCompatibleVersions(&.{ quic_version_1, quic_version_2 });
+    peer_params.initial_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+    conn.cached_peer_transport_params = peer_params;
+
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.lifecycle.pending_close == null);
+}
+
+test "validatePeerTransportRole accepts absent version_information [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // No compatible_versions on the peer side — a v0.x server that
+    // never advertises version_information. The §6 downgrade guard
+    // is silent because there is no `chosen_version` to check
+    // against.
+    var peer_params: TransportParams = .{};
+    peer_params.initial_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+    conn.cached_peer_transport_params = peer_params;
+
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.lifecycle.pending_close == null);
+}

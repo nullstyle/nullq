@@ -171,6 +171,28 @@ pub fn handleInitial(
         }
         try self.setInitialDcid(bytes[6 .. 6 + dcid_len]);
     }
+    // RFC 9368 §6 client-side compatible-version-negotiation upgrade
+    // detection: the server may answer the client's wire-version
+    // Initial under a *different* version drawn from the client's
+    // advertised `version_information.available_versions`. When that
+    // happens, the inbound long-header version field will not match
+    // `self.version`. Try to flip our active version so Initial-key
+    // derivation below picks up the upgrade-target salt + HKDF labels.
+    //
+    // Defensive: `clientAcceptCompatibleVersion` re-validates the role,
+    // the candidate's presence in our advertised list, and the
+    // pre-handshake state. If it returns false the candidate is
+    // dropped and decryption falls through to AEAD-auth failure under
+    // the wire-version keys (which silently drops the packet — the
+    // spec-compliant fallback). The check is gated on the receive-side
+    // Initial space being empty so a stale-but-on-wire-version Initial
+    // arriving after the upgrade can't accidentally flip us back.
+    if (self.role == .client and bytes.len >= 5) {
+        const inbound_version = std.mem.readInt(u32, bytes[1..5], .big);
+        if (inbound_version != self.version and self.pnSpaceForLevel(.initial).received.largest == null) {
+            _ = self.clientAcceptCompatibleVersion(inbound_version);
+        }
+    }
     try self.ensureInitialKeys();
     const r_keys_opt = self.initial_keys_read;
     const r_keys = r_keys_opt orelse {

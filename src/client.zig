@@ -159,17 +159,26 @@ const ConfigImpl = struct {
     preferred_version: u32 = 0x00000001,
 
     /// Optional list of additional QUIC versions the client is
-    /// willing to upgrade to via the RFC 9368 §5 compatible-version
+    /// willing to upgrade to via the RFC 9368 §5/§6 compatible-version
     /// negotiation mechanism. Empty (the default) suppresses the
     /// `version_information` (codepoint 0x11) transport parameter,
     /// keeping the on-wire posture indistinguishable from a v0.x
     /// client. When non-empty, the client advertises
     /// `[preferred_version, compatible_versions...]` so a server
     /// that supports a different overlapping version can opt in to
-    /// a compatible upgrade. (Server-driven upgrade is currently
-    /// detected only — the client emits its first Initial under
-    /// `preferred_version` and the upgrade path itself is tracked
-    /// as `// TODO(B3-followup):` work.)
+    /// a compatible upgrade.
+    ///
+    /// Upgrade consumption is implemented end-to-end: the first
+    /// inbound Initial whose long-header version field differs from
+    /// `preferred_version` triggers
+    /// `Connection.clientAcceptCompatibleVersion` (in
+    /// `conn/conn_recv_packet_handlers.handleInitial`), which
+    /// validates the candidate against this list and re-derives
+    /// Initial keys for the upgraded version before the AEAD open
+    /// runs. Once the handshake produces the server's
+    /// EncryptedExtensions, `validatePeerTransportRole` enforces the
+    /// RFC 9368 §6 ¶6/¶7 downgrade guard (`chosen_version` MUST equal
+    /// the wire version of the response carrying it).
     compatible_versions: []const u32 = &.{},
 
     /// RFC 8899 DPLPMTUD configuration applied to the underlying
