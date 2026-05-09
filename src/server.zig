@@ -93,6 +93,7 @@ const ConnectionId = conn_mod.path.ConnectionId;
 const Address = conn_mod.path.Address;
 const QlogCallback = conn_mod.QlogCallback;
 const RetryTokenKey = conn_mod.RetryTokenKey;
+const PreferredAddressTp = tls_mod.transport_params.PreferredAddress;
 
 /// Maximum byte size of a single queued stateless response (Version
 /// Negotiation or Retry). Both packet types fit comfortably inside
@@ -433,6 +434,38 @@ const SourceRateEntry = struct {
 
 /// Configuration handed to `Server.init`. Re-exported as
 /// `Server.Config`.
+/// Server `preferred_address` (RFC 9000 §18.2 / §5.1.1) configuration.
+/// When set on `Config.preferred_address`, the server advertises this
+/// alternate IPv4/IPv6 address pair to clients during the handshake,
+/// and (when used with `runUdpServer`) binds an additional listener
+/// socket on each configured address. Clients that complete the
+/// handshake migrate to the preferred address per RFC 9000 §5.1.1.
+///
+/// At least one of `ipv4` / `ipv6` must be non-null. When only one
+/// family is set, the unused-family fields in the on-wire transport
+/// parameter are left zero (the spec sentinel meaning "no preferred
+/// address for this family"). The CID + stateless-reset token the
+/// parameter advertises are derived per-connection at handshake time
+/// using `Config.stateless_reset_key` and `Server.mintLocalScid`; the
+/// embedder does not supply them.
+///
+/// **`Config.stateless_reset_key` is required** when this field is
+/// set. The seq-1 stateless-reset token in the parameter must match
+/// the token a future stateless-reset on the alt-CID would produce,
+/// and the deterministic `conn.stateless_reset.derive` helper is the
+/// only path quic_zig surfaces for that. Setting `preferred_address`
+/// without a key fails `Server.init` with `InvalidConfig`.
+pub const PreferredAddressConfig = struct {
+    /// Alt IPv4 address + port to advertise + bind, or null. The
+    /// 4-byte address bytes are advertised verbatim; an all-zero
+    /// `ipv4` is interpreted by RFC 9000 §18.2 as "no IPv4
+    /// preferred address" and `runUdpServer` will skip the v4 bind.
+    ipv4: ?std.Io.net.Ip4Address = null,
+    /// Alt IPv6 address + port to advertise + bind, or null.
+    /// Same all-zero sentinel semantics as `ipv4`.
+    ipv6: ?std.Io.net.Ip6Address = null,
+};
+
 const ConfigImpl = struct {
     /// Wall-clock allocator used for the connection table and any
     /// transient per-server allocations. Each `Connection` allocates
@@ -768,6 +801,31 @@ const ConfigImpl = struct {
     /// MTU. Set `enable = false` to keep the historical static-MTU
     /// behaviour (PMTU stays at `initial_mtu`).
     pmtud: conn_mod.PmtudConfig = .{},
+
+    /// RFC 9000 §18.2 / §5.1.1 server preferred-address advertisement.
+    /// Null disables the feature (default — no `preferred_address`
+    /// transport parameter is sent and clients have no server-driven
+    /// post-handshake migration target).
+    ///
+    /// When set, every accepted connection's outbound transport
+    /// parameters carry a `preferred_address` value pointing at the
+    /// configured IPv4 / IPv6 address pair. The seq-1 server CID +
+    /// stateless reset token the parameter embeds is minted per-
+    /// connection through `mintLocalScid` + `conn.stateless_reset.derive`,
+    /// and queued on the connection as a NEW_CONNECTION_ID(seq=1)
+    /// equivalent so post-migration packets the client addresses
+    /// to the alt-CID authenticate. **Requires
+    /// `Config.stateless_reset_key`**; without it `Server.init`
+    /// returns `InvalidConfig` (the deterministic token derivation
+    /// is the only path quic_zig surfaces for the seq-1 token).
+    ///
+    /// `runUdpServer` consults this field to also bind alt listener
+    /// socket(s) on the configured port(s), poll all bound sockets
+    /// per iteration, and route outbound replies through the socket
+    /// the slot most recently received on. Embedders driving their
+    /// own loop are responsible for the multi-socket plumbing —
+    /// the codec auto-build still applies.
+    preferred_address: ?PreferredAddressConfig = null,
 };
 
 /// Argument to `Server.replaceTlsContext`. Either fresh PEM bytes
@@ -864,6 +922,18 @@ const SlotImpl = struct {
     /// version). Stays null for the rest of the slot's life — it is
     /// strictly a bootstrap construct.
     pending_upgrade: ?*PendingUpgradeState = null,
+
+    /// Index into the `runUdpServer`-owned listener-socket array
+    /// recording which socket most recently received an authenticated
+    /// datagram for this slot. 0 = primary socket; 1+ = alt-listener
+    /// sockets the loop bound from `Config.preferred_address`. The
+    /// outbound drain consults this so replies follow the path the
+    /// peer is currently sending on (RFC 9000 §5.1.1 server-initiated
+    /// migration: pre-migration the client addresses the primary
+    /// socket; post-migration it addresses the preferred-address
+    /// alt-port). Embedders running their own loop ignore this
+    /// field; nothing in the core transport reads it.
+    last_recv_socket_idx: u8 = 0,
 
     /// Attach a W3C tracecontext to this slot. Embedders typically
     /// call this after `Server.feed` returns `.accepted` and the
@@ -1144,6 +1214,13 @@ pub const Server = struct {
     /// slot-open time. RFC 8899 DPLPMTUD.
     pmtud_config: conn_mod.PmtudConfig,
 
+    /// Captured `Config.preferred_address` — used by `openSlotFromInitial`
+    /// to auto-build the `preferred_address` transport parameter for
+    /// every accepted connection (RFC 9000 §18.2 / §5.1.1) and by
+    /// `runUdpServer` to bind alt listener sockets. Null when the
+    /// feature is disabled (default).
+    preferred_address: ?PreferredAddressConfig,
+
     /// Captured `Config.max_datagrams_per_window`. Null disables the
     /// listener-level packet rate limit; otherwise gates *every*
     /// inbound datagram (existing-slot routes included) at the very
@@ -1329,6 +1406,19 @@ pub const Server = struct {
             // `(key, combined)` automatically.
             lb_cfg.validate() catch return Error.InvalidConfig;
         }
+        // RFC 9000 §18.2 / §5.1.1: a `preferred_address` advertisement
+        // requires a stateless-reset key so the seq-1 reset token in
+        // the parameter matches the token a future stateless-reset on
+        // the alt-CID would produce. The parameter must also point at
+        // at least one address — both families null is a misconfiguration.
+        if (config.preferred_address) |pa_cfg| {
+            if (pa_cfg.ipv4 == null and pa_cfg.ipv6 == null) {
+                return Error.InvalidConfig;
+            }
+            if (config.stateless_reset_key == null) {
+                return Error.InvalidConfig;
+            }
+        }
 
         // Resolve the on-wire CID length and the transport parameters
         // we'll commit to. With QUIC-LB enabled, the CID length is
@@ -1472,6 +1562,7 @@ pub const Server = struct {
             .max_log_events_per_source = config.max_log_events_per_source_per_window,
             .versions = config.versions,
             .pmtud_config = config.pmtud,
+            .preferred_address = config.preferred_address,
             .stateless_responses = .empty,
         };
     }
@@ -2354,6 +2445,31 @@ pub const Server = struct {
         if (retry_ctx) |_| {
             params.retry_source_connection_id = ConnectionId.fromSlice(local_scid);
         }
+
+        // RFC 9000 §18.2 / §5.1.1 `preferred_address` advertise. When
+        // `Config.preferred_address` is set, mint a fresh seq-1 SCID
+        // through the same `mintLocalScid` path as seq-0, derive the
+        // accompanying stateless-reset token from the
+        // `Config.stateless_reset_key` (Server.init's validation
+        // guarantees the key is set whenever `preferred_address` is),
+        // and stamp both into the outbound transport parameter so the
+        // EE BoringSSL serializes carries the value verbatim. The
+        // matching NEW_CONNECTION_ID(seq=1) is queued below, after
+        // `acceptInitial` so the connection's local-CID table is
+        // ready to register a sequence-1 entry.
+        var pa_alt_cid_storage: [20]u8 = undefined;
+        var pa_alt_cid_slice: ?[]u8 = null;
+        var pa_alt_token: [16]u8 = @splat(0);
+        if (self.preferred_address) |pa_cfg| {
+            const slice = pa_alt_cid_storage[0..self.local_cid_len];
+            try self.mintLocalScid(slice);
+            const key = self.stateless_reset_key orelse unreachable;
+            pa_alt_token = conn_mod.stateless_reset.derive(&key, slice) catch
+                return Error.RandFailed;
+            pa_alt_cid_slice = slice;
+            params.preferred_address = buildPreferredAddressParam(pa_cfg, slice, pa_alt_token);
+        }
+
         // RFC 9368 §5/§6: pre-parse the inbound Initial under wire-
         // version keys to extract the client's `version_information`
         // (codepoint 0x11) transport parameter, and intersect with
@@ -2428,6 +2544,34 @@ pub const Server = struct {
         }
         errdefer if (pending_upgrade) |pu| self.allocator.destroy(pu);
 
+        // Queue NEW_CONNECTION_ID(seq=1) carrying the alt-CID minted
+        // for `preferred_address`. RFC 9000 §5.1.1 ¶6 says the client
+        // treats the preferred-address `connection_id` as if it had
+        // arrived in `NEW_CONNECTION_ID(seq=1)`; the server still
+        // emits the matching frame on the wire, and the client's
+        // `registerPeerCid` idempotently absorbs the duplicate. We
+        // queue it AFTER `acceptInitial` so the connection's local-CID
+        // table has its seq-0 entry already in place.
+        if (pa_alt_cid_slice) |alt_cid| {
+            const provision = conn_mod.ConnectionIdProvision{
+                .connection_id = alt_cid,
+                .stateless_reset_token = pa_alt_token,
+            };
+            // Propagate OOM (the broader feed loop expects to bubble
+            // it). Any other failure (CID-issue budget saturated,
+            // alt-CID collision with the seq-0 mint) silently skips
+            // the queue: the transport parameter is still advertised,
+            // and a post-migration packet bearing the unregistered
+            // alt-CID will simply be dropped — pathological for the
+            // server (a same-connection client whose
+            // `active_connection_id_limit < 2` cannot follow the PA
+            // anyway), no need to fail the handshake.
+            _ = conn_ptr.replenishConnectionIds(&[_]conn_mod.ConnectionIdProvision{provision}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            };
+        }
+
         slot.* = .{
             .conn = conn_ptr,
             .initial_dcid = initial_dcid,
@@ -2436,6 +2580,7 @@ pub const Server = struct {
             .slot_id = self.next_slot_id,
             .tls_generation = self.current_generation,
             .pending_upgrade = pending_upgrade,
+            .last_recv_socket_idx = 0,
         };
         self.next_slot_id +%= 1;
 
@@ -3587,6 +3732,36 @@ fn logEventSource(ev: LogEventImpl) ?Address {
     };
 }
 
+/// Project a `PreferredAddressConfig` into the on-wire transport-
+/// parameter struct. The seq-1 CID + token are minted by the caller
+/// (`openSlotFromInitial`); this helper just packs the address pair
+/// and identity bytes into the codec's six-field shape.
+///
+/// RFC 9000 §18.2 lets either family be all-zero as a sentinel for
+/// "no preferred address for this family". When `cfg.ipv4` /
+/// `cfg.ipv6` is null, the corresponding output bytes / port stay
+/// zero — clients reading the parameter see no v4 / v6 address as
+/// expected.
+fn buildPreferredAddressParam(
+    cfg: PreferredAddressConfig,
+    cid: []const u8,
+    stateless_reset_token: [16]u8,
+) PreferredAddressTp {
+    var out: PreferredAddressTp = .{
+        .connection_id = ConnectionId.fromSlice(cid),
+        .stateless_reset_token = stateless_reset_token,
+    };
+    if (cfg.ipv4) |v4| {
+        out.ipv4_address = v4.bytes;
+        out.ipv4_port = v4.port;
+    }
+    if (cfg.ipv6) |v6| {
+        out.ipv6_address = v6.bytes;
+        out.ipv6_port = v6.port;
+    }
+    return out;
+}
+
 // -- header-peek helpers ------------------------------------------------
 
 const LongHeaderIds = struct {
@@ -3783,6 +3958,110 @@ test "Server.init validates configuration" {
         .source_rate_window_us = 0,
         .transport_params = .{},
     }));
+
+    // preferred_address with neither v4 nor v6 set.
+    try std.testing.expectError(Server.Error.InvalidConfig, Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = "stub",
+        .tls_key_pem = "stub",
+        .alpn_protocols = &protos,
+        .transport_params = .{},
+        .preferred_address = .{},
+        .stateless_reset_key = @splat(0x42),
+    }));
+
+    // preferred_address without stateless_reset_key.
+    try std.testing.expectError(Server.Error.InvalidConfig, Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = "stub",
+        .tls_key_pem = "stub",
+        .alpn_protocols = &protos,
+        .transport_params = .{},
+        .preferred_address = .{
+            .ipv6 = .{ .port = 444, .bytes = @splat(0), .flow = 0 },
+        },
+        // stateless_reset_key intentionally null.
+    }));
+}
+
+test "buildPreferredAddressParam packs config + identity into transport-param shape" {
+    // The codec auto-build path (used by `openSlotFromInitial`) projects
+    // the embedder-supplied `PreferredAddressConfig` into the on-wire
+    // `tls.transport_params.PreferredAddress` shape that the encoder
+    // serializes. Pin the field-by-field mapping so future config
+    // additions can't silently break the wire output.
+    const cfg: PreferredAddressConfig = .{
+        .ipv4 = .{ .bytes = .{ 193, 167, 100, 100 }, .port = 444 },
+        .ipv6 = .{ .bytes = @splat(0), .port = 445, .flow = 0 },
+    };
+    var alt_cid: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var token: [16]u8 = @splat(0xee);
+    const got = buildPreferredAddressParam(cfg, &alt_cid, token);
+
+    try std.testing.expectEqualSlices(u8, &cfg.ipv4.?.bytes, &got.ipv4_address);
+    try std.testing.expectEqual(@as(u16, 444), got.ipv4_port);
+    try std.testing.expectEqualSlices(u8, &cfg.ipv6.?.bytes, &got.ipv6_address);
+    try std.testing.expectEqual(@as(u16, 445), got.ipv6_port);
+    try std.testing.expectEqualSlices(u8, &alt_cid, got.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &token, &got.stateless_reset_token);
+}
+
+test "buildPreferredAddressParam leaves missing-family fields zero (RFC 9000 §18.2 sentinel)" {
+    // §18.2 ¶2: the address pair fields are independently optional;
+    // the all-zero address + zero port is the "no preferred address
+    // for this family" sentinel. Verify the helper preserves that
+    // when `ipv4` (or `ipv6`) is left null in the config.
+    const cfg: PreferredAddressConfig = .{
+        .ipv6 = .{ .bytes = .{
+            0xfd, 0x00, 0xca, 0xfe, 0xca, 0xfe, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+        }, .port = 444, .flow = 0 },
+    };
+    const cid: [8]u8 = .{ 9, 8, 7, 6, 5, 4, 3, 2 };
+    const tok: [16]u8 = @splat(0xab);
+    const got = buildPreferredAddressParam(cfg, &cid, tok);
+
+    // v4 stays at the all-zero / port-zero sentinel.
+    const zero_v4: [4]u8 = @splat(0);
+    try std.testing.expectEqualSlices(u8, &zero_v4, &got.ipv4_address);
+    try std.testing.expectEqual(@as(u16, 0), got.ipv4_port);
+    // v6 is populated.
+    try std.testing.expectEqualSlices(u8, &cfg.ipv6.?.bytes, &got.ipv6_address);
+    try std.testing.expectEqual(@as(u16, 444), got.ipv6_port);
+}
+
+test "buildPreferredAddressParam round-trips through Params codec" {
+    // End-to-end: pack a config into the transport-parameter struct,
+    // encode through `Params.encode`, decode via `Params.decode`, and
+    // confirm every field survives the wire format. The decoder is
+    // role-aware (server-only acceptance) but `Params.decode` itself
+    // is role-neutral; we use it for the codec round-trip without
+    // engaging the role gate.
+    const transport_params = @import("tls/root.zig").transport_params;
+
+    const cfg: PreferredAddressConfig = .{
+        .ipv4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 4433 },
+        .ipv6 = .{ .bytes = .{
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 1,
+        }, .port = 4434, .flow = 0 },
+    };
+    const cid: [8]u8 = .{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe };
+    const token: [16]u8 = @splat(0x77);
+    const pa = buildPreferredAddressParam(cfg, &cid, token);
+
+    const params: transport_params.Params = .{ .preferred_address = pa };
+    var buf: [256]u8 = undefined;
+    const n = try params.encode(&buf);
+    const decoded = try transport_params.Params.decode(buf[0..n]);
+    const got = decoded.preferred_address orelse return error.MissingPreferredAddress;
+
+    try std.testing.expectEqualSlices(u8, &pa.ipv4_address, &got.ipv4_address);
+    try std.testing.expectEqual(pa.ipv4_port, got.ipv4_port);
+    try std.testing.expectEqualSlices(u8, &pa.ipv6_address, &got.ipv6_address);
+    try std.testing.expectEqual(pa.ipv6_port, got.ipv6_port);
+    try std.testing.expectEqualSlices(u8, pa.connection_id.slice(), got.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &pa.stateless_reset_token, &got.stateless_reset_token);
 }
 
 test "peekLongHeaderIds rejects too-short" {

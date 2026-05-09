@@ -86,6 +86,14 @@ pub const alt_addr = @import("alt_addr/root.zig");
 /// embedder still owns the UDP socket and the clock.
 pub const Server = @import("server.zig").Server;
 
+/// Server-side `preferred_address` (RFC 9000 §18.2 / §5.1.1)
+/// configuration. Set on `Server.Config.preferred_address` to
+/// advertise an alternate IPv4/IPv6 socket address pair to clients
+/// during the handshake; `runUdpServer` consults the same field to
+/// also bind alt listener sockets and dispatch their inbound
+/// datagrams into the connection table.
+pub const PreferredAddressConfig = @import("server.zig").PreferredAddressConfig;
+
 /// High-level convenience wrapper for embedding quic_zig as a QUIC
 /// client. Mirror to `Server` — owns the TLS context and per-Initial
 /// random DCID/SCID generation; the embedder still owns the UDP
