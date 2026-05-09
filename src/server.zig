@@ -1932,6 +1932,17 @@ pub const Server = struct {
         // so it's guaranteed to be in our configured list. Build the
         // list with the chosen version first, followed by every
         // other configured version in preference order.
+        //
+        // TODO(B3-followup): RFC 9368 §6 compatible-version-negotiation
+        // upgrade. When the client's first Initial is on version A
+        // but its `version_information` transport parameter lists a
+        // version B that the server prefers, the server is allowed
+        // to switch the connection's version to B without an extra
+        // round trip — but doing so means re-deriving Initial keys
+        // under B's salt + labels in the middle of the handshake,
+        // which the current state machine doesn't model. Standalone
+        // v2 (this commit) is the more common case in practice;
+        // upgrade lands in a follow-up.
         if (self.versions.len > 1) {
             var ordered: [16]u32 = undefined;
             ordered[0] = ids.version;
