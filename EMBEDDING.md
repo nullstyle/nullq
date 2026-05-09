@@ -214,6 +214,22 @@ deployment:
 - **`max_initials_per_source_per_window: ?u32 = null`** — per-source
   Initial-acceptance cap. Recommended ~32 for open internet. Off by
   default for dev/interop ergonomics.
+- **`preferred_address: ?PreferredAddressConfig = null`** — RFC 9000
+  §18.2 / §5.1.1 server-preferred-address advertisement. When set,
+  every accepted connection's outbound transport parameters carry a
+  `preferred_address` value pointing at the configured IPv4 / IPv6
+  address pair; the seq-1 alt-CID + matching stateless-reset token
+  are minted per-connection through `mintLocalScid` +
+  `conn.stateless_reset.derive`. `runUdpServer` consults the same
+  field to bind alt listener socket(s) on the configured port(s),
+  poll all listeners per iteration, and route outbound replies
+  through the listener the slot most recently received on.
+  **Requires `stateless_reset_key`** (the deterministic token
+  derivation is the only path quic-zig exposes for the seq-1 reset
+  token); `Server.init` returns `InvalidConfig` if you forget. At
+  least one of `ipv4` / `ipv6` must be non-null. Embedders driving
+  their own loop still get the codec auto-build — only the multi-
+  socket plumbing is `runUdpServer`-specific.
 
 ## 0-RTT security checklist
 

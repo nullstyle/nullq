@@ -166,3 +166,54 @@ test "runUdpServer with shutdown_flag already set returns immediately" {
     // must be exactly 0 after the loop returns.
     try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
 }
+
+test "runUdpServer binds preferred-address alt listener and returns cleanly" {
+    // Same shape as the shutdown-flag-already-set test, but with a
+    // `preferred_address` configured. The loop must bind both the
+    // primary and the alt listener (else the bind error surfaces),
+    // then bail on the first iteration when it sees the shutdown
+    // flag. The alt-listener binds on a separate ephemeral port so
+    // the test cannot collide with anything else on the host.
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .stateless_reset_key = @splat(0x42),
+        .preferred_address = .{
+            // ephemeral port, IPv4 loopback
+            .ipv4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 },
+        },
+    });
+    defer srv.deinit();
+
+    var stop = std.atomic.Value(bool).init(true);
+
+    quic_zig.transport.runUdpServer(&srv, .{
+        .listen = "127.0.0.1:0",
+        .io = std.testing.io,
+        .shutdown_flag = &stop,
+        .tune_socket = false,
+        .shutdown_grace_us = 1_000,
+        .receive_timeout = std.Io.Duration.fromMilliseconds(1),
+    }) catch |err| switch (err) {
+        error.AddressInUse,
+        error.AddressUnavailable,
+        error.AddressFamilyUnsupported,
+        error.SystemResources,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.SocketModeUnsupported,
+        error.OptionUnsupported,
+        error.NetworkDown,
+        error.ProtocolUnsupportedBySystem,
+        error.ProtocolUnsupportedByAddressFamily,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), srv.connectionCount());
+}

@@ -11,6 +11,42 @@ breaking changes; see notes per release.
 
 ### Added
 
+- **Public-API `Server.Config.preferred_address` (RFC 9000 §18.2 / §5.1.1)** —
+  arbitrary `quic_zig.Server` embedders can now advertise a server-
+  preferred-address transport parameter without rolling their own
+  multi-socket dispatch. New `quic_zig.PreferredAddressConfig` type
+  carries optional IPv4 / IPv6 alt-address pairs; setting
+  `Server.Config.preferred_address` plus `stateless_reset_key`
+  arms the auto-build path in `openSlotFromInitial`. Per accepted
+  Initial the server mints a fresh seq-1 alt-CID via the same
+  `mintLocalScid` path as the seq-0 SCID (so QUIC-LB embedders get a
+  routing-encoded alt-CID for free), derives the matching stateless-
+  reset token via `quic_zig.conn.stateless_reset.derive(key, alt_cid)`,
+  stamps both into the outbound transport-parameter blob, and queues
+  the matching NEW_CONNECTION_ID(seq=1) on the connection so post-
+  migration packets that address the alt-CID authenticate. The
+  `runUdpServer` helper consults the same field to bind alt listener
+  socket(s) on the configured port(s), poll all bound listeners per
+  iteration, track per-slot `last_recv_socket_idx`, and route
+  outbound replies through the listener the slot most recently
+  received on. `Server.init` rejects misconfigurations
+  (`preferred_address` without `stateless_reset_key`,
+  `preferred_address` with neither family set) as `InvalidConfig`.
+  Embedders driving their own loop still get the codec auto-build —
+  only the multi-socket plumbing is loop-helper-specific. New unit
+  tests in `src/server.zig` (config-validation negative cases,
+  `buildPreferredAddressParam` field mapping, codec round-trip
+  through `Params.encode`/`decode`) and `tests/e2e/server_smoke.zig`
+  (full handshake with PA: client's `peerTransportParams` surfaces
+  the configured address pair + a derived stateless-reset token
+  matching `conn.stateless_reset.derive(key, alt_cid)`; server-side
+  slot ends up with ≥2 local SCIDs after `openSlotFromInitial`).
+  `tests/e2e/server_loop_smoke.zig` covers the alt-listener bind via
+  the existing shutdown-flag-already-set pattern. The qns embedder
+  (`interop/qns_endpoint.zig`) keeps its bespoke deterministic-CID
+  derivation in this PR; refactoring it onto the public API is a
+  follow-up because it would change on-wire CID values across the
+  interop matrix.
 - **Server-side RFC 9368 §6 compatible-version-negotiation upgrade** —
   a multi-version `Server.Config.versions` (e.g. `[QUIC_VERSION_2,
   QUIC_VERSION_1]`) now drives an upgrade decision per inbound Initial

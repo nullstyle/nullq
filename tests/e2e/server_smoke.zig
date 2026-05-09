@@ -2056,3 +2056,200 @@ test "Server.init rejects max_bytes_per_source_per_second=0" {
         .max_bytes_per_source_per_second = 0,
     }));
 }
+
+// -- preferred_address (RFC 9000 §18.2 / §5.1.1) -------------------------
+
+test "Server.Config.preferred_address: validation rejects empty pair" {
+    // Setting `preferred_address` with neither v4 nor v6 is a misconfig
+    // — the parameter must point at at least one address. Surface as
+    // InvalidConfig at `Server.init` time rather than letting the
+    // handshake silently advertise an unreachable param.
+    const protos = [_][]const u8{"hq-test"};
+    try std.testing.expectError(quic_zig.Server.Error.InvalidConfig, quic_zig.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .preferred_address = .{},
+        .stateless_reset_key = @splat(0x42),
+    }));
+}
+
+test "Server.Config.preferred_address: validation requires stateless_reset_key" {
+    // The seq-1 stateless-reset token in the PA parameter must match
+    // the deterministic `conn.stateless_reset.derive(key, cid)` output
+    // — the seq-1 reset on the alt-CID needs the same token. Without
+    // a key the derivation isn't well-defined, so `Server.init`
+    // refuses the config rather than silently emitting an all-zero
+    // token.
+    const protos = [_][]const u8{"hq-test"};
+    try std.testing.expectError(quic_zig.Server.Error.InvalidConfig, quic_zig.Server.init(.{
+        .allocator = std.testing.allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .preferred_address = .{
+            .ipv6 = .{ .port = 444, .bytes = @splat(0), .flow = 0 },
+        },
+        // stateless_reset_key intentionally null.
+    }));
+}
+
+test "Server.Config.preferred_address: openSlotFromInitial mints seq-1 alt-CID and registers it locally" {
+    // End-to-end via the public API: drive a full Server↔Client
+    // handshake with `preferred_address` on, and verify the slot's
+    // connection ends up with TWO local SCIDs — the seq-0 initial
+    // SCID `Server.feed` minted for this connection, plus the seq-1
+    // alt-CID `openSlotFromInitial` issued for the PA value. The
+    // alt-CID is queued via `replenishConnectionIds`, which is what
+    // any future post-migration packet from the client must address
+    // for the connection to authenticate.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .stateless_reset_key = @splat(0x42),
+        .preferred_address = .{
+            .ipv4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 4444 },
+            .ipv6 = .{ .bytes = .{
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 1,
+            }, .port = 4445, .flow = 0 },
+        },
+    });
+    defer srv.deinit();
+
+    var cli = try quic_zig.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer cli.deinit();
+
+    var rx: [4096]u8 = undefined;
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xab) };
+    try cli.conn.advance();
+
+    // Pump a few rounds so the Server-side slot is at least allocated;
+    // we don't need a full handshake — `openSlotFromInitial` runs
+    // synchronously inside the first `Server.feed` call.
+    var step: u32 = 0;
+    while (step < 6) : (step += 1) {
+        const now_us: u64 = @as(u64, step) * 1_000;
+        while (try cli.conn.poll(&rx, now_us)) |len| {
+            _ = try srv.feed(rx[0..len], peer_addr, now_us);
+        }
+        while (srv.drainStatelessResponse()) |_| {}
+        for (srv.iterator()) |slot| {
+            while (try slot.conn.poll(&rx, now_us)) |len| {
+                try cli.conn.handle(rx[0..len], null, now_us);
+            }
+        }
+        try srv.tick(now_us);
+        try cli.conn.tick(now_us);
+        if (srv.iterator().len > 0) break;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+    const slot = srv.iterator()[0];
+
+    // The slot's connection has the seq-0 initial SCID + the seq-1
+    // alt-CID we minted for the PA. `localScidCount` reports them
+    // both. (NEW_CONNECTION_ID frames are queued at the same time
+    // they're appended to `local_cids`, so the count reflects the
+    // alt-CID immediately — see `Connection.queueNewConnectionId`.)
+    try std.testing.expect(slot.conn.localScidCount() >= 2);
+
+    // The slot's `last_recv_socket_idx` is 0 by default — every
+    // accepted connection starts on the primary listener; only after
+    // the client follows the PA migration does the alt-listener
+    // dispatch flip the field.
+    try std.testing.expectEqual(@as(u8, 0), slot.last_recv_socket_idx);
+}
+
+test "Server.Config.preferred_address: client sees the parameter on a completed handshake" {
+    // A full Server↔Client handshake with `preferred_address` set
+    // must surface the parameter on the client side — the client
+    // decodes the EE's transport_params blob and `peerTransportParams`
+    // returns a `preferred_address` that round-trips the configured
+    // address pair.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .stateless_reset_key = @splat(0x42),
+        .preferred_address = .{
+            .ipv4 = .{ .bytes = .{ 10, 1, 2, 3 }, .port = 4444 },
+        },
+    });
+    defer srv.deinit();
+
+    var cli = try quic_zig.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer cli.deinit();
+
+    var rx: [4096]u8 = undefined;
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xcd) };
+    try cli.conn.advance();
+
+    // Run the handshake to completion. Same shape as the
+    // server_client_handshake suite; we only care that the
+    // EE→client transport_params blob ends up parsed.
+    var step: u32 = 0;
+    const max_steps: u32 = 32;
+    while (step < max_steps) : (step += 1) {
+        const now_us: u64 = @as(u64, step) * 1_000;
+        while (try cli.conn.poll(&rx, now_us)) |len| {
+            _ = try srv.feed(rx[0..len], peer_addr, now_us);
+        }
+        while (srv.drainStatelessResponse()) |_| {}
+        for (srv.iterator()) |slot| {
+            while (try slot.conn.poll(&rx, now_us)) |len| {
+                try cli.conn.handle(rx[0..len], null, now_us);
+            }
+        }
+        try srv.tick(now_us);
+        try cli.conn.tick(now_us);
+        if (cli.conn.handshakeDone() and srv.iterator().len > 0 and
+            srv.iterator()[0].conn.handshakeDone()) break;
+    }
+    try std.testing.expect(cli.conn.handshakeDone());
+
+    // The client's `peerTransportParams` reflects the EE's blob —
+    // including the `preferred_address` value the server auto-built.
+    const peer_tp = (try cli.conn.peerTransportParams()) orelse return error.NoPeerTransportParams;
+    const pa = peer_tp.preferred_address orelse return error.MissingPreferredAddress;
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 1, 2, 3 }, &pa.ipv4_address);
+    try std.testing.expectEqual(@as(u16, 4444), pa.ipv4_port);
+    // v6 family null in config -> all-zero sentinel on the wire.
+    const zero_v6: [16]u8 = @splat(0);
+    try std.testing.expectEqualSlices(u8, &zero_v6, &pa.ipv6_address);
+    try std.testing.expectEqual(@as(u16, 0), pa.ipv6_port);
+    // CID + token are mint-derived per-connection. The CID length
+    // matches `local_cid_len` and the token must match
+    // `conn.stateless_reset.derive(key, cid)`.
+    try std.testing.expectEqual(@as(u8, 8), pa.connection_id.len);
+    const expected_token = try quic_zig.conn.stateless_reset.derive(
+        &@as(quic_zig.conn.stateless_reset.Key, @splat(0x42)),
+        pa.connection_id.slice(),
+    );
+    try std.testing.expectEqualSlices(u8, &expected_token, &pa.stateless_reset_token);
+}
