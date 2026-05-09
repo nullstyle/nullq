@@ -9,6 +9,46 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Added
+
+- **RFC 8899 DPLPMTUD (Datagram Packetization Layer Path MTU
+  Discovery), QUIC profile.** Per-`PathState` probe state machine
+  (`PmtudState`: disabled / search / search_complete / error_state),
+  plus an embedder configuration knob exposed through
+  `Server.Config.pmtud` / `Client.Config.pmtud` (re-exported as
+  `quic_zig.conn.PmtudConfig`). The probe scheduler runs in
+  `Connection.pollLevelOnPath` (`.application` only): when the active
+  path is in `search` and no probe is in flight it builds a
+  PADDING+PING packet sized to `pmtu + probe_step`, capped at the
+  upper bound or `pmtud_config.max_mtu` (RFC 9000 §14.4 names the
+  PADDING+PING shape; RFC 8899 §6 names the QUIC profile). Probe
+  outcomes are routed independently of regular ack/loss bookkeeping:
+  probe ack lifts `path.pmtu` and either schedules the next step or
+  transitions to `search_complete`; probe loss bumps a fail counter
+  and — once `probe_threshold` consecutive losses land — records the
+  probed size as the upper bound (RFC 8899 §5.1.4). Probe loss MUST
+  NOT trigger congestion-control reactions (RFC 8899 §4.4 / §5.1.5);
+  the loss-detection paths skip the `LossStats` add for probes while
+  still routing any coalesced STREAM / control frames through the
+  normal requeue path. `pmtudOnRegularLost` drives §4.4 black-hole
+  detection: `probe_threshold` consecutive REGULAR-packet losses at
+  the current pmtu halve `path.pmtu` (down to `initial_mtu`) and
+  re-enter `search`. New `Connection.pmtu()` getter returns the
+  active path's PMTU floor; new `PathStats` fields surface
+  `pmtu` / `pmtu_state` / `pmtu_probes_in_flight` / `pmtu_fail_count`
+  / `pmtu_upper_bound` for embedder telemetry. `seal1Rtt` gains a
+  `pad_to: usize = 0` option mirroring `sealInitial`. The 1-RTT
+  plaintext staging buffer grew from 1200 to 4096 bytes
+  (`max_recv_plaintext`) to accommodate probes up to 1452+ bytes.
+  Defaults: `initial_mtu = 1200`, `max_mtu = 1452`,
+  `probe_step = 64`, `probe_threshold = 3`, `enable = true` on the
+  embedder-facing `PmtudConfig{}` and on `Server`/`Client` configs;
+  `Connection.pmtud_config` defaults to `enable = false` so direct
+  `Connection.initClient/initServer` callers (test fixtures) keep
+  the historical static-MTU behaviour. Covered by 12 RFC-traceable
+  conformance tests in `tests/conformance/rfc8899_dplpmtud.zig` and
+  10 inline state-machine tests in `src/conn/path.zig`.
+
 ### Hardening (security-relevant)
 
 - **§17.2.1 / §17.3 — Reserved Bits enforced on receive.**
