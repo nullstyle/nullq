@@ -1177,6 +1177,21 @@ pub const Connection = struct {
     /// `setPendingVersionUpgrade` / `applyPendingVersionUpgrade`.
     pending_version_upgrade: ?u32 = null,
 
+    /// RFC 9368 §6 ¶6/¶7 downgrade-attack guard: wire version on the
+    /// FIRST Initial we observed. Captured BEFORE any compatible-
+    /// version-negotiation upgrade flips `self.version`, so the
+    /// server-side check in `validatePeerTransportRole` can compare
+    /// the client's advertised `version_information.chosen_version`
+    /// against the actual on-wire version of the client's Initial,
+    /// even after `applyPendingVersionUpgrade` has retargeted
+    /// `self.version` to the upgrade target. Set by `acceptInitial`
+    /// on the server side; left `null` on the client side (the client
+    /// only ever sends a single wire version on its first Initial,
+    /// which equals `self.version` at the time the params are
+    /// validated, so the simpler `advertised_versions[0] !=
+    /// self.version` check in the client branch is sufficient).
+    initial_wire_version: ?u32 = null,
+
     /// Client side: the random DCID it sent on the very first Initial.
     /// Server side: same value, recovered from that incoming Initial.
     initial_dcid: ConnectionId = .{},
@@ -2791,6 +2806,17 @@ pub const Connection = struct {
         // / RFC 9368 §3.3 constants. Invalidates any pre-existing
         // Initial keys via `setVersion`.
         if (version != self.version) self.setVersion(version);
+        // RFC 9368 §6 ¶6/¶7 downgrade-attack guard: snapshot the wire
+        // version of the FIRST Initial we accepted, BEFORE any
+        // compatible-version upgrade flips `self.version`. The client's
+        // `version_information.chosen_version` (parsed later from the
+        // ClientHello transport params) MUST equal this — otherwise a
+        // path attacker rewrote the wire version while leaving the
+        // ClientHello intact. Latched once: subsequent `acceptInitial`
+        // calls (e.g. retransmits) leave the snapshot alone.
+        if (self.initial_wire_version == null) {
+            self.initial_wire_version = version;
+        }
 
         const dcid_len = bytes[5];
         if (dcid_len > path_mod.max_cid_len) return Error.DcidTooLong;
@@ -4463,6 +4489,38 @@ pub const Connection = struct {
                 if (params.retry_source_connection_id != null) {
                     self.close(true, transport_error_transport_parameter, "client sent retry source cid");
                     return;
+                }
+                // RFC 9368 §6 ¶6/¶7 downgrade-attack guard (symmetric
+                // server-side counterpart to the client-side check
+                // below): the client's `version_information.chosen_version`
+                // MUST equal the wire version of the FIRST Initial we
+                // observed. We can't compare against `self.version`
+                // directly because, when an RFC 9368 §6 compatible-
+                // version upgrade has been applied, `self.version` has
+                // already been flipped to the upgrade target by
+                // `applyPendingVersionUpgrade` — the original wire
+                // version was snapshotted into `initial_wire_version`
+                // by `acceptInitial` before that flip. A mismatch
+                // means a path attacker rewrote the wire version on
+                // the client's Initial while leaving the encrypted
+                // ClientHello intact (which would otherwise steer the
+                // server onto a weaker version). Graceful fallback:
+                // when `advertised_versions` is empty (a peer that
+                // never sent `version_information`) or
+                // `initial_wire_version` is null (handshake started
+                // before this code was active), we ignore the check.
+                const advertised_versions = params.compatibleVersions();
+                if (advertised_versions.len > 0) {
+                    if (self.initial_wire_version) |wire_version| {
+                        if (advertised_versions[0] != wire_version) {
+                            self.close(
+                                true,
+                                transport_error_transport_parameter,
+                                "client chosen_version mismatches wire version",
+                            );
+                            return;
+                        }
+                    }
                 }
             },
             .client => {

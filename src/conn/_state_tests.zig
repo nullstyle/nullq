@@ -6962,3 +6962,111 @@ test "validatePeerTransportRole accepts absent version_information [RFC9368 §6]
 
     try std.testing.expect(conn.lifecycle.pending_close == null);
 }
+
+// -- RFC 9368 §6 server-side downgrade-attack guard --
+
+test "server validatePeerTransportRole accepts matching client chosen_version [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Server `versions = [v1]`, client sent its first Initial under
+    // v1 with `chosen_version = v1`. `initial_wire_version` matches
+    // the advertised chosen_version → §6 downgrade guard stays silent.
+    conn.initial_wire_version = quic_version_1;
+    conn.version = quic_version_1;
+
+    var peer_params: TransportParams = .{};
+    try peer_params.setCompatibleVersions(&.{quic_version_1});
+    peer_params.initial_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+    conn.cached_peer_transport_params = peer_params;
+
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.lifecycle.pending_close == null);
+}
+
+test "server validatePeerTransportRole accepts wire-version chosen after compatible upgrade [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Server `versions = [v2, v1]`. Client sent its first Initial
+    // under v1 with `chosen_version = v1, available_versions =
+    // [v1, v2]`. Server picked the upgrade target v2 and flipped
+    // `self.version` (via `applyPendingVersionUpgrade`), but
+    // `initial_wire_version` still records the original v1 wire
+    // version. The client's `chosen_version = v1` matches the
+    // wire version, so the §6 guard MUST stay silent — even though
+    // `self.version` is now v2.
+    conn.initial_wire_version = quic_version_1;
+    conn.version = quic_version_2;
+
+    var peer_params: TransportParams = .{};
+    try peer_params.setCompatibleVersions(&.{ quic_version_1, quic_version_2 });
+    peer_params.initial_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+    conn.cached_peer_transport_params = peer_params;
+
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.lifecycle.pending_close == null);
+}
+
+test "server validatePeerTransportRole closes when client chosen_version mismatches wire [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Server `versions = [v1]`, client's first Initial arrived on
+    // the wire under v1 (`initial_wire_version = v1`), but a
+    // (forged) ClientHello advertises `chosen_version = v2`. Per
+    // RFC 9368 §6 ¶6/¶7 this is a downgrade attack and the server
+    // MUST close with TRANSPORT_PARAMETER_ERROR (0x08).
+    conn.initial_wire_version = quic_version_1;
+    conn.version = quic_version_1;
+
+    var peer_params: TransportParams = .{};
+    try peer_params.setCompatibleVersions(&.{ quic_version_2, quic_version_1 });
+    peer_params.initial_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+    conn.cached_peer_transport_params = peer_params;
+
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.lifecycle.pending_close != null);
+    const pending = conn.lifecycle.pending_close.?;
+    try std.testing.expect(pending.is_transport);
+    try std.testing.expectEqual(transport_error_transport_parameter, pending.error_code);
+    try std.testing.expectEqualStrings(
+        "client chosen_version mismatches wire version",
+        pending.reason,
+    );
+}
+
+test "server validatePeerTransportRole accepts when initial_wire_version is unset [RFC9368 §6]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Graceful fallback: when the snapshot wasn't captured (e.g.
+    // a handshake started before this code was active, or a test
+    // path that bypasses `acceptInitial`), the §6 server-side guard
+    // ignores the check rather than rejecting the connection.
+    try std.testing.expect(conn.initial_wire_version == null);
+
+    var peer_params: TransportParams = .{};
+    try peer_params.setCompatibleVersions(&.{ quic_version_2, quic_version_1 });
+    peer_params.initial_source_connection_id = ConnectionId.fromSlice(&.{ 0xaa, 0xbb, 0xcc, 0xdd });
+    conn.cached_peer_transport_params = peer_params;
+
+    conn.validatePeerTransportRole();
+
+    try std.testing.expect(conn.lifecycle.pending_close == null);
+}
