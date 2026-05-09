@@ -105,6 +105,24 @@ const interop_runner_server_ipv6: [16]u8 = .{
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
 };
 
+// 32-byte HMAC key used to derive stateless-reset tokens for the qns
+// server (RFC 9000 §10.3). Mirrors `retry_token_key` and `new_token_key`
+// in posture: a deterministic constant chosen so that the interop
+// runner — which spawns a fresh server process per scenario — keeps
+// reset tokens stable across the run, including for the seq-1 alt-CID
+// the `preferred_address` transport parameter advertises (RFC 9000
+// §18.2 / §5.1.1). Operators deploying quic_zig outside the interop
+// runner should generate a key with `quic_zig.conn.stateless_reset.generateKey`
+// and persist it across restarts so a cold-start doesn't invalidate
+// every previously-issued reset token. The qns is interop-test
+// territory; reproducibility wins over per-process randomness.
+const stateless_reset_key: quic_zig.conn.stateless_reset.Key = .{
+    0x4e, 0x55, 0x4c, 0x4c, 0x51, 0x2d, 0x51, 0x4e,
+    0x53, 0x2d, 0x53, 0x52, 0x2d, 0x4b, 0x45, 0x59,
+    0xa0, 0x18, 0x6b, 0x52, 0xc4, 0xd1, 0x33, 0x7e,
+    0x29, 0x4f, 0xb6, 0x71, 0xe2, 0x88, 0x95, 0x6a,
+};
+
 const ServerOptions = struct {
     // Dual-stack: an IPv6 wildcard socket on Linux (the deployment OS for
     // the official quic-interop-runner) also accepts IPv4 traffic via
@@ -118,16 +136,24 @@ const ServerOptions = struct {
     keylog_file: ?[]const u8 = null,
     qlog_dir: ?[]const u8 = null,
     retry: bool = false,
-    /// Optional alt-port literal (e.g. `"[::]:444"`) the server binds
-    /// in addition to `listen`. When set, the server advertises a
-    /// `preferred_address` transport parameter (RFC 9000 §18.2)
-    /// pointing at the runner's known server IPs (v4 + v6) on the
-    /// alt-port, and the recv loop polls both sockets. The runner's
-    /// `connectionmigration` testcase relies on this server-initiated
-    /// migration: the client receives the parameter, registers the
-    /// alt-CID at sequence 1, and migrates to the alt-address mid-
-    /// transfer. Wired in via `-pref-addr [::]:444` from
-    /// `interop/qns/run_endpoint.sh` only when
+    /// Optional alt-port literal (e.g. `"[::]:444"`) — only the
+    /// PORT is consumed. When set, the server builds a
+    /// `quic_zig.PreferredAddressConfig` whose v4/v6 addresses come
+    /// from the runner-bridge `interop_runner_server_ipv4` /
+    /// `_ipv6` constants and whose port comes from this literal.
+    /// Mirroring the public-API `runUdpServer`'s pattern, the loop
+    /// then binds one alt-listener per configured family (v4 first,
+    /// then v6) and polls every bound socket per iteration. The
+    /// `preferred_address` transport parameter (RFC 9000 §18.2) the
+    /// server advertises points at the same address pair, with the
+    /// seq-1 alt-CID + matching stateless-reset token minted per-
+    /// connection through the public
+    /// `quic_zig.conn.stateless_reset.derive` helper. The runner's
+    /// `connectionmigration` testcase relies on this server-
+    /// initiated migration: the client receives the parameter,
+    /// registers the alt-CID at sequence 1, and migrates to the
+    /// alt-address mid-transfer. Wired in via `-pref-addr [::]:444`
+    /// from `interop/qns/run_endpoint.sh` only when
     /// `TESTCASE=connectionmigration`.
     pref_addr: ?[]const u8 = null,
     /// QUIC wire-format versions this server accepts. The first
@@ -518,11 +544,12 @@ const ServerConn = struct {
 
     /// Which of the bound listening sockets received the most recent
     /// authenticated datagram for this connection. 0 = main port,
-    /// 1 = preferred-address alt-port. The qns server uses this to
-    /// pick the outbound socket: once a peer has migrated to the
-    /// preferred address (RFC 9000 §5.1.1, §18.2), all subsequent
-    /// inbound datagrams arrive on the alt-port and outbound replies
-    /// must follow.
+    /// 1+ = preferred-address alt-listener(s) (one per family, in the
+    /// order `runUdpServer`-style alt binds: v4 first if present,
+    /// then v6). The qns server uses this to pick the outbound
+    /// socket: once a peer has migrated to the preferred address
+    /// (RFC 9000 §5.1.1, §18.2), all subsequent inbound datagrams
+    /// arrive on the alt-listener and outbound replies must follow.
     ///
     /// We track this on the embedder (this struct) rather than the
     /// `Connection` because per-path `local_addr` bookkeeping in the
@@ -534,6 +561,36 @@ const ServerConn = struct {
     /// way to surface it to the send side is the latch below.
     last_recv_socket: u8 = 0,
 
+    /// Pre-minted seq-1 server CID for the `preferred_address`
+    /// (RFC 9000 §18.2 / §5.1.1) advertisement, when one is configured
+    /// at runtime. Drawn from the CSPRNG at `ServerConn.init` (mirrors
+    /// what `Server.openSlotFromInitial` does in the public API path)
+    /// so the alt-CID lives in the same routing-encoded space as the
+    /// seq-0 SCID rather than in the older deterministic
+    /// `cid[7] +%= 1` derivation. Both `buildPreferredAddress` (which
+    /// stamps the CID + matching stateless-reset token into the
+    /// transport-parameter blob) and `queueServerConnectionIds` (which
+    /// emits the matching NEW_CONNECTION_ID(seq=1) frame) read from
+    /// this single source of truth so the two on-wire surfaces describe
+    /// the same CID.
+    ///
+    /// Zero-initialized when no `preferred_address` is configured;
+    /// `pa_alt_cid_set` discriminates.
+    pa_alt_cid: [server_cid_len]u8 = @splat(0),
+    /// Matching stateless-reset token for `pa_alt_cid` derived via
+    /// `quic_zig.conn.stateless_reset.derive(stateless_reset_key,
+    /// pa_alt_cid)` at `ServerConn.init`. Cached so the per-Initial
+    /// hot path doesn't re-run the HMAC, and so the seq-1
+    /// NEW_CONNECTION_ID emitted by `queueServerConnectionIds` carries
+    /// the same token bytes the transport-parameter advertise pinned.
+    pa_alt_token: quic_zig.conn.stateless_reset.Token = @splat(0),
+    /// Latches when the preferred-address alt-CID + token have been
+    /// minted on this connection. Stays false when no
+    /// `preferred_address` is configured; `dispatchInbound` and
+    /// `queueServerConnectionIds` consult this to decide whether to
+    /// advertise the parameter and queue the seq-1 frame.
+    pa_alt_cid_set: bool = false,
+
     fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -542,6 +599,13 @@ const ServerConn = struct {
         qlog_sink: ?*QlogSink,
         peer: Net.IpAddress,
         now_us: u64,
+        /// True when the runtime configuration has a `preferred_address`
+        /// to advertise (`runServer` set up at least one alt listener);
+        /// drives the seq-1 alt-CID mint below. When false, the seq-1
+        /// CID is still derived deterministically from the seq-0 SCID
+        /// the way `queueServerConnectionIds` always has — no behavior
+        /// change for the non-PA scenarios that interop runs.
+        pa_advertise: bool,
     ) !*ServerConn {
         const self = try allocator.create(ServerConn);
         errdefer allocator.destroy(self);
@@ -564,11 +628,46 @@ const ServerConn = struct {
         self.last_activity_us = now_us;
         self.new_token_emitted = false;
         self.last_recv_socket = 0;
+        self.pa_alt_cid = @splat(0);
+        self.pa_alt_token = @splat(0);
+        self.pa_alt_cid_set = false;
+
+        // Mint the seq-1 preferred-address alt-CID via the CSPRNG and
+        // derive its matching stateless-reset token via the public
+        // `quic_zig.conn.stateless_reset.derive` helper. Mirrors what
+        // `Server.openSlotFromInitial` does for `Config.preferred_address`
+        // so the qns becomes a clean reference embedder of the public
+        // API rather than a parallel deterministic implementation.
+        // Failure to mint the token is non-fatal for the rest of the
+        // connection: we leave `pa_alt_cid_set = false` and the
+        // dispatch path simply does not advertise the parameter for
+        // this connection — the rest of the handshake proceeds as if
+        // no preferred-address were configured. The HMAC failure mode
+        // is not peer-reachable (BoringSSL HMAC over fixed-size inputs)
+        // but the silent-degrade matches the qns's existing posture
+        // for `maybeIssueNewToken` and similar best-effort hardening.
+        if (pa_advertise) {
+            const cid_slice = self.pa_alt_cid[0..];
+            io.random(cid_slice);
+            // Steer clear of accidentally aliasing the seq-0 SCID — a
+            // 64-bit collision is astronomically unlikely but the
+            // `cid_table` upstream rejects duplicate registrations and
+            // we don't want a single coincidence to take out a
+            // connection. Cheap to re-roll one byte in the rare case.
+            if (std.mem.eql(u8, cid_slice, &self.initial_server_cid)) {
+                cid_slice[0] +%= 1;
+            }
+            const token = quic_zig.conn.stateless_reset.derive(&stateless_reset_key, cid_slice) catch null;
+            if (token) |t| {
+                self.pa_alt_token = t;
+                self.pa_alt_cid_set = true;
+            }
+        }
 
         if (qlog_sink) |sink| self.conn.setQlogCallback(QlogSink.callback, sink);
         try self.conn.bind();
         try self.conn.setLocalScid(&self.initial_server_cid);
-        try queueServerConnectionIds(&self.conn, &self.next_cid_seq, endpoint_server_cid_desired_last_seq, &self.initial_server_cid);
+        try queueServerConnectionIds(&self.conn, &self.next_cid_seq, endpoint_server_cid_desired_last_seq, self);
         return self;
     }
 
@@ -590,8 +689,31 @@ const ServerConn = struct {
         // handshake on top of the first.
         if (self.client_initial_dcid.len > 0 and std.mem.eql(u8, cid, self.client_initial_dcid.slice())) return true;
 
+        // Match the seq-1 preferred-address alt-CID when one was minted.
+        // The alt-CID is no longer derivable from `initial_server_cid +
+        // seq`, so the routing table looks it up via the stored bytes.
+        // Without this branch, a post-migration packet addressed to the
+        // alt-CID would fall through to `findServerConn`'s peer-addr
+        // fallback and only match because the source 4-tuple still
+        // points at the same peer — but the runner's connectionmigration
+        // testcase sends from the same client address through the
+        // simulator, so the fallback would normally kick in. We still
+        // want CID-keyed matching to be the primary path because (a)
+        // `findServerConn`'s peer-addr branch refuses Initials for
+        // already-handshaken connections (so a stray Initial bearing
+        // the alt-CID would be dropped silently) and (b) an upcoming
+        // multi-server-per-process embedder would not have the 4-tuple
+        // disambiguator we currently lean on.
+        if (self.pa_alt_cid_set and std.mem.eql(u8, cid, &self.pa_alt_cid)) return true;
+
+        // Match the deterministic seq-1..N CIDs the non-PA path emits
+        // (`cid[7] +%= seq`). The PA-path seq-1 alt-CID is matched
+        // above and skipped here so we don't double-reject an
+        // accidental collision that lands in the deterministic
+        // walk-window.
         var seq: u8 = 1;
         while (seq < self.next_cid_seq) : (seq += 1) {
+            if (seq == 1 and self.pa_alt_cid_set) continue;
             var issued = self.initial_server_cid;
             issued[7] +%= seq;
             if (std.mem.eql(u8, cid, &issued)) return true;
@@ -776,21 +898,36 @@ fn runServer(
     if (opts.qlog_dir) |dir| qlog_sink = try QlogSink.init(io, dir, "server");
     defer if (qlog_sink) |*sink| sink.deinit();
 
-    // Bind the main listening socket, plus an optional alt-port socket
-    // for `preferred_address` advertise. The `preferred_address`
-    // (RFC 9000 §18.2) transport parameter advertises a different
-    // local port the client SHOULD migrate to once the handshake
-    // completes — the runner's `connectionmigration` testcase
-    // exercises exactly this server-initiated migration. Both
-    // sockets are tuned and ECN-marked identically; we keep them in
-    // an array so the recv loop and the per-conn outbound dispatch
-    // can iterate without special cases.
+    // Bind the main listening socket, plus optional alt-listener
+    // socket(s) for `preferred_address` advertise. The
+    // `preferred_address` (RFC 9000 §18.2) transport parameter
+    // advertises a different local address pair the client SHOULD
+    // migrate to once the handshake completes — the runner's
+    // `connectionmigration` testcase exercises exactly this server-
+    // initiated migration. We mirror the public-API
+    // `quic_zig.transport.runUdpServer` shape: when `preferred_address`
+    // is configured, bind one alt-listener per configured family (v4
+    // first if present, then v6). The qns advertises both families on
+    // the same port for the runner; the dispatch loop polls every
+    // bound socket per iteration and routes outbound replies through
+    // the listener the slot most recently received on.
+    //
+    // The CLI flag `-pref-addr LITERAL` keeps its historical shape:
+    // the LITERAL's port is consumed as the qns alt-port; the v4/v6
+    // address bytes come from the runner-bridge constants because the
+    // runner is the only environment that exercises this binary, and
+    // its bridge IPs are stable. Embedders bringing their own runner
+    // would patch those constants.
     const main_addr = try Net.IpAddress.parseLiteral(opts.listen);
     const main_handle = try Net.IpAddress.bind(&main_addr, io, .{
         .mode = .dgram,
         .protocol = .udp,
     });
-    var sockets_storage: [2]ServerSocket = undefined;
+    // sockets[0] = primary; sockets[1..] = alt-listeners (v4, v6) in
+    // the same order the on-wire transport-parameter blob lists them.
+    // Three slots covers main + v4 + v6 simultaneously; bumping the
+    // capacity is a one-line change if a future scenario needs more.
+    var sockets_storage: [3]ServerSocket = undefined;
     sockets_storage[0] = .{
         .handle = main_handle,
         .bind_addr = main_addr,
@@ -798,28 +935,60 @@ fn runServer(
     };
     var sockets_len: usize = 1;
 
-    // Optional alt-port socket. We bind it eagerly (before the recv
-    // loop) so a parsing or bind failure surfaces immediately; the
-    // runner's `connectionmigration` testcase would otherwise time
-    // out without an actionable error.
-    var alt_addr_storage: ?Net.IpAddress = null;
+    // Build the runtime `quic_zig.PreferredAddressConfig` once, so the
+    // bind logic and the per-Initial transport-parameter advertise
+    // both read from a single source of truth. `null` when the CLI
+    // flag wasn't supplied (every testcase except `connectionmigration`).
+    var pa_config: ?quic_zig.PreferredAddressConfig = null;
     if (opts.pref_addr) |pref_addr_str| {
-        alt_addr_storage = try Net.IpAddress.parseLiteral(pref_addr_str);
-        const alt_handle = try Net.IpAddress.bind(&alt_addr_storage.?, io, .{
-            .mode = .dgram,
-            .protocol = .udp,
-        });
-        sockets_storage[1] = .{
-            .handle = alt_handle,
-            .bind_addr = alt_addr_storage.?,
-            .ecn_active = false,
+        const alt_literal = try Net.IpAddress.parseLiteral(pref_addr_str);
+        const alt_port: u16 = switch (alt_literal) {
+            .ip4 => |ip4| ip4.port,
+            .ip6 => |ip6| ip6.port,
         };
-        sockets_len = 2;
+        pa_config = .{
+            .ipv4 = .{ .bytes = interop_runner_server_ipv4, .port = alt_port },
+            .ipv6 = .{ .bytes = interop_runner_server_ipv6, .port = alt_port, .flow = 0 },
+        };
     }
+
+    // Bind alt-listeners eagerly (before the recv loop) so a bind
+    // failure surfaces immediately; the runner's `connectionmigration`
+    // testcase would otherwise time out without an actionable error.
+    // Mirrors what `runUdpServer` does in `src/transport/udp_server.zig`.
+    if (pa_config) |pa| {
+        if (pa.ipv4) |v4| {
+            var bind_v4: Net.IpAddress = .{ .ip4 = v4 };
+            const sock = try Net.IpAddress.bind(&bind_v4, io, .{
+                .mode = .dgram,
+                .protocol = .udp,
+            });
+            sockets_storage[sockets_len] = .{
+                .handle = sock,
+                .bind_addr = bind_v4,
+                .ecn_active = false,
+            };
+            sockets_len += 1;
+        }
+        if (pa.ipv6) |v6| {
+            var bind_v6: Net.IpAddress = .{ .ip6 = v6 };
+            const sock = try Net.IpAddress.bind(&bind_v6, io, .{
+                .mode = .dgram,
+                .protocol = .udp,
+            });
+            sockets_storage[sockets_len] = .{
+                .handle = sock,
+                .bind_addr = bind_v6,
+                .ecn_active = false,
+            };
+            sockets_len += 1;
+        }
+    }
+
     const sockets = sockets_storage[0..sockets_len];
     defer for (sockets) |s| s.handle.close(io);
 
-    // Tune both sockets identically. We grow the kernel UDP buffers
+    // Tune all sockets identically. We grow the kernel UDP buffers
     // so a single connection can absorb a burst of ~3000 1350-byte
     // datagrams (a multiplexing stream open or a flight of stream
     // data) without dropping packets at the OS layer.
@@ -828,26 +997,11 @@ fn runServer(
         s.ecn_active = enableServerEcn(s.handle.handle);
     }
 
-    // Build the `preferred_address` value once if the alt socket
-    // is bound. The alt-port we advertise comes from the alt socket's
-    // bind literal — so the value reaches the wire even when the
-    // embedder picked an unusual port. (The runner uses 444 by
-    // convention but the binary doesn't insist on it.) The CID +
-    // token must match the seq-1 SCID the server registers via
-    // `queueServerConnectionIds`, so the post-migration packets
-    // bearing that DCID authenticate correctly.
-    const alt_port: u16 = blk: {
-        const alt = alt_addr_storage orelse break :blk 0;
-        break :blk switch (alt) {
-            .ip4 => |ip4| ip4.port,
-            .ip6 => |ip6| ip6.port,
-        };
-    };
-
-    if (sockets_len > 1) {
+    if (pa_config) |pa| {
+        const alt_port: u16 = if (pa.ipv4) |v4| v4.port else if (pa.ipv6) |v6| v6.port else 0;
         std.debug.print(
-            "quic_zig qns endpoint listening on {f} (main) + alt-port {d} for preferred_address; www={s} retry={}\n",
-            .{ sockets[0].bind_addr, alt_port, opts.www, opts.retry },
+            "quic_zig qns endpoint listening on {f} (main) + {d} alt-listener(s) on port {d} for preferred_address; www={s} retry={}\n",
+            .{ sockets[0].bind_addr, sockets.len - 1, alt_port, opts.www, opts.retry },
         );
     } else {
         std.debug.print(
@@ -869,10 +1023,15 @@ fn runServer(
 
     // When polling multiple sockets we split the per-iteration idle
     // wait across them so the worst-case loop latency stays close to
-    // the original 5ms heartbeat. Two sockets each waiting 5ms would
-    // double the PTO-tick latency at idle; halving keeps QUIC's
-    // recovery timers responsive without requiring a real reactor.
-    const recv_timeout_ms: i64 = if (sockets_len > 1) 2 else 5;
+    // the original 5ms heartbeat. Each socket waiting 5ms would
+    // multiply the PTO-tick latency at idle by `sockets_len`; floor at
+    // 1ms so we never spin. Mirrors the `runUdpServer` per-listener
+    // timeout split.
+    const recv_timeout_ms: i64 = blk: {
+        if (sockets_len <= 1) break :blk 5;
+        const split: i64 = @divFloor(5, @as(i64, @intCast(sockets_len)));
+        break :blk if (split < 1) 1 else split;
+    };
 
     while (true) {
         var now_us = qnsNowUs(io, start);
@@ -937,7 +1096,7 @@ fn runServer(
                 .ecn = ecn,
                 .tx = &tx,
                 .now_us = now_us,
-                .alt_port = alt_port,
+                .pa_config = pa_config,
             });
         }
 
@@ -945,17 +1104,17 @@ fn runServer(
         while (i < conns.items.len) {
             const sc = conns.items[i];
             if (sc.conn.handshakeDone()) {
-                try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, endpoint_server_cid_desired_last_seq, &sc.initial_server_cid);
+                try queueServerConnectionIds(&sc.conn, &sc.next_cid_seq, endpoint_server_cid_desired_last_seq, sc);
                 maybeIssueNewToken(sc, now_us);
             }
             try sc.app.process(&sc.conn);
             // Outbound on the socket the connection most recently
             // received from. Pre-migration that's the main socket
             // (last_recv_socket = 0); once the client follows the
-            // `preferred_address` advertise, it flips to the alt
-            // socket (last_recv_socket = 1). This is the simplest
-            // routing rule that doesn't require multiplexing the
-            // outbound across both sockets per packet.
+            // `preferred_address` advertise, it flips to whichever
+            // alt-listener (v4 or v6) the migrated path arrives on.
+            // This is the simplest routing rule that doesn't require
+            // multiplexing the outbound across all sockets per packet.
             const out_sock = sockets[sc.last_recv_socket].handle;
             while (try sc.conn.poll(&tx, now_us)) |n| {
                 try out_sock.send(io, &sc.peer, tx[0..n]);
@@ -987,21 +1146,24 @@ const DispatchInboundCtx = struct {
     ecn: quic_zig.transport.EcnCodepoint,
     tx: *[endpoint_udp_payload_size]u8,
     now_us: u64,
-    /// Alt-port the server is also listening on, captured here so
-    /// the per-connection `acceptInitial` call can build a
-    /// `preferred_address` with the right port. Zero when no alt
-    /// socket is bound (the dispatch helper just does not advertise
-    /// the parameter).
-    alt_port: u16,
+    /// Runtime preferred-address configuration mirrored from
+    /// `runServer`. Non-null when the qns advertises a
+    /// `preferred_address` transport parameter (the runner's
+    /// `connectionmigration` testcase); the per-connection
+    /// `acceptInitial` call reads the v4/v6 address pair off this
+    /// value to build the on-wire `PreferredAddress`. Null disables
+    /// the advertise — the dispatch path just skips the parameter and
+    /// `ServerConn.init` doesn't mint a seq-1 alt-CID.
+    pa_config: ?quic_zig.PreferredAddressConfig,
 };
 
 /// Dispatch one inbound datagram pulled off `ctx.sockets[ctx.sock_idx]`.
-/// Mirrors what the loop body did inline before the alt-port socket
-/// support landed; factored out so both sockets share the same
+/// Mirrors what the loop body did inline before alt-listener support
+/// landed; factored out so every bound socket shares the same
 /// per-datagram lookup / handshake-bootstrap / `handle` path. The
 /// only socket-aware bit is `ServerConn.last_recv_socket`, which the
-/// outbound drain consults to route replies to the alt-port once the
-/// client has migrated.
+/// outbound drain consults to route replies to the alt-listener once
+/// the client has migrated to the preferred-address.
 fn dispatchInbound(ctx: DispatchInboundCtx) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
@@ -1043,6 +1205,7 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
             ctx.qlog_sink,
             msg.from,
             now_us,
+            ctx.pa_config != null,
         );
         try conns.append(allocator, new_conn);
         server_conn = new_conn;
@@ -1106,16 +1269,20 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
             }
         }
 
-        // Advertise `preferred_address` only when an alt socket is
-        // bound — the parameter is server-only (RFC 9000 §18.2 ¶29)
-        // and pointing at an unbound port would teach the client to
-        // migrate into a black hole. The CID + token are derived in
-        // lockstep with `queueServerConnectionIds`'s seq-1 issue
-        // logic so both code paths describe the same CID.
-        const preferred_address: ?quic_zig.tls.transport_params.PreferredAddress = if (sockets.len > 1)
-            buildPreferredAddress(&sc.initial_server_cid, ctx.alt_port)
-        else
-            null;
+        // Advertise `preferred_address` only when (a) the runtime
+        // config supplied one (`ctx.pa_config`), AND (b) the
+        // per-connection alt-CID + token mint succeeded in
+        // `ServerConn.init` (`sc.pa_alt_cid_set`). The parameter is
+        // server-only (RFC 9000 §18.2 ¶29); pointing at an unbound
+        // port would teach the client to migrate into a black hole.
+        // The CID + token are pre-minted on `sc` so this code path
+        // and `queueServerConnectionIds`'s seq-1 frame describe the
+        // same on-wire bytes.
+        const preferred_address: ?quic_zig.tls.transport_params.PreferredAddress = blk: {
+            const pa = ctx.pa_config orelse break :blk null;
+            if (!sc.pa_alt_cid_set) break :blk null;
+            break :blk buildPreferredAddress(pa, sc);
+        };
 
         var params: quic_zig.tls.TransportParams = .{
             .original_destination_connection_id = original_dcid,
@@ -2213,7 +2380,7 @@ fn queueServerConnectionIds(
     conn: *quic_zig.Connection,
     next_seq: *u8,
     desired_last_seq: u8,
-    base_cid: *const [server_cid_len]u8,
+    sc: *ServerConn,
 ) !void {
     const budget = conn.localConnectionIdIssueBudget(0);
     if (budget == 0 or next_seq.* > desired_last_seq) return;
@@ -2223,12 +2390,49 @@ fn queueServerConnectionIds(
     var count: usize = 0;
     var seq = next_seq.*;
     while (seq <= desired_last_seq and count < provisions.len and count < budget) {
-        cid_storage[count] = base_cid.*;
-        cid_storage[count][7] +%= seq;
-        provisions[count] = .{
-            .connection_id = cid_storage[count][0..],
-            .stateless_reset_token = statelessResetToken(&cid_storage[count], seq),
-        };
+        // Two seq-1 CID-mint paths share this loop. Both produce a
+        // CID + matching stateless-reset token, but they describe the
+        // same on-wire bytes through different routes:
+        //
+        //   * `pa_alt_cid_set`: the connection has a preferred-address
+        //     advertise pinned, so seq-1 MUST reuse `sc.pa_alt_cid` /
+        //     `sc.pa_alt_token`. Anything else and the post-migration
+        //     packets the client addresses to the PA's CID would not
+        //     authenticate (the local CID table doesn't recognize the
+        //     PA's bytes). RFC 9000 §5.1.1 ¶6 says the client treats
+        //     the PA's `connection_id` as if it had arrived in
+        //     NEW_CONNECTION_ID(seq=1); we still emit the matching
+        //     frame on the wire and the client's `registerPeerCid`
+        //     idempotently absorbs the duplicate.
+        //
+        //   * Otherwise (no PA configured, or PA mint failed at
+        //     `ServerConn.init`): the historical deterministic
+        //     `cid[7] +%= seq` derivation, paired with a token
+        //     derived via `quic_zig.conn.stateless_reset.derive` from
+        //     the qns-wide `stateless_reset_key`. The wider refactor
+        //     replaced an XOR-shaped stand-in token with the public-
+        //     API HMAC; the seq-1..N CID derivation stays
+        //     deterministic so the rest of the runner's (non-PA)
+        //     testcase matrix sees no on-wire bookkeeping change.
+        //     `connectionmigration` is the only testcase that
+        //     exercises the seq-1 CID, and it always configures a PA
+        //     so it goes through the branch above.
+        if (seq == 1 and sc.pa_alt_cid_set) {
+            cid_storage[count] = sc.pa_alt_cid;
+            provisions[count] = .{
+                .connection_id = cid_storage[count][0..],
+                .stateless_reset_token = sc.pa_alt_token,
+            };
+        } else {
+            cid_storage[count] = sc.initial_server_cid;
+            cid_storage[count][7] +%= seq;
+            const tok = quic_zig.conn.stateless_reset.derive(&stateless_reset_key, &cid_storage[count]) catch
+                return error.RandFailure;
+            provisions[count] = .{
+                .connection_id = cid_storage[count][0..],
+                .stateless_reset_token = tok,
+            };
+        }
         count += 1;
         seq += 1;
     }
@@ -2238,45 +2442,41 @@ fn queueServerConnectionIds(
     next_seq.* += @as(u8, @intCast(queued));
 }
 
-fn statelessResetToken(cid: []const u8, seq: u8) [16]u8 {
-    var token: [16]u8 = undefined;
-    for (&token, 0..) |*b, i| b.* = seq ^ @as(u8, @truncate(i * 17)) ^ cid[i % cid.len];
-    return token;
-}
-
 /// Build the `preferred_address` transport-parameter value the server
-/// advertises for the runner's `connectionmigration` testcase. The
-/// embedded CID + stateless-reset token MUST match the server CID
-/// the server is willing to honour at sequence 1 — RFC 9000 §5.1.1
-/// says the client treats it as if it had arrived in a
-/// `NEW_CONNECTION_ID(seq=1)` frame, so any mismatch with the
-/// real seq-1 CID minted by `queueServerConnectionIds` would leave
-/// the server unable to authenticate the post-migration packets.
+/// advertises for the runner's `connectionmigration` testcase. Reads
+/// the alt-address pair from `pa_cfg` (the runtime
+/// `quic_zig.PreferredAddressConfig` the qns endpoint constructed at
+/// `runServer`) and pulls the per-connection seq-1 CID + stateless-
+/// reset token off `sc` — both pre-minted in `ServerConn.init` so the
+/// seq-1 NEW_CONNECTION_ID emitted by `queueServerConnectionIds`
+/// describes the same on-wire CID this transport-parameter
+/// advertises. RFC 9000 §5.1.1 ¶6 says the client treats the PA's
+/// `connection_id` as if it had arrived in NEW_CONNECTION_ID(seq=1);
+/// the matching frame the server still emits is then idempotently
+/// absorbed by the client's peer-CID table.
 ///
-/// `initial_server_cid` is the seq-0 SCID from `ServerConn.init`;
-/// the seq-1 CID is constructed using the same `cid[7] +%= 1` rule
-/// used by `queueServerConnectionIds`, and the token via
-/// `statelessResetToken(seq=1)` — keeping the helpers in lockstep so
-/// the seq-1 NEW_CONNECTION_ID frame and the `preferred_address`
-/// blob describe the same CID. The runner gives the server fixed
-/// IPv4 + IPv6 addresses on the `rightnet` bridge; both families
-/// are advertised on `alt_port` (RFC 9000 §18.2 lets either be the
-/// all-zero sentinel, but advertising both lets the runner exercise
-/// either v4 or v6 resolution of `server46`).
+/// Mirrors what the public-API `Server` does internally
+/// (`src/server.zig`'s `buildPreferredAddressParam`): the qns just
+/// runs the same projection from `PreferredAddressConfig` shape into
+/// the on-wire `tls.transport_params.PreferredAddress` shape, with
+/// the missing-family fields zeroed per the §18.2 sentinel.
 fn buildPreferredAddress(
-    initial_server_cid: *const [server_cid_len]u8,
-    alt_port: u16,
+    pa_cfg: quic_zig.PreferredAddressConfig,
+    sc: *const ServerConn,
 ) quic_zig.tls.transport_params.PreferredAddress {
-    var alt_cid: [server_cid_len]u8 = initial_server_cid.*;
-    alt_cid[7] +%= 1;
-    return .{
-        .ipv4_address = interop_runner_server_ipv4,
-        .ipv4_port = alt_port,
-        .ipv6_address = interop_runner_server_ipv6,
-        .ipv6_port = alt_port,
-        .connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&alt_cid),
-        .stateless_reset_token = statelessResetToken(&alt_cid, 1),
+    var out: quic_zig.tls.transport_params.PreferredAddress = .{
+        .connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&sc.pa_alt_cid),
+        .stateless_reset_token = sc.pa_alt_token,
     };
+    if (pa_cfg.ipv4) |v4| {
+        out.ipv4_address = v4.bytes;
+        out.ipv4_port = v4.port;
+    }
+    if (pa_cfg.ipv6) |v6| {
+        out.ipv6_address = v6.bytes;
+        out.ipv6_port = v6.port;
+    }
+    return out;
 }
 
 /// Client-side mirror of `queueServerConnectionIds`. Once the
@@ -2298,9 +2498,11 @@ fn buildPreferredAddress(
 ///
 /// The client's initial SCID is at sequence 0 (`setLocalScid` registers
 /// it implicitly). We start issuing at `next_seq.*` and stop at
-/// `desired_last_seq` inclusive. Stateless reset tokens are derived
-/// deterministically from the CID and sequence — same pattern as the
-/// server side.
+/// `desired_last_seq` inclusive. CIDs are derived deterministically
+/// from the seq-0 base; stateless reset tokens go through
+/// `quic_zig.conn.stateless_reset.derive` with the qns-wide
+/// `stateless_reset_key`, matching the public-API path the
+/// server side now uses for seq-1 alt-CIDs.
 fn queueClientConnectionIds(
     conn: *quic_zig.Connection,
     next_seq: *u8,
@@ -2317,9 +2519,11 @@ fn queueClientConnectionIds(
     while (seq <= desired_last_seq and count < provisions.len and count < budget) {
         cid_storage[count] = base_cid.*;
         cid_storage[count][7] +%= seq;
+        const tok = quic_zig.conn.stateless_reset.derive(&stateless_reset_key, &cid_storage[count]) catch
+            return error.RandFailure;
         provisions[count] = .{
             .connection_id = cid_storage[count][0..],
-            .stateless_reset_token = statelessResetToken(&cid_storage[count], seq),
+            .stateless_reset_token = tok,
         };
         count += 1;
         seq += 1;
@@ -2805,45 +3009,52 @@ test "queueClientConnectionIds no-ops when peer's CID limit is saturated" {
     try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.new_connection_ids.items.len);
 }
 
-test "buildPreferredAddress aligns with queueServerConnectionIds(seq=1)" {
+test "buildPreferredAddress packs config + identity into transport-param shape" {
     // The preferred_address transport parameter (RFC 9000 §18.2)
     // carries a CID + stateless reset token the client treats as if
     // it had arrived in a NEW_CONNECTION_ID frame at sequence 1
-    // (§5.1.1 ¶3). For the qns server, that sequence-1 CID is also
-    // the one minted by `queueServerConnectionIds` — the two code
-    // paths describe the SAME CID + SAME token so the seq-1
-    // NEW_CONNECTION_ID the server still emits is treated as a
-    // duplicate by the client (registerPeerCid is idempotent for
-    // matching tuples per `src/conn/state.zig`'s peer-CID table).
-    //
-    // This test pins that alignment: a divergence here would
-    // either (a) make the client close with `connection id
-    // sequence reused` because two different seq-1 CIDs were
-    // advertised, or (b) leave the post-migration packets
-    // bearing the PA's CID unauthenticated server-side because
-    // the seq-1 SCID we registered locally is for a different
-    // CID.
-    const initial: [server_cid_len]u8 = .{
-        'Q', 'N', 'S', '-', 0x11, 0x22, 0x33, 0x44,
+    // (§5.1.1 ¶3). The qns server pre-mints those bytes in
+    // `ServerConn.init` and `buildPreferredAddress` simply projects
+    // them — together with the v4/v6 address pair from
+    // `quic_zig.PreferredAddressConfig` — into the on-wire shape.
+    // This test pins that projection: any divergence between the
+    // pre-minted bytes on `sc` and the encoded transport-parameter
+    // would either (a) leave the post-migration packets that bear
+    // the PA's CID unauthenticated server-side, or (b) make the
+    // client migrate to the wrong family / port and silently
+    // black-hole.
+    var sc: ServerConn = .{
+        .conn = undefined,
+        .app = undefined,
+        .peer = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        .retry_source_cid = @splat(0),
+        .initial_server_cid = .{ 'Q', 'N', 'S', '-', 0x11, 0x22, 0x33, 0x44 },
+        .last_activity_us = 0,
     };
-    const pa = buildPreferredAddress(&initial, 444);
+    sc.pa_alt_cid = .{ 'Q', 'N', 'S', '-', 0xaa, 0xbb, 0xcc, 0xdd };
+    sc.pa_alt_token = .{
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    };
+    sc.pa_alt_cid_set = true;
 
-    // Mirror the seq-1 derivation in `queueServerConnectionIds`
-    // (`cid[7] +%= 1`) and the matching token derivation.
-    var expected_alt = initial;
-    expected_alt[7] +%= 1;
-    const expected_token = statelessResetToken(&expected_alt, 1);
+    const cfg: quic_zig.PreferredAddressConfig = .{
+        .ipv4 = .{ .bytes = interop_runner_server_ipv4, .port = 444 },
+        .ipv6 = .{ .bytes = interop_runner_server_ipv6, .port = 444, .flow = 0 },
+    };
+    const pa = buildPreferredAddress(cfg, &sc);
 
+    // CID + token: must come from `sc.pa_alt_cid` / `sc.pa_alt_token`
+    // verbatim (the same bytes `queueServerConnectionIds` uses for
+    // the matching seq-1 NEW_CONNECTION_ID frame).
     try std.testing.expectEqual(@as(u8, server_cid_len), pa.connection_id.len);
-    try std.testing.expectEqualSlices(u8, &expected_alt, pa.connection_id.slice());
-    try std.testing.expectEqualSlices(u8, &expected_token, &pa.stateless_reset_token);
+    try std.testing.expectEqualSlices(u8, &sc.pa_alt_cid, pa.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &sc.pa_alt_token, &pa.stateless_reset_token);
 
-    // Ports + addresses match the runner's static rightnet
-    // assignment plus the embedder-supplied alt port. A test
-    // failure here would mean the client migrates to either an
-    // unbound IP family or to the wrong port — both produce a
-    // silent black-hole that's hard to diagnose from the
-    // runner's pcap alone.
+    // Ports + addresses come from the runtime config. A test failure
+    // here would mean the client migrates to either an unbound IP
+    // family or to the wrong port — both silent black-holes that are
+    // hard to diagnose from the runner's pcap alone.
     try std.testing.expectEqual(@as(u16, 444), pa.ipv4_port);
     try std.testing.expectEqual(@as(u16, 444), pa.ipv6_port);
     try std.testing.expectEqualSlices(u8, &interop_runner_server_ipv4, &pa.ipv4_address);
@@ -2858,10 +3069,23 @@ test "buildPreferredAddress encodes into the transport-params blob" {
     // `setTransportParams`, which calls `Params.encode`. This test
     // shortcuts to the codec because we don't want to spin up a TLS
     // handshake just to assert the PA fields make it onto the wire.
-    const initial: [server_cid_len]u8 = .{
-        'Q', 'N', 'S', '-', 0xa1, 0xa2, 0xa3, 0xa4,
+    var sc: ServerConn = .{
+        .conn = undefined,
+        .app = undefined,
+        .peer = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        .retry_source_cid = @splat(0),
+        .initial_server_cid = .{ 'Q', 'N', 'S', '-', 0xa1, 0xa2, 0xa3, 0xa4 },
+        .last_activity_us = 0,
     };
-    const pa = buildPreferredAddress(&initial, 444);
+    sc.pa_alt_cid = .{ 'Q', 'N', 'S', '-', 0xb1, 0xb2, 0xb3, 0xb4 };
+    sc.pa_alt_token = try quic_zig.conn.stateless_reset.derive(&stateless_reset_key, &sc.pa_alt_cid);
+    sc.pa_alt_cid_set = true;
+
+    const cfg: quic_zig.PreferredAddressConfig = .{
+        .ipv4 = .{ .bytes = interop_runner_server_ipv4, .port = 444 },
+        .ipv6 = .{ .bytes = interop_runner_server_ipv6, .port = 444, .flow = 0 },
+    };
+    const pa = buildPreferredAddress(cfg, &sc);
 
     const params: quic_zig.tls.TransportParams = .{
         .max_idle_timeout_ms = 30_000,
@@ -2887,6 +3111,46 @@ test "buildPreferredAddress encodes into the transport-params blob" {
     try std.testing.expectEqual(pa.ipv6_port, got.ipv6_port);
     try std.testing.expectEqualSlices(u8, &pa.ipv4_address, &got.ipv4_address);
     try std.testing.expectEqualSlices(u8, &pa.ipv6_address, &got.ipv6_address);
+}
+
+test "buildPreferredAddress projects v4-only / v6-only configs into RFC 9000 §18.2 sentinels" {
+    // RFC 9000 §18.2 lets either family be all-zero as a sentinel for
+    // "no preferred address for this family". When the runtime
+    // `PreferredAddressConfig` only sets one family, the other should
+    // come out zero-valued — no spurious hostname leak across families.
+    var sc: ServerConn = .{
+        .conn = undefined,
+        .app = undefined,
+        .peer = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        .retry_source_cid = @splat(0),
+        .initial_server_cid = .{ 'Q', 'N', 'S', '-', 0xc1, 0xc2, 0xc3, 0xc4 },
+        .last_activity_us = 0,
+    };
+    sc.pa_alt_cid = .{ 'Q', 'N', 'S', '-', 0xd1, 0xd2, 0xd3, 0xd4 };
+    sc.pa_alt_token = @splat(0xab);
+    sc.pa_alt_cid_set = true;
+
+    const v4_only_cfg: quic_zig.PreferredAddressConfig = .{
+        .ipv4 = .{ .bytes = interop_runner_server_ipv4, .port = 444 },
+        .ipv6 = null,
+    };
+    const v4_only = buildPreferredAddress(v4_only_cfg, &sc);
+    try std.testing.expectEqualSlices(u8, &interop_runner_server_ipv4, &v4_only.ipv4_address);
+    try std.testing.expectEqual(@as(u16, 444), v4_only.ipv4_port);
+    const zero16: [16]u8 = @splat(0);
+    try std.testing.expectEqualSlices(u8, &zero16, &v4_only.ipv6_address);
+    try std.testing.expectEqual(@as(u16, 0), v4_only.ipv6_port);
+
+    const v6_only_cfg: quic_zig.PreferredAddressConfig = .{
+        .ipv4 = null,
+        .ipv6 = .{ .bytes = interop_runner_server_ipv6, .port = 444, .flow = 0 },
+    };
+    const v6_only = buildPreferredAddress(v6_only_cfg, &sc);
+    const zero4: [4]u8 = @splat(0);
+    try std.testing.expectEqualSlices(u8, &zero4, &v6_only.ipv4_address);
+    try std.testing.expectEqual(@as(u16, 0), v6_only.ipv4_port);
+    try std.testing.expectEqualSlices(u8, &interop_runner_server_ipv6, &v6_only.ipv6_address);
+    try std.testing.expectEqual(@as(u16, 444), v6_only.ipv6_port);
 }
 
 test "ServerConn.last_recv_socket defaults to main on init" {
