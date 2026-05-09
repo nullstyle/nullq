@@ -11,6 +11,13 @@ breaking changes; see notes per release.
 
 ### Added
 
+- **Server-side RFC 9368 §6 ¶6/¶7 downgrade-attack guard** — symmetric
+  counterpart to the client-side guard. New `Connection.initial_wire_version`
+  snapshots the wire version of the first Initial in `acceptInitial` (before
+  any compatible-version upgrade flip), and `validatePeerTransportRole`'s
+  server branch closes with TRANSPORT_PARAMETER_ERROR (0x08) when the client's
+  `version_information.chosen_version` doesn't match it.
+
 - **Client-side RFC 9368 §6 compatible-version-negotiation consumption** —
   a multi-version `Client.Config.compatible_versions` (e.g.
   `preferred_version = QUIC_VERSION_1, compatible_versions =
