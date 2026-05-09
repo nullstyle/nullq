@@ -154,6 +154,236 @@ pub fn reassembleClientHello(dst: []u8, payload: []const u8) ?[]const u8 {
     return dst[0..want];
 }
 
+/// Streaming offset-based ClientHello reassembler.
+///
+/// Multi-Initial fragmented ClientHellos (RFC 9000 §17.2.2 / TLS 1.3
+/// CH up to 16 KiB-ish) are split across two or more client Initial
+/// packets, each carrying its own slice of CRYPTO frames at distinct
+/// offsets. The single-shot `reassembleClientHello` only sees one
+/// Initial at a time and bails when offset 0 is missing or the
+/// declared CH length isn't covered. To still drive the RFC 9368 §6
+/// upgrade decision under that pattern, the server feeds each
+/// Initial's decrypted plaintext through a `ChReassembler`; once the
+/// CH is contiguous from offset 0 to its declared length the
+/// reassembler returns the assembled slice.
+///
+/// Defensive posture: any malformed input (oversize CH, unexpected
+/// non-CRYPTO frame, conflicting overlapping data) returns
+/// `error.Invalid` from `feed`, and the caller treats it the same as
+/// "skip the upgrade and use the wire version". The reassembler
+/// itself never panics and never allocates.
+///
+/// Capacity:
+///   - `dst` is the caller-owned backing storage for the assembled
+///     CH. Must be at least `max_client_hello_bytes` long. The
+///     returned slice on `feed` borrows into `dst` and is valid until
+///     the next `reset` or until `dst` itself is reused.
+///   - At most `max_segments` non-contiguous segments are tracked in
+///     parallel. Real CHs hardly ever fragment beyond two segments;
+///     16 is a generous cap that still bounds the memory footprint.
+pub const ChReassembler = struct {
+    /// Maximum number of non-contiguous segments retained while
+    /// waiting for the gaps to fill. A typical 2-Initial CH produces
+    /// 1–2 segments; the cap is per-CID so a cap of 16 absorbs
+    /// pathological reordering without unbounded growth.
+    pub const max_segments: usize = 16;
+
+    const Segment = struct {
+        offset: usize,
+        end: usize, // exclusive
+    };
+
+    pub const Error = error{
+        /// Caller-supplied buffer is too small or the CH overflows it.
+        Overflow,
+        /// Frame stream is malformed, conflicts with previously-seen
+        /// bytes, or contains a frame type that doesn't belong in an
+        /// Initial (RFC 9000 §17.2.2).
+        Invalid,
+    };
+
+    dst: []u8,
+    /// Highest contiguous offset reached starting from 0. The CH is
+    /// complete when `contig_end >= declared_len`.
+    contig_end: usize = 0,
+    /// Declared CH length (TLS Handshake header value + 4 prefix
+    /// bytes), or null until at least the first 4 bytes have arrived.
+    declared_len: ?usize = null,
+    /// Sorted, disjoint list of byte ranges already received. Always
+    /// merged on insert so that consecutive entries have a gap
+    /// between them (i.e. `segs[i].end < segs[i+1].offset`). The
+    /// segment that includes offset 0 always sits at index 0 if any
+    /// range starting at 0 has been seen.
+    segs: [max_segments]Segment = @splat(.{ .offset = 0, .end = 0 }),
+    seg_count: u8 = 0,
+
+    /// Construct an empty reassembler that writes into the
+    /// caller-owned `dst`. `dst.len >= max_client_hello_bytes` is
+    /// required; smaller buffers degrade to `error.Overflow` on the
+    /// first frame.
+    pub fn init(dst: []u8) ChReassembler {
+        return .{ .dst = dst };
+    }
+
+    /// Reset to the empty state. The backing buffer is *not* zeroed —
+    /// every byte returned by `feed` corresponds to a CRYPTO offset
+    /// the caller observed, so leftover bytes from a prior
+    /// reassembly that the new CH does not overwrite stay invisible
+    /// behind `contig_end`.
+    pub fn reset(self: *ChReassembler) void {
+        self.contig_end = 0;
+        self.declared_len = null;
+        self.seg_count = 0;
+    }
+
+    /// True once the assembled CH covers `[0, declared_len)`.
+    /// Idempotent — additional `feed` calls after completion are
+    /// allowed (e.g. retransmitted CRYPTO frames) and continue to
+    /// return the same slice.
+    pub fn isComplete(self: *const ChReassembler) bool {
+        const want = self.declared_len orelse return false;
+        return self.contig_end >= want;
+    }
+
+    /// Feed one Initial's decrypted plaintext. Walks the frame stream
+    /// for CRYPTO frames, records each fragment in the reassembler's
+    /// segment list, and returns the assembled CH the moment the
+    /// contiguous prefix covers the declared length.
+    ///
+    /// Returns:
+    ///   - `null` while waiting for more bytes (gap not yet filled,
+    ///     or declared length not yet covered).
+    ///   - `error.Overflow` when a CRYPTO offset/length would write
+    ///     past `dst`.
+    ///   - `error.Invalid` for a malformed frame stream, an overlap
+    ///     that conflicts with previously-seen bytes, or a non-PADDING
+    ///     non-PING non-ACK frame other than CRYPTO. Callers should
+    ///     treat this identically to `null` for upgrade purposes —
+    ///     fall back to the wire version — but propagate distinctly so
+    ///     the caller can stop feeding (the stream is broken).
+    pub fn feed(self: *ChReassembler, payload: []const u8) Error!?[]const u8 {
+        if (self.dst.len < max_client_hello_bytes) return Error.Overflow;
+        var pos: usize = 0;
+        while (pos < payload.len) {
+            const decoded = frame_decode.decode(payload[pos..]) catch return Error.Invalid;
+            pos += decoded.bytes_consumed;
+            switch (decoded.frame) {
+                .crypto => |cr| {
+                    if (cr.data.len == 0) continue;
+                    const off64: u64 = cr.offset;
+                    const end64 = std.math.add(u64, off64, @intCast(cr.data.len)) catch return Error.Overflow;
+                    if (end64 > @as(u64, self.dst.len)) return Error.Overflow;
+                    const off: usize = @intCast(off64);
+                    const end: usize = @intCast(end64);
+
+                    // Conflict check on any overlap with already-stored
+                    // bytes — segments hold the bytes we're confident
+                    // about, and a CRYPTO retransmission should match
+                    // the original. A peer that contradicts itself is
+                    // either malicious or buggy; either way we skip the
+                    // upgrade.
+                    if (overlapsAndDiffers(self.segs[0..self.seg_count], self.dst, off, cr.data)) {
+                        return Error.Invalid;
+                    }
+
+                    @memcpy(self.dst[off..end], cr.data);
+                    try self.insertSegment(off, end);
+                    self.advanceContig();
+
+                    // Lock in the declared length once the first 4
+                    // bytes are contiguous.
+                    if (self.declared_len == null and self.contig_end >= 4) {
+                        if (self.dst[0] != tls_msg_type_client_hello) return Error.Invalid;
+                        const u24_len = (@as(usize, self.dst[1]) << 16) |
+                            (@as(usize, self.dst[2]) << 8) |
+                            @as(usize, self.dst[3]);
+                        const total = u24_len + 4;
+                        if (total > self.dst.len) return Error.Overflow;
+                        self.declared_len = total;
+                    }
+                },
+                // CRYPTO + ACK + PING + PADDING are the only frame
+                // types legitimate inside an Initial (RFC 9000 §17.2.2).
+                .padding, .ping, .ack, .path_ack => {},
+                else => return Error.Invalid,
+            }
+        }
+
+        if (self.isComplete()) {
+            return self.dst[0..self.declared_len.?];
+        }
+        return null;
+    }
+
+    /// Returns true when `[off, off+data.len)` intersects an existing
+    /// segment but the byte values differ from what's already stored
+    /// at that offset.
+    fn overlapsAndDiffers(segs: []const Segment, dst: []const u8, off: usize, data: []const u8) bool {
+        const end = off + data.len;
+        for (segs) |s| {
+            if (s.offset >= end or s.end <= off) continue;
+            const ov_start = @max(s.offset, off);
+            const ov_end = @min(s.end, end);
+            if (!std.mem.eql(u8, dst[ov_start..ov_end], data[ov_start - off .. ov_end - off])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Insert `[off, end)` into the sorted segment list, merging with
+    /// any neighbours it overlaps or abuts. Returns `error.Invalid`
+    /// if the merge would exceed `max_segments` (deeply pathological
+    /// reordering — fall back to no upgrade).
+    fn insertSegment(self: *ChReassembler, off: usize, end: usize) Error!void {
+        // Find the first segment whose end >= off (potential merge
+        // candidate); everything strictly to its left stays untouched.
+        var i: usize = 0;
+        while (i < self.seg_count and self.segs[i].end < off) : (i += 1) {}
+
+        // Greedy merge: while the next segment overlaps or abuts the
+        // new range, swallow it.
+        var new_off = off;
+        var new_end = end;
+        var j = i;
+        while (j < self.seg_count and self.segs[j].offset <= new_end) : (j += 1) {
+            if (self.segs[j].offset < new_off) new_off = self.segs[j].offset;
+            if (self.segs[j].end > new_end) new_end = self.segs[j].end;
+        }
+
+        // Rewrite [i..j) with the merged range, shifting the tail.
+        const removed = j - i;
+        if (removed == 0) {
+            if (self.seg_count >= self.segs.len) return Error.Invalid;
+            // Shift right to make room.
+            var k: usize = self.seg_count;
+            while (k > i) : (k -= 1) self.segs[k] = self.segs[k - 1];
+            self.segs[i] = .{ .offset = new_off, .end = new_end };
+            self.seg_count += 1;
+        } else {
+            // Replace the merged span and shift the tail left.
+            self.segs[i] = .{ .offset = new_off, .end = new_end };
+            const drop = removed - 1;
+            if (drop > 0) {
+                var k: usize = i + 1;
+                while (k + drop < self.seg_count) : (k += 1) {
+                    self.segs[k] = self.segs[k + drop];
+                }
+                self.seg_count -= @intCast(drop);
+            }
+        }
+    }
+
+    /// Re-evaluate the contiguous-from-zero frontier after an insert.
+    /// The first segment, if it starts at 0, defines the reachable
+    /// prefix; everything else stays buffered until the gap fills.
+    fn advanceContig(self: *ChReassembler) void {
+        if (self.seg_count == 0) return;
+        if (self.segs[0].offset != 0) return;
+        if (self.segs[0].end > self.contig_end) self.contig_end = self.segs[0].end;
+    }
+};
+
 /// Walk a TLS ClientHello (including the outer Handshake header) and
 /// return the bytes of the `quic_transport_parameters` extension
 /// value. Returns `null` on any malformation or if the extension is
@@ -488,4 +718,243 @@ test "reassembleClientHello: bails on missing offset 0 frame (fragmented)" {
         @as(?[]const u8, null),
         reassembleClientHello(&dst, payload_buf[0 .. 4 + body.len]),
     );
+}
+
+// -- ChReassembler test helpers ----------------------------------------
+
+const frame_encode = @import("../frame/encode.zig");
+const frame_types = @import("../frame/types.zig");
+
+/// Build an Initial-style payload containing a single CRYPTO frame at
+/// `offset` carrying `data`. Returns the bytes written into `out`.
+fn buildCryptoPayload(out: []u8, offset: u64, data: []const u8) []u8 {
+    const n = frame_encode.encode(out, .{ .crypto = .{
+        .offset = offset,
+        .data = data,
+    } }) catch unreachable;
+    return out[0..n];
+}
+
+/// Construct a synthetic ClientHello with `total` total bytes (header
+/// + body). Bytes 4..total are an arbitrary deterministic pattern so
+/// equality assertions can verify the reassembler reproduced exactly
+/// what was fed in.
+fn buildSyntheticCh(buf: []u8, total: usize) []u8 {
+    std.debug.assert(total >= 4 and total <= buf.len);
+    const body_len = total - 4;
+    buf[0] = tls_msg_type_client_hello;
+    buf[1] = @intCast((body_len >> 16) & 0xff);
+    buf[2] = @intCast((body_len >> 8) & 0xff);
+    buf[3] = @intCast(body_len & 0xff);
+    var i: usize = 4;
+    while (i < total) : (i += 1) buf[i] = @as(u8, @intCast(i & 0xff)) ^ 0x5a;
+    return buf[0..total];
+}
+
+test "ChReassembler: single-feed CH completes in one shot" {
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 64);
+    var payload: [128]u8 = undefined;
+    const pkt = buildCryptoPayload(&payload, 0, ch);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    const got = (try rc.feed(pkt)) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, got);
+    try std.testing.expect(rc.isComplete());
+}
+
+test "ChReassembler: two-Initial CH fed in order" {
+    // CH split across two CRYPTO frames at offset 0 and offset 32.
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 80);
+    var p1: [128]u8 = undefined;
+    var p2: [128]u8 = undefined;
+    const pkt1 = buildCryptoPayload(&p1, 0, ch[0..32]);
+    const pkt2 = buildCryptoPayload(&p2, 32, ch[32..]);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try rc.feed(pkt1),
+    );
+    const got = (try rc.feed(pkt2)) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, got);
+    try std.testing.expect(rc.isComplete());
+}
+
+test "ChReassembler: two-Initial CH fed out of order" {
+    // Tail arrives first, then the head — a plausible reordering on a
+    // congested path. The reassembler must hold the tail until offset
+    // 0 fills.
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 80);
+    var p1: [128]u8 = undefined;
+    var p2: [128]u8 = undefined;
+    const pkt_head = buildCryptoPayload(&p1, 0, ch[0..32]);
+    const pkt_tail = buildCryptoPayload(&p2, 32, ch[32..]);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    // Tail first: declared length isn't observable yet (we haven't
+    // seen byte 0..3 contiguously) so feed must report null.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try rc.feed(pkt_tail),
+    );
+    const got = (try rc.feed(pkt_head)) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, got);
+}
+
+test "ChReassembler: duplicate / retransmitted CRYPTO frames are idempotent" {
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 64);
+    var p1: [128]u8 = undefined;
+    const pkt = buildCryptoPayload(&p1, 0, ch);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    const first = (try rc.feed(pkt)) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, first);
+
+    // Re-feed the same frame; isComplete stays true and the slice is
+    // unchanged.
+    const again = (try rc.feed(pkt)) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, again);
+    try std.testing.expect(rc.isComplete());
+}
+
+test "ChReassembler: oversize CH is rejected with Overflow" {
+    // Forge a CH header advertising 5000 bytes — far past
+    // `max_client_hello_bytes` (4096) — and feed it.
+    var hdr: [4]u8 = .{ 0x01, 0x00, 0x13, 0x84 };
+    _ = &hdr;
+    var p1: [16]u8 = undefined;
+    const pkt = buildCryptoPayload(&p1, 0, &hdr);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    try std.testing.expectError(ChReassembler.Error.Overflow, rc.feed(pkt));
+}
+
+test "ChReassembler: hole in offsets keeps result null" {
+    // Feed only the first 16 bytes of a 64-byte CH and one trailing
+    // chunk past a hole. Until the gap fills, feed() returns null.
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 64);
+    var p1: [128]u8 = undefined;
+    var p2: [128]u8 = undefined;
+    const head = buildCryptoPayload(&p1, 0, ch[0..16]);
+    const tail = buildCryptoPayload(&p2, 32, ch[32..]); // gap [16..32)
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    try std.testing.expectEqual(@as(?[]const u8, null), try rc.feed(head));
+    try std.testing.expectEqual(@as(?[]const u8, null), try rc.feed(tail));
+    try std.testing.expect(!rc.isComplete());
+
+    // Now patch the gap and we should complete.
+    var p3: [128]u8 = undefined;
+    const fill = buildCryptoPayload(&p3, 16, ch[16..32]);
+    const got = (try rc.feed(fill)) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, got);
+}
+
+test "ChReassembler: reset clears state for reuse" {
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 32);
+    var p1: [128]u8 = undefined;
+    const pkt = buildCryptoPayload(&p1, 0, ch);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    _ = try rc.feed(pkt);
+    try std.testing.expect(rc.isComplete());
+    rc.reset();
+    try std.testing.expect(!rc.isComplete());
+    try std.testing.expectEqual(@as(?[]const u8, null), try rc.feed(p1[0..0]));
+}
+
+test "ChReassembler: out-of-order three-fragment CH" {
+    // Fragments [0..16), [16..32), [32..64) fed in order [16..32),
+    // [32..64), [0..16). The reassembler must merge segments and
+    // resolve the contiguous frontier only on the last feed.
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 64);
+    var p1: [128]u8 = undefined;
+    var p2: [128]u8 = undefined;
+    var p3: [128]u8 = undefined;
+    const a = buildCryptoPayload(&p1, 16, ch[16..32]);
+    const b = buildCryptoPayload(&p2, 32, ch[32..]);
+    const c = buildCryptoPayload(&p3, 0, ch[0..16]);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    try std.testing.expectEqual(@as(?[]const u8, null), try rc.feed(a));
+    try std.testing.expectEqual(@as(?[]const u8, null), try rc.feed(b));
+    const got = (try rc.feed(c)) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, got);
+}
+
+test "ChReassembler: conflicting overlap returns Invalid" {
+    // First feed lays down bytes [0..32) of one synthetic CH; second
+    // feed claims to deliver [16..48) but with mismatched overlap
+    // bytes. The reassembler should reject as Invalid.
+    var ch1_storage: [128]u8 = undefined;
+    const ch1 = buildSyntheticCh(&ch1_storage, 64);
+    var p1: [128]u8 = undefined;
+    const pkt1 = buildCryptoPayload(&p1, 0, ch1[0..32]);
+
+    // Build a "conflicting" second buffer: same offsets but bytes
+    // bit-flipped in the overlap region.
+    var bad: [32]u8 = undefined;
+    @memcpy(bad[0..16], ch1[16..32]);
+    for (bad[0..16]) |*b| b.* ^= 0xff;
+    @memcpy(bad[16..], ch1[32..48]);
+    var p2: [128]u8 = undefined;
+    const pkt2 = buildCryptoPayload(&p2, 16, &bad);
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    _ = try rc.feed(pkt1);
+    try std.testing.expectError(ChReassembler.Error.Invalid, rc.feed(pkt2));
+}
+
+test "ChReassembler: rejects unexpected frame type" {
+    // STREAM frame in an Initial is a protocol violation; we don't
+    // try to interpret it — fall back to no upgrade.
+    var pkt: [16]u8 = undefined;
+    // STREAM with type=0x08 (no OFF/LEN/FIN bits), id=0, no data.
+    pkt[0] = 0x08;
+    pkt[1] = 0x00;
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    try std.testing.expectError(ChReassembler.Error.Invalid, rc.feed(pkt[0..2]));
+}
+
+test "ChReassembler: tolerates leading PADDING/PING/ACK in the payload" {
+    var ch_storage: [128]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 32);
+
+    // [PADDING 4][PING][CRYPTO offset=0 data=ch][PADDING 8]
+    var payload: [128]u8 = undefined;
+    var p: usize = 0;
+    @memset(payload[p .. p + 4], 0); // 4 PADDING bytes (frame type 0x00)
+    p += 4;
+    payload[p] = 0x01; // PING
+    p += 1;
+    const wrote = frame_encode.encode(payload[p..], .{ .crypto = .{
+        .offset = 0,
+        .data = ch,
+    } }) catch unreachable;
+    p += wrote;
+    @memset(payload[p .. p + 8], 0);
+    p += 8;
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    var rc = ChReassembler.init(&dst);
+    const got = (try rc.feed(payload[0..p])) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, got);
 }
