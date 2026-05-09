@@ -20,6 +20,17 @@ const case_aliases = [_]CaseAlias{
     .{ .short = "C2", .long = "transfercorruption" },
     .{ .short = "BP", .long = "rebind-port" },
     .{ .short = "U", .long = "keyupdate" },
+    .{ .short = "BA", .long = "rebind-addr" },
+    .{ .short = "CM", .long = "connectionmigration" },
+    .{ .short = "V2", .long = "v2" },
+    // The runner ships no `versionnegotiation` testcase; `v2` is the
+    // version-negotiation testcase, so `V` is an alias for `v2`.
+    .{ .short = "V", .long = "v2" },
+    .{ .short = "LR", .long = "longrtt" },
+    .{ .short = "IPV6", .long = "ipv6" },
+    .{ .short = "6", .long = "ipv6" },
+    .{ .short = "E", .long = "ecn" },
+    .{ .short = "A", .long = "amplificationlimit" },
 };
 
 const CaseAlias = struct {
@@ -718,6 +729,14 @@ test "case expansion supports presets and aliases" {
     const recovery = try expandCases(allocator, "L1,L2,B,BP");
     defer allocator.free(recovery);
     try std.testing.expectEqualStrings("handshakeloss,transferloss,blackhole,rebind-port", recovery);
+
+    // New aliases for runner testcases that previously had no short form.
+    const extras = try expandCases(allocator, "BA,CM,V2,V,LR,IPV6,6,E,A");
+    defer allocator.free(extras);
+    try std.testing.expectEqualStrings(
+        "rebind-addr,connectionmigration,v2,v2,longrtt,ipv6,ipv6,ecn,amplificationlimit",
+        extras,
+    );
 }
 
 test "runner paths are normalized to absolute paths" {

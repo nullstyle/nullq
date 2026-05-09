@@ -51,8 +51,15 @@ handshake,transfer,chacha20,retry,resumption,zerortt,multiplexing
 The official runner's current abbreviations map as follows:
 
 ```text
-H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multiplexing
+H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multiplexing,
+B=blackhole, L1=handshakeloss, L2=transferloss, C1=handshakecorruption,
+C2=transfercorruption, BP=rebind-port, U=keyupdate, BA=rebind-addr,
+CM=connectionmigration, V2=v2, V=v2, LR=longrtt, IPV6=ipv6, 6=ipv6, E=ecn,
+A=amplificationlimit
 ```
+
+Note: the runner does not ship a `versionnegotiation` testcase — `v2` is its
+version-negotiation testcase, so `V` is an alias for `v2`.
 
 ## Latest local results
 

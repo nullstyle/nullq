@@ -11,6 +11,12 @@ breaking changes; see notes per release.
 
 ### Added
 
+- **External-interop wrapper testcase aliases** — `tools/external_interop.zig`
+  now recognizes the short forms `BA`, `CM`, `V2`, `V`, `LR`, `IPV6`/`6`, `E`,
+  and `A` for the runner's `rebind-addr`, `connectionmigration`, `v2`,
+  `longrtt`, `ipv6`, `ecn`, and `amplificationlimit` testcases. (`V` aliases
+  to `v2` because the runner has no separate `versionnegotiation` testcase.)
+  Existing aliases are unchanged.
 - **Client-side RFC 9368 §6 compatible-version-negotiation consumption** —
   a multi-version `Client.Config.compatible_versions` (e.g.
   `preferred_version = QUIC_VERSION_1, compatible_versions =
