@@ -109,23 +109,24 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
 - **Server `M` (multiplexing) × quiche** — original quiche-only
   failure mode reverts to its 2026-05-09 morning state. The core
   watermark fix above is the path forward.
-- **Client `BA` (rebind-addr) × {quic-go, quiche}** — partially
-  addressed (2026-05-09 follow-up commit on
-  `followup-client-migration-cid`): the qns client driver now issues
-  a fresh client SCID at sequence 1 once the handshake completes
-  via the new `queueClientConnectionIds` helper, mirroring the
-  long-standing server-side pattern. This unblocks the FIRST half
-  of the failure — the server (e.g. quic-go) no longer has to log
+- **Client `BA` (rebind-addr) × {quic-go, quiche}** — both arms now
+  addressed; matrix re-run pending. First arm (2026-05-09
+  `followup-client-migration-cid`): the qns client driver issues a
+  fresh client SCID at sequence 1 via `queueClientConnectionIds`,
+  unblocking server-side path validation that previously logged
   `skipping validation of new path … since no connection ID is
-  available`. The SECOND half (quiche-style) — the qns client
-  "keeps sending from the OLD socket" after the server validates
-  the new path — is still open. The client driver has no signal
-  for the SIM-side rebind (the runner rewrites the client's source
-  transparently in ns3) and would need either a transport-level
-  rebind callback or a passive trigger when an inbound
-  PATH_CHALLENGE arrives at a new server tuple. Re-running the
-  matrix is needed to confirm whether the NEW_CONNECTION_ID fix
-  alone flips quic-go × `BA` to PASS.
+  available`. Second arm (2026-05-09 `followup-rebind-detection`):
+  the qns client driver now forwards the inbound source address to
+  `Connection.handleWithEcn` (was `null`) and switched from
+  `conn.poll` to `conn.pollDatagram`, so an embedder-routed
+  per-datagram destination follows the migrated `peer_addr` instead
+  of the original `connect()` target. The transport core already
+  detects peer-side rebind passively in
+  `recordAuthenticatedDatagramAddress` (no role gate), so the fix
+  was a pure embedder-side change once both inputs were wired.
+  A new state-tests unit test (`client peer-address rebind:
+  pollDatagram exposes the new server tuple after migration`) pins
+  the contract.
 - **Server `CM` (connectionmigration) × all three peers** —
   `qns_endpoint.zig` does not advertise `preferred_address` in
   the server's transport-parameter blob; the codec exists in

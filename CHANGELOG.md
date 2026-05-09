@@ -11,6 +11,29 @@ breaking changes; see notes per release.
 
 ### Fixed
 
+- **Interop client × `rebind-addr` × quiche (second half)** — the qns
+  client driver (`interop/qns_endpoint.zig`) now forwards the inbound
+  source address to `Connection.handleWithEcn` and uses
+  `Connection.pollDatagram` to pick the per-datagram destination
+  instead of `conn.poll` + a hardcoded `server_addr`. The previous
+  driver passed `null` as the source on every recv, which short-
+  circuited `peerAddressChangeCandidate` (`src/conn/state.zig`) and
+  left the connection blind to the simulator-rewritten server tuple;
+  even when path-migration logic ran, outbound 1-RTT packets continued
+  to address the original `connect()` target because the embedder
+  ignored the migrated `peer_addr`. With both halves of the contract
+  honored, a runner-rewritten server source now arms PATH_CHALLENGE on
+  the active path (already wired in core via
+  `recordAuthenticatedDatagramAddress` → `handlePeerAddressChange` —
+  no role gate, the existing flow already works for the client side
+  as long as the embedder feeds it the source) AND the client's
+  next datagram lands on the post-rebind tuple. The second arm of
+  the `client × {quic-go, quiche} × rebind-addr` failure is closed.
+  A new state-tests unit test pins both halves: detection (PATH_CHALLENGE
+  queued for the active path) and routing (`pollDatagram.to` reflects
+  the new server tuple). A small inverse helper `pathAddressToNetAddress`
+  is added next to the existing `netAddressToPathAddress` in the qns
+  endpoint module.
 - **Interop server × `rebind-addr` × quiche** — the server's packet
   builder now emits `PATH_CHALLENGE` as the FIRST frame of the first
   datagram on a freshly-migrated path (peer-initiated migration). The
