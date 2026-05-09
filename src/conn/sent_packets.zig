@@ -44,6 +44,11 @@ pub const RetransmitFrame = union(enum) {
     /// chase a borrowed slice that may have been overwritten when
     /// `pending_frames.new_token` was cleared on first emit.
     new_token: NewTokenRetransmit,
+    /// ALTERNATIVE_V4_ADDRESS retransmit slot
+    /// (draft-munizaga-quic-alternative-server-address-00 §6).
+    alternative_v4_address: frame_types.AlternativeV4Address,
+    /// ALTERNATIVE_V6_ADDRESS retransmit slot.
+    alternative_v6_address: frame_types.AlternativeV6Address,
 };
 
 /// Inline NEW_TOKEN payload for `RetransmitFrame.new_token`. Mirrors

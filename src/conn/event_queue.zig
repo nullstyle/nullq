@@ -77,6 +77,76 @@ pub const DatagramSendEvent = struct {
 /// Maximum buffered datagram ack/loss events before older entries are dropped.
 pub const max_datagram_send_events: usize = 64;
 
+/// One ALTERNATIVE_V4_ADDRESS event surfaced to the embedder.
+pub const AlternativeServerAddressV4Event = struct {
+    address: [4]u8,
+    port: u16,
+    /// `Status Sequence Number` from the on-wire frame
+    /// (draft-munizaga-quic-alternative-server-address-00 §6 ¶5).
+    status_sequence_number: u64,
+    preferred: bool,
+    retire: bool,
+};
+
+/// One ALTERNATIVE_V6_ADDRESS event surfaced to the embedder.
+pub const AlternativeServerAddressV6Event = struct {
+    address: [16]u8,
+    port: u16,
+    status_sequence_number: u64,
+    preferred: bool,
+    retire: bool,
+};
+
+/// Tagged union of received `ALTERNATIVE_V4/V6_ADDRESS` updates the
+/// embedder pulls via `Connection.pollEvent`. The active tag mirrors
+/// the on-wire frame type the peer emitted.
+///
+/// The receive path enforces §6 ¶5 monotonicity (Status Sequence
+/// Number strictly increases) before queuing the event. Retransmits
+/// (same sequence number, same content) are absorbed silently — the
+/// receiver never sees a duplicate event for an already-emitted
+/// sequence. Out-of-order older sequences are dropped: QUIC's app-PN
+/// space allows packet reordering, so a strictly-lower sequence
+/// number is treated as a stale state update from a sender that
+/// honored §6 ¶5.
+pub const AlternativeServerAddressEvent = union(enum) {
+    v4: AlternativeServerAddressV4Event,
+    v6: AlternativeServerAddressV6Event,
+
+    /// `Status Sequence Number` shared by both variants — convenience
+    /// accessor so embedders can sort received events without
+    /// pattern-matching the union.
+    pub fn statusSequenceNumber(self: AlternativeServerAddressEvent) u64 {
+        return switch (self) {
+            .v4 => |v| v.status_sequence_number,
+            .v6 => |v| v.status_sequence_number,
+        };
+    }
+
+    /// True if the peer set the `Preferred` flag bit on the frame.
+    pub fn preferred(self: AlternativeServerAddressEvent) bool {
+        return switch (self) {
+            .v4 => |v| v.preferred,
+            .v6 => |v| v.preferred,
+        };
+    }
+
+    /// True if the peer set the `Retire` flag bit on the frame.
+    pub fn retire(self: AlternativeServerAddressEvent) bool {
+        return switch (self) {
+            .v4 => |v| v.retire,
+            .v6 => |v| v.retire,
+        };
+    }
+};
+
+/// Maximum buffered alternative-server-address events before older
+/// entries are dropped. 16 mirrors the connection-id event cap; an
+/// embedder that polls fast enough to act on `Preferred` migrations
+/// won't see backlog, and a misbehaving peer that fires a thousand
+/// updates can't pin proportional connection memory.
+pub const max_alternative_address_events: usize = 16;
+
 /// Internal storage form for datagram events, tagged by ack-vs-loss so the
 /// queue can carry both kinds in one FIFO and `pollEvent` can re-tag them.
 pub const StoredDatagramSendEvent = union(enum) {

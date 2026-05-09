@@ -65,6 +65,16 @@ pub const PendingPathStatus = struct {
     available: bool,
 };
 
+/// One queued ALTERNATIVE_V4_ADDRESS / ALTERNATIVE_V6_ADDRESS frame
+/// (draft-munizaga-quic-alternative-server-address-00 §6). Both
+/// variants share the connection-wide sequence-number space (§6 ¶5),
+/// so they live in a single FIFO. The active tag selects which on-
+/// wire frame the drain emits.
+pub const PendingAlternativeAddress = union(enum) {
+    v4: frame_types.AlternativeV4Address,
+    v6: frame_types.AlternativeV6Address,
+};
+
 /// All control-frame backlogs the connection owes the peer at the
 /// application encryption level. Drained in `pollLevel`; mutations
 /// happen through helper methods on this struct or directly through
@@ -132,6 +142,15 @@ pub const PendingFrameQueues = struct {
     paths_blocked: ?u32 = null,
     path_cids_blocked: ?frame_types.PathCidsBlocked = null,
 
+    // -- draft-munizaga-quic-alternative-server-address-00 --
+    /// FIFO of queued ALTERNATIVE_V4/V6_ADDRESS frames the embedder
+    /// has staged via `Connection.advertiseAlternative*Address`. Both
+    /// frame types share one sequence space (§6 ¶5), and one queue
+    /// keeps the FIFO order of advertise calls, which is also the
+    /// monotonic sequence-number order. Drained at the application
+    /// encryption level only (§7).
+    alternative_addresses: std.ArrayList(PendingAlternativeAddress) = .empty,
+
     // -- RFC 9221 datagram queues --
     /// Outbound DATAGRAM payloads waiting to be packed into 1-RTT
     /// packets. Each entry's `data` is allocator-owned by the
@@ -163,6 +182,7 @@ pub const PendingFrameQueues = struct {
         self.path_statuses.deinit(allocator);
         self.path_new_connection_ids.deinit(allocator);
         self.path_retire_connection_ids.deinit(allocator);
+        self.alternative_addresses.deinit(allocator);
     }
 
     // -- mutation helpers used by Connection --------------------------
@@ -261,6 +281,7 @@ test "pending_frames: empty initial state has nothing pending" {
     try std.testing.expectEqual(@as(usize, 0), q.path_statuses.items.len);
     try std.testing.expectEqual(@as(usize, 0), q.path_new_connection_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), q.path_retire_connection_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.alternative_addresses.items.len);
     try std.testing.expectEqual(@as(usize, 0), q.send_datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), q.recv_datagrams.items.len);
     try std.testing.expectEqual(@as(usize, 0), q.send_datagram_bytes);

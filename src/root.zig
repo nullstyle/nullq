@@ -19,6 +19,19 @@ pub const QUIC_VERSION_1: u32 = 0x00000001;
 /// stable RFC values.
 pub const multipath_draft_version: u32 = 21;
 
+/// Public QUIC-LB target. Connection-ID generation follows
+/// draft-ietf-quic-load-balancers-21 until the draft is published
+/// as an RFC. Bumping this is a deliberate scoped change.
+pub const quic_lb_draft_version: u32 = 21;
+
+/// Public Alternative Server Address target.
+/// `frame.types.AlternativeV4Address` / `AlternativeV6Address` and the
+/// 0xff0969d85c transport parameter follow
+/// draft-munizaga-quic-alternative-server-address-00. The current
+/// drop ships only the codec; receive-side state-machine integration
+/// is pending. Bumping this is a deliberate scoped change.
+pub const alt_server_address_draft_version: u32 = 0;
+
 /// Pure-Zig wire-format encoders and decoders (varints, packet
 /// numbers, headers). No BoringSSL dependency.
 pub const wire = @import("wire/root.zig");
@@ -43,6 +56,21 @@ pub const retry_token = conn.retry_token;
 /// UDP transport plumbing — socket-option tuning today, batch
 /// I/O and path-tracking helpers later.
 pub const transport = @import("transport/root.zig");
+
+/// Server-side QUIC-LB connection-ID generation
+/// (draft-ietf-quic-load-balancers-21). Off by default — wiring
+/// `Server.Config.quic_lb` opts in. See `lb.LbConfig` for the
+/// per-deployment shape and the README hardening note for the
+/// CSPRNG-by-default inversion this introduces.
+pub const lb = @import("lb/root.zig");
+
+/// Embedder helpers for the alternative-server-address extension
+/// (draft-munizaga-quic-alternative-server-address-00). Today the
+/// only export is `recommendedMigrationDelayMs`, the §9 thundering-
+/// herd mitigation. The on-wire codec lives in `frame`, the
+/// transport-parameter codec lives in `tls.transport_params`, and
+/// the connection-level emit / receive APIs live on `Connection`.
+pub const alt_addr = @import("alt_addr/root.zig");
 
 /// High-level convenience wrapper for embedding quic_zig as a QUIC
 /// server. Owns the TLS context and a connection table; the
@@ -90,6 +118,14 @@ pub const CloseState = conn.CloseState;
 /// Polled connection-level event: close, flow-blocked, CIDs needed,
 /// or DATAGRAM ack/loss notifications.
 pub const ConnectionEvent = conn.ConnectionEvent;
+
+/// One received `ALTERNATIVE_V4/V6_ADDRESS` update surfaced via
+/// `Connection.pollEvent` (draft-munizaga-quic-alternative-server-address-00 §6).
+pub const AlternativeServerAddressEvent = conn.AlternativeServerAddressEvent;
+/// IPv4 payload of `AlternativeServerAddressEvent.v4`.
+pub const AlternativeServerAddressV4Event = conn.AlternativeServerAddressV4Event;
+/// IPv6 payload of `AlternativeServerAddressEvent.v6`.
+pub const AlternativeServerAddressV6Event = conn.AlternativeServerAddressV6Event;
 
 /// Embedder-tunable AEAD packet/integrity limits driving application
 /// key updates (RFC 9001 §6.6).
@@ -188,6 +224,8 @@ test {
     _ = tls;
     _ = conn;
     _ = transport;
+    _ = lb;
+    _ = alt_addr;
     _ = @import("server.zig");
     _ = @import("client.zig");
 }

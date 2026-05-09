@@ -26,6 +26,8 @@ const frame_type_path_retire_connection_id: u64 = 0x3e79;
 const frame_type_max_path_id: u64 = 0x3e7a;
 const frame_type_paths_blocked: u64 = 0x3e7b;
 const frame_type_path_cids_blocked: u64 = 0x3e7c;
+const frame_type_alternative_v4_address: u64 = 0x1d5845e2;
+const frame_type_alternative_v6_address: u64 = 0x1d5845e3;
 
 /// Errors `decode` can return. Wire-level varint/CID errors plus:
 /// - `UnknownFrameType` — frame type byte/varint is not a recognized v1
@@ -127,6 +129,8 @@ pub fn decode(src: []const u8) Error!Decoded {
         frame_type_max_path_id => decodeMaxPathId(src, start),
         frame_type_paths_blocked => decodePathsBlocked(src, start),
         frame_type_path_cids_blocked => decodePathCidsBlocked(src, start),
+        frame_type_alternative_v4_address => decodeAlternativeV4Address(src, start),
+        frame_type_alternative_v6_address => decodeAlternativeV6Address(src, start),
         else => Error.UnknownFrameType,
     };
 }
@@ -670,6 +674,62 @@ fn decodePathCidsBlocked(src: []const u8, start: usize) Error!Decoded {
     };
 }
 
+fn decodeAlternativeV4Address(src: []const u8, start: usize) Error!Decoded {
+    var pos = start;
+    if (src.len < pos + 1) return Error.InsufficientBytes;
+    const flags = src[pos];
+    pos += 1;
+    const preferred = (flags & 0b1000_0000) != 0;
+    const retire = (flags & 0b0100_0000) != 0;
+    const seq = try varint.decode(src[pos..]);
+    pos += seq.bytes_read;
+    if (src.len < pos + 4) return Error.InsufficientBytes;
+    var address: [4]u8 = undefined;
+    @memcpy(&address, src[pos .. pos + 4]);
+    pos += 4;
+    if (src.len < pos + 2) return Error.InsufficientBytes;
+    const port = std.mem.readInt(u16, src[pos..][0..2], .big);
+    pos += 2;
+    return .{
+        .frame = .{ .alternative_v4_address = .{
+            .preferred = preferred,
+            .retire = retire,
+            .status_sequence_number = seq.value,
+            .address = address,
+            .port = port,
+        } },
+        .bytes_consumed = pos,
+    };
+}
+
+fn decodeAlternativeV6Address(src: []const u8, start: usize) Error!Decoded {
+    var pos = start;
+    if (src.len < pos + 1) return Error.InsufficientBytes;
+    const flags = src[pos];
+    pos += 1;
+    const preferred = (flags & 0b1000_0000) != 0;
+    const retire = (flags & 0b0100_0000) != 0;
+    const seq = try varint.decode(src[pos..]);
+    pos += seq.bytes_read;
+    if (src.len < pos + 16) return Error.InsufficientBytes;
+    var address: [16]u8 = undefined;
+    @memcpy(&address, src[pos .. pos + 16]);
+    pos += 16;
+    if (src.len < pos + 2) return Error.InsufficientBytes;
+    const port = std.mem.readInt(u16, src[pos..][0..2], .big);
+    pos += 2;
+    return .{
+        .frame = .{ .alternative_v6_address = .{
+            .preferred = preferred,
+            .retire = retire,
+            .status_sequence_number = seq.value,
+            .address = address,
+            .port = port,
+        } },
+        .bytes_consumed = pos,
+    };
+}
+
 // -- tests ---------------------------------------------------------------
 
 test "decode rejects empty input" {
@@ -915,6 +975,16 @@ test "fuzz: frame decode single-frame property" {
             // PATH_ACK (multipath, 2-byte varint type 0x3e): path_id=0,
             // largest=0, ack_delay=0, range_count=0, first_range=0
             "\x06\x00\x00\x00\x40\x3e\x00\x00\x00\x00",
+            // ALTERNATIVE_V4_ADDRESS: 4-byte type varint(0x1d5845e2),
+            // flags=0x80 (Preferred), seq=0, addr=192.0.2.1, port=4433.
+            // Total payload = 4 + 1 + 1 + 4 + 2 = 12 bytes.
+            "\x0c\x00\x00\x00\x9d\x58\x45\xe2\x80\x00\xc0\x00\x02\x01\x11\x51",
+            // ALTERNATIVE_V6_ADDRESS: 4-byte type varint(0x1d5845e3),
+            // flags=0x40 (Retire), seq=2, addr=2001:db8::1, port=8443.
+            // Total payload = 4 + 1 + 1 + 16 + 2 = 24 bytes.
+            "\x18\x00\x00\x00\x9d\x58\x45\xe3\x40\x02" ++
+                "\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01" ++
+                "\x20\xfb",
             // Adjacent ACK ranges (gap=0): largest=30, first_range=10, gap=0, length=8
             "\x07\x00\x00\x00\x02\x1e\x00\x01\x0a\x00\x08",
             // ACK with overflowing range_count (rejected by AckRangeCountTooLarge)

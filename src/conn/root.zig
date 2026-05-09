@@ -83,6 +83,13 @@ pub const CloseState = lifecycle.CloseState;
 pub const LifecycleState = lifecycle.LifecycleState;
 /// Tagged event surfaced from `Connection.poll`.
 pub const ConnectionEvent = state.ConnectionEvent;
+/// One received ALTERNATIVE_V4/V6_ADDRESS update
+/// (draft-munizaga-quic-alternative-server-address-00 §6).
+pub const AlternativeServerAddressEvent = state.AlternativeServerAddressEvent;
+/// IPv4 payload variant of `AlternativeServerAddressEvent.v4`.
+pub const AlternativeServerAddressV4Event = state.AlternativeServerAddressV4Event;
+/// IPv6 payload variant of `AlternativeServerAddressEvent.v6`.
+pub const AlternativeServerAddressV6Event = state.AlternativeServerAddressV6Event;
 /// Outcome of a `sendDatagram` call (queued, blocked, lost).
 pub const DatagramSendEvent = state.DatagramSendEvent;
 /// Detail about why outgoing data is blocked on flow control.

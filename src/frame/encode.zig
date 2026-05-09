@@ -36,6 +36,12 @@ pub const frame_type_max_path_id: u64 = 0x3e7a;
 pub const frame_type_paths_blocked: u64 = 0x3e7b;
 /// Frame type for PATH_CIDS_BLOCKED.
 pub const frame_type_path_cids_blocked: u64 = 0x3e7c;
+/// Frame type for ALTERNATIVE_V4_ADDRESS
+/// (draft-munizaga-quic-alternative-server-address-00 §6).
+pub const frame_type_alternative_v4_address: u64 = 0x1d5845e2;
+/// Frame type for ALTERNATIVE_V6_ADDRESS
+/// (draft-munizaga-quic-alternative-server-address-00 §6).
+pub const frame_type_alternative_v6_address: u64 = 0x1d5845e3;
 
 /// Writes `frame` to the start of `dst` and returns the number of
 /// bytes written. Returns `error.BufferTooSmall` if `dst` doesn't have
@@ -72,6 +78,8 @@ pub fn encode(dst: []u8, frame: Frame) Error!usize {
         .max_path_id => |f| encodePathIdOnly(dst, frame_type_max_path_id, f.maximum_path_id),
         .paths_blocked => |f| encodePathIdOnly(dst, frame_type_paths_blocked, f.maximum_path_id),
         .path_cids_blocked => |f| encodePathCidsBlocked(dst, f),
+        .alternative_v4_address => |f| encodeAlternativeV4Address(dst, f),
+        .alternative_v6_address => |f| encodeAlternativeV6Address(dst, f),
     };
 }
 
@@ -182,6 +190,16 @@ pub fn encodedLen(frame: Frame) usize {
         .path_cids_blocked => |f| varint.encodedLen(frame_type_path_cids_blocked) +
             varint.encodedLen(f.path_id) +
             varint.encodedLen(f.next_sequence_number),
+        .alternative_v4_address => |f| varint.encodedLen(frame_type_alternative_v4_address) +
+            1 +
+            varint.encodedLen(f.status_sequence_number) +
+            4 +
+            2,
+        .alternative_v6_address => |f| varint.encodedLen(frame_type_alternative_v6_address) +
+            1 +
+            varint.encodedLen(f.status_sequence_number) +
+            16 +
+            2,
     };
 }
 
@@ -412,6 +430,45 @@ fn encodePathCidsBlocked(dst: []u8, f: types.PathCidsBlocked) Error!usize {
     return pos;
 }
 
+/// Pack the §6 flag byte: bit 7 = Preferred, bit 6 = Retire,
+/// bits 5..0 unused (`MUST` be zero on encode).
+fn altAddressFlags(preferred: bool, retire: bool) u8 {
+    var flags: u8 = 0;
+    if (preferred) flags |= 0b1000_0000;
+    if (retire) flags |= 0b0100_0000;
+    return flags;
+}
+
+fn encodeAlternativeV4Address(dst: []u8, f: types.AlternativeV4Address) Error!usize {
+    var pos = try writeFrameType(dst, frame_type_alternative_v4_address);
+    if (dst.len < pos + 1) return Error.BufferTooSmall;
+    dst[pos] = altAddressFlags(f.preferred, f.retire);
+    pos += 1;
+    pos += try varint.encode(dst[pos..], f.status_sequence_number);
+    if (dst.len < pos + 4) return Error.BufferTooSmall;
+    @memcpy(dst[pos .. pos + 4], &f.address);
+    pos += 4;
+    if (dst.len < pos + 2) return Error.BufferTooSmall;
+    std.mem.writeInt(u16, dst[pos..][0..2], f.port, .big);
+    pos += 2;
+    return pos;
+}
+
+fn encodeAlternativeV6Address(dst: []u8, f: types.AlternativeV6Address) Error!usize {
+    var pos = try writeFrameType(dst, frame_type_alternative_v6_address);
+    if (dst.len < pos + 1) return Error.BufferTooSmall;
+    dst[pos] = altAddressFlags(f.preferred, f.retire);
+    pos += 1;
+    pos += try varint.encode(dst[pos..], f.status_sequence_number);
+    if (dst.len < pos + 16) return Error.BufferTooSmall;
+    @memcpy(dst[pos .. pos + 16], &f.address);
+    pos += 16;
+    if (dst.len < pos + 2) return Error.BufferTooSmall;
+    std.mem.writeInt(u16, dst[pos..][0..2], f.port, .big);
+    pos += 2;
+    return pos;
+}
+
 // -- tests ---------------------------------------------------------------
 
 test "encode PING produces 0x01" {
@@ -522,7 +579,13 @@ fn fuzzFrameRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {
     const challenge_data: [8]u8 = reset_token[0..8].*;
     const response_data: [8]u8 = reset_token[8..16].*;
 
-    const frame: Frame = switch (smith.valueRangeAtMost(u8, 0, 32)) {
+    // Prepare V4/V6 address payloads for ALTERNATIVE_*_ADDRESS variants.
+    const v4_addr: [4]u8 = reset_token[0..4].*;
+    var v6_addr: [16]u8 = undefined;
+    smith.bytes(&v6_addr);
+    const flags_byte = smith.value(u8);
+
+    const frame: Frame = switch (smith.valueRangeAtMost(u8, 0, 34)) {
         0 => .{ .padding = .{ .count = smith.valueRangeAtMost(u8, 1, 16) } },
         1 => .{ .ping = .{} },
         2 => .{ .handshake_done = .{} },
@@ -645,9 +708,23 @@ fn fuzzFrameRoundTrip(_: void, smith: *std.testing.Smith) anyerror!void {
         } },
         30 => .{ .max_path_id = .{ .maximum_path_id = path_id } },
         31 => .{ .paths_blocked = .{ .maximum_path_id = path_id } },
-        else => .{ .path_cids_blocked = .{
+        32 => .{ .path_cids_blocked = .{
             .path_id = path_id,
             .next_sequence_number = value,
+        } },
+        33 => .{ .alternative_v4_address = .{
+            .preferred = (flags_byte & 0b1000_0000) != 0,
+            .retire = (flags_byte & 0b0100_0000) != 0,
+            .status_sequence_number = value % 4096,
+            .address = v4_addr,
+            .port = @truncate(value),
+        } },
+        else => .{ .alternative_v6_address = .{
+            .preferred = (flags_byte & 0b1000_0000) != 0,
+            .retire = (flags_byte & 0b0100_0000) != 0,
+            .status_sequence_number = value % 4096,
+            .address = v6_addr,
+            .port = @truncate(value),
         } },
     };
 

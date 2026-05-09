@@ -80,6 +80,7 @@ const boringssl = @import("boringssl");
 const conn_mod = @import("conn/root.zig");
 const tls_mod = @import("tls/root.zig");
 const wire = @import("wire/root.zig");
+const lb_mod = @import("lb/root.zig");
 const retry_token_mod = conn_mod.retry_token;
 const new_token_mod = conn_mod.new_token;
 const lifecycle = conn_mod.lifecycle;
@@ -462,8 +463,55 @@ const ConfigImpl = struct {
 
     /// Length of the locally-issued connection IDs (the SCIDs the
     /// server returns to clients). Must be 1..20. Default 8 matches
-    /// the QNS endpoint.
+    /// the QNS endpoint. **Ignored when `quic_lb` is set** — the
+    /// QUIC-LB configuration determines the CID length
+    /// (`1 + server_id_len + nonce_len`) and `Server.init` overrides
+    /// this field with the resolved value.
     local_cid_len: u8 = 8,
+
+    /// 32-byte HMAC key used to derive stateless-reset tokens
+    /// (RFC 9000 §10.3) for CIDs the Server auto-issues on
+    /// `installLbConfig` rotation. Off by default — leave null and
+    /// drive replenishment manually via the `connection_ids_needed`
+    /// event flow with embedder-supplied tokens.
+    ///
+    /// When set, `installLbConfig` automatically pushes a
+    /// NEW_CONNECTION_ID frame to every live slot using the new LB
+    /// factory; tokens are derived as
+    /// `HMAC-SHA256(stateless_reset_key, "quic_zig stateless reset
+    /// v1" || cid)` per `quic_zig.conn.stateless_reset.derive`.
+    ///
+    /// **Persist this key across server restarts.** A cold-start
+    /// embedder that forgets the key invalidates every previously
+    /// issued reset token: live connections through the restart will
+    /// no longer drop on stateless reset. The same hardening note in
+    /// the README §"Things you must wire yourself" applies.
+    stateless_reset_key: ?conn_mod.stateless_reset.Key = null,
+
+    /// QUIC-LB connection-ID generation
+    /// (draft-ietf-quic-load-balancers-21). Off by default — leave
+    /// null for pure-CSPRNG SCIDs. Set to opt every locally-issued
+    /// SCID into the routing-encoded format an external layer-4 LB
+    /// can decode.
+    ///
+    /// **Hardening note:** this deliberately inverts the
+    /// "Server SCIDs are CSPRNG draws — no deployment metadata leaks
+    /// on the wire" default (README §"On by default"). Treat the
+    /// load balancer as the trust boundary; in plaintext mode (no
+    /// `LbConfig.key`) any on-path observer between LB and peer can
+    /// read `server_id` directly. Encrypted modes (LB-2, LB-3) raise
+    /// the bar to "linkability without key" but do not protect
+    /// against attackers between LB and server.
+    ///
+    /// LB-1 ships only the plaintext mode (`LbConfig.key == null`).
+    /// Encrypted modes return `error.UnsupportedMode` from the
+    /// minter until LB-2 / LB-3 land.
+    ///
+    /// When set in plaintext mode, `Server.init` also auto-enables
+    /// `transport_params.disable_active_migration` per the draft
+    /// §3 ¶3 SHOULD requirement, unless the embedder already set
+    /// it true.
+    quic_lb: ?lb_mod.LbConfig = null,
 
     /// If non-null, every accepted `Connection` is wired up to this
     /// qlog callback for application-key-update telemetry.
@@ -916,6 +964,19 @@ pub const Server = struct {
     transport_params: TransportParams,
     max_concurrent_connections: u32,
     local_cid_len: u8,
+    /// QUIC-LB factory built from `Config.quic_lb` at `init` time.
+    /// Null when QUIC-LB is disabled; in that case all SCIDs are
+    /// drawn directly from BoringSSL's CSPRNG (the secure-by-default
+    /// path). When set, both initial-Slot SCIDs (in
+    /// `openSlotFromInitial`) and Retry SCIDs (in
+    /// `mintAndQueueRetry`) flow through `lb_factory.mint`.
+    lb_factory: ?lb_mod.Factory,
+    /// Stateless-reset HMAC key from `Config.stateless_reset_key`.
+    /// `secureZero`-ed in `deinit`. When set, `installLbConfig`
+    /// auto-pushes NEW_CONNECTION_ID frames to live slots; null
+    /// means rotation is "lazy" (peers retain existing CIDs until
+    /// they organically retire).
+    stateless_reset_key: ?conn_mod.stateless_reset.Key,
     qlog_callback: ?QlogCallback,
     qlog_user_data: ?*anyopaque,
     log_callback: ?LogCallbackImpl,
@@ -1144,6 +1205,48 @@ pub const Server = struct {
             if (config.source_rate_window_us == 0) return Error.InvalidConfig;
             if (config.source_rate_table_capacity == 0) return Error.InvalidConfig;
         }
+        if (config.quic_lb) |lb_cfg| {
+            // Per-field and combined-length bounds from
+            // draft-ietf-quic-load-balancers-21 §3 (server_id 1..15,
+            // nonce 4..18, combined ≤ 19, config_id 0..6). Surface as
+            // `InvalidConfig` so the failure mode matches every other
+            // bad-Config case in `Server.init`. All three encoder
+            // modes (§5.2 plaintext, §5.4.1 single-pass, §5.4.2
+            // four-pass) are now wired — `Factory.mint` dispatches on
+            // `(key, combined)` automatically.
+            lb_cfg.validate() catch return Error.InvalidConfig;
+        }
+
+        // Resolve the on-wire CID length and the transport parameters
+        // we'll commit to. With QUIC-LB enabled, the CID length is
+        // dictated by the LB configuration (1 + server_id_len +
+        // nonce_len), and plaintext mode triggers the SHOULD from
+        // draft §3 ¶3 to advertise `disable_active_migration` so peers
+        // don't mint extra CIDs through this server (the unkeyed CIDs
+        // would leak `server_id` directly on every NEW_CONNECTION_ID).
+        var resolved_transport_params = config.transport_params;
+        const resolved_local_cid_len: u8 = if (config.quic_lb) |lb_cfg| blk: {
+            if (lb_cfg.isPlaintext() and !resolved_transport_params.disable_active_migration) {
+                resolved_transport_params.disable_active_migration = true;
+            }
+            break :blk lb_cfg.cidLength();
+        } else config.local_cid_len;
+
+        // Build the LB factory before any allocation so an AES key
+        // setup or CSPRNG-seeded nonce-counter failure short-circuits
+        // before we own anything that needs cleanup. Errors are mapped
+        // to existing Server-level codes — `AesKeyInvalid` to
+        // `InvalidConfig` (the supplied `[16]u8` was somehow refused),
+        // CSPRNG draws to `RandFailed`.
+        const resolved_lb_factory: ?lb_mod.Factory = if (config.quic_lb) |lb_cfg| blk: {
+            const f = lb_mod.Factory.initUnchecked(lb_cfg) catch |err| switch (err) {
+                error.AesKeyInvalid => return Error.InvalidConfig,
+                error.RandFailure => return Error.RandFailed,
+                error.InvalidLbConfig => return Error.InvalidConfig,
+                error.BufferTooSmall, error.NonceExhausted => unreachable,
+            };
+            break :blk f;
+        } else null;
 
         var tls_ctx: boringssl.tls.Context = undefined;
         var owns_tls = false;
@@ -1208,9 +1311,11 @@ pub const Server = struct {
             .tls_ctx = tls_ctx,
             .owns_tls = owns_tls,
             .alpn_protocols = config.alpn_protocols,
-            .transport_params = config.transport_params,
+            .transport_params = resolved_transport_params,
             .max_concurrent_connections = config.max_concurrent_connections,
-            .local_cid_len = config.local_cid_len,
+            .local_cid_len = resolved_local_cid_len,
+            .lb_factory = resolved_lb_factory,
+            .stateless_reset_key = config.stateless_reset_key,
             .qlog_callback = config.qlog_callback,
             .qlog_user_data = config.qlog_user_data,
             .log_callback = config.log_callback,
@@ -1242,6 +1347,112 @@ pub const Server = struct {
         };
     }
 
+    /// Install a new QUIC-LB configuration. Subsequent SCID mints
+    /// (post-Initial Slot SCIDs and Retry SCIDs) use the new
+    /// configuration; the previous factory's key bytes are
+    /// `secureZero`-ed before the swap.
+    ///
+    /// **If `Config.stateless_reset_key` was provided**, this method
+    /// ALSO pushes a NEW_CONNECTION_ID frame to every live slot via
+    /// `rotateLiveSlotCids`, so peers retire their old CIDs and
+    /// migrate to the new-config CIDs on their next datagram. Per-
+    /// slot push failures are swallowed (best-effort) — the factory
+    /// swap commits regardless.
+    ///
+    /// **Without `stateless_reset_key`**, the swap is point-in-time
+    /// and peers continue using their existing CIDs until they
+    /// organically retire them via the existing `connection_ids_needed`
+    /// event flow.
+    ///
+    /// To keep the routing key shape stable for the slot table and
+    /// `peekDcidForServer`, the new configuration MUST mint CIDs of
+    /// the same length as the configuration the Server was built with
+    /// (`Server.local_cid_len`). Mismatched lengths surface as
+    /// `Error.InvalidConfig`. This restriction matches typical
+    /// rotation flows (key rotation under a fixed deployment shape).
+    ///
+    /// Errors:
+    ///   * `InvalidConfig` — `LbConfig.validate` failed, or the
+    ///     resolved `cidLength` doesn't match the server's existing
+    ///     `local_cid_len`, or the previous Server was built without
+    ///     a `quic_lb` configuration (no factory to rotate).
+    ///   * `RandFailed` — CSPRNG nonce-counter seed failed.
+    pub fn installLbConfig(self: *Server, new_cfg: lb_mod.LbConfig) Error!void {
+        new_cfg.validate() catch return Error.InvalidConfig;
+        if (self.lb_factory == null) return Error.InvalidConfig;
+        if (new_cfg.cidLength() != self.local_cid_len) return Error.InvalidConfig;
+
+        const new_factory = lb_mod.Factory.initUnchecked(new_cfg) catch |err| switch (err) {
+            error.AesKeyInvalid => return Error.InvalidConfig,
+            error.RandFailure => return Error.RandFailed,
+            error.InvalidLbConfig => return Error.InvalidConfig,
+            error.BufferTooSmall, error.NonceExhausted => unreachable,
+        };
+        if (self.lb_factory) |*old| old.deinit();
+        self.lb_factory = new_factory;
+
+        // Auto-push to live peers. No-op without a stateless-reset
+        // key (token derivation needs one); embedders running
+        // without the key drive replenishment manually via
+        // `connection_ids_needed`.
+        if (self.stateless_reset_key != null) {
+            _ = self.rotateLiveSlotCids();
+        }
+    }
+
+    /// Push a fresh NEW_CONNECTION_ID frame to every live slot using
+    /// the active LB factory and the configured stateless-reset key.
+    /// Each pushed frame's `retire_prior_to` invalidates every
+    /// previously-issued local CID on that slot, so the peer
+    /// switches to the new CID on its next datagram.
+    ///
+    /// Returns the number of slots that successfully received a new
+    /// CID. Per-slot failures (no LB factory, no stateless-reset
+    /// key, CID-issue budget exhausted, factory mint failure,
+    /// HMAC error, replenishment rejected) are swallowed so a single
+    /// bad slot doesn't abort the rotation. Pre-handshake slots
+    /// receive the queued frame but don't transmit it until they
+    /// reach 1-RTT — NEW_CONNECTION_ID is a §12.4 / §17 1-RTT-only
+    /// frame.
+    ///
+    /// `installLbConfig` calls this automatically when
+    /// `Config.stateless_reset_key` is set; embedders typically
+    /// reach for it directly only when proactively pushing CIDs
+    /// without a config swap.
+    pub fn rotateLiveSlotCids(self: *Server) usize {
+        const factory_ptr = if (self.lb_factory) |*f| f else return 0;
+        const key = self.stateless_reset_key orelse return 0;
+
+        var rotated: usize = 0;
+        for (self.slots.items) |slot| {
+            if (slot.conn.isClosed()) continue;
+            if (slot.conn.localConnectionIdIssueBudget(0) == 0) continue;
+
+            var cid_buf: [20]u8 = undefined;
+            const cid_slice = cid_buf[0..self.local_cid_len];
+            _ = factory_ptr.mint(cid_slice) catch continue;
+
+            const token = conn_mod.stateless_reset.derive(&key, cid_slice) catch continue;
+            const next_seq = slot.conn.nextLocalConnectionIdSequence(0);
+            const provision = conn_mod.ConnectionIdProvision{
+                .connection_id = cid_slice,
+                .stateless_reset_token = token,
+                .retire_prior_to = next_seq,
+            };
+            _ = slot.conn.replenishConnectionIds(&[_]conn_mod.ConnectionIdProvision{provision}) catch continue;
+
+            // Bring the routing table in line with the slot's new
+            // active-CID set so the new CID becomes routable on
+            // the next inbound datagram. Failures here leave the
+            // CID in the connection but unreachable until the next
+            // organic resync — log via the standard error path
+            // by skipping the rotation count.
+            self.resyncSlotCids(slot) catch continue;
+            rotated += 1;
+        }
+        return rotated;
+    }
+
     pub fn deinit(self: *Server) void {
         for (self.slots.items) |slot| {
             slot.conn.deinit();
@@ -1266,6 +1477,17 @@ pub const Server = struct {
         // key — a peer-mintable token's worth of crypto state must
         // not linger after the Server struct is freed.
         if (self.new_token_key) |*key| {
+            std.crypto.secureZero(u8, key[0..]);
+        }
+        // Same for the QUIC-LB encryption key — `Factory.deinit`
+        // zeros the embedded `LbConfig.key` and the nonce counter
+        // buffer. No-op for plaintext-mode factories (key was null).
+        if (self.lb_factory) |*factory| {
+            factory.deinit();
+        }
+        // And the stateless-reset HMAC key — same hardening
+        // rationale as the other secret key fields.
+        if (self.stateless_reset_key) |*key| {
             std.crypto.secureZero(u8, key[0..]);
         }
         // Draining contexts always represent ownership the Server
@@ -1817,6 +2039,74 @@ pub const Server = struct {
         return self.cid_table.get(key);
     }
 
+    /// Fill `dst` (length `self.local_cid_len`) with a freshly-minted
+    /// server-side SCID. With QUIC-LB enabled (`Config.quic_lb`), the
+    /// bytes are produced by the configured `lb.Factory` so an
+    /// external load balancer can decode the routing identity;
+    /// otherwise the bytes come straight from BoringSSL's CSPRNG.
+    /// Used by both `openSlotFromInitial` (initial Slot SCID) and
+    /// `mintAndQueueRetry` (Retry SCID).
+    /// Mint a fresh server SCID into `dst`. Three paths, in order of
+    /// preference:
+    ///
+    ///   1. **No LB configured** — draw `dst.len` bytes from the
+    ///      BoringSSL CSPRNG. Pure entropy on the wire; no metadata.
+    ///   2. **LB configured, factory accepts** — defer to
+    ///      `lb.Factory.mint`, which dispatches to plaintext,
+    ///      single-pass AES, or four-pass Feistel based on
+    ///      `(key, combined)`.
+    ///   3. **LB configured, nonce counter exhausted** — fall back
+    ///      to `lb.mintUnroutable` so the server keeps minting
+    ///      well-formed CIDs (config_id `0b111`, length self-encoded)
+    ///      until the operator rotates to a new configuration via
+    ///      `installLbConfig`. The fallback requires
+    ///      `local_cid_len >= lb.min_unroutable_cid_len` (8 octets);
+    ///      configurations with shorter CIDs surface
+    ///      `Error.RandFailed` instead.
+    ///
+    /// Public so the LB-5 conformance suite can exercise path (3)
+    /// directly via white-box state manipulation. Embedders rarely
+    /// need to call this — the Server's existing
+    /// `openSlotFromInitial` and `mintAndQueueRetry` paths route
+    /// through here automatically.
+    pub fn mintLocalScid(self: *Server, dst: []u8) Error!void {
+        if (self.lb_factory) |*factory| {
+            const n = factory.mint(dst) catch |err| switch (err) {
+                error.RandFailure => return Error.RandFailed,
+                // Per draft §3 ¶3 / §3.1: when the active
+                // configuration can no longer mint distinct CIDs the
+                // server SHOULD switch to a new configuration or use
+                // the unroutable fallback. Until the operator calls
+                // `installLbConfig`, this branch keeps the server
+                // alive by emitting unroutable CIDs that an LB can
+                // route via its configured fallback path.
+                error.NonceExhausted => {
+                    if (dst.len < lb_mod.min_unroutable_cid_len) {
+                        return Error.RandFailed;
+                    }
+                    _ = lb_mod.mintUnroutable(dst, @intCast(dst.len)) catch {
+                        return Error.RandFailed;
+                    };
+                    return;
+                },
+                // `Server.init` already rejected ill-sized
+                // configurations, and `local_cid_len` matches
+                // `Factory.cidLength()` by construction. Reaching any
+                // of these would mean an invariant upstream slipped —
+                // surface as the generic SCID mint-failure code
+                // rather than panicking, since the network-input path
+                // must remain non-fatal.
+                error.BufferTooSmall,
+                error.InvalidLbConfig,
+                error.AesKeyInvalid,
+                => return Error.RandFailed,
+            };
+            std.debug.assert(n == dst.len);
+            return;
+        }
+        try boringssl.crypto.rand.fillBytes(dst);
+    }
+
     fn openSlotFromInitial(
         self: *Server,
         bytes: []const u8,
@@ -1852,7 +2142,7 @@ pub const Server = struct {
             @memcpy(server_scid[0..echo.retry_scid_len], local_scid);
             local_scid = server_scid[0..echo.retry_scid_len];
         } else {
-            try boringssl.crypto.rand.fillBytes(server_scid[0..self.local_cid_len]);
+            try self.mintLocalScid(server_scid[0..self.local_cid_len]);
             local_scid = server_scid[0..self.local_cid_len];
         }
         try conn_ptr.setLocalScid(local_scid);
@@ -2508,7 +2798,7 @@ pub const Server = struct {
         // a different connection.
         var retry_scid: [20]u8 = @splat(0);
         const retry_scid_len = self.local_cid_len;
-        try boringssl.crypto.rand.fillBytes(retry_scid[0..retry_scid_len]);
+        try self.mintLocalScid(retry_scid[0..retry_scid_len]);
 
         var addr_buf: [22]u8 = undefined;
         const ctx = addressContext(&addr_buf, addr);

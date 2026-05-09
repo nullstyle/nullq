@@ -145,6 +145,28 @@ pub const Error = error{
     /// fixed-shape 96-byte tokens via `conn.new_token.mint`; only
     /// custom embedder formats can hit this.
     NewTokenTooLong,
+    /// `Connection.advertiseAlternativeV4Address` /
+    /// `Connection.advertiseAlternativeV6Address` was called before
+    /// the peer advertised support via the `alternative_address`
+    /// transport parameter (draft-munizaga-quic-alternative-server-address-00 §4).
+    /// Embedder-side misuse — advertising an alternative address to
+    /// a peer that doesn't expect the frame would force a peer
+    /// PROTOCOL_VIOLATION close.
+    AlternativeAddressNotNegotiated,
+    /// `Connection.advertiseAlternativeV4Address` /
+    /// `Connection.advertiseAlternativeV6Address` ran out of fresh
+    /// Status Sequence Numbers
+    /// (draft-munizaga-quic-alternative-server-address-00 §6 ¶5).
+    /// Saturating the counter and reusing the maximum value would
+    /// silently violate the §6 ¶5 monotonically-increasing
+    /// requirement — the receiver would dedupe the second emission
+    /// as a retransmit and drop a real update on the floor.
+    /// Embedders that hit this should restart the connection (or
+    /// use a different connection for further advertisements);
+    /// reaching 2^64 advertise calls on one connection without a
+    /// teardown is functionally impossible, but failing closed is
+    /// the right behavior at the boundary.
+    AlternativeAddressSequenceExhausted,
 } || boringssl.tls.Error ||
     boringssl.crypto.rand.Error ||
     short_packet_mod.Error ||
@@ -382,6 +404,14 @@ pub const ConnectionEvent = union(enum) {
     connection_ids_needed: ConnectionIdReplenishInfo,
     datagram_acked: DatagramSendEvent,
     datagram_lost: DatagramSendEvent,
+    /// One ALTERNATIVE_V4/V6_ADDRESS update received from the peer
+    /// (draft-munizaga-quic-alternative-server-address-00 §6). Only
+    /// surfaced when the local endpoint advertised support via the
+    /// §4 `alternative_address` transport parameter and the peer's
+    /// Status Sequence Number is strictly greater than every previous
+    /// update — see `AlternativeServerAddressEvent` for the dedup /
+    /// reorder rules.
+    alternative_server_address: AlternativeServerAddressEvent,
 };
 
 /// Whether a flow-control block was hit on the local side or reported by the peer.
@@ -406,6 +436,14 @@ pub const max_connection_id_events: usize = event_queue_mod.max_connection_id_ev
 pub const DatagramSendEvent = event_queue_mod.DatagramSendEvent;
 /// Maximum buffered datagram ack/loss events before older entries are dropped.
 pub const max_datagram_send_events: usize = event_queue_mod.max_datagram_send_events;
+/// One §6 update surfaced via `Connection.pollEvent`.
+pub const AlternativeServerAddressEvent = event_queue_mod.AlternativeServerAddressEvent;
+/// One IPv4 update — payload of `AlternativeServerAddressEvent.v4`.
+pub const AlternativeServerAddressV4Event = event_queue_mod.AlternativeServerAddressV4Event;
+/// One IPv6 update — payload of `AlternativeServerAddressEvent.v6`.
+pub const AlternativeServerAddressV6Event = event_queue_mod.AlternativeServerAddressV6Event;
+/// Maximum buffered alt-address events before older entries are dropped.
+pub const max_alternative_address_events: usize = event_queue_mod.max_alternative_address_events;
 
 const StoredDatagramSendEvent = event_queue_mod.StoredDatagramSendEvent;
 
@@ -1063,6 +1101,12 @@ pub const Connection = struct {
 
     next_datagram_id: u64 = 0,
 
+    /// Next Status Sequence Number to mint for an
+    /// `ALTERNATIVE_V4/V6_ADDRESS` frame
+    /// (draft-munizaga-quic-alternative-server-address-00 §6 ¶5).
+    /// Both frame types share one monotonically-increasing space.
+    next_alternative_address_sequence: u64 = 0,
+
     /// DCID we put on outgoing packets (the peer chose this; client
     /// learns it from the server's first Initial SCID, or
     /// NEW_CONNECTION_ID). Zero-length CIDs are valid — `peer_dcid_set`
@@ -1259,6 +1303,23 @@ pub const Connection = struct {
     flow_blocked_events: event_queue_mod.EventQueue(FlowBlockedInfo, max_flow_blocked_events) = .{},
     connection_id_events: event_queue_mod.EventQueue(ConnectionIdReplenishInfo, max_connection_id_events) = .{},
     datagram_send_events: event_queue_mod.EventQueue(StoredDatagramSendEvent, max_datagram_send_events) = .{},
+    /// Received `ALTERNATIVE_V4/V6_ADDRESS` events
+    /// (draft-munizaga-quic-alternative-server-address-00 §6) the
+    /// embedder hasn't drained via `pollEvent` yet. Bounded at
+    /// `max_alternative_address_events` (16) with drop-oldest
+    /// eviction. Eviction is semantically safe under §6 ¶5
+    /// monotonicity — the latest update always supersedes older
+    /// ones — but a sluggish embedder polling on a chatty peer can
+    /// miss intermediate state. The high-watermark is preserved on
+    /// `highest_alternative_address_sequence_seen` so the embedder
+    /// can detect that updates were dropped (sequence gap between
+    /// the latest polled event and `highestAlternativeAddressSequenceSeen()`).
+    alternative_server_address_events: event_queue_mod.EventQueue(AlternativeServerAddressEvent, max_alternative_address_events) = .{},
+    /// Highest §6 ¶5 Status Sequence Number we've already observed.
+    /// `null` until the first frame arrives. Drives the receive-side
+    /// monotonicity gate: equal-or-lower numbers are absorbed silently
+    /// (idempotent retransmit / out-of-order delivery).
+    highest_alternative_address_sequence_seen: ?u64 = null,
     local_data_blocked_at: ?u64 = null,
     local_stream_data_blocked: std.ArrayList(frame_types.StreamDataBlocked) = .empty,
     local_streams_blocked_bidi: ?u64 = null,
@@ -3619,6 +3680,122 @@ pub const Connection = struct {
         });
     }
 
+    // -- draft-munizaga-quic-alternative-server-address-00 ------------
+
+    /// Optional flags for `Connection.advertiseAlternative*Address`.
+    /// Both bits are off by default — embedders set them to drive the
+    /// §6 Preferred / Retire semantics on the receiving client.
+    pub const AdvertiseAlternativeAddressOptions = struct {
+        /// §6: hint to the client that the path bound to this address
+        /// SHOULD be migrated-to or otherwise prioritized.
+        preferred: bool = false,
+        /// §6: ask the client to close any path associated with this
+        /// address (the SHOULD in §6 ¶3).
+        retire: bool = false,
+    };
+
+    /// True if the peer advertised the §4 `alternative_address`
+    /// transport parameter on its handshake. Returns false when peer
+    /// transport parameters haven't been received yet, when the peer
+    /// is a server (servers MUST NOT send the parameter), or when the
+    /// peer simply omitted it. Drives the negotiation gate on
+    /// `advertiseAlternative*Address`.
+    pub fn peerSupportsAlternativeAddress(self: *const Connection) bool {
+        const params = self.cached_peer_transport_params orelse return false;
+        return params.alternative_address;
+    }
+
+    /// True if this endpoint advertised the §4 `alternative_address`
+    /// transport parameter to its peer. Drives the receive-side gate
+    /// in the frame dispatcher: a client that didn't advertise
+    /// support is in a peer protocol-violation state on receipt of
+    /// any ALT_*_ADDRESS frame.
+    pub fn localAdvertisedAlternativeAddress(self: *const Connection) bool {
+        return self.local_transport_params.alternative_address;
+    }
+
+    /// Queue an ALTERNATIVE_V4_ADDRESS frame
+    /// (draft-munizaga-quic-alternative-server-address-00 §6) for
+    /// emission at the application encryption level. Allocates a
+    /// fresh, monotonically-increasing Status Sequence Number shared
+    /// with the V6 sibling (§6 ¶5) and returns it.
+    ///
+    /// Server-only API: §4 ¶2 forbids clients from sending these
+    /// frames. The peer MUST have advertised
+    /// `alternative_address = true` in its transport parameters
+    /// before this call — `Error.AlternativeAddressNotNegotiated` is
+    /// returned otherwise so the embedder can't accidentally force a
+    /// PROTOCOL_VIOLATION close on a non-supporting client. Returns
+    /// `Error.AlternativeAddressSequenceExhausted` once the
+    /// connection has emitted 2^64 advertisements, which is
+    /// functionally unreachable but bounded explicitly so the wire
+    /// contract can never silently break.
+    pub fn advertiseAlternativeV4Address(
+        self: *Connection,
+        address: [4]u8,
+        port: u16,
+        opts: AdvertiseAlternativeAddressOptions,
+    ) Error!u64 {
+        if (self.role != .server) return Error.NotServerContext;
+        if (!self.peerSupportsAlternativeAddress()) {
+            return Error.AlternativeAddressNotNegotiated;
+        }
+        const seq = try self.allocAlternativeAddressSequence();
+        try self.pending_frames.alternative_addresses.append(self.allocator, .{
+            .v4 = .{
+                .preferred = opts.preferred,
+                .retire = opts.retire,
+                .status_sequence_number = seq,
+                .address = address,
+                .port = port,
+            },
+        });
+        return seq;
+    }
+
+    /// IPv6 sibling of `advertiseAlternativeV4Address`. Same semantics
+    /// — same role gate, same shared sequence-number space, same
+    /// `AlternativeAddressSequenceExhausted` boundary handling.
+    pub fn advertiseAlternativeV6Address(
+        self: *Connection,
+        address: [16]u8,
+        port: u16,
+        opts: AdvertiseAlternativeAddressOptions,
+    ) Error!u64 {
+        if (self.role != .server) return Error.NotServerContext;
+        if (!self.peerSupportsAlternativeAddress()) {
+            return Error.AlternativeAddressNotNegotiated;
+        }
+        const seq = try self.allocAlternativeAddressSequence();
+        try self.pending_frames.alternative_addresses.append(self.allocator, .{
+            .v6 = .{
+                .preferred = opts.preferred,
+                .retire = opts.retire,
+                .status_sequence_number = seq,
+                .address = address,
+                .port = port,
+            },
+        });
+        return seq;
+    }
+
+    /// Allocate the next §6 ¶5 Status Sequence Number. Mirrors the
+    /// `next_datagram_id` allocator pattern: returns
+    /// `Error.AlternativeAddressSequenceExhausted` at the u64 cap
+    /// rather than wrapping or saturating. Wrapping back to 0 would
+    /// silently violate §6 ¶5 monotonicity; saturating would emit
+    /// two distinct logical updates with the same sequence number,
+    /// which the receiver would dedupe as a retransmit and drop the
+    /// second update on the floor.
+    fn allocAlternativeAddressSequence(self: *Connection) Error!u64 {
+        const seq = self.next_alternative_address_sequence;
+        if (seq == std.math.maxInt(u64)) {
+            return Error.AlternativeAddressSequenceExhausted;
+        }
+        self.next_alternative_address_sequence = seq + 1;
+        return seq;
+    }
+
     /// Pop the oldest received DATAGRAM into `dst`. Returns the
     /// number of bytes written, or null if none pending. The
     /// payload is dropped from the queue regardless of whether it
@@ -3992,23 +4169,50 @@ pub const Connection = struct {
     }
 
     pub fn validatePeerTransportRole(self: *Connection) void {
-        if (self.role != .server) return;
         const params = self.cached_peer_transport_params orelse return;
-        if (params.original_destination_connection_id != null) {
-            self.close(true, transport_error_transport_parameter, "client sent original destination cid");
-            return;
-        }
-        if (params.stateless_reset_token != null) {
-            self.close(true, transport_error_transport_parameter, "client sent stateless reset token");
-            return;
-        }
-        if (params.preferred_address != null) {
-            self.close(true, transport_error_transport_parameter, "client sent preferred address");
-            return;
-        }
-        if (params.retry_source_connection_id != null) {
-            self.close(true, transport_error_transport_parameter, "client sent retry source cid");
-            return;
+        switch (self.role) {
+            .server => {
+                if (params.original_destination_connection_id != null) {
+                    self.close(true, transport_error_transport_parameter, "client sent original destination cid");
+                    return;
+                }
+                if (params.stateless_reset_token != null) {
+                    self.close(true, transport_error_transport_parameter, "client sent stateless reset token");
+                    return;
+                }
+                if (params.preferred_address != null) {
+                    self.close(true, transport_error_transport_parameter, "client sent preferred address");
+                    return;
+                }
+                if (params.retry_source_connection_id != null) {
+                    self.close(true, transport_error_transport_parameter, "client sent retry source cid");
+                    return;
+                }
+            },
+            .client => {
+                // draft-munizaga-quic-alternative-server-address-00 §4 ¶2:
+                // "Servers MUST NOT send this transport parameter. A
+                // client that supports this extension and receives this
+                // transport parameter MUST abort the connection with a
+                // TRANSPORT_PARAMETER_ERROR."
+                //
+                // The MUST is explicitly conditioned on the client
+                // supporting the extension; a non-supporting client
+                // is technically free to ignore the parameter (RFC
+                // 9000 §18 forward-compat would treat an unrecognized
+                // parameter as a no-op). quic_zig deliberately picks
+                // the strict close instead: a server that emits the
+                // parameter is broken regardless of whether *this*
+                // client happens to support the extension, and
+                // surfacing the violation forces the operator to
+                // notice and fix it rather than papering over the
+                // bug. Both behaviors are spec-conformant; this is
+                // the safer of the two.
+                if (params.alternative_address) {
+                    self.close(true, transport_error_transport_parameter, "server sent alternative_address");
+                    return;
+                }
+            },
         }
     }
 
@@ -5108,6 +5312,7 @@ pub const Connection = struct {
         if (self.pending_frames.max_path_id != null) return true;
         if (self.pending_frames.paths_blocked != null) return true;
         if (self.pending_frames.path_cids_blocked != null) return true;
+        if (self.pending_frames.alternative_addresses.items.len > 0) return true;
         if (self.pending_frames.send_datagrams.items.len > 0) return true;
         var it = self.streams.iterator();
         while (it.next()) |entry| {
@@ -5781,6 +5986,33 @@ pub const Connection = struct {
                     .retire_connection_id = item,
                 });
                 _ = self.pending_frames.retire_connection_ids.orderedRemove(0);
+                ack_eliciting = true;
+            }
+        }
+
+        // 2bx) ALTERNATIVE_V4/V6_ADDRESS (application only).
+        // draft-munizaga-quic-alternative-server-address-00 §6 / §7:
+        // application-data PN space, ack-eliciting. One frame per
+        // packet keeps the size budgeting trivial and matches the
+        // NEW_CONNECTION_ID drain pattern above; back-pressured advertise
+        // calls accumulate in `pending_frames.alternative_addresses` and
+        // drain across subsequent polls.
+        if (!app_control_blocked and lvl == .application and self.pending_frames.alternative_addresses.items.len > 0) {
+            const item = self.pending_frames.alternative_addresses.items[0];
+            const candidate: frame_types.Frame = switch (item) {
+                .v4 => |a| .{ .alternative_v4_address = a },
+                .v6 => |a| .{ .alternative_v6_address = a },
+            };
+            const overhead_alt = frame_mod.encodedLen(candidate);
+            if (max_payload >= pl_pos + overhead_alt) {
+                const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], candidate);
+                pl_pos += wrote;
+                const retx: sent_packets_mod.RetransmitFrame = switch (item) {
+                    .v4 => |a| .{ .alternative_v4_address = a },
+                    .v6 => |a| .{ .alternative_v6_address = a },
+                };
+                try sent_packet.addRetransmitFrame(self.allocator, retx);
+                _ = self.pending_frames.alternative_addresses.orderedRemove(0);
                 ack_eliciting = true;
             }
         }
@@ -6533,6 +6765,9 @@ pub const Connection = struct {
                 .lost => |event| .{ .datagram_lost = event },
             };
         }
+        if (self.alternative_server_address_events.pop()) |out| {
+            return .{ .alternative_server_address = out };
+        }
         return null;
     }
 
@@ -6951,6 +7186,38 @@ pub const Connection = struct {
                 },
                 .retire_connection_id => |rc| self.handleRetireConnectionId(rc),
                 .new_token => |nt| self.handleNewToken(nt),
+                // draft-munizaga-quic-alternative-server-address-00 §6.
+                // ALTERNATIVE_V4/V6_ADDRESS frames are gated by the
+                // `alternative_address` transport parameter (§4) — only
+                // a server may send them, and only after the client
+                // advertised support. Receipt outside that envelope is
+                // a peer protocol violation.
+                .alternative_v4_address => |a| {
+                    if (self.role != .client or
+                        !self.localAdvertisedAlternativeAddress())
+                    {
+                        self.close(
+                            true,
+                            transport_error_protocol_violation,
+                            "alternative_address frame without negotiation",
+                        );
+                        return;
+                    }
+                    self.handleAlternativeAddressV4(a);
+                },
+                .alternative_v6_address => |a| {
+                    if (self.role != .client or
+                        !self.localAdvertisedAlternativeAddress())
+                    {
+                        self.close(
+                            true,
+                            transport_error_protocol_violation,
+                            "alternative_address frame without negotiation",
+                        );
+                        return;
+                    }
+                    self.handleAlternativeAddressV6(a);
+                },
             }
         }
         if (debugFrames() != null) {
@@ -6982,6 +7249,17 @@ pub const Connection = struct {
             .new_token,
             .path_response,
             .retire_connection_id,
+            // draft-munizaga-quic-alternative-server-address-00 §4 ¶3
+            // forbids remembering the `alternative_address` parameter
+            // for 0-RTT, so the negotiation cannot have happened by
+            // the time a 0-RTT packet is processed. Reject the frames
+            // outright at the early-data gate so the diagnostic close
+            // reason is "forbidden frame in 0-RTT" rather than
+            // "without negotiation" — clearer for operators and
+            // closes the door even if a future role-gate change
+            // accidentally weakens the inner check.
+            .alternative_v4_address,
+            .alternative_v6_address,
             => false,
             else => true,
         };
@@ -7228,6 +7506,65 @@ pub const Connection = struct {
     pub fn handlePathsBlocked(self: *Connection, pb: frame_types.PathsBlocked) void { return conn_recv_multipath_handlers.handlePathsBlocked(self, pb); }
 
     pub fn handlePathCidsBlocked(self: *Connection, pcb: frame_types.PathCidsBlocked) void { return conn_recv_multipath_handlers.handlePathCidsBlocked(self, pcb); }
+
+    /// Handle a received ALTERNATIVE_V4_ADDRESS frame
+    /// (draft-munizaga-quic-alternative-server-address-00 §6).
+    /// Caller has already validated the negotiation gate. Enforces
+    /// §6 ¶5 monotonicity: a strictly-greater Status Sequence Number
+    /// produces a fresh `ConnectionEvent.alternative_server_address`;
+    /// equal-or-lower is dropped (idempotent retransmit / out-of-
+    /// order delivery).
+    pub fn handleAlternativeAddressV4(
+        self: *Connection,
+        a: frame_types.AlternativeV4Address,
+    ) void {
+        if (!self.acceptAltAddrSequence(a.status_sequence_number)) return;
+        self.alternative_server_address_events.push(.{ .v4 = .{
+            .address = a.address,
+            .port = a.port,
+            .status_sequence_number = a.status_sequence_number,
+            .preferred = a.preferred,
+            .retire = a.retire,
+        } });
+    }
+
+    /// IPv6 sibling of `handleAlternativeAddressV4`. Same monotonicity
+    /// rules — V4 and V6 share the §6 ¶5 sequence space.
+    pub fn handleAlternativeAddressV6(
+        self: *Connection,
+        a: frame_types.AlternativeV6Address,
+    ) void {
+        if (!self.acceptAltAddrSequence(a.status_sequence_number)) return;
+        self.alternative_server_address_events.push(.{ .v6 = .{
+            .address = a.address,
+            .port = a.port,
+            .status_sequence_number = a.status_sequence_number,
+            .preferred = a.preferred,
+            .retire = a.retire,
+        } });
+    }
+
+    /// True if `seq` is strictly greater than every previously-seen
+    /// Status Sequence Number; updates `highest_alternative_address_sequence_seen`
+    /// as a side-effect on accept. Older or equal numbers return
+    /// false (idempotent retransmit / out-of-order delivery — §6 ¶5
+    /// is sender-side).
+    fn acceptAltAddrSequence(self: *Connection, seq: u64) bool {
+        if (self.highest_alternative_address_sequence_seen) |highest| {
+            if (seq <= highest) return false;
+        }
+        self.highest_alternative_address_sequence_seen = seq;
+        return true;
+    }
+
+    /// Highest Status Sequence Number this connection has received
+    /// across both ALT_*_ADDRESS frame types
+    /// (draft-munizaga-quic-alternative-server-address-00 §6 ¶5), or
+    /// `null` when no frame has arrived yet. Useful for tests and
+    /// embedder-side debugging.
+    pub fn highestAlternativeAddressSequenceSeen(self: *const Connection) ?u64 {
+        return self.highest_alternative_address_sequence_seen;
+    }
 
     pub fn handleStopSending( self: *Connection, ss: frame_types.StopSending, ) Error!void { return conn_recv_stream_control_handlers.handleStopSending(self, ss); }
 
@@ -7810,6 +8147,30 @@ pub const Connection = struct {
                         self.pending_frames.new_token = stage;
                         any = true;
                     }
+                },
+                .alternative_v4_address => |a| {
+                    // draft-munizaga-quic-alternative-server-address-00
+                    // §6 ¶5: monotonically-increasing Status Sequence
+                    // Numbers, but the spec is silent on retransmission.
+                    // RFC 9000 §13.3 default applies — control frames
+                    // that aren't redundant on receipt MUST be
+                    // retransmitted on loss with the same content. The
+                    // Status Sequence Number stays attached to the
+                    // semantic update (which IPv4 address, what flags),
+                    // so the requeued frame keeps its original
+                    // sequence number.
+                    try self.pending_frames.alternative_addresses.append(
+                        self.allocator,
+                        .{ .v4 = a },
+                    );
+                    any = true;
+                },
+                .alternative_v6_address => |a| {
+                    try self.pending_frames.alternative_addresses.append(
+                        self.allocator,
+                        .{ .v6 = a },
+                    );
+                    any = true;
                 },
             }
         }

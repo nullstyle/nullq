@@ -239,6 +239,40 @@ pub const PathCidsBlocked = struct {
     next_sequence_number: u64,
 };
 
+/// ALTERNATIVE_V4_ADDRESS frame (draft-munizaga-quic-alternative-server-address-00 §6).
+/// Server-only frame advertising an alternative IPv4 address the
+/// client MAY open or retire a path to. Frame type `0x1d5845e2`.
+/// Ack-eliciting and application-data-PN-space only (§7); the wire
+/// layer here exposes the shape — the connection state machine is
+/// responsible for those constraints.
+///
+/// Sequence-number space is shared with `AlternativeV6Address`; the
+/// sender MUST emit monotonically increasing values (§6 ¶5).
+pub const AlternativeV4Address = struct {
+    /// First flag bit: server's hint that the client SHOULD prioritize
+    /// (or migrate to) the path bound to this address (§6).
+    preferred: bool,
+    /// Second flag bit: server is asking the client to close any path
+    /// associated with this address (§6).
+    retire: bool,
+    /// Monotonically increasing counter shared with the V6 frame (§6 ¶5).
+    status_sequence_number: u64,
+    /// IPv4 address bytes in network byte order.
+    address: [4]u8,
+    /// UDP port. Stored in host byte order; the wire encoding emits big-endian.
+    port: u16,
+};
+
+/// ALTERNATIVE_V6_ADDRESS frame (draft-munizaga-quic-alternative-server-address-00 §6).
+/// IPv6 sibling of `AlternativeV4Address`. Frame type `0x1d5845e3`.
+pub const AlternativeV6Address = struct {
+    preferred: bool,
+    retire: bool,
+    status_sequence_number: u64,
+    address: [16]u8,
+    port: u16,
+};
+
 /// QUIC STREAM frame (RFC 9000 §19.8). The type byte has three flag
 /// bits — OFF (0x04), LEN (0x02), FIN (0x01) — combined with the
 /// base 0x08 to give the 8 wire types 0x08..0x0f.
@@ -306,4 +340,6 @@ pub const Frame = union(enum) {
     max_path_id: MaxPathId,
     paths_blocked: PathsBlocked,
     path_cids_blocked: PathCidsBlocked,
+    alternative_v4_address: AlternativeV4Address,
+    alternative_v6_address: AlternativeV6Address,
 };

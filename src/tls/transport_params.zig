@@ -63,6 +63,13 @@ pub const Id = struct {
     pub const max_datagram_frame_size: u64 = 0x20;
     /// draft-ietf-quic-multipath-21 §2.1
     pub const initial_max_path_id: u64 = 0x3e;
+    /// draft-munizaga-quic-alternative-server-address-00 §4 / §10.1.
+    /// Zero-length flag advertised by clients that support the
+    /// extension. Servers MUST NOT send it (§4 ¶2). The
+    /// codepoint sits in the provisional individual-submission space
+    /// and may move; the project memo bumps `alt_server_address_draft_version`
+    /// when this is renegotiated upstream.
+    pub const alternative_address: u64 = 0xff0969d85c;
 };
 
 /// Errors returned by `Params.encode` and `Params.decode`.
@@ -190,6 +197,27 @@ pub const Params = struct {
     /// advertises the extension but allows no extra paths yet.
     initial_max_path_id: ?u32 = null,
 
+    /// 0xff0969d85c — draft-munizaga-quic-alternative-server-address-00 §4.
+    /// Zero-length flag the *client* may set to advertise that it
+    /// supports ALTERNATIVE_V4/V6_ADDRESS frames. A `true` value on
+    /// a server-authored blob is rejected by `decodeAs` per §4 ¶2
+    /// ("Servers MUST NOT send this transport parameter").
+    ///
+    /// §4 ¶3 contract for embedders: "Endpoints MUST NOT remember
+    /// the value of this extension for 0-RTT." The connection state
+    /// machine satisfies this by construction — server emit gates on
+    /// `Connection.cached_peer_transport_params`, which is populated
+    /// from the *live* handshake's CRYPTO frames (not from a session
+    /// ticket), and `Connection.localAdvertisedAlternativeAddress`
+    /// reads `Connection.local_transport_params`, which is whatever
+    /// the embedder set via `setTransportParams` for *this*
+    /// connection. The only way to violate §4 ¶3 is for the embedder
+    /// to persist a peer-params struct across sessions and re-install
+    /// it manually; in that case the embedder MUST clear this field
+    /// before reinstalling. The `false` default makes "freshly
+    /// constructed Params" the safe state.
+    alternative_address: bool = false,
+
     /// Serialize `self` into `dst`. Only non-default fields are
     /// emitted; the resulting blob is the same shape regardless of
     /// whether the sender is client or server.
@@ -251,6 +279,9 @@ pub const Params = struct {
         }
         if (self.initial_max_path_id) |max_path_id| {
             pos += try writeVarint(dst, pos, Id.initial_max_path_id, max_path_id);
+        }
+        if (self.alternative_address) {
+            pos += try writeFlag(dst, pos, Id.alternative_address);
         }
         return pos;
     }
@@ -360,6 +391,15 @@ pub fn decodeAs(blob: []const u8, opts: DecodeOptions) Error!Params {
                 return Error.TransportParameterError;
             }
             if (!opts.server_sent_retry and has_retry_scid) {
+                return Error.TransportParameterError;
+            }
+            // draft-munizaga-quic-alternative-server-address-00 §4 ¶2:
+            // "Servers MUST NOT send this transport parameter. A client
+            // that supports this extension and receives this transport
+            // parameter MUST abort the connection with a
+            // TRANSPORT_PARAMETER_ERROR." Surface the violation here so
+            // the client's handle path can map it to a CONNECTION_CLOSE.
+            if (params.alternative_address) {
                 return Error.TransportParameterError;
             }
         },
@@ -496,6 +536,11 @@ fn setOne(p: *Params, id: u64, value: []const u8) Error!void {
             const v = try decodeVarintValue(value);
             if (v > std.math.maxInt(u32)) return Error.InvalidValue;
             p.initial_max_path_id = @intCast(v);
+        },
+        Id.alternative_address => {
+            // Zero-length flag (§4 ¶1): non-empty value is malformed.
+            if (value.len != 0) return Error.InvalidValue;
+            p.alternative_address = true;
         },
         else => {}, // unknown ids are ignored per §18
     }
@@ -851,6 +896,62 @@ test "decodeAs enforces server's retry_source_connection_id presence rule (§7.3
     try testing.expect(ok.retry_source_connection_id != null);
 }
 
+test "alternative_address transport parameter round-trips as a zero-length flag (draft-munizaga §4)" {
+    // Encode alternative_address by itself so the blob's first
+    // varint is the parameter id and we can pin its byte-shape down.
+    const sent: Params = .{ .alternative_address = true };
+    var buf: [32]u8 = undefined;
+    const n = try sent.encode(&buf);
+
+    // The blob MUST contain the zero-length flag with id 0xff0969d85c.
+    // 0xff0969d85c needs an 8-byte varint (value > 2^30).
+    const id = try varint.decode(buf[0..n]);
+    try testing.expectEqual(@as(u64, Id.alternative_address), id.value);
+    try testing.expectEqual(@as(u8, 8), id.bytes_read);
+    const len = try varint.decode(buf[id.bytes_read..n]);
+    try testing.expectEqual(@as(u64, 0), len.value);
+    // 8-byte id varint + 1-byte length varint == 9 bytes total.
+    try testing.expectEqual(@as(usize, 9), n);
+
+    const got = try Params.decode(buf[0..n]);
+    try testing.expect(got.alternative_address);
+}
+
+test "alternative_address with non-zero length is rejected (draft-munizaga §4)" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    pos += try varint.encode(buf[pos..], Id.alternative_address);
+    pos += try varint.encode(buf[pos..], 1);
+    buf[pos] = 0;
+    pos += 1;
+    try testing.expectError(Error.InvalidValue, Params.decode(buf[0..pos]));
+}
+
+test "decodeAs rejects alternative_address authored by a server (draft-munizaga §4 ¶2)" {
+    const sent: Params = .{
+        .initial_source_connection_id = example_scid,
+        .original_destination_connection_id = example_scid,
+        .alternative_address = true,
+    };
+    var buf: [128]u8 = undefined;
+    const n = try sent.encode(&buf);
+    try testing.expectError(
+        Error.TransportParameterError,
+        decodeAs(buf[0..n], .{ .role = .server, .server_sent_retry = false }),
+    );
+}
+
+test "decodeAs accepts alternative_address from a client (draft-munizaga §4)" {
+    const sent: Params = .{
+        .initial_source_connection_id = example_scid,
+        .alternative_address = true,
+    };
+    var buf: [128]u8 = undefined;
+    const n = try sent.encode(&buf);
+    const got = try decodeAs(buf[0..n], .{ .role = .client });
+    try testing.expect(got.alternative_address);
+}
+
 test "decodeAs accepts a typical client blob and a typical server blob" {
     // Client side: ISCID present, server-only fields absent.
     const client_sent: Params = .{
@@ -949,6 +1050,7 @@ fn fuzzTransportParams(_: void, smith: *std.testing.Smith) anyerror!void {
     try testing.expectEqual(p.active_connection_id_limit, p2.active_connection_id_limit);
     try testing.expectEqual(p.disable_active_migration, p2.disable_active_migration);
     try testing.expectEqual(p.initial_max_path_id, p2.initial_max_path_id);
+    try testing.expectEqual(p.alternative_address, p2.alternative_address);
 }
 
 // Build a `Params` struct with every field populated from corpus
@@ -1028,6 +1130,7 @@ fn fuzzTransportParamsRoundTrip(_: void, smith: *std.testing.Smith) anyerror!voi
         .retry_source_connection_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else cid_c,
         .max_datagram_frame_size = smith.valueRangeAtMost(u64, 0, 4095),
         .initial_max_path_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else smith.valueRangeAtMost(u32, 0, 255),
+        .alternative_address = smith.valueRangeAtMost(u8, 0, 1) == 0,
     };
 
     var encoded: [1024]u8 = undefined;

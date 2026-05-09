@@ -6160,3 +6160,358 @@ fn fuzzConnCloseAtInitial(_: void, smith: *std.testing.Smith) anyerror!void {
         );
     }
 }
+
+// -- draft-munizaga-quic-alternative-server-address-00 (ALT-3) ----------
+
+test "advertiseAlternativeV4Address rejects client role" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try std.testing.expectError(
+        Error.NotServerContext,
+        conn.advertiseAlternativeV4Address(.{ 192, 0, 2, 1 }, 4433, .{}),
+    );
+    try std.testing.expectError(
+        Error.NotServerContext,
+        conn.advertiseAlternativeV6Address(@splat(0), 4433, .{}),
+    );
+}
+
+test "advertiseAlternative*Address rejects when peer hasn't advertised support" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // No peer transport params at all → predicate returns false.
+    try std.testing.expect(!conn.peerSupportsAlternativeAddress());
+    try std.testing.expectError(
+        Error.AlternativeAddressNotNegotiated,
+        conn.advertiseAlternativeV4Address(.{ 192, 0, 2, 1 }, 4433, .{}),
+    );
+
+    // Peer params present but flag absent → still rejected.
+    conn.cached_peer_transport_params = .{ .alternative_address = false };
+    try std.testing.expect(!conn.peerSupportsAlternativeAddress());
+    try std.testing.expectError(
+        Error.AlternativeAddressNotNegotiated,
+        conn.advertiseAlternativeV6Address(@splat(0), 4433, .{}),
+    );
+}
+
+test "advertiseAlternativeV4Address queues a frame and increments the shared sequence" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .alternative_address = true };
+    try std.testing.expect(conn.peerSupportsAlternativeAddress());
+
+    const seq0 = try conn.advertiseAlternativeV4Address(
+        .{ 192, 0, 2, 1 },
+        4433,
+        .{ .preferred = true },
+    );
+    const seq1 = try conn.advertiseAlternativeV6Address(
+        @splat(0),
+        4433,
+        .{ .retire = true },
+    );
+    const seq2 = try conn.advertiseAlternativeV4Address(
+        .{ 198, 51, 100, 7 },
+        4433,
+        .{},
+    );
+
+    try std.testing.expectEqual(@as(u64, 0), seq0);
+    try std.testing.expectEqual(@as(u64, 1), seq1);
+    try std.testing.expectEqual(@as(u64, 2), seq2);
+    try std.testing.expectEqual(@as(usize, 3), conn.pending_frames.alternative_addresses.items.len);
+
+    // The queue order matches the call order so the sequence numbers
+    // come out monotonically increasing on the wire.
+    const items = conn.pending_frames.alternative_addresses.items;
+    try std.testing.expect(items[0] == .v4);
+    try std.testing.expectEqual(@as(u64, 0), items[0].v4.status_sequence_number);
+    try std.testing.expect(items[0].v4.preferred);
+    try std.testing.expect(items[1] == .v6);
+    try std.testing.expectEqual(@as(u64, 1), items[1].v6.status_sequence_number);
+    try std.testing.expect(items[1].v6.retire);
+    try std.testing.expect(items[2] == .v4);
+    try std.testing.expectEqual(@as(u64, 2), items[2].v4.status_sequence_number);
+
+    // canSend reports work pending while the queue is non-empty so the
+    // outer poll loop won't park before we drain.
+    try std.testing.expect(conn.canSend());
+}
+
+test "lost ALTERNATIVE_V4_ADDRESS frame is requeued for retransmission" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    var packet: sent_packets_mod.SentPacket = .{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 0,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    defer packet.deinit(allocator);
+
+    const original: frame_types.AlternativeV4Address = .{
+        .preferred = true,
+        .retire = false,
+        .status_sequence_number = 9,
+        .address = .{ 198, 51, 100, 7 },
+        .port = 4433,
+    };
+    try packet.addRetransmitFrame(allocator, .{ .alternative_v4_address = original });
+
+    const requeued = try conn.dispatchLostControlFramesOnPath(&packet, conn.activePath().id);
+    try std.testing.expect(requeued);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.alternative_addresses.items.len);
+
+    const got = conn.pending_frames.alternative_addresses.items[0];
+    try std.testing.expect(got == .v4);
+    try std.testing.expectEqual(original.status_sequence_number, got.v4.status_sequence_number);
+    try std.testing.expectEqual(original.address, got.v4.address);
+    try std.testing.expectEqual(original.port, got.v4.port);
+    try std.testing.expectEqual(original.preferred, got.v4.preferred);
+}
+
+test "lost ALTERNATIVE_V6_ADDRESS frame is requeued for retransmission" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    var packet: sent_packets_mod.SentPacket = .{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 0,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    defer packet.deinit(allocator);
+
+    const original: frame_types.AlternativeV6Address = .{
+        .preferred = false,
+        .retire = true,
+        .status_sequence_number = 42,
+        .address = .{
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42,
+        },
+        .port = 8443,
+    };
+    try packet.addRetransmitFrame(allocator, .{ .alternative_v6_address = original });
+
+    const requeued = try conn.dispatchLostControlFramesOnPath(&packet, conn.activePath().id);
+    try std.testing.expect(requeued);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.alternative_addresses.items.len);
+
+    const got = conn.pending_frames.alternative_addresses.items[0];
+    try std.testing.expect(got == .v6);
+    try std.testing.expectEqual(original.status_sequence_number, got.v6.status_sequence_number);
+    try std.testing.expectEqual(original.retire, got.v6.retire);
+    try std.testing.expectEqualSlices(u8, &original.address, &got.v6.address);
+}
+
+test "advertise errors with AlternativeAddressSequenceExhausted at the u64 boundary" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.cached_peer_transport_params = .{ .alternative_address = true };
+    // Pre-position the counter one short of u64::max so the next
+    // advertise drains the very last allocatable sequence and the
+    // call after that fails closed.
+    conn.next_alternative_address_sequence = std.math.maxInt(u64) - 1;
+
+    const last = try conn.advertiseAlternativeV4Address(.{ 0, 0, 0, 0 }, 0, .{});
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 1), last);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), conn.next_alternative_address_sequence);
+
+    // Saturating would silently violate §6 ¶5 by reissuing
+    // u64::max-1 (the receiver dedupes on equal sequence numbers and
+    // drops the duplicate as a retransmit). The boundary now fails
+    // closed.
+    try std.testing.expectError(
+        Error.AlternativeAddressSequenceExhausted,
+        conn.advertiseAlternativeV4Address(.{ 0, 0, 0, 0 }, 0, .{}),
+    );
+    // V6 sibling shares the counter and trips the same boundary.
+    try std.testing.expectError(
+        Error.AlternativeAddressSequenceExhausted,
+        conn.advertiseAlternativeV6Address(@splat(0), 0, .{}),
+    );
+}
+
+// -- ALT-4 receive surface -------------------------------------------
+
+test "handleAlternativeAddressV4 surfaces a typed event for a fresh sequence" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.handleAlternativeAddressV4(.{
+        .preferred = true,
+        .retire = false,
+        .status_sequence_number = 1,
+        .address = .{ 192, 0, 2, 1 },
+        .port = 4433,
+    });
+
+    const event = conn.pollEvent() orelse return error.TestUnexpectedNull;
+    try std.testing.expect(event == .alternative_server_address);
+    const inner = event.alternative_server_address;
+    try std.testing.expect(inner == .v4);
+    try std.testing.expectEqual(@as(u64, 1), inner.statusSequenceNumber());
+    try std.testing.expect(inner.preferred());
+    try std.testing.expect(!inner.retire());
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &inner.v4.address);
+    try std.testing.expectEqual(@as(u16, 4433), inner.v4.port);
+    try std.testing.expectEqual(@as(?u64, 1), conn.highestAlternativeAddressSequenceSeen());
+
+    // Queue is now drained.
+    try std.testing.expect(conn.pollEvent() == null);
+}
+
+test "handleAlternativeAddressV6 surfaces a typed event with the IPv6 address bytes" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const ipv6: [16]u8 = .{
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+        0,    0,    0,    0,    0, 0, 0, 0x42,
+    };
+    conn.handleAlternativeAddressV6(.{
+        .preferred = false,
+        .retire = true,
+        .status_sequence_number = 7,
+        .address = ipv6,
+        .port = 8443,
+    });
+
+    const event = conn.pollEvent() orelse return error.TestUnexpectedNull;
+    try std.testing.expect(event.alternative_server_address == .v6);
+    const v6 = event.alternative_server_address.v6;
+    try std.testing.expectEqualSlices(u8, &ipv6, &v6.address);
+    try std.testing.expectEqual(@as(u16, 8443), v6.port);
+    try std.testing.expectEqual(@as(u64, 7), v6.status_sequence_number);
+    try std.testing.expect(v6.retire);
+    try std.testing.expectEqual(@as(?u64, 7), conn.highestAlternativeAddressSequenceSeen());
+}
+
+test "handleAlternativeAddressV4 ignores a duplicate Status Sequence Number" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const original: frame_types.AlternativeV4Address = .{
+        .preferred = false,
+        .retire = false,
+        .status_sequence_number = 5,
+        .address = .{ 192, 0, 2, 1 },
+        .port = 4433,
+    };
+    conn.handleAlternativeAddressV4(original);
+    conn.handleAlternativeAddressV4(original); // idempotent retransmit
+
+    // First call queued the event; second call MUST NOT.
+    try std.testing.expect(conn.pollEvent() != null);
+    try std.testing.expect(conn.pollEvent() == null);
+    try std.testing.expectEqual(@as(?u64, 5), conn.highestAlternativeAddressSequenceSeen());
+}
+
+test "handleAlternativeAddressV4 drops a stale (lower) sequence as out-of-order delivery" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.handleAlternativeAddressV4(.{
+        .preferred = false,
+        .retire = false,
+        .status_sequence_number = 10,
+        .address = .{ 0, 0, 0, 0 },
+        .port = 0,
+    });
+    // Stale reorder: a packet carrying seq=3 arrives after seq=10.
+    // QUIC's app-PN space allows that. The receiver MUST NOT close;
+    // the older update is treated as superseded.
+    conn.handleAlternativeAddressV4(.{
+        .preferred = true,
+        .retire = false,
+        .status_sequence_number = 3,
+        .address = .{ 198, 51, 100, 7 },
+        .port = 4433,
+    });
+
+    // Only the seq=10 event surfaces; the stale seq=3 is dropped.
+    const event = conn.pollEvent() orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(u64, 10), event.alternative_server_address.statusSequenceNumber());
+    try std.testing.expect(conn.pollEvent() == null);
+    try std.testing.expectEqual(@as(?u64, 10), conn.highestAlternativeAddressSequenceSeen());
+}
+
+test "monotonicity tracker shares the sequence space across V4 and V6" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    conn.handleAlternativeAddressV4(.{
+        .preferred = false,
+        .retire = false,
+        .status_sequence_number = 1,
+        .address = .{ 0, 0, 0, 0 },
+        .port = 0,
+    });
+    conn.handleAlternativeAddressV6(.{
+        .preferred = false,
+        .retire = false,
+        .status_sequence_number = 2,
+        .address = @splat(0),
+        .port = 0,
+    });
+    // Stale V4 with seq=1 (already-seen) — silently absorbed.
+    conn.handleAlternativeAddressV4(.{
+        .preferred = false,
+        .retire = false,
+        .status_sequence_number = 1,
+        .address = .{ 0, 0, 0, 0 },
+        .port = 0,
+    });
+
+    // Two events queued; the seq-1 retransmit is dropped.
+    const e1 = conn.pollEvent() orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(u64, 1), e1.alternative_server_address.statusSequenceNumber());
+    try std.testing.expect(e1.alternative_server_address == .v4);
+    const e2 = conn.pollEvent() orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(u64, 2), e2.alternative_server_address.statusSequenceNumber());
+    try std.testing.expect(e2.alternative_server_address == .v6);
+    try std.testing.expect(conn.pollEvent() == null);
+    try std.testing.expectEqual(@as(?u64, 2), conn.highestAlternativeAddressSequenceSeen());
+}

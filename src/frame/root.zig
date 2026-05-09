@@ -548,6 +548,83 @@ test "iter on empty input yields null" {
     try std.testing.expectEqual(@as(?Frame, null), try it.next());
 }
 
+test "round-trip: ALTERNATIVE_V4_ADDRESS with both flags toggled" {
+    const cases = [_]struct { preferred: bool, retire: bool }{
+        .{ .preferred = false, .retire = false },
+        .{ .preferred = true, .retire = false },
+        .{ .preferred = false, .retire = true },
+        .{ .preferred = true, .retire = true },
+    };
+    for (cases) |c| {
+        const f: Frame = .{ .alternative_v4_address = .{
+            .preferred = c.preferred,
+            .retire = c.retire,
+            .status_sequence_number = 7,
+            .address = .{ 192, 0, 2, 1 },
+            .port = 4433,
+        } };
+        const d = try roundTrip(f);
+        try std.testing.expect(d.frame == .alternative_v4_address);
+        const got = d.frame.alternative_v4_address;
+        try std.testing.expectEqual(c.preferred, got.preferred);
+        try std.testing.expectEqual(c.retire, got.retire);
+        try std.testing.expectEqual(@as(u64, 7), got.status_sequence_number);
+        try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 1 }, &got.address);
+        try std.testing.expectEqual(@as(u16, 4433), got.port);
+    }
+}
+
+test "round-trip: ALTERNATIVE_V6_ADDRESS with status_sequence > single-byte varint" {
+    const ipv6: [16]u8 = .{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    const f: Frame = .{ .alternative_v6_address = .{
+        .preferred = true,
+        .retire = false,
+        // 0x4001 forces a 2-byte varint encoding for the sequence number.
+        .status_sequence_number = 0x4001,
+        .address = ipv6,
+        .port = 8443,
+    } };
+    const d = try roundTrip(f);
+    try std.testing.expect(d.frame == .alternative_v6_address);
+    const got = d.frame.alternative_v6_address;
+    try std.testing.expectEqual(true, got.preferred);
+    try std.testing.expectEqual(false, got.retire);
+    try std.testing.expectEqual(@as(u64, 0x4001), got.status_sequence_number);
+    try std.testing.expectEqualSlices(u8, &ipv6, &got.address);
+    try std.testing.expectEqual(@as(u16, 8443), got.port);
+}
+
+test "ALTERNATIVE_V4_ADDRESS frame type encodes as 4-byte varint 0x1d5845e2" {
+    var buf: [32]u8 = undefined;
+    const n = try encode(&buf, .{ .alternative_v4_address = .{
+        .preferred = false,
+        .retire = false,
+        .status_sequence_number = 0,
+        .address = .{ 0, 0, 0, 0 },
+        .port = 0,
+    } });
+    try std.testing.expectEqual(@as(usize, 4 + 1 + 1 + 4 + 2), n);
+    // 4-byte varint encoding of 0x1d5845e2: top two bits = 0b10
+    // (length = 4), remaining 30 bits = 0x1d5845e2.
+    try std.testing.expectEqualSlices(u8, &.{ 0x9d, 0x58, 0x45, 0xe2 }, buf[0..4]);
+}
+
+test "ALTERNATIVE_V6_ADDRESS frame type encodes as 4-byte varint 0x1d5845e3" {
+    var buf: [64]u8 = undefined;
+    const n = try encode(&buf, .{ .alternative_v6_address = .{
+        .preferred = false,
+        .retire = false,
+        .status_sequence_number = 0,
+        .address = @splat(0),
+        .port = 0,
+    } });
+    try std.testing.expectEqual(@as(usize, 4 + 1 + 1 + 16 + 2), n);
+    try std.testing.expectEqualSlices(u8, &.{ 0x9d, 0x58, 0x45, 0xe3 }, buf[0..4]);
+}
+
 test "STREAM without LEN: data spans the rest of the input" {
     // Manually construct: type=0x08 (no flags) | stream_id=4 | data
     const wire = [_]u8{
