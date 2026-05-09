@@ -61,6 +61,8 @@ pub const Id = struct {
     pub const retry_source_connection_id: u64 = 0x10;
     /// RFC 9221 §3
     pub const max_datagram_frame_size: u64 = 0x20;
+    /// RFC 9287 §3 — `grease_quic_bit` (zero-length flag).
+    pub const grease_quic_bit: u64 = 0x2ab2;
     /// draft-ietf-quic-multipath-21 §2.1
     pub const initial_max_path_id: u64 = 0x3e;
     /// draft-munizaga-quic-alternative-server-address-00 §4 / §10.1.
@@ -191,6 +193,13 @@ pub const Params = struct {
     /// 0x20 — RFC 9221: max datagram frame size accepted. 0 = no DATAGRAM support.
     max_datagram_frame_size: u64 = 0,
 
+    /// 0x2ab2 — RFC 9287 §3 zero-length flag. When `true`, the
+    /// endpoint advertises that it will accept long- or short-header
+    /// packets whose QUIC Bit (bit 6 of the first byte) is 0. Once
+    /// both peers advertise this, each side SHOULD set the bit to an
+    /// unpredictable value per packet.
+    grease_quic_bit: bool = false,
+
     /// 0x3e — draft-ietf-quic-multipath-21: maximum path ID this
     /// endpoint is willing to maintain at connection initiation.
     /// Null means multipath was not advertised; a value of 0 still
@@ -276,6 +285,9 @@ pub const Params = struct {
         }
         if (self.max_datagram_frame_size != 0) {
             pos += try writeVarint(dst, pos, Id.max_datagram_frame_size, self.max_datagram_frame_size);
+        }
+        if (self.grease_quic_bit) {
+            pos += try writeFlag(dst, pos, Id.grease_quic_bit);
         }
         if (self.initial_max_path_id) |max_path_id| {
             pos += try writeVarint(dst, pos, Id.initial_max_path_id, max_path_id);
@@ -532,6 +544,14 @@ fn setOne(p: *Params, id: u64, value: []const u8) Error!void {
             p.retry_source_connection_id = ConnectionId.fromSlice(value);
         },
         Id.max_datagram_frame_size => p.max_datagram_frame_size = try decodeVarintValue(value),
+        Id.grease_quic_bit => {
+            // RFC 9287 §3: "An endpoint that includes this transport
+            // parameter MUST send it with an empty value." A non-empty
+            // value is a TRANSPORT_PARAMETER_ERROR; surface as
+            // InvalidValue so the role-aware caller can map it.
+            if (value.len != 0) return Error.InvalidValue;
+            p.grease_quic_bit = true;
+        },
         Id.initial_max_path_id => {
             const v = try decodeVarintValue(value);
             if (v > std.math.maxInt(u32)) return Error.InvalidValue;
@@ -1129,6 +1149,7 @@ fn fuzzTransportParamsRoundTrip(_: void, smith: *std.testing.Smith) anyerror!voi
         .initial_source_connection_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else cid_b,
         .retry_source_connection_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else cid_c,
         .max_datagram_frame_size = smith.valueRangeAtMost(u64, 0, 4095),
+        .grease_quic_bit = smith.valueRangeAtMost(u8, 0, 1) == 0,
         .initial_max_path_id = if (smith.valueRangeAtMost(u8, 0, 1) == 0) null else smith.valueRangeAtMost(u32, 0, 255),
         .alternative_address = smith.valueRangeAtMost(u8, 0, 1) == 0,
     };

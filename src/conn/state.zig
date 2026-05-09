@@ -3850,6 +3850,30 @@ pub const Connection = struct {
         return peer_params.initial_max_path_id != null;
     }
 
+    /// True only when *both* peers advertised the RFC 9287 §3
+    /// `grease_quic_bit` transport parameter. While this returns
+    /// true, every encoded long- or short-header packet draws bit 6
+    /// of the first byte (the QUIC Bit) at random; the wire decoder
+    /// has always accepted any value there.
+    pub fn peerSupportsGreaseQuicBit(self: *const Connection) bool {
+        if (!self.local_transport_params.grease_quic_bit) return false;
+        const peer_params = self.cached_peer_transport_params orelse return false;
+        return peer_params.grease_quic_bit;
+    }
+
+    /// Draw a fresh QUIC Bit value for the next outgoing packet.
+    /// Returns 1 unless `peerSupportsGreaseQuicBit()` is true, in
+    /// which case the bit is sampled uniformly at random per packet
+    /// from BoringSSL's CSPRNG (RFC 9287 §3 SHOULDs an unpredictable
+    /// value). Falls back to 1 if `RAND_bytes` errors so a transient
+    /// CSPRNG failure can't drop us off the wire.
+    fn nextQuicBit(self: *const Connection) u1 {
+        if (!self.peerSupportsGreaseQuicBit()) return 1;
+        var byte: [1]u8 = undefined;
+        boringssl.crypto.rand.fillBytes(&byte) catch return 1;
+        return @intCast(byte[0] & 0x01);
+    }
+
     /// Register a new application path. Full draft-21 frame exchange is
     /// still staged behind this, but the path already owns independent
     /// Application PN, sent, RTT, congestion, validation, and PTO state.
@@ -5605,6 +5629,7 @@ pub const Connection = struct {
             // record it (it occupies a PN). Skip stream/CRYPTO/etc.
             const pn = pn_space.nextPn() orelse return Error.PnSpaceExhausted;
             const largest_acked_close = pn_space.largest_acked_sent;
+            const close_quic_bit = self.nextQuicBit();
             const n_close = switch (lvl) {
                 .initial => try long_packet_mod.sealInitial(dst, .{
                     .dcid = packet_dcid.slice(),
@@ -5613,6 +5638,7 @@ pub const Connection = struct {
                     .largest_acked = largest_acked_close,
                     .payload = pl_buf[0..pl_pos],
                     .keys = &keys,
+                    .quic_bit = close_quic_bit,
                 }),
                 .handshake => try long_packet_mod.sealHandshake(dst, .{
                     .dcid = packet_dcid.slice(),
@@ -5621,6 +5647,7 @@ pub const Connection = struct {
                     .largest_acked = largest_acked_close,
                     .payload = pl_buf[0..pl_pos],
                     .keys = &keys,
+                    .quic_bit = close_quic_bit,
                 }),
                 .application => try short_packet_mod.seal1Rtt(dst, .{
                     .dcid = packet_dcid.slice(),
@@ -5630,6 +5657,7 @@ pub const Connection = struct {
                     .keys = &keys,
                     .key_phase = self.applicationWriteKeyPhase(),
                     .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
+                    .quic_bit = close_quic_bit,
                 }),
                 .early_data => try long_packet_mod.sealZeroRtt(dst, .{
                     .dcid = packet_dcid.slice(),
@@ -5638,6 +5666,7 @@ pub const Connection = struct {
                     .largest_acked = largest_acked_close,
                     .payload = pl_buf[0..pl_pos],
                     .keys = &keys,
+                    .quic_bit = close_quic_bit,
                 }),
             };
             var close_packet: sent_packets_mod.SentPacket = .{
@@ -6216,6 +6245,7 @@ pub const Connection = struct {
         // 4) Allocate PN at this level, seal at the right header type.
         const pn = pn_space.nextPn() orelse return Error.PnSpaceExhausted;
         const largest_acked = pn_space.largest_acked_sent;
+        const quic_bit = self.nextQuicBit();
         const n = switch (lvl) {
             .initial => try long_packet_mod.sealInitial(dst, .{
                 .dcid = packet_dcid.slice(),
@@ -6230,6 +6260,7 @@ pub const Connection = struct {
                 // for simplicity; tightening to "first flight only"
                 // is a future scope.
                 .pad_to = if (self.role == .client) 1200 else 0,
+                .quic_bit = quic_bit,
             }),
             .handshake => try long_packet_mod.sealHandshake(dst, .{
                 .dcid = packet_dcid.slice(),
@@ -6238,6 +6269,7 @@ pub const Connection = struct {
                 .largest_acked = largest_acked,
                 .payload = pl_buf[0..pl_pos],
                 .keys = &keys,
+                .quic_bit = quic_bit,
             }),
             .application => try short_packet_mod.seal1Rtt(dst, .{
                 .dcid = packet_dcid.slice(),
@@ -6247,6 +6279,7 @@ pub const Connection = struct {
                 .keys = &keys,
                 .key_phase = self.applicationWriteKeyPhase(),
                 .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
+                .quic_bit = quic_bit,
             }),
             .early_data => try long_packet_mod.sealZeroRtt(dst, .{
                 .dcid = packet_dcid.slice(),
@@ -6255,6 +6288,7 @@ pub const Connection = struct {
                 .largest_acked = largest_acked,
                 .payload = pl_buf[0..pl_pos],
                 .keys = &keys,
+                .quic_bit = quic_bit,
             }),
         };
 

@@ -99,6 +99,11 @@ pub const Initial = struct {
     /// packets after header protection is removed; preserved here for
     /// round-trip tests.
     reserved_bits: u2 = 0,
+    /// Bit 6 of the first byte — the QUIC Bit (RFC 9000 §17.2 calls
+    /// this the Fixed Bit). Defaults to 1, the v1 wire requirement.
+    /// RFC 9287 lets endpoints draw this bit randomly per packet once
+    /// both peers advertise the `grease_quic_bit` transport parameter.
+    quic_bit: u1 = 1,
 };
 
 /// 0-RTT long-header packet (RFC 9000 §17.2.3). Sent by clients to
@@ -111,6 +116,8 @@ pub const ZeroRtt = struct {
     pn_truncated: u64,
     payload_length: u64,
     reserved_bits: u2 = 0,
+    /// QUIC Bit (RFC 9000 §17.2). See `Initial.quic_bit`.
+    quic_bit: u1 = 1,
 };
 
 /// Handshake long-header packet (RFC 9000 §17.2.4). Carries TLS
@@ -123,6 +130,8 @@ pub const Handshake = struct {
     pn_truncated: u64,
     payload_length: u64,
     reserved_bits: u2 = 0,
+    /// QUIC Bit (RFC 9000 §17.2). See `Initial.quic_bit`.
+    quic_bit: u1 = 1,
 };
 
 /// Retry long-header packet (RFC 9000 §17.2.5). Server-issued
@@ -137,6 +146,11 @@ pub const Retry = struct {
     integrity_tag: [16]u8,
     /// Bits 3-0 of the first byte; spec'd "Unused" — preserve as-is.
     unused_bits: u4 = 0,
+    /// QUIC Bit (RFC 9000 §17.2). See `Initial.quic_bit`. RFC 9287
+    /// permits the server to randomize this on Retry once the client
+    /// has advertised `grease_quic_bit` (e.g. via a NEW_TOKEN-derived
+    /// hint on a future connection).
+    quic_bit: u1 = 1,
 };
 
 /// 1-RTT short-header packet (RFC 9000 §17.3). Carries
@@ -151,6 +165,8 @@ pub const OneRtt = struct {
     key_phase: bool = false,
     pn_length: PnLength,
     pn_truncated: u64,
+    /// QUIC Bit (RFC 9000 §17.3). See `Initial.quic_bit`.
+    quic_bit: u1 = 1,
 };
 
 /// Version Negotiation packet (RFC 8999 §6). Sent by a server that
@@ -233,6 +249,7 @@ pub fn parse(src: []const u8, dcid_len_for_short: u8) Error!Parsed {
 
 fn parseShort(src: []const u8, first: u8, dcid_len: u8) Error!Parsed {
     if (dcid_len > max_cid_len) return Error.ConnIdTooLong;
+    const quic_bit: u1 = @intCast((first >> 6) & 0x01);
     const spin = (first & 0x20) != 0;
     const reserved_bits: u2 = @intCast((first >> 3) & 0x03);
     const key_phase = (first & 0x04) != 0;
@@ -256,6 +273,7 @@ fn parseShort(src: []const u8, first: u8, dcid_len: u8) Error!Parsed {
             .key_phase = key_phase,
             .pn_length = pn_length,
             .pn_truncated = pn_truncated,
+            .quic_bit = quic_bit,
         } },
         .pn_offset = pn_offset,
     };
@@ -316,15 +334,16 @@ fn parseLong(src: []const u8, first: u8) Error!Parsed {
     }
 
     const long_type: LongType = @enumFromInt(@as(u2, @intCast((first >> 4) & 0x03)));
+    const quic_bit: u1 = @intCast((first >> 6) & 0x01);
     const reserved_bits: u2 = @intCast((first >> 2) & 0x03);
     const pn_bits: u2 = @intCast(first & 0x03);
     const pn_length = PnLength.fromTwoBits(pn_bits);
 
     return switch (long_type) {
-        .initial => parseInitialTail(src, common, reserved_bits, pn_length),
-        .zero_rtt => parseLongPnTail(src, common, reserved_bits, pn_length, .zero_rtt),
-        .handshake => parseLongPnTail(src, common, reserved_bits, pn_length, .handshake),
-        .retry => parseRetryTail(src, common, @intCast(first & 0x0f)),
+        .initial => parseInitialTail(src, common, reserved_bits, pn_length, quic_bit),
+        .zero_rtt => parseLongPnTail(src, common, reserved_bits, pn_length, quic_bit, .zero_rtt),
+        .handshake => parseLongPnTail(src, common, reserved_bits, pn_length, quic_bit, .handshake),
+        .retry => parseRetryTail(src, common, @intCast(first & 0x0f), quic_bit),
     };
 }
 
@@ -333,6 +352,7 @@ fn parseInitialTail(
     common: LongCommon,
     reserved_bits: u2,
     pn_length: PnLength,
+    quic_bit: u1,
 ) Error!Parsed {
     var pos = common.end_pos;
 
@@ -361,6 +381,7 @@ fn parseInitialTail(
             .pn_truncated = pn_truncated,
             .payload_length = length.value,
             .reserved_bits = reserved_bits,
+            .quic_bit = quic_bit,
         } },
         .pn_offset = pn_offset,
     };
@@ -373,6 +394,7 @@ fn parseLongPnTail(
     common: LongCommon,
     reserved_bits: u2,
     pn_length: PnLength,
+    quic_bit: u1,
     kind: PnTailKind,
 ) Error!Parsed {
     var pos = common.end_pos;
@@ -393,6 +415,7 @@ fn parseLongPnTail(
             .pn_truncated = pn_truncated,
             .payload_length = length.value,
             .reserved_bits = reserved_bits,
+            .quic_bit = quic_bit,
         } },
         .handshake => .{ .handshake = .{
             .version = common.version,
@@ -402,13 +425,14 @@ fn parseLongPnTail(
             .pn_truncated = pn_truncated,
             .payload_length = length.value,
             .reserved_bits = reserved_bits,
+            .quic_bit = quic_bit,
         } },
     };
 
     return Parsed{ .header = header, .pn_offset = pn_offset };
 }
 
-fn parseRetryTail(src: []const u8, common: LongCommon, unused_bits: u4) Error!Parsed {
+fn parseRetryTail(src: []const u8, common: LongCommon, unused_bits: u4, quic_bit: u1) Error!Parsed {
     if (src.len < common.end_pos + 16) return Error.InsufficientBytes;
     const tag_start = src.len - 16;
     if (tag_start < common.end_pos) return Error.InsufficientBytes;
@@ -424,6 +448,7 @@ fn parseRetryTail(src: []const u8, common: LongCommon, unused_bits: u4) Error!Pa
             .retry_token = retry_token,
             .integrity_tag = integrity_tag,
             .unused_bits = unused_bits,
+            .quic_bit = quic_bit,
         } },
         .pn_offset = 0,
     };
@@ -442,6 +467,19 @@ pub fn encode(dst: []u8, header: Header) Error!usize {
         .one_rtt => |h| encodeOneRtt(dst, h),
         .version_negotiation => |h| encodeVersionNegotiation(dst, h),
     };
+}
+
+/// Build the high four bits of a long-header first byte: Header Form
+/// (always 1), QUIC Bit (RFC 9287 lets either side draw it at random
+/// after both peers advertised support), and the 2-bit Long Packet
+/// Type. Reserved Bits go into bits 3-2; the PN-length field follows
+/// in the low two bits. Retry has no Reserved/PN bits — callers pass
+/// `reserved_bits = 0` and OR in the §17.2.5 Unused field after.
+fn longHeaderFirstByte(long_type: LongType, quic_bit: u1, reserved_bits: u2) u8 {
+    return 0x80 |
+        (@as(u8, quic_bit) << 6) |
+        (@as(u8, @intFromEnum(long_type)) << 4) |
+        (@as(u8, reserved_bits) << 2);
 }
 
 fn writeLongHeaderCommon(
@@ -470,9 +508,7 @@ fn writeLongHeaderCommon(
 }
 
 fn encodeInitial(dst: []u8, h: Initial) Error!usize {
-    const first_byte: u8 = 0xc0 |
-        (@as(u8, @intFromEnum(LongType.initial)) << 4) |
-        (@as(u8, h.reserved_bits) << 2) |
+    const first_byte: u8 = longHeaderFirstByte(.initial, h.quic_bit, h.reserved_bits) |
         h.pn_length.toTwoBits();
     var pos = try writeLongHeaderCommon(dst, first_byte, h.version, h.dcid, h.scid);
 
@@ -494,9 +530,7 @@ fn encodeLongPn(dst: []u8, h: anytype, comptime kind: PnTailKind) Error!usize {
         .zero_rtt => .zero_rtt,
         .handshake => .handshake,
     };
-    const first_byte: u8 = 0xc0 |
-        (@as(u8, @intFromEnum(long_type)) << 4) |
-        (@as(u8, h.reserved_bits) << 2) |
+    const first_byte: u8 = longHeaderFirstByte(long_type, h.quic_bit, h.reserved_bits) |
         h.pn_length.toTwoBits();
     var pos = try writeLongHeaderCommon(dst, first_byte, h.version, h.dcid, h.scid);
 
@@ -509,8 +543,9 @@ fn encodeLongPn(dst: []u8, h: anytype, comptime kind: PnTailKind) Error!usize {
 }
 
 fn encodeRetry(dst: []u8, h: Retry) Error!usize {
-    const first_byte: u8 = 0xc0 |
-        (@as(u8, @intFromEnum(LongType.retry)) << 4) |
+    // Retry uses the same QUIC-Bit semantics as the rest of the long
+    // headers; the lower 4 bits are "Unused" per RFC 9000 §17.2.5.
+    const first_byte: u8 = (longHeaderFirstByte(.retry, h.quic_bit, 0) & 0xf0) |
         @as(u8, h.unused_bits);
     var pos = try writeLongHeaderCommon(dst, first_byte, h.version, h.dcid, h.scid);
 
@@ -525,8 +560,9 @@ fn encodeRetry(dst: []u8, h: Retry) Error!usize {
 fn encodeOneRtt(dst: []u8, h: OneRtt) Error!usize {
     const total: usize = 1 + h.dcid.len + h.pn_length.bytes();
     if (dst.len < total) return Error.BufferTooSmall;
-    // First byte: 0 1 S R R K LL  (form=0, fixed=1)
-    var first: u8 = 0x40;
+    // First byte: 0 Q S R R K LL  (form=0, Q is the QUIC Bit per
+    // RFC 9000 §17.3 / RFC 9287 §3).
+    var first: u8 = @as(u8, h.quic_bit) << 6;
     if (h.spin_bit) first |= 0x20;
     first |= @as(u8, h.reserved_bits) << 3;
     if (h.key_phase) first |= 0x04;

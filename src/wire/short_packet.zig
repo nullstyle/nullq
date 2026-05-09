@@ -373,6 +373,11 @@ pub const SealOptions = struct {
     /// gate (§17.3 ¶3). Defaults to 0 — production callers MUST NOT
     /// change it.
     reserved_bits: u2 = 0,
+    /// QUIC Bit (RFC 9000 §17.3 / RFC 9287 §3). Defaults to 1 so v1
+    /// peers that don't understand grease still parse the packet. The
+    /// connection layer flips this on per packet once both peers
+    /// advertised `grease_quic_bit`.
+    quic_bit: u1 = 1,
     /// When set, use draft-ietf-quic-multipath-21 §2.4's
     /// path-ID-aware nonce for 1-RTT packet protection.
     multipath_path_id: ?u32 = null,
@@ -417,6 +422,7 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
         .key_phase = opts.key_phase,
         .pn_length = pn_length,
         .pn_truncated = truncated,
+        .quic_bit = opts.quic_bit,
     } });
 
     // Stage the plaintext if we need to pad. Common case (no padding)
