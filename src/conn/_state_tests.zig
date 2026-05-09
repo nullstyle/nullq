@@ -2884,6 +2884,70 @@ test "draining a peer-initiated stream returns MAX_STREAMS credit" {
     try std.testing.expectEqual(@as(u64, 17), conn.local_max_streams_bidi);
 }
 
+test "MAX_STREAMS replenishes early enough for pipelining peers" {
+    // Regression test: with `initial_max_streams_bidi = 1000` (the cap the
+    // interop `multiplexing` testcase enforces), a peer that pipelines
+    // streams aggressively (notably quiche) must observe a MAX_STREAMS
+    // increase well before it has consumed the full initial allotment.
+    // The previous 1/2 watermark held credit until the peer had drained
+    // 500 streams, by which point quiche's RTT-windowed burst could
+    // already exhaust the cap. The 1/4 watermark issues credit after the
+    // peer has drained ~250 streams, leaving headroom for the in-flight
+    // burst before it actually hits the limit.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const initial_limit: u64 = 1000;
+    try conn.setTransportParams(.{
+        .initial_max_data = 64 * 1024,
+        .initial_max_stream_data_bidi_remote = 16,
+        .initial_max_streams_bidi = initial_limit,
+    });
+
+    // Drain peer-initiated bidi streams 0, 4, 8, ... one at a time and
+    // capture the stream count at the moment the first MAX_STREAMS frame
+    // gets queued.
+    var first_grant_at: ?u64 = null;
+    var first_grant_limit: ?u64 = null;
+    var i: u64 = 0;
+    while (i < initial_limit) : (i += 1) {
+        const sid = i * 4; // client-initiated bidi: 4n
+        try conn.handleStream(.application, .{
+            .stream_id = sid,
+            .offset = 0,
+            .data = "x",
+            .has_length = true,
+            .fin = true,
+        });
+        var buf: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try conn.streamRead(sid, &buf));
+        if (first_grant_at == null) {
+            if (conn.pending_frames.max_streams_bidi) |new_limit| {
+                first_grant_at = i + 1;
+                first_grant_limit = new_limit;
+                break;
+            }
+        }
+    }
+
+    // Credit must arrive while the peer still has substantial pipelining
+    // headroom: strictly before half the initial allotment is consumed.
+    // The previous 1/2 watermark only fired AT 500 streams drained, which
+    // was too late for quiche's RTT-windowed burst — we now fire by ~250
+    // (i.e. once a quarter of the cap is consumed).
+    try std.testing.expect(first_grant_at != null);
+    try std.testing.expect(first_grant_at.? < initial_limit / 2);
+    // And the new advertised limit must strictly advance past the cap so
+    // an in-flight pipelined burst beyond `initial_limit` has somewhere
+    // to land.
+    try std.testing.expect(first_grant_limit != null);
+    try std.testing.expect(first_grant_limit.? > initial_limit);
+    try std.testing.expectEqual(first_grant_limit.?, conn.local_max_streams_bidi);
+}
+
 test "draining at stream cap does not queue duplicate MAX_STREAMS" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initServer(.{});

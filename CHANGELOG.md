@@ -35,11 +35,13 @@ three landed interop fixes did NOT flip their predicted cells:
   (`testcases_quic.py:286-288`: "Server set a stream limit > 1000."),
   so raising the cap broke 2 previously-passing cells
   (server × {quic-go, ngtcp2} × `multiplexing`). The proper fix
-  is in `maybeQueueBatchedMaxStreams` (`src/conn/state.zig`):
-  lower the credit-return watermark from `remaining > batch / 2`
-  to a smaller threshold so dynamic `MAX_STREAMS` issuance reaches
-  the peer before quiche's pipelined burst exhausts the initial
-  allotment. Tracked as a follow-up.
+  landed instead: `maybeQueueBatchedMaxStreams` in
+  `src/conn/state.zig` now drops the credit-return watermark from
+  "1/2 consumed" to "1/4 consumed" so dynamic `MAX_STREAMS`
+  issuance reaches the peer before quiche's pipelined burst
+  exhausts the 1000-stream initial allotment. Predicts a flip of
+  server × quiche × `multiplexing` (FAIL → PASS) on the next
+  matrix re-run, with no impact on the quic-go / ngtcp2 cells.
 
 Net interop delta from the recent landed work: **+3 cells**
 (retry × 3 peers); 0 regressions; 0 of the 2 rebind-addr cells the

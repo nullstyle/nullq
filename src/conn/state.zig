@@ -3427,9 +3427,22 @@ pub const Connection = struct {
 
         const opened = if (bidi) self.peer_opened_streams_bidi else self.peer_opened_streams_uni;
         const remaining = current -| opened;
-        const batch = streamCreditReturnBatch(current);
-        if (remaining > batch / 2) return;
+        // Fire MAX_STREAMS once the peer has consumed at least a quarter of
+        // the current limit (i.e. <= 3/4 of the cap remains). The previous
+        // 1/2 watermark waited until the peer had drained 50% of the cap
+        // before granting more, which left no room for an aggressively
+        // pipelining peer (notably quiche) to keep going — by the time our
+        // credit reached them they had already exhausted the 1000-stream
+        // initial allotment the multiplexing interop testcase requires
+        // (`initial_max_streams_bidi <= 1000`,
+        // `quic-interop-runner/testcases_quic.py:286-288`). Dropping the
+        // watermark to 1/4-consumed gives ~3 RTTs of headroom at typical
+        // burst rates before the peer actually hits the cap, while still
+        // batching enough closes per frame to keep MAX_STREAMS traffic low.
+        const watermark = (current * 3) / 4;
+        if (remaining > watermark) return;
 
+        const batch = streamCreditReturnBatch(current);
         const grant = @min(batch, max_streams_per_connection - current);
         self.queueMaxStreams(bidi, current + grant);
     }

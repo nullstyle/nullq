@@ -68,12 +68,11 @@ const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
 // 2026-05-09 verification matrix showed it broke server ×
 // multiplexing × {quic-go, ngtcp2} — the runner deliberately
 // validates that servers issue `MAX_STREAMS` dynamically rather
-// than statically advertising a huge floor. The proper fix lives
-// in `maybeQueueBatchedMaxStreams` in `src/conn/state.zig` —
-// lower the `remaining > batch / 2` watermark to `> batch / 4`
-// (or smaller) so credit-return reaches the peer before quiche's
-// pipelined burst exhausts the initial allotment. Tracked as a
-// follow-up in `interop/README.md`.
+// than statically advertising a huge floor. The actual fix lives
+// in `maybeQueueBatchedMaxStreams` in `src/conn/state.zig`, which
+// now lowers the credit-return watermark from "1/2 consumed" to
+// "1/4 consumed" so MAX_STREAMS reaches the peer before quiche's
+// pipelined burst exhausts the initial allotment.
 const endpoint_bidi_stream_limit: u64 = 1000;
 const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 2;
