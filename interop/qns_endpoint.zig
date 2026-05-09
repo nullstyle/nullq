@@ -89,6 +89,22 @@ const endpoint_client_cid_desired_last_seq: u8 = 1;
 const max_qns_server_connections = 128;
 const qns_time_base_us: u64 = 1_000_000;
 
+// IPv4 + IPv6 addresses the runner statically assigns to the SERVER
+// container on the rightnet bridge (per `docker-compose.yml`). The
+// `connectionmigration` testcase needs the server's `preferred_address`
+// transport parameter to advertise reachable IPs, and the runner does
+// not surface its own assignment as an env var — every published QNS
+// endpoint either hardcodes these or peeks at the local interfaces.
+// Hardcoding is the simpler path for the interop fixture: the runner
+// is the only environment that actually exercises this binary, and
+// the addresses are stable across runs (changing them would force
+// every interop endpoint in the matrix to drop).
+const interop_runner_server_ipv4: [4]u8 = .{ 193, 167, 100, 100 };
+const interop_runner_server_ipv6: [16]u8 = .{
+    0xfd, 0x00, 0xca, 0xfe, 0xca, 0xfe, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+};
+
 const ServerOptions = struct {
     // Dual-stack: an IPv6 wildcard socket on Linux (the deployment OS for
     // the official quic-interop-runner) also accepts IPv4 traffic via
@@ -102,6 +118,18 @@ const ServerOptions = struct {
     keylog_file: ?[]const u8 = null,
     qlog_dir: ?[]const u8 = null,
     retry: bool = false,
+    /// Optional alt-port literal (e.g. `"[::]:444"`) the server binds
+    /// in addition to `listen`. When set, the server advertises a
+    /// `preferred_address` transport parameter (RFC 9000 §18.2)
+    /// pointing at the runner's known server IPs (v4 + v6) on the
+    /// alt-port, and the recv loop polls both sockets. The runner's
+    /// `connectionmigration` testcase relies on this server-initiated
+    /// migration: the client receives the parameter, registers the
+    /// alt-CID at sequence 1, and migrates to the alt-address mid-
+    /// transfer. Wired in via `-pref-addr [::]:444` from
+    /// `interop/qns/run_endpoint.sh` only when
+    /// `TESTCASE=connectionmigration`.
+    pref_addr: ?[]const u8 = null,
 };
 
 const ClientOptions = struct {
@@ -426,6 +454,24 @@ const ServerConn = struct {
     /// clients).
     new_token_emitted: bool = false,
 
+    /// Which of the bound listening sockets received the most recent
+    /// authenticated datagram for this connection. 0 = main port,
+    /// 1 = preferred-address alt-port. The qns server uses this to
+    /// pick the outbound socket: once a peer has migrated to the
+    /// preferred address (RFC 9000 §5.1.1, §18.2), all subsequent
+    /// inbound datagrams arrive on the alt-port and outbound replies
+    /// must follow.
+    ///
+    /// We track this on the embedder (this struct) rather than the
+    /// `Connection` because per-path `local_addr` bookkeeping in the
+    /// core is informational only — the routing decision lives
+    /// entirely above the public API. A naive alternative would be
+    /// to inspect `OutgoingDatagram.to.port`, but that's the *peer's*
+    /// destination, not our local socket; the local-port is a
+    /// property of which UDP socket we received on, and the simplest
+    /// way to surface it to the send side is the latch below.
+    last_recv_socket: u8 = 0,
+
     fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -455,6 +501,7 @@ const ServerConn = struct {
         self.next_cid_seq = 1;
         self.last_activity_us = now_us;
         self.new_token_emitted = false;
+        self.last_recv_socket = 0;
 
         if (qlog_sink) |sink| self.conn.setQlogCallback(QlogSink.callback, sink);
         try self.conn.bind();
@@ -523,6 +570,8 @@ pub fn main(init: std.process.Init) !void {
                 opts.qlog_dir = args.next() orelse return error.MissingQlogDirectory;
             } else if (std.mem.eql(u8, arg, "-retry")) {
                 opts.retry = true;
+            } else if (std.mem.eql(u8, arg, "-pref-addr")) {
+                opts.pref_addr = args.next() orelse return error.MissingPreferredAddress;
             } else {
                 usage();
                 return error.UnknownArgument;
@@ -569,7 +618,7 @@ pub fn main(init: std.process.Init) !void {
 fn usage() void {
     std.debug.print(
         \\usage:
-        \\  qns-endpoint server [-listen [::]:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-keylog-file path] [-qlog-dir dir] [-retry]
+        \\  qns-endpoint server [-listen [::]:443] [-www /www] [-cert /certs/cert.pem] [-key /certs/priv.key] [-keylog-file path] [-qlog-dir dir] [-retry] [-pref-addr [::]:444]
         \\  qns-endpoint client [-server server:443] [-server-name server] [-downloads /downloads] [-requests "$REQUESTS"] [-testcase "$TESTCASE"] [-keylog-file path] [-qlog-dir dir]
         \\
     , .{});
@@ -606,34 +655,26 @@ fn writeKeylogLine(line: []const u8) void {
     file.writeStreamingAll(io, "\n") catch return;
 }
 
+/// One bound listening socket plus its log-friendly metadata.
+const ServerSocket = struct {
+    handle: Net.Socket,
+    /// Local bind address (informational; printed at startup so the
+    /// runner's keylog tooling can correlate ports). Borrows the
+    /// caller's literal so no allocation is needed.
+    bind_addr: Net.IpAddress,
+    /// Per-socket ECN active flag. Best-effort: a kernel that rejects
+    /// the IPV6_TCLASS / IP_TOS sockopts on this socket leaves us in
+    /// the not-ECT path for that socket while another socket may
+    /// still carry ECN. Tracked per-socket because `ecn_active` is a
+    /// property of the file descriptor, not the loop.
+    ecn_active: bool,
+};
+
 fn runServer(
     allocator: std.mem.Allocator,
     io: std.Io,
     opts: ServerOptions,
 ) !void {
-    const bind_addr = try Net.IpAddress.parseLiteral(opts.listen);
-    const sock = try Net.IpAddress.bind(&bind_addr, io, .{
-        .mode = .dgram,
-        .protocol = .udp,
-    });
-    defer sock.close(io);
-
-    // Grow the kernel UDP buffers so a single connection can
-    // absorb a burst of ~3000 1350-byte datagrams (a multiplexing
-    // stream open or a flight of stream data) without dropping
-    // packets at the OS layer. The default of ~200 KiB on Linux
-    // and ~9 KiB on macOS holds far fewer than that, and any
-    // packet the kernel discards looks like ordinary loss to
-    // QUIC — triggering retransmits and obscuring real congestion
-    // signals.
-    tuneServerSocket(sock.handle);
-
-    // Enable RFC 9000 §13.4 / RFC 3168 IP ECN signaling so the
-    // runner's `E` testcase exercises the end-to-end ECN path.
-    // Both setsockopts are best-effort; in a sandbox without
-    // CAP_NET_ADMIN we silently degrade to the Not-ECT path.
-    const ecn_active = enableServerEcn(sock.handle);
-
     const cert_pem = try readWholeFile(io, allocator, opts.cert, 1024 * 1024);
     defer allocator.free(cert_pem);
     const key_pem = try readWholeFile(io, allocator, opts.key, 1024 * 1024);
@@ -656,7 +697,85 @@ fn runServer(
     if (opts.qlog_dir) |dir| qlog_sink = try QlogSink.init(io, dir, "server");
     defer if (qlog_sink) |*sink| sink.deinit();
 
-    std.debug.print("quic_zig qns endpoint listening on {f} www={s} retry={}\n", .{ bind_addr, opts.www, opts.retry });
+    // Bind the main listening socket, plus an optional alt-port socket
+    // for `preferred_address` advertise. The `preferred_address`
+    // (RFC 9000 §18.2) transport parameter advertises a different
+    // local port the client SHOULD migrate to once the handshake
+    // completes — the runner's `connectionmigration` testcase
+    // exercises exactly this server-initiated migration. Both
+    // sockets are tuned and ECN-marked identically; we keep them in
+    // an array so the recv loop and the per-conn outbound dispatch
+    // can iterate without special cases.
+    const main_addr = try Net.IpAddress.parseLiteral(opts.listen);
+    const main_handle = try Net.IpAddress.bind(&main_addr, io, .{
+        .mode = .dgram,
+        .protocol = .udp,
+    });
+    var sockets_storage: [2]ServerSocket = undefined;
+    sockets_storage[0] = .{
+        .handle = main_handle,
+        .bind_addr = main_addr,
+        .ecn_active = false,
+    };
+    var sockets_len: usize = 1;
+
+    // Optional alt-port socket. We bind it eagerly (before the recv
+    // loop) so a parsing or bind failure surfaces immediately; the
+    // runner's `connectionmigration` testcase would otherwise time
+    // out without an actionable error.
+    var alt_addr_storage: ?Net.IpAddress = null;
+    if (opts.pref_addr) |pref_addr_str| {
+        alt_addr_storage = try Net.IpAddress.parseLiteral(pref_addr_str);
+        const alt_handle = try Net.IpAddress.bind(&alt_addr_storage.?, io, .{
+            .mode = .dgram,
+            .protocol = .udp,
+        });
+        sockets_storage[1] = .{
+            .handle = alt_handle,
+            .bind_addr = alt_addr_storage.?,
+            .ecn_active = false,
+        };
+        sockets_len = 2;
+    }
+    const sockets = sockets_storage[0..sockets_len];
+    defer for (sockets) |s| s.handle.close(io);
+
+    // Tune both sockets identically. We grow the kernel UDP buffers
+    // so a single connection can absorb a burst of ~3000 1350-byte
+    // datagrams (a multiplexing stream open or a flight of stream
+    // data) without dropping packets at the OS layer.
+    for (sockets) |*s| {
+        tuneServerSocket(s.handle.handle);
+        s.ecn_active = enableServerEcn(s.handle.handle);
+    }
+
+    // Build the `preferred_address` value once if the alt socket
+    // is bound. The alt-port we advertise comes from the alt socket's
+    // bind literal — so the value reaches the wire even when the
+    // embedder picked an unusual port. (The runner uses 444 by
+    // convention but the binary doesn't insist on it.) The CID +
+    // token must match the seq-1 SCID the server registers via
+    // `queueServerConnectionIds`, so the post-migration packets
+    // bearing that DCID authenticate correctly.
+    const alt_port: u16 = blk: {
+        const alt = alt_addr_storage orelse break :blk 0;
+        break :blk switch (alt) {
+            .ip4 => |ip4| ip4.port,
+            .ip6 => |ip6| ip6.port,
+        };
+    };
+
+    if (sockets_len > 1) {
+        std.debug.print(
+            "quic_zig qns endpoint listening on {f} (main) + alt-port {d} for preferred_address; www={s} retry={}\n",
+            .{ sockets[0].bind_addr, alt_port, opts.www, opts.retry },
+        );
+    } else {
+        std.debug.print(
+            "quic_zig qns endpoint listening on {f} www={s} retry={}\n",
+            .{ sockets[0].bind_addr, opts.www, opts.retry },
+        );
+    }
 
     var conns: std.ArrayList(*ServerConn) = .empty;
     defer {
@@ -669,156 +788,78 @@ fn runServer(
     var tx: [endpoint_udp_payload_size]u8 = undefined;
     var cmsg_buf: [quic_zig.transport.default_cmsg_buffer_bytes]u8 = undefined;
 
+    // When polling multiple sockets we split the per-iteration idle
+    // wait across them so the worst-case loop latency stays close to
+    // the original 5ms heartbeat. Two sockets each waiting 5ms would
+    // double the PTO-tick latency at idle; halving keeps QUIC's
+    // recovery timers responsive without requiring a real reactor.
+    const recv_timeout_ms: i64 = if (sockets_len > 1) 2 else 5;
+
     while (true) {
         var now_us = qnsNowUs(io, start);
-        // Two recv shapes: when ECN is active we go through
-        // `receiveManyTimeout` so the kernel populates the cmsg
-        // control buffer with IP_TOS / IPV6_TCLASS bytes. Otherwise
-        // the cheaper `receiveTimeout` shape (no control buffer,
-        // no cmsg parse).
-        var maybe_msg: ?Net.IncomingMessage = null;
-        var ecn: quic_zig.transport.EcnCodepoint = .not_ect;
-        if (ecn_active) {
-            var recv_msg: Net.IncomingMessage = .init;
-            recv_msg.control = &cmsg_buf;
-            const buf_slice = (&recv_msg)[0..1];
-            const ret = sock.receiveManyTimeout(io, buf_slice, &rx, .{}, .{
-                .duration = .{
-                    .raw = std.Io.Duration.fromMilliseconds(5),
-                    .clock = .awake,
-                },
+        // Drain each bound socket once per iteration. Most loops
+        // see traffic on the main socket; the alt-port socket only
+        // carries traffic after the client migrates following a
+        // `preferred_address` advertise. We deliberately do NOT
+        // break on the first socket that returns a datagram — both
+        // sockets share the same connection table and processing a
+        // stale alt-port datagram before the next main-port one is
+        // semantically equivalent to processing them in network
+        // arrival order at the granularity QUIC cares about.
+        for (sockets, 0..) |s, sock_idx| {
+            // Two recv shapes: when ECN is active we go through
+            // `receiveManyTimeout` so the kernel populates the cmsg
+            // control buffer with IP_TOS / IPV6_TCLASS bytes. Otherwise
+            // the cheaper `receiveTimeout` shape (no control buffer,
+            // no cmsg parse).
+            var maybe_msg: ?Net.IncomingMessage = null;
+            var ecn: quic_zig.transport.EcnCodepoint = .not_ect;
+            if (s.ecn_active) {
+                var recv_msg: Net.IncomingMessage = .init;
+                recv_msg.control = &cmsg_buf;
+                const buf_slice = (&recv_msg)[0..1];
+                const ret = s.handle.receiveManyTimeout(io, buf_slice, &rx, .{}, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromMilliseconds(recv_timeout_ms),
+                        .clock = .awake,
+                    },
+                });
+                if (ret[0]) |err| switch (err) {
+                    error.Timeout => {},
+                    else => return err,
+                } else if (ret[1] == 1) {
+                    ecn = quic_zig.transport.parseEcnFromControl(recv_msg.control);
+                    maybe_msg = recv_msg;
+                }
+            } else {
+                maybe_msg = s.handle.receiveTimeout(io, &rx, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromMilliseconds(recv_timeout_ms),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => null,
+                    else => return err,
+                };
+            }
+            now_us = qnsNowUs(io, start);
+
+            const msg = maybe_msg orelse continue;
+            try dispatchInbound(.{
+                .allocator = allocator,
+                .io = io,
+                .server_tls = server_tls,
+                .opts = opts,
+                .qlog_sink = if (qlog_sink) |*sink| sink else null,
+                .conns = &conns,
+                .sockets = sockets,
+                .sock_idx = sock_idx,
+                .msg = msg,
+                .ecn = ecn,
+                .tx = &tx,
+                .now_us = now_us,
+                .alt_port = alt_port,
             });
-            if (ret[0]) |err| switch (err) {
-                error.Timeout => {},
-                else => return err,
-            } else if (ret[1] == 1) {
-                ecn = quic_zig.transport.parseEcnFromControl(recv_msg.control);
-                maybe_msg = recv_msg;
-            }
-        } else {
-            maybe_msg = sock.receiveTimeout(io, &rx, .{
-                .duration = .{
-                    .raw = std.Io.Duration.fromMilliseconds(5),
-                    .clock = .awake,
-                },
-            }) catch |err| switch (err) {
-                error.Timeout => null,
-                else => return err,
-            };
-        }
-        now_us = qnsNowUs(io, start);
-
-        if (maybe_msg) |msg| {
-            var server_conn = findServerConn(conns.items, msg.data, msg.from);
-            if (server_conn == null) {
-                const ids = peekLongHeaderIds(msg.data) orelse {
-                    continue;
-                };
-                if (ids.version != quic_zig.QUIC_VERSION_1) {
-                    const n = try writeVersionNegotiation(&tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
-                    try sock.send(io, &msg.from, tx[0..n]);
-                    continue;
-                }
-                if (!isInitialLongHeader(msg.data)) {
-                    continue;
-                }
-                if (conns.items.len >= max_qns_server_connections) {
-                    std.debug.print("dropping new QNS server connection from {f}: active limit reached\n", .{msg.from});
-                    continue;
-                }
-                const new_conn = try ServerConn.init(
-                    allocator,
-                    io,
-                    server_tls,
-                    opts.www,
-                    if (qlog_sink) |*sink| sink else null,
-                    msg.from,
-                    now_us,
-                );
-                try conns.append(allocator, new_conn);
-                server_conn = new_conn;
-            }
-
-            const sc = server_conn.?;
-            sc.peer = msg.from;
-            sc.last_activity_us = now_us;
-            if (!sc.transport_params_set) {
-                const ids = peekLongHeaderIds(msg.data) orelse {
-                    continue;
-                };
-                if (ids.version != quic_zig.QUIC_VERSION_1) {
-                    const n = try writeVersionNegotiation(&tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
-                    try sock.send(io, &msg.from, tx[0..n]);
-                    continue;
-                }
-
-                // NEW_TOKEN check first: a returning interop client
-                // that captured a NEW_TOKEN on a prior connection echoes
-                // it in this Initial's long-header Token field. A valid
-                // NEW_TOKEN means the source is already address-validated
-                // and we skip the Retry round-trip even when `-retry` is
-                // on. On any failure (.malformed/.expired/.invalid) we
-                // fall through to the Retry gate, mirroring
-                // `Server.applyRetryGate` so a stale stored token
-                // gracefully degrades to a fresh Retry rather than
-                // dropping the connection.
-                const presented_token = peekInitialToken(msg.data);
-                const new_token_validated = blk: {
-                    const t = presented_token orelse break :blk false;
-                    if (t.len == 0) break :blk false;
-                    break :blk validNewToken(msg.from, now_us, t);
-                };
-
-                if (opts.retry and !sc.retry_sent and !new_token_validated) {
-                    sc.retry_original_dcid = quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
-                    const token = try retryToken(msg.from, now_us, ids.dcid, &sc.retry_source_cid);
-                    const n = try sc.conn.writeRetry(&tx, msg.data, &sc.retry_source_cid, &token);
-                    try sock.send(io, &msg.from, tx[0..n]);
-                    sc.retry_sent = true;
-                    continue;
-                }
-
-                const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
-                // Pin the wire DCID we're about to accept so future
-                // Initial retransmits from any peer 4-tuple route here.
-                // Pre-Retry: peer-chosen random. Post-Retry:
-                // `retry_source_cid` (already covered by `ownsServerCid`,
-                // but storing it is harmless and keeps the field
-                // semantically meaningful: "the DCID the peer is
-                // currently addressing on the Initial wire").
-                sc.client_initial_dcid = quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
-                const retry_source: ?quic_zig.conn.path.ConnectionId = if (sc.retry_sent)
-                    quic_zig.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
-                else
-                    null;
-                if (sc.retry_sent) {
-                    const token = peekInitialToken(msg.data) orelse {
-                        continue;
-                    };
-                    if (!validRetryToken(msg.from, now_us, original_dcid.slice(), &sc.retry_source_cid, token)) {
-                        continue;
-                    }
-                }
-
-                const params: quic_zig.tls.TransportParams = .{
-                    .original_destination_connection_id = original_dcid,
-                    .initial_source_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
-                    .retry_source_connection_id = retry_source,
-                    .max_idle_timeout_ms = 30_000,
-                    .initial_max_data = endpoint_connection_receive_window,
-                    .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
-                    .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
-                    .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
-                    .initial_max_streams_bidi = endpoint_bidi_stream_limit,
-                    .initial_max_streams_uni = endpoint_uni_stream_limit,
-                    .max_udp_payload_size = endpoint_udp_payload_size,
-                    .active_connection_id_limit = endpoint_active_connection_id_limit,
-                };
-                try sc.conn.acceptInitial(msg.data, params);
-                _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "quic_zig qns endpoint v1");
-                sc.transport_params_set = true;
-            }
-            try sc.conn.handleWithEcn(msg.data, netAddressToPathAddress(msg.from), ecn, now_us);
         }
 
         var i: usize = 0;
@@ -829,8 +870,16 @@ fn runServer(
                 maybeIssueNewToken(sc, now_us);
             }
             try sc.app.process(&sc.conn);
+            // Outbound on the socket the connection most recently
+            // received from. Pre-migration that's the main socket
+            // (last_recv_socket = 0); once the client follows the
+            // `preferred_address` advertise, it flips to the alt
+            // socket (last_recv_socket = 1). This is the simplest
+            // routing rule that doesn't require multiplexing the
+            // outbound across both sockets per packet.
+            const out_sock = sockets[sc.last_recv_socket].handle;
             while (try sc.conn.poll(&tx, now_us)) |n| {
-                try sock.send(io, &sc.peer, tx[0..n]);
+                try out_sock.send(io, &sc.peer, tx[0..n]);
             }
             try sc.conn.tick(now_us);
             if (sc.conn.isClosed()) {
@@ -841,6 +890,174 @@ fn runServer(
             i += 1;
         }
     }
+}
+
+/// Per-iteration dispatch parameters for `dispatchInbound`. Bundled
+/// into a struct so the call site stays readable when the loop polls
+/// every bound socket.
+const DispatchInboundCtx = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server_tls: boringssl.tls.Context,
+    opts: ServerOptions,
+    qlog_sink: ?*QlogSink,
+    conns: *std.ArrayList(*ServerConn),
+    sockets: []const ServerSocket,
+    sock_idx: usize,
+    msg: Net.IncomingMessage,
+    ecn: quic_zig.transport.EcnCodepoint,
+    tx: *[endpoint_udp_payload_size]u8,
+    now_us: u64,
+    /// Alt-port the server is also listening on, captured here so
+    /// the per-connection `acceptInitial` call can build a
+    /// `preferred_address` with the right port. Zero when no alt
+    /// socket is bound (the dispatch helper just does not advertise
+    /// the parameter).
+    alt_port: u16,
+};
+
+/// Dispatch one inbound datagram pulled off `ctx.sockets[ctx.sock_idx]`.
+/// Mirrors what the loop body did inline before the alt-port socket
+/// support landed; factored out so both sockets share the same
+/// per-datagram lookup / handshake-bootstrap / `handle` path. The
+/// only socket-aware bit is `ServerConn.last_recv_socket`, which the
+/// outbound drain consults to route replies to the alt-port once the
+/// client has migrated.
+fn dispatchInbound(ctx: DispatchInboundCtx) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const opts = ctx.opts;
+    const conns = ctx.conns;
+    const sockets = ctx.sockets;
+    const msg = ctx.msg;
+    const ecn = ctx.ecn;
+    const tx = ctx.tx;
+    const now_us = ctx.now_us;
+    const sock = sockets[ctx.sock_idx].handle;
+
+    var server_conn = findServerConn(conns.items, msg.data, msg.from);
+    if (server_conn == null) {
+        const ids = peekLongHeaderIds(msg.data) orelse return;
+        if (ids.version != quic_zig.QUIC_VERSION_1) {
+            const n = try writeVersionNegotiation(tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
+            try sock.send(io, &msg.from, tx[0..n]);
+            return;
+        }
+        if (!isInitialLongHeader(msg.data)) return;
+        if (conns.items.len >= max_qns_server_connections) {
+            std.debug.print("dropping new QNS server connection from {f}: active limit reached\n", .{msg.from});
+            return;
+        }
+        // Brand-new connections always begin on the main socket
+        // (the runner only advertises `[::]:443` to the client by
+        // default; the alt-port is reachable only after the
+        // `preferred_address` migration). If a peer happens to
+        // address an Initial directly to the alt-port we still
+        // accept it — the post-handshake migration just becomes a
+        // no-op for that connection — but bookkeeping below treats
+        // the receiving socket index uniformly.
+        const new_conn = try ServerConn.init(
+            allocator,
+            io,
+            ctx.server_tls,
+            opts.www,
+            ctx.qlog_sink,
+            msg.from,
+            now_us,
+        );
+        try conns.append(allocator, new_conn);
+        server_conn = new_conn;
+    }
+
+    const sc = server_conn.?;
+    sc.peer = msg.from;
+    sc.last_activity_us = now_us;
+    sc.last_recv_socket = @intCast(ctx.sock_idx);
+    if (!sc.transport_params_set) {
+        const ids = peekLongHeaderIds(msg.data) orelse return;
+        if (ids.version != quic_zig.QUIC_VERSION_1) {
+            const n = try writeVersionNegotiation(tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
+            try sock.send(io, &msg.from, tx[0..n]);
+            return;
+        }
+
+        // NEW_TOKEN check first: a returning interop client
+        // that captured a NEW_TOKEN on a prior connection echoes
+        // it in this Initial's long-header Token field. A valid
+        // NEW_TOKEN means the source is already address-validated
+        // and we skip the Retry round-trip even when `-retry` is
+        // on. On any failure (.malformed/.expired/.invalid) we
+        // fall through to the Retry gate, mirroring
+        // `Server.applyRetryGate` so a stale stored token
+        // gracefully degrades to a fresh Retry rather than
+        // dropping the connection.
+        const presented_token = peekInitialToken(msg.data);
+        const new_token_validated = blk: {
+            const t = presented_token orelse break :blk false;
+            if (t.len == 0) break :blk false;
+            break :blk validNewToken(msg.from, now_us, t);
+        };
+
+        if (opts.retry and !sc.retry_sent and !new_token_validated) {
+            sc.retry_original_dcid = quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
+            const token = try retryToken(msg.from, now_us, ids.dcid, &sc.retry_source_cid);
+            const n = try sc.conn.writeRetry(tx, msg.data, &sc.retry_source_cid, &token);
+            try sock.send(io, &msg.from, tx[0..n]);
+            sc.retry_sent = true;
+            return;
+        }
+
+        const original_dcid = if (sc.retry_sent) sc.retry_original_dcid else quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
+        // Pin the wire DCID we're about to accept so future
+        // Initial retransmits from any peer 4-tuple route here.
+        // Pre-Retry: peer-chosen random. Post-Retry:
+        // `retry_source_cid` (already covered by `ownsServerCid`,
+        // but storing it is harmless and keeps the field
+        // semantically meaningful: "the DCID the peer is
+        // currently addressing on the Initial wire").
+        sc.client_initial_dcid = quic_zig.conn.path.ConnectionId.fromSlice(ids.dcid);
+        const retry_source: ?quic_zig.conn.path.ConnectionId = if (sc.retry_sent)
+            quic_zig.conn.path.ConnectionId.fromSlice(&sc.retry_source_cid)
+        else
+            null;
+        if (sc.retry_sent) {
+            const token = peekInitialToken(msg.data) orelse return;
+            if (!validRetryToken(msg.from, now_us, original_dcid.slice(), &sc.retry_source_cid, token)) {
+                return;
+            }
+        }
+
+        // Advertise `preferred_address` only when an alt socket is
+        // bound — the parameter is server-only (RFC 9000 §18.2 ¶29)
+        // and pointing at an unbound port would teach the client to
+        // migrate into a black hole. The CID + token are derived in
+        // lockstep with `queueServerConnectionIds`'s seq-1 issue
+        // logic so both code paths describe the same CID.
+        const preferred_address: ?quic_zig.tls.transport_params.PreferredAddress = if (sockets.len > 1)
+            buildPreferredAddress(&sc.initial_server_cid, ctx.alt_port)
+        else
+            null;
+
+        const params: quic_zig.tls.TransportParams = .{
+            .original_destination_connection_id = original_dcid,
+            .initial_source_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
+            .retry_source_connection_id = retry_source,
+            .max_idle_timeout_ms = 30_000,
+            .initial_max_data = endpoint_connection_receive_window,
+            .initial_max_stream_data_bidi_local = endpoint_stream_receive_window,
+            .initial_max_stream_data_bidi_remote = endpoint_stream_receive_window,
+            .initial_max_stream_data_uni = endpoint_uni_stream_receive_window,
+            .initial_max_streams_bidi = endpoint_bidi_stream_limit,
+            .initial_max_streams_uni = endpoint_uni_stream_limit,
+            .max_udp_payload_size = endpoint_udp_payload_size,
+            .active_connection_id_limit = endpoint_active_connection_id_limit,
+            .preferred_address = preferred_address,
+        };
+        try sc.conn.acceptInitial(msg.data, params);
+        _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "quic_zig qns endpoint v1");
+        sc.transport_params_set = true;
+    }
+    try sc.conn.handleWithEcn(msg.data, netAddressToPathAddress(msg.from), ecn, now_us);
 }
 
 fn runClient(
@@ -1823,6 +2040,41 @@ fn statelessResetToken(cid: []const u8, seq: u8) [16]u8 {
     return token;
 }
 
+/// Build the `preferred_address` transport-parameter value the server
+/// advertises for the runner's `connectionmigration` testcase. The
+/// embedded CID + stateless-reset token MUST match the server CID
+/// the server is willing to honour at sequence 1 — RFC 9000 §5.1.1
+/// says the client treats it as if it had arrived in a
+/// `NEW_CONNECTION_ID(seq=1)` frame, so any mismatch with the
+/// real seq-1 CID minted by `queueServerConnectionIds` would leave
+/// the server unable to authenticate the post-migration packets.
+///
+/// `initial_server_cid` is the seq-0 SCID from `ServerConn.init`;
+/// the seq-1 CID is constructed using the same `cid[7] +%= 1` rule
+/// used by `queueServerConnectionIds`, and the token via
+/// `statelessResetToken(seq=1)` — keeping the helpers in lockstep so
+/// the seq-1 NEW_CONNECTION_ID frame and the `preferred_address`
+/// blob describe the same CID. The runner gives the server fixed
+/// IPv4 + IPv6 addresses on the `rightnet` bridge; both families
+/// are advertised on `alt_port` (RFC 9000 §18.2 lets either be the
+/// all-zero sentinel, but advertising both lets the runner exercise
+/// either v4 or v6 resolution of `server46`).
+fn buildPreferredAddress(
+    initial_server_cid: *const [server_cid_len]u8,
+    alt_port: u16,
+) quic_zig.tls.transport_params.PreferredAddress {
+    var alt_cid: [server_cid_len]u8 = initial_server_cid.*;
+    alt_cid[7] +%= 1;
+    return .{
+        .ipv4_address = interop_runner_server_ipv4,
+        .ipv4_port = alt_port,
+        .ipv6_address = interop_runner_server_ipv6,
+        .ipv6_port = alt_port,
+        .connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&alt_cid),
+        .stateless_reset_token = statelessResetToken(&alt_cid, 1),
+    };
+}
+
 /// Client-side mirror of `queueServerConnectionIds`. Once the
 /// handshake completes, queue extra NEW_CONNECTION_ID frames so the
 /// peer (server) has a fresh DCID available when it needs to rotate
@@ -2284,4 +2536,111 @@ test "queueClientConnectionIds no-ops when peer's CID limit is saturated" {
     // No frame queued; cursor unchanged.
     try std.testing.expectEqual(@as(u8, 1), next_seq);
     try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.new_connection_ids.items.len);
+}
+
+test "buildPreferredAddress aligns with queueServerConnectionIds(seq=1)" {
+    // The preferred_address transport parameter (RFC 9000 §18.2)
+    // carries a CID + stateless reset token the client treats as if
+    // it had arrived in a NEW_CONNECTION_ID frame at sequence 1
+    // (§5.1.1 ¶3). For the qns server, that sequence-1 CID is also
+    // the one minted by `queueServerConnectionIds` — the two code
+    // paths describe the SAME CID + SAME token so the seq-1
+    // NEW_CONNECTION_ID the server still emits is treated as a
+    // duplicate by the client (registerPeerCid is idempotent for
+    // matching tuples per `src/conn/state.zig`'s peer-CID table).
+    //
+    // This test pins that alignment: a divergence here would
+    // either (a) make the client close with `connection id
+    // sequence reused` because two different seq-1 CIDs were
+    // advertised, or (b) leave the post-migration packets
+    // bearing the PA's CID unauthenticated server-side because
+    // the seq-1 SCID we registered locally is for a different
+    // CID.
+    const initial: [server_cid_len]u8 = .{
+        'Q', 'N', 'S', '-', 0x11, 0x22, 0x33, 0x44,
+    };
+    const pa = buildPreferredAddress(&initial, 444);
+
+    // Mirror the seq-1 derivation in `queueServerConnectionIds`
+    // (`cid[7] +%= 1`) and the matching token derivation.
+    var expected_alt = initial;
+    expected_alt[7] +%= 1;
+    const expected_token = statelessResetToken(&expected_alt, 1);
+
+    try std.testing.expectEqual(@as(u8, server_cid_len), pa.connection_id.len);
+    try std.testing.expectEqualSlices(u8, &expected_alt, pa.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &expected_token, &pa.stateless_reset_token);
+
+    // Ports + addresses match the runner's static rightnet
+    // assignment plus the embedder-supplied alt port. A test
+    // failure here would mean the client migrates to either an
+    // unbound IP family or to the wrong port — both produce a
+    // silent black-hole that's hard to diagnose from the
+    // runner's pcap alone.
+    try std.testing.expectEqual(@as(u16, 444), pa.ipv4_port);
+    try std.testing.expectEqual(@as(u16, 444), pa.ipv6_port);
+    try std.testing.expectEqualSlices(u8, &interop_runner_server_ipv4, &pa.ipv4_address);
+    try std.testing.expectEqualSlices(u8, &interop_runner_server_ipv6, &pa.ipv6_address);
+}
+
+test "buildPreferredAddress encodes into the transport-params blob" {
+    // End-to-end check that a server-authored TransportParams blob
+    // carrying `preferred_address` round-trips through `Params.encode`
+    // and `Params.decode`. The qns endpoint passes the value through
+    // `Connection.acceptInitial`, which calls
+    // `setTransportParams`, which calls `Params.encode`. This test
+    // shortcuts to the codec because we don't want to spin up a TLS
+    // handshake just to assert the PA fields make it onto the wire.
+    const initial: [server_cid_len]u8 = .{
+        'Q', 'N', 'S', '-', 0xa1, 0xa2, 0xa3, 0xa4,
+    };
+    const pa = buildPreferredAddress(&initial, 444);
+
+    const params: quic_zig.tls.TransportParams = .{
+        .max_idle_timeout_ms = 30_000,
+        .initial_max_data = 1 * 1024 * 1024,
+        .initial_max_stream_data_bidi_local = 1 * 1024 * 1024,
+        .initial_max_stream_data_bidi_remote = 1 * 1024 * 1024,
+        .initial_max_stream_data_uni = 1 * 1024 * 1024,
+        .initial_max_streams_bidi = 100,
+        .initial_max_streams_uni = 16,
+        .max_udp_payload_size = endpoint_udp_payload_size,
+        .active_connection_id_limit = 2,
+        .preferred_address = pa,
+    };
+
+    var buf: [512]u8 = undefined;
+    const n = try params.encode(&buf);
+    const decoded = try quic_zig.tls.transport_params.Params.decode(buf[0..n]);
+
+    const got = decoded.preferred_address orelse return error.MissingPreferredAddress;
+    try std.testing.expectEqualSlices(u8, pa.connection_id.slice(), got.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &pa.stateless_reset_token, &got.stateless_reset_token);
+    try std.testing.expectEqual(pa.ipv4_port, got.ipv4_port);
+    try std.testing.expectEqual(pa.ipv6_port, got.ipv6_port);
+    try std.testing.expectEqualSlices(u8, &pa.ipv4_address, &got.ipv4_address);
+    try std.testing.expectEqualSlices(u8, &pa.ipv6_address, &got.ipv6_address);
+}
+
+test "ServerConn.last_recv_socket defaults to main on init" {
+    // Pre-migration the qns server's outbound drain assumes
+    // `last_recv_socket == 0` (the main listening socket). A regression
+    // that left it as garbage / non-zero would make every reply on a
+    // brand-new connection go through the alt-port socket, breaking
+    // the handshake before any peer ever observes the
+    // `preferred_address` advertise. We can't run `ServerConn.init`
+    // without a real `/www` and an `std.Io` but the field's
+    // default-zero invariant is enough — `ServerConn.init` doesn't
+    // override it (only the recv-side `dispatchInbound` flips it),
+    // so as long as the struct literal and the in-place assignment
+    // in `ServerConn.init` agree, this latch holds.
+    const sc: ServerConn = .{
+        .conn = undefined,
+        .app = undefined,
+        .peer = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+        .retry_source_cid = @splat(0),
+        .initial_server_cid = @splat(0),
+        .last_activity_us = 0,
+    };
+    try std.testing.expectEqual(@as(u8, 0), sc.last_recv_socket);
 }

@@ -128,11 +128,27 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   pollDatagram exposes the new server tuple after migration`) pins
   the contract.
 - **Server `CM` (connectionmigration) × all three peers** —
-  `qns_endpoint.zig` does not advertise `preferred_address` in
-  the server's transport-parameter blob; the codec exists in
-  `src/tls/transport_params.zig`, the wiring is unfinished.
-  **Deferred** to a follow-up session (needs an alt-port
-  listening socket and runner-IP introspection).
+  fix landed on `followup-preferred-address` (2026-05-09):
+  `qns_endpoint.zig` now binds a second UDP listener on
+  `[::]:444` (gated on `TESTCASE=connectionmigration`,
+  driven by a new `-pref-addr` server flag in
+  `interop/qns/run_endpoint.sh`) and advertises a
+  `preferred_address` transport parameter (RFC 9000 §18.2)
+  carrying the runner's static rightnet IPs + the alt-port +
+  the seq-1 server CID + stateless reset token. The recv loop
+  polls both sockets per iteration; per-connection
+  `last_recv_socket` tracks which listener last received an
+  authenticated datagram so outbound replies follow the
+  client onto the alt-port once it migrates. The seq-1 CID
+  is derived in lockstep with `queueServerConnectionIds`, so
+  the existing post-handshake NEW_CONNECTION_ID(seq=1) frame
+  describes the same CID + same token — `registerPeerCid`
+  treats matching tuples as a no-op. Three new unit tests
+  pin `buildPreferredAddress` ↔ `queueServerConnectionIds`
+  alignment, the codec round-trip via `Params.encode` /
+  `Params.decode`, and the `last_recv_socket = 0` default.
+  **Re-running the interop matrix is needed to confirm the
+  cells actually flip PASS.**
 - **Server `BA` (rebind-addr) × quiche** — fix landed on
   `followup-path-challenge-order` (2026-05-09): the server's
   packet builder now emits `PATH_CHALLENGE` as the FIRST frame of
