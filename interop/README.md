@@ -109,10 +109,23 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
 - **Server `M` (multiplexing) × quiche** — original quiche-only
   failure mode reverts to its 2026-05-09 morning state. The core
   watermark fix above is the path forward.
-- **Client `BA` (rebind-addr) × {quic-go, quiche}** — client-side
-  active-migration + NEW_CONNECTION_ID-for-new-path issuance
-  surfaced by the verification matrix. Distinct from the warmup
-  workaround.
+- **Client `BA` (rebind-addr) × {quic-go, quiche}** — partially
+  addressed (2026-05-09 follow-up commit on
+  `followup-client-migration-cid`): the qns client driver now issues
+  a fresh client SCID at sequence 1 once the handshake completes
+  via the new `queueClientConnectionIds` helper, mirroring the
+  long-standing server-side pattern. This unblocks the FIRST half
+  of the failure — the server (e.g. quic-go) no longer has to log
+  `skipping validation of new path … since no connection ID is
+  available`. The SECOND half (quiche-style) — the qns client
+  "keeps sending from the OLD socket" after the server validates
+  the new path — is still open. The client driver has no signal
+  for the SIM-side rebind (the runner rewrites the client's source
+  transparently in ns3) and would need either a transport-level
+  rebind callback or a passive trigger when an inbound
+  PATH_CHALLENGE arrives at a new server tuple. Re-running the
+  matrix is needed to confirm whether the NEW_CONNECTION_ID fix
+  alone flips quic-go × `BA` to PASS.
 - **Server `CM` (connectionmigration) × all three peers** —
   `qns_endpoint.zig` does not advertise `preferred_address` in
   the server's transport-parameter blob; the codec exists in
