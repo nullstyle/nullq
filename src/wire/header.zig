@@ -20,14 +20,74 @@ const packet_number = @import("packet_number.zig");
 /// Maximum Connection ID length permitted by QUIC v1.
 pub const max_cid_len: u8 = 20;
 
-/// Long Packet Type, encoded as a 2-bit field at positions 5-4 of the
-/// first byte of a long-header packet (RFC 9000 §17.2).
-pub const LongType = enum(u2) {
-    initial = 0,
-    zero_rtt = 1,
-    handshake = 2,
-    retry = 3,
+/// QUIC v1 wire-format version (RFC 9000 §15).
+pub const quic_version_1: u32 = 0x00000001;
+
+/// QUIC v2 wire-format version (RFC 9368 §3.1).
+pub const quic_version_2: u32 = 0x6b3343cf;
+
+/// Long Packet Type — abstract identifier for one of the four QUIC
+/// long-header packet kinds. The on-wire 2-bit encoding (positions
+/// 5-4 of the first byte) is *version-specific*: v1 (RFC 9000 §17.2)
+/// uses Initial=0b00, 0-RTT=0b01, Handshake=0b10, Retry=0b11; v2
+/// (RFC 9368 §3.2) rotates these to Initial=0b01, 0-RTT=0b10,
+/// Handshake=0b11, Retry=0b00. Use `longTypeFromBits` /
+/// `longTypeToBits` (or one of the version-specific variants) to
+/// translate between this enum and the wire form.
+pub const LongType = enum {
+    initial,
+    zero_rtt,
+    handshake,
+    retry,
 };
+
+/// Translate the on-wire 2-bit long-packet-type field for `version`
+/// to the abstract `LongType` enum. RFC 9368 §3.2 v2 rotation: the
+/// type bits XOR with 0b01 against the v1 layout. Unknown versions
+/// fall back to the v1 mapping — callers that care about strict
+/// version gating should consult `isSupportedVersion` first.
+pub fn longTypeFromBits(version: u32, bits: u2) LongType {
+    return switch (version) {
+        quic_version_2 => switch (bits) {
+            0b00 => .retry,
+            0b01 => .initial,
+            0b10 => .zero_rtt,
+            0b11 => .handshake,
+        },
+        else => switch (bits) {
+            0b00 => .initial,
+            0b01 => .zero_rtt,
+            0b10 => .handshake,
+            0b11 => .retry,
+        },
+    };
+}
+
+/// Translate an abstract `LongType` to the on-wire 2-bit
+/// long-packet-type field for `version`. Inverse of
+/// `longTypeFromBits`. Unknown versions fall back to the v1 mapping.
+pub fn longTypeToBits(version: u32, t: LongType) u2 {
+    return switch (version) {
+        quic_version_2 => switch (t) {
+            .retry => 0b00,
+            .initial => 0b01,
+            .zero_rtt => 0b10,
+            .handshake => 0b11,
+        },
+        else => switch (t) {
+            .initial => 0b00,
+            .zero_rtt => 0b01,
+            .handshake => 0b10,
+            .retry => 0b11,
+        },
+    };
+}
+
+/// True if `version` is a QUIC version code this module knows the
+/// long-packet-type bit layout for.
+pub fn isSupportedVersion(version: u32) bool {
+    return version == quic_version_1 or version == quic_version_2;
+}
 
 /// Packet Number length in bytes. Encoded as N-1 in the low 2 bits of
 /// the first byte after header protection is removed.
@@ -333,7 +393,15 @@ fn parseLong(src: []const u8, first: u8) Error!Parsed {
         };
     }
 
-    const long_type: LongType = @enumFromInt(@as(u2, @intCast((first >> 4) & 0x03)));
+    // RFC 9368 §3.2: the v2 long-header type bits rotate against
+    // the v1 layout. Use `longTypeFromBits` so the abstract `LongType`
+    // value is correct under both versions.
+    const type_bits: u2 = @intCast((first >> 4) & 0x03);
+    const long_type: LongType = longTypeFromBits(common.version, type_bits);
+    // RFC 9287 §3: the QUIC Bit is randomized per packet when both
+    // peers advertised `grease_quic_bit`; preserved verbatim through
+    // parse so the connection-level negotiation gate on emit
+    // round-trips.
     const quic_bit: u1 = @intCast((first >> 6) & 0x01);
     const reserved_bits: u2 = @intCast((first >> 2) & 0x03);
     const pn_bits: u2 = @intCast(first & 0x03);
@@ -475,10 +543,15 @@ pub fn encode(dst: []u8, header: Header) Error!usize {
 /// Type. Reserved Bits go into bits 3-2; the PN-length field follows
 /// in the low two bits. Retry has no Reserved/PN bits — callers pass
 /// `reserved_bits = 0` and OR in the §17.2.5 Unused field after.
-fn longHeaderFirstByte(long_type: LongType, quic_bit: u1, reserved_bits: u2) u8 {
+///
+/// The Long Packet Type wire bits are version-specific (RFC 9368 §3.2
+/// rotates them between v1 and v2). The `version` argument routes
+/// through `longTypeToBits` so this helper produces the right bits
+/// for either version.
+fn longHeaderFirstByte(version: u32, long_type: LongType, quic_bit: u1, reserved_bits: u2) u8 {
     return 0x80 |
         (@as(u8, quic_bit) << 6) |
-        (@as(u8, @intFromEnum(long_type)) << 4) |
+        (@as(u8, longTypeToBits(version, long_type)) << 4) |
         (@as(u8, reserved_bits) << 2);
 }
 
@@ -508,7 +581,7 @@ fn writeLongHeaderCommon(
 }
 
 fn encodeInitial(dst: []u8, h: Initial) Error!usize {
-    const first_byte: u8 = longHeaderFirstByte(.initial, h.quic_bit, h.reserved_bits) |
+    const first_byte: u8 = longHeaderFirstByte(h.version, .initial, h.quic_bit, h.reserved_bits) |
         h.pn_length.toTwoBits();
     var pos = try writeLongHeaderCommon(dst, first_byte, h.version, h.dcid, h.scid);
 
@@ -530,7 +603,7 @@ fn encodeLongPn(dst: []u8, h: anytype, comptime kind: PnTailKind) Error!usize {
         .zero_rtt => .zero_rtt,
         .handshake => .handshake,
     };
-    const first_byte: u8 = longHeaderFirstByte(long_type, h.quic_bit, h.reserved_bits) |
+    const first_byte: u8 = longHeaderFirstByte(h.version, long_type, h.quic_bit, h.reserved_bits) |
         h.pn_length.toTwoBits();
     var pos = try writeLongHeaderCommon(dst, first_byte, h.version, h.dcid, h.scid);
 
@@ -545,7 +618,10 @@ fn encodeLongPn(dst: []u8, h: anytype, comptime kind: PnTailKind) Error!usize {
 fn encodeRetry(dst: []u8, h: Retry) Error!usize {
     // Retry uses the same QUIC-Bit semantics as the rest of the long
     // headers; the lower 4 bits are "Unused" per RFC 9000 §17.2.5.
-    const first_byte: u8 = (longHeaderFirstByte(.retry, h.quic_bit, 0) & 0xf0) |
+    // RFC 9368 §3.2: in QUIC v2 the Retry type bits are 0b00 (the
+    // v1 "Initial" slot); `longHeaderFirstByte` routes through
+    // `longTypeToBits` to handle both layouts.
+    const first_byte: u8 = (longHeaderFirstByte(h.version, .retry, h.quic_bit, 0) & 0xf0) |
         @as(u8, h.unused_bits);
     var pos = try writeLongHeaderCommon(dst, first_byte, h.version, h.dcid, h.scid);
 

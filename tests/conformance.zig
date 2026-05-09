@@ -37,6 +37,7 @@ test {
     _ = @import("conformance/rfc9002_loss_recovery.zig");
     _ = @import("conformance/rfc9221_datagram.zig");
     _ = @import("conformance/rfc9287_grease_quic_bit.zig");
+    _ = @import("conformance/rfc9368_quic_v2.zig");
     _ = @import("conformance/quic_lb_draft21.zig");
     _ = @import("conformance/draft_munizaga_alt_addr_00.zig");
     // Fixture-internal sanity tests for `_handshake_fixture.zig`.

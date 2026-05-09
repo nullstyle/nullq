@@ -24,7 +24,6 @@ const wire_header = state_mod.wire_header;
 const long_packet_mod = state_mod.long_packet_mod;
 const path_mod = state_mod.path_mod;
 const transport_error_protocol_violation = state_mod.transport_error_protocol_violation;
-const quic_version_1 = state_mod.quic_version_1;
 const max_recv_plaintext = state_mod.max_recv_plaintext;
 
 /// Handle a Version Negotiation packet (RFC 8999 §6 / RFC 9000 §6).
@@ -48,7 +47,12 @@ pub fn handleVersionNegotiation(
     else
         self.initial_dcid;
     if (!std.mem.eql(u8, vn.scid.slice(), odcid.slice())) return bytes.len;
-    if (Connection.versionListContains(vn, quic_version_1)) return bytes.len;
+    // The connection's currently-active version must NOT appear in the
+    // VN list — RFC 8999 §6 / RFC 9000 §6 say a peer MUST send VN only
+    // when it does NOT support our version. If our version is listed,
+    // we silently ignore the VN per the same spec text (this includes
+    // the v1↔v2 case where a server happens to support both).
+    if (Connection.versionListContains(vn, self.version)) return bytes.len;
 
     self.enterClosed(
         .version_negotiation,
@@ -245,7 +249,12 @@ pub fn handleRetry(
     const parsed = wire_header.parse(bytes, 0) catch return bytes.len;
     if (parsed.header != .retry) return bytes.len;
     const retry = parsed.header.retry;
-    if (retry.version != quic_version_1) return bytes.len;
+    // Retry's version field MUST match our active version; if a v1
+    // server tries to Retry our v2 Initial (or vice versa) we silently
+    // drop. RFC 9368 §3.3.3 ties the integrity tag to the Retry's
+    // version, so a mismatched version here would also fail tag
+    // validation a few lines below.
+    if (retry.version != self.version) return bytes.len;
     if (!self.local_scid_set or !self.initial_dcid_set) return bytes.len;
     if (!std.mem.eql(u8, retry.dcid.slice(), self.local_scid.slice())) return bytes.len;
 

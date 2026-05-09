@@ -363,6 +363,61 @@ breaking changes; see notes per release.
   `tests/conformance/rfc9287_grease_quic_bit.zig` covering §3 wire
   format and §6.1 transport parameter.
 
+- **RFC 9368 QUIC v2.** Embedders can now opt into the v2 wire format
+  alongside v1. The differences are version-scoped — short headers,
+  frame syntax, and the connection-level state machine are
+  unchanged from RFC 9000.
+    * `quic_zig.QUIC_VERSION_2 = 0x6b3343cf` constant.
+    * `wire.initial.deriveInitialKeysFor(version, dcid, is_server)`
+      uses the §3.3.1 salt + §3.3.2 HKDF labels (`quicv2 key` / `iv`
+      / `hp`) for v2; the existing `deriveInitialKeys(dcid, is_server)`
+      stays as a v1 thin wrapper.
+    * `wire.header.LongType` is now an abstract enum with
+      `longTypeFromBits(version, bits)` / `longTypeToBits(version,
+      type)` helpers — RFC 9368 §3.2 v2 rotates the wire bits to
+      Initial=0b01, 0-RTT=0b10, Handshake=0b11, Retry=0b00.
+    * `wire.long_packet.retryIntegrityTag(version, ...)` and
+      `validateRetryIntegrity(...)` use the §3.3.3 v2 AEAD constants
+      when the packet's version field is `0x6b3343cf`.
+    * `tls.transport_params.Params` learns the §5
+      `version_information` parameter (codepoint `0x11`) via
+      `setCompatibleVersions(versions)` /
+      `compatibleVersions()` — encoded as a list of u32s with the
+      sender's chosen version first, decoded into a fixed-size
+      inline buffer so `Params` stays a value type.
+    * `Server.Config.versions: []const u32 = &.{0x00000001}` — opt
+      a server into v2 by adding `0x6b3343cf`. The Version
+      Negotiation gate now lists every entry; an inbound Initial
+      with a non-listed version earns a VN response listing the
+      configured set. The slot's connection adopts the matching
+      incoming version, deriving its Initial keys under the right
+      salt + label set.
+    * `Client.Config.preferred_version: u32 = 0x00000001` and
+      `Client.Config.compatible_versions: []const u32 = &.{}` —
+      opt a client into v2 by setting `preferred_version =
+      0x6b3343cf`. A non-empty `compatible_versions` advertises
+      `version_information` for the server's RFC 9368 §6
+      compatible-version-negotiation upgrade path.
+    * New `tests/conformance/rfc9368_quic_v2.zig` (19 tests)
+      covering the §3.2 packet-type rotation, §3.3.1 salt, §3.3.2
+      HKDF labels, §3.3.3 Retry tag constants, §5
+      transport-parameter codec, and §6 server gating.
+    * New `tests/e2e/quic_v2_handshake.zig` (5 tests) drives a real
+      Server <-> Client handshake under v2 including the v1
+      regression path, the v1+v2-server / v1-client backwards-compat
+      path, and the version-information transport-parameter
+      visibility.
+
+  Server-driven compatible-version-negotiation upgrade (RFC 9368
+  §6) — switching a slot's version mid-handshake based on the
+  client's `version_information` set — is tracked as a follow-up
+  (`// TODO(B3-followup):` in `src/server.zig`); standalone v2 is
+  the more common case in practice. The merge into main also fixed
+  a latent v1 dispatch bug in `Connection.handleOnePacket` and
+  `shouldDrainTlsAfterPacket` where raw long-header type bits were
+  read via the v1 mapping; both now route through
+  `wire_header.longTypeFromBits(version, bits)`.
+
 ### Hardening (security-relevant)
 
 - **§17.2.1 / §17.3 — Reserved Bits enforced on receive.**

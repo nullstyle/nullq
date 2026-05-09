@@ -59,6 +59,13 @@ pub const Id = struct {
     pub const initial_source_connection_id: u64 = 0x0f;
     /// Per RFC 9000 §18.2 — `retry_source_connection_id` (server-only).
     pub const retry_source_connection_id: u64 = 0x10;
+    /// RFC 9368 §5 — `version_information`. Carries the sender's
+    /// chosen version followed by the list of versions it considers
+    /// compatible with that choice. quic_zig surfaces this as
+    /// `Params.compatible_versions` (a `[]const u32`); the first
+    /// entry is the chosen version and the remaining entries are the
+    /// compatibility set in preference order.
+    pub const version_information: u64 = 0x11;
     /// RFC 9221 §3
     pub const max_datagram_frame_size: u64 = 0x20;
     /// RFC 9287 §3 — `grease_quic_bit` (zero-length flag).
@@ -130,6 +137,13 @@ const min_max_udp_payload_size: u64 = 1200;
 /// QUIC varint. Universal (role-independent) bound.
 const max_initial_max_streams: u64 = 1 << 60;
 
+/// Maximum number of u32 entries we accept in the RFC 9368 §5
+/// `version_information` transport parameter. Keeps the on-wire
+/// blob bounded and avoids unbounded heap chatter on the decode
+/// path. 16 is well above the practical "chosen version + a few
+/// compatible versions" the spec suggests.
+pub const max_compatible_versions: usize = 16;
+
 /// Typed view of the QUIC transport parameters blob exchanged
 /// during the handshake (RFC 9000 §18, RFC 9221, draft-ietf-quic-multipath-21).
 /// Each field corresponds to one IANA-registered parameter id;
@@ -189,6 +203,22 @@ pub const Params = struct {
     initial_source_connection_id: ?ConnectionId = null,
     /// 0x10 — server-only: SCID from the Retry packet, if Retry was sent.
     retry_source_connection_id: ?ConnectionId = null,
+
+    /// 0x11 — RFC 9368 §5 `version_information`. Stored inline as a
+    /// fixed-size buffer so `Params` stays a value type that doesn't
+    /// borrow from a parse buffer. Use `setCompatibleVersions` to
+    /// populate; use `compatibleVersions()` to read the active slice.
+    /// On the wire the field is a list of u32s where the first entry
+    /// is the sender's chosen version and the remaining entries are
+    /// versions the sender considers compatible with that choice.
+    /// `compatible_versions_count == 0` means the parameter was not
+    /// advertised by the encoder (the default).
+    compatible_versions_buf: [max_compatible_versions]u32 = @splat(0),
+    /// Number of valid u32 entries in `compatible_versions_buf`. Zero
+    /// means the parameter is absent. Capped at
+    /// `max_compatible_versions`; decode rejects oversize blobs as
+    /// `InvalidValue`.
+    compatible_versions_count: u8 = 0,
 
     /// 0x20 — RFC 9221: max datagram frame size accepted. 0 = no DATAGRAM support.
     max_datagram_frame_size: u64 = 0,
@@ -283,6 +313,9 @@ pub const Params = struct {
         if (self.retry_source_connection_id) |cid| {
             pos += try writeBytes(dst, pos, Id.retry_source_connection_id, cid.slice());
         }
+        if (self.compatible_versions_count > 0) {
+            pos += try writeVersionList(dst, pos, Id.version_information, self.compatibleVersions());
+        }
         if (self.max_datagram_frame_size != 0) {
             pos += try writeVarint(dst, pos, Id.max_datagram_frame_size, self.max_datagram_frame_size);
         }
@@ -320,6 +353,29 @@ pub const Params = struct {
             try setOne(&p, id_d.value, value);
         }
         return p;
+    }
+
+    /// Borrowed view of the active `compatible_versions` entries.
+    /// Empty when the parameter was not advertised. The first entry
+    /// is the sender's chosen version; remaining entries are the
+    /// compatibility set in preference order.
+    pub fn compatibleVersions(self: *const Params) []const u32 {
+        return self.compatible_versions_buf[0..self.compatible_versions_count];
+    }
+
+    /// Populate the RFC 9368 §5 `version_information` parameter from
+    /// the supplied slice. The first entry is the sender's chosen
+    /// version; the remainder are compatible versions in preference
+    /// order. Empty `versions` clears the parameter (so it is not
+    /// emitted by `encode`). Errors with `InvalidValue` if `versions`
+    /// has more than `max_compatible_versions` entries.
+    pub fn setCompatibleVersions(self: *Params, versions: []const u32) Error!void {
+        if (versions.len > max_compatible_versions) return Error.InvalidValue;
+        self.compatible_versions_count = @intCast(versions.len);
+        @memcpy(self.compatible_versions_buf[0..versions.len], versions);
+        // Zero the unused tail so two `Params` with the same active
+        // slice compare equal byte-for-byte.
+        @memset(self.compatible_versions_buf[versions.len..], 0);
     }
 };
 
@@ -461,6 +517,39 @@ fn writeFlag(dst: []u8, pos: usize, id: u64) Error!usize {
     return written;
 }
 
+fn writeVersionList(dst: []u8, pos: usize, id: u64, versions: []const u32) Error!usize {
+    if (versions.len == 0) return Error.InvalidValue;
+    if (versions.len > max_compatible_versions) return Error.InvalidValue;
+    const value_len: usize = versions.len * 4;
+    var written: usize = 0;
+    written += try varint.encode(dst[pos..], id);
+    written += try varint.encode(dst[pos + written ..], value_len);
+    if (dst.len < pos + written + value_len) return Error.BufferTooSmall;
+    var i: usize = 0;
+    while (i < versions.len) : (i += 1) {
+        std.mem.writeInt(u32, dst[pos + written + i * 4 ..][0..4], versions[i], .big);
+    }
+    written += value_len;
+    return written;
+}
+
+fn setVersionInformation(p: *Params, value: []const u8) Error!void {
+    // RFC 9368 §5: the encoded value is one or more concatenated
+    // 32-bit big-endian version codes — chosen version first, then
+    // any compatible versions. Reject malformed shapes (zero length,
+    // not a multiple of 4, or more entries than we support) as
+    // `InvalidValue` so peers get a clean transport-parameter error.
+    if (value.len == 0 or value.len % 4 != 0) return Error.InvalidValue;
+    const count = value.len / 4;
+    if (count > max_compatible_versions) return Error.InvalidValue;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        p.compatible_versions_buf[i] = std.mem.readInt(u32, value[i * 4 ..][0..4], .big);
+    }
+    @memset(p.compatible_versions_buf[count..], 0);
+    p.compatible_versions_count = @intCast(count);
+}
+
 fn writePreferredAddress(dst: []u8, pos: usize, addr: PreferredAddress) Error!usize {
     const cid_len = addr.connection_id.len;
     const value_len: usize = 4 + 2 + 16 + 2 + 1 + cid_len + 16;
@@ -543,6 +632,7 @@ fn setOne(p: *Params, id: u64, value: []const u8) Error!void {
             if (value.len > path_mod.max_cid_len) return Error.InvalidValue;
             p.retry_source_connection_id = ConnectionId.fromSlice(value);
         },
+        Id.version_information => try setVersionInformation(p, value),
         Id.max_datagram_frame_size => p.max_datagram_frame_size = try decodeVarintValue(value),
         Id.grease_quic_bit => {
             // RFC 9287 §3: "An endpoint that includes this transport

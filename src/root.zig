@@ -14,6 +14,15 @@ const boringssl = @import("boringssl");
 /// QUIC v1 wire-format version, per RFC 9000 §15.
 pub const QUIC_VERSION_1: u32 = 0x00000001;
 
+/// QUIC v2 wire-format version, per RFC 9368 §3.1. The wire-format
+/// differences against v1 are scoped to the Initial-key salt + HKDF
+/// labels (§3.3.1 / §3.3.2), the long-header packet-type bit layout
+/// (§3.2), and the Retry integrity constants (§3.3.3); short-header
+/// packets, frame syntax, and connection-level state are identical.
+/// Embedders opt in via `Server.Config.versions` (server) and
+/// `Client.Config.preferred_version` (client).
+pub const QUIC_VERSION_2: u32 = 0x6b3343cf;
+
 /// Public multipath target. Frame/transport behavior follows
 /// draft-ietf-quic-multipath-21 until this extension is assigned
 /// stable RFC values.
@@ -237,4 +246,5 @@ test "phase 0: builds and links against boringssl-zig" {
 
     try std.testing.expectEqualStrings("0.0.0", version());
     try std.testing.expectEqual(@as(u32, 1), QUIC_VERSION_1);
+    try std.testing.expectEqual(@as(u32, 0x6b3343cf), QUIC_VERSION_2);
 }

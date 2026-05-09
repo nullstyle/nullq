@@ -1126,6 +1126,18 @@ pub const Connection = struct {
     initial_source_cid: ConnectionId = .{},
     initial_source_cid_set: bool = false,
     /// Original DCID used for Initial-key derivation (RFC 9001 §5.2).
+    /// Active QUIC wire-format version for this connection. Drives
+    /// the Initial-key salt + HKDF labels (RFC 9001 §5.2 / RFC 9368
+    /// §3.3.1, §3.3.2), the long-header packet-type bit layout
+    /// (RFC 9000 §17.2 / RFC 9368 §3.2), and the Retry integrity
+    /// constants (RFC 9001 §5.8 / RFC 9368 §3.3.3). Defaults to
+    /// QUIC v1; embedders that opt in to v2 set this via
+    /// `setVersion` after `initClient` / `initServer`. Once an
+    /// Initial is sealed or opened the value is effectively
+    /// immutable (changing it would re-derive Initial keys against
+    /// a different salt).
+    version: u32 = quic_version_1,
+
     /// Client side: the random DCID it sent on the very first Initial.
     /// Server side: same value, recovered from that incoming Initial.
     initial_dcid: ConnectionId = .{},
@@ -2667,8 +2679,20 @@ pub const Connection = struct {
         if (self.role != .server) return Error.NotServerContext;
         if (bytes.len < 6) return Error.InsufficientBytes;
         if ((bytes[0] & 0x80) == 0) return Error.NotInitialPacket; // bit 7 clear → short header
+        // RFC 9368 §3.2: the v2 long-header type rotation puts Initial
+        // at 0b01 instead of 0b00. Resolve through `longTypeFromBits`
+        // so a v2 ClientHello survives this gate.
+        const version = std.mem.readInt(u32, bytes[1..5], .big);
         const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
-        if (long_type_bits != 0) return Error.NotInitialPacket; // long header but type ≠ Initial
+        if (wire_header.longTypeFromBits(version, long_type_bits) != .initial) {
+            return Error.NotInitialPacket;
+        }
+        // Adopt the peer's version so subsequent Initial-key
+        // derivation (`ensureInitialKeys`), header encoding, and
+        // Retry-tag construction all key off the right RFC 9001 §5
+        // / RFC 9368 §3.3 constants. Invalidates any pre-existing
+        // Initial keys via `setVersion`.
+        if (version != self.version) self.setVersion(version);
 
         const dcid_len = bytes[5];
         if (dcid_len > path_mod.max_cid_len) return Error.DcidTooLong;
@@ -2716,7 +2740,11 @@ pub const Connection = struct {
     } {
         const cids = try longHeaderCids(bytes);
         const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
-        if (long_type_bits != @intFromEnum(wire_header.LongType.initial)) return Error.NotInitialPacket;
+        // RFC 9368 §3.2: the v2 long-header type rotation makes the
+        // wire-bit value version-specific; resolve through
+        // `longTypeFromBits` so v2 Initials don't get rejected here.
+        const long_type = wire_header.longTypeFromBits(cids.version, long_type_bits);
+        if (long_type != .initial) return Error.NotInitialPacket;
         return .{ .dcid = cids.dcid, .scid = cids.scid };
     }
 
@@ -2746,10 +2774,12 @@ pub const Connection = struct {
         } });
     }
 
-    /// Server-side helper: write a QUIC v1 Retry packet in response
-    /// to `client_initial`. Token contents and validation remain
-    /// embedder-owned; quic_zig handles the Retry header and RFC 9001
-    /// integrity tag.
+    /// Server-side helper: write a Retry packet in response to
+    /// `client_initial`. Token contents and validation remain
+    /// embedder-owned; quic_zig handles the Retry header and the
+    /// version-keyed RFC 9001 §5.8 / RFC 9368 §3.3.3 integrity tag.
+    /// The Retry's version field mirrors the client's Initial so the
+    /// peer can validate under the matching constants.
     pub fn writeRetry(
         self: *Connection,
         dst: []u8,
@@ -2758,8 +2788,16 @@ pub const Connection = struct {
         retry_token: []const u8,
     ) Error!usize {
         if (self.role != .server) return error.NotServerContext;
-        const cids = try initialHeaderCids(client_initial);
+        const cids = try longHeaderCids(client_initial);
+        // Make sure the leading long-header packet really is an Initial
+        // under the client's chosen version (RFC 9368 §3.2 v2 layout
+        // moves the Retry slot, so a v1-only check would mis-classify
+        // a v2 Retry as "not an Initial").
+        const long_type_bits: u2 = @intCast((client_initial[0] >> 4) & 0x03);
+        const long_type = wire_header.longTypeFromBits(cids.version, long_type_bits);
+        if (long_type != .initial) return Error.NotInitialPacket;
         return try long_packet_mod.sealRetry(dst, .{
+            .version = cids.version,
             .original_dcid = cids.dcid,
             .dcid = cids.scid,
             .scid = retry_scid,
@@ -2813,11 +2851,11 @@ pub const Connection = struct {
         if (self.initial_keys_read != null and self.initial_keys_write != null) return;
         if (!self.initial_dcid_set) return;
         const dcid_slice = self.initial_dcid.slice();
-        // RFC 9001 §5.2: client-direction secret comes from "client in",
-        // server-direction from "server in". The Connection's role
-        // determines which secret is the read-side and which is write.
-        const client_keys_initial = try initial_keys_mod.deriveInitialKeys(dcid_slice, false);
-        const server_keys_initial = try initial_keys_mod.deriveInitialKeys(dcid_slice, true);
+        // RFC 9001 §5.2 / RFC 9368 §3.3.1: client-direction secret
+        // comes from "client in", server-direction from "server in";
+        // the active version selects salt + HKDF labels.
+        const client_keys_initial = try initial_keys_mod.deriveInitialKeysFor(self.version, dcid_slice, false);
+        const server_keys_initial = try initial_keys_mod.deriveInitialKeysFor(self.version, dcid_slice, true);
         const client_pkt = try short_packet_mod.derivePacketKeys(.aes128_gcm_sha256, &client_keys_initial.secret);
         const server_pkt = try short_packet_mod.derivePacketKeys(.aes128_gcm_sha256, &server_keys_initial.secret);
         switch (self.role) {
@@ -2830,6 +2868,23 @@ pub const Connection = struct {
                 self.initial_keys_read = client_pkt;
             },
         }
+    }
+
+    /// Set the active QUIC wire-format version. The Initial-keys
+    /// derivation depends on it (RFC 9001 §5.2 v1 / RFC 9368 §3.3.1
+    /// v2), so any cached Initial keys are dropped on change. Calling
+    /// this after Initial-level traffic has been exchanged is a
+    /// configuration error and bypasses the safety latch — embedders
+    /// MUST switch versions only at construction time or via the
+    /// compatible-version-negotiation upgrade path before either side
+    /// has emitted an Initial under the previous version.
+    pub fn setVersion(self: *Connection, version: u32) void {
+        if (self.version == version) return;
+        self.version = version;
+        if (self.initial_keys_read) |*k| std.crypto.secureZero(u8, std.mem.asBytes(k));
+        if (self.initial_keys_write) |*k| std.crypto.secureZero(u8, std.mem.asBytes(k));
+        self.initial_keys_read = null;
+        self.initial_keys_write = null;
     }
 
     /// Open a new bidirectional stream with the given id. The id
@@ -5632,6 +5687,7 @@ pub const Connection = struct {
             const close_quic_bit = self.nextQuicBit();
             const n_close = switch (lvl) {
                 .initial => try long_packet_mod.sealInitial(dst, .{
+                    .version = self.version,
                     .dcid = packet_dcid.slice(),
                     .scid = packet_scid.slice(),
                     .pn = pn,
@@ -5641,6 +5697,7 @@ pub const Connection = struct {
                     .quic_bit = close_quic_bit,
                 }),
                 .handshake => try long_packet_mod.sealHandshake(dst, .{
+                    .version = self.version,
                     .dcid = packet_dcid.slice(),
                     .scid = packet_scid.slice(),
                     .pn = pn,
@@ -5660,6 +5717,7 @@ pub const Connection = struct {
                     .quic_bit = close_quic_bit,
                 }),
                 .early_data => try long_packet_mod.sealZeroRtt(dst, .{
+                    .version = self.version,
                     .dcid = packet_dcid.slice(),
                     .scid = packet_scid.slice(),
                     .pn = pn,
@@ -6248,6 +6306,7 @@ pub const Connection = struct {
         const quic_bit = self.nextQuicBit();
         const n = switch (lvl) {
             .initial => try long_packet_mod.sealInitial(dst, .{
+                .version = self.version,
                 .dcid = packet_dcid.slice(),
                 .scid = packet_scid.slice(),
                 .token = if (self.role == .client) self.retry_token.items else &.{},
@@ -6263,6 +6322,7 @@ pub const Connection = struct {
                 .quic_bit = quic_bit,
             }),
             .handshake => try long_packet_mod.sealHandshake(dst, .{
+                .version = self.version,
                 .dcid = packet_dcid.slice(),
                 .scid = packet_scid.slice(),
                 .pn = pn,
@@ -6282,6 +6342,7 @@ pub const Connection = struct {
                 .quic_bit = quic_bit,
             }),
             .early_data => try long_packet_mod.sealZeroRtt(dst, .{
+                .version = self.version,
                 .dcid = packet_dcid.slice(),
                 .scid = packet_scid.slice(),
                 .pn = pn,
@@ -6557,9 +6618,15 @@ pub const Connection = struct {
     fn shouldDrainTlsAfterPacket(bytes: []const u8) bool {
         if (bytes.len < 1) return false;
         if ((bytes[0] & 0x80) == 0) return false;
-        if (bytes.len >= 5 and std.mem.readInt(u32, bytes[1..5], .big) == 0) return false;
+        if (bytes.len < 5) return false;
+        const version = std.mem.readInt(u32, bytes[1..5], .big);
+        if (version == 0) return false;
         const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
-        return long_type_bits != @intFromEnum(wire_header.LongType.retry);
+        // RFC 9368 §3.2: Retry's wire bits depend on the version
+        // (v1 = 0b11, v2 = 0b00). Resolve through `longTypeFromBits`
+        // so the TLS drain skip on Retry packets covers both layouts.
+        const long_type = wire_header.longTypeFromBits(version, long_type_bits);
+        return long_type != .retry;
     }
 
     /// True when the connection is in RFC 9000 §10.2.1's closing state
@@ -6945,16 +7012,26 @@ pub const Connection = struct {
             return try self.handleShort(bytes, now_us);
         }
 
-        if (bytes.len >= 5 and std.mem.readInt(u32, bytes[1..5], .big) == 0) {
+        if (bytes.len < 5) return 0;
+        const version = std.mem.readInt(u32, bytes[1..5], .big);
+        if (version == 0) {
             return self.handleVersionNegotiation(bytes, now_us);
         }
 
+        // RFC 9368 §3.2: long-header type bits rotate between v1 and
+        // v2. Resolve through `longTypeFromBits` so a v2 packet with
+        // wire bits 0b01 dispatches to `handleInitial`, not
+        // `handleZeroRtt` (the v1 slot for that bit pattern). For
+        // versions we don't recognize, the v1 mapping is the safest
+        // default — those packets will fail downstream version /
+        // AEAD gates anyway.
         const long_type_bits: u2 = @intCast((first >> 4) & 0x03);
-        return switch (long_type_bits) {
-            0 => try self.handleInitial(bytes, now_us),
-            1 => try self.handleZeroRtt(bytes, now_us),
-            2 => try self.handleHandshake(bytes, now_us),
-            3 => try self.handleRetry(bytes, now_us),
+        const long_type = wire_header.longTypeFromBits(version, long_type_bits);
+        return switch (long_type) {
+            .initial => try self.handleInitial(bytes, now_us),
+            .zero_rtt => try self.handleZeroRtt(bytes, now_us),
+            .handshake => try self.handleHandshake(bytes, now_us),
+            .retry => try self.handleRetry(bytes, now_us),
         };
     }
 

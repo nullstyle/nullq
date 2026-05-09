@@ -26,12 +26,75 @@ pub const HkdfHash = enum {
     sha384,
 };
 
+/// QUIC v1 wire-format version (RFC 9000 §15).
+pub const quic_version_1: u32 = 0x00000001;
+
+/// QUIC v2 wire-format version (RFC 9368 §3.1).
+pub const quic_version_2: u32 = 0x6b3343cf;
+
 /// QUIC v1 Initial Salt (RFC 9001 §5.2).
 pub const initial_salt_v1 = [_]u8{
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
     0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
     0xcc, 0xbb, 0x7f, 0x0a,
 };
+
+/// QUIC v2 Initial Salt (RFC 9368 §3.3.1).
+pub const initial_salt_v2 = [_]u8{
+    0x0d, 0xed, 0xe1, 0x05, 0x8e, 0x9c, 0x07, 0x46,
+    0x84, 0x5c, 0xb9, 0xaa, 0xb6, 0xa1, 0xe0, 0x3d,
+    0x52, 0xe2, 0xd5, 0xa3,
+};
+
+/// HKDF-Expand-Label suffix labels for Initial keys / IV / HP. RFC
+/// 9001 §5.1 (v1) uses the bare `quic ...` prefix; RFC 9368 §3.3.2
+/// (v2) bumps it to `quicv2 ...` so the same TLS 1.3 hash with a
+/// different label set produces a distinct key, IV, and HP key under
+/// the same Initial Secret.
+pub const InitialLabels = struct {
+    key: []const u8,
+    iv: []const u8,
+    hp: []const u8,
+};
+
+/// QUIC v1 Initial labels (RFC 9001 §5.1).
+pub const initial_labels_v1: InitialLabels = .{
+    .key = "quic key",
+    .iv = "quic iv",
+    .hp = "quic hp",
+};
+
+/// QUIC v2 Initial labels (RFC 9368 §3.3.2).
+pub const initial_labels_v2: InitialLabels = .{
+    .key = "quicv2 key",
+    .iv = "quicv2 iv",
+    .hp = "quicv2 hp",
+};
+
+/// True if `version` is one of the version codes this module knows
+/// how to derive Initial keys for.
+pub fn isSupportedVersion(version: u32) bool {
+    return version == quic_version_1 or version == quic_version_2;
+}
+
+/// Look up the Initial salt for `version`. Falls back to the v1 salt
+/// for unknown versions; callers that care about strict version
+/// gating should consult `isSupportedVersion` first.
+pub fn initialSaltFor(version: u32) *const [20]u8 {
+    return switch (version) {
+        quic_version_2 => &initial_salt_v2,
+        else => &initial_salt_v1,
+    };
+}
+
+/// Look up the Initial HKDF labels for `version`. Same fallback shape
+/// as `initialSaltFor`.
+pub fn initialLabelsFor(version: u32) InitialLabels {
+    return switch (version) {
+        quic_version_2 => initial_labels_v2,
+        else => initial_labels_v1,
+    };
+}
 
 /// Per-direction Initial keys.
 pub const Keys = struct {
@@ -116,21 +179,36 @@ pub fn hkdfExpandLabelWithHash(
     }
 }
 
-/// Derive a full set of Initial keys for a given role.
+/// Derive a full set of Initial keys for a given role under QUIC v1.
 ///
 /// `dcid` is the Destination Connection ID from the client's first
 /// Initial packet — both endpoints use the same DCID as IKM (RFC 9001
 /// §5.2). `is_server = false` produces client-side keys; `true`
 /// produces server-side keys.
+///
+/// Thin wrapper over `deriveInitialKeysFor(quic_version_1, dcid, is_server)`,
+/// kept for callers that don't need version negotiation.
 pub fn deriveInitialKeys(dcid: []const u8, is_server: bool) Error!Keys {
-    const initial_secret = try HkdfSha256.extract(&initial_salt_v1, dcid);
+    return deriveInitialKeysFor(quic_version_1, dcid, is_server);
+}
+
+/// Version-aware Initial-key derivation. RFC 9001 §5.2 specifies the
+/// derivation for QUIC v1; RFC 9368 §3.3.1 / §3.3.2 specifies the
+/// QUIC v2 variant, which uses the same shape with a different salt
+/// and a different HKDF-Expand-Label label set. Unknown versions
+/// fall back to v1 — callers that care about strict version gating
+/// should consult `isSupportedVersion` first.
+pub fn deriveInitialKeysFor(version: u32, dcid: []const u8, is_server: bool) Error!Keys {
+    const salt = initialSaltFor(version);
+    const labels = initialLabelsFor(version);
+    const initial_secret = try HkdfSha256.extract(salt, dcid);
 
     var keys: Keys = undefined;
     const role_label: []const u8 = if (is_server) "server in" else "client in";
     try hkdfExpandLabel(&keys.secret, &initial_secret, role_label, "");
-    try hkdfExpandLabel(&keys.key, &keys.secret, "quic key", "");
-    try hkdfExpandLabel(&keys.iv, &keys.secret, "quic iv", "");
-    try hkdfExpandLabel(&keys.hp, &keys.secret, "quic hp", "");
+    try hkdfExpandLabel(&keys.key, &keys.secret, labels.key, "");
+    try hkdfExpandLabel(&keys.iv, &keys.secret, labels.iv, "");
+    try hkdfExpandLabel(&keys.hp, &keys.secret, labels.hp, "");
     return keys;
 }
 
