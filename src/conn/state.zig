@@ -39,6 +39,7 @@ pub const pending_frames_mod = @import("pending_frames.zig");
 pub const lifecycle_mod = @import("lifecycle.zig");
 pub const stateless_reset_mod = @import("stateless_reset.zig");
 pub const path_frame_queue = @import("path_frame_queue.zig");
+pub const socket_opts_mod = @import("../transport/socket_opts.zig");
 pub const _internal = @import("_internal.zig");
 const conn_recv_flow_handlers = @import("conn_recv_flow_handlers.zig");
 const conn_recv_cid_token_handlers = @import("conn_recv_cid_token_handlers.zig");
@@ -984,6 +985,31 @@ pub const Connection = struct {
     /// `Server.Config` and `Client.Config` thread the chosen value
     /// onto every Connection at construction time.
     delayed_ack_packet_threshold: u8 = application_ack_eliciting_threshold,
+
+    /// Enable IETF ECN signaling (RFC 9000 §13.4 / RFC 3168). When
+    /// `true` (the default), quic_zig will:
+    ///   * count incoming `EcnCodepoint` markings into per-PN-space
+    ///     `recv_ect0` / `recv_ect1` / `recv_ce` counters,
+    ///   * emit `0x03` ACK frames carrying those counts whenever any
+    ///     received packet at that level was ECN-marked,
+    ///   * validate peer-reported counts on incoming ACKs per
+    ///     §13.4.2 and react to CE bumps via the NewReno
+    ///     congestion controller.
+    ///
+    /// When `false`, the codec is otherwise unchanged but no marking
+    /// signal is propagated either way; outgoing ACKs stay at type
+    /// `0x02`. Embedders flip this off only on environments known to
+    /// bleach ECN bits (some legacy NATs / firewalls), or when
+    /// running tests that need a deterministic congestion control
+    /// path.
+    ecn_enabled: bool = true,
+    /// IP-layer ECN codepoint observed on the most recently received
+    /// (and decrypted) datagram. Set by `handle` from the cmsg the
+    /// embedder plumbs in; consumed by the per-packet handlers when
+    /// they record received PNs into the level's `PnSpace`.
+    /// `not_ect` is the conservative default — the embedder
+    /// hasn't surfaced any TOS byte for this datagram.
+    last_recv_ecn: socket_opts_mod.EcnCodepoint = .not_ect,
 
     /// Running total of bytes currently resident in peer-controlled
     /// buffers — see `max_connection_memory`. Mutated by
@@ -5469,16 +5495,33 @@ pub const Connection = struct {
             if (lvl == .application) {
                 ranges_budget = @min(ranges_budget, max_application_ack_ranges_bytes);
             }
+            // RFC 9000 §13.4.1: outgoing ACK frames include ECN
+            // counts when (a) we still believe ECN works on this
+            // path (`validation == .testing`), AND (b) at least one
+            // received packet at this level was ECN-marked. Otherwise
+            // we stay at the no-ECN frame type so we don't mislead
+            // the peer's monotonicity validation.
+            const ack_ecn_counts: ?frame_types.EcnCounts = blk: {
+                if (!self.ecn_enabled) break :blk null;
+                if (pn_space.validation == .failed) break :blk null;
+                if (!pn_space.hasObservedEcn()) break :blk null;
+                break :blk frame_types.EcnCounts{
+                    .ect0 = pn_space.recv_ect0,
+                    .ect1 = pn_space.recv_ect1,
+                    .ecn_ce = pn_space.recv_ce,
+                };
+            };
             while (true) {
                 const max_lower_ranges = if (lvl == .application)
                     max_application_ack_lower_ranges
                 else
                     std.math.maxInt(u64);
-                const ack_frame = try recv_tracker.toAckFrameLimitedRanges(
+                const ack_frame = try recv_tracker.toAckFrameLimitedRangesWithEcn(
                     self.ackDelayScaled(recv_tracker, now_us),
                     &ranges_buf,
                     ranges_budget,
                     max_lower_ranges,
+                    ack_ecn_counts,
                 );
                 const frame: frame_types.Frame = if (lvl == .application and app_path.id != 0)
                     .{ .path_ack = .{
@@ -6203,6 +6246,29 @@ pub const Connection = struct {
         from: ?Address,
         now_us: u64,
     ) Error!void {
+        return self.handleWithEcn(bytes, from, .not_ect, now_us);
+    }
+
+    /// Same as `handle` but also accepts the IP-layer ECN codepoint
+    /// the embedder peeled off the datagram's TOS byte (RFC 3168 §5).
+    /// Plumbed through from `Server.feedWithEcn` /
+    /// `runUdpServer`'s recvmsg cmsg parser; per-packet handlers read
+    /// `last_recv_ecn` to bump the receiving PN-space's counters
+    /// (RFC 9000 §13.4.1).
+    pub fn handleWithEcn(
+        self: *Connection,
+        bytes: []u8,
+        from: ?Address,
+        ecn: socket_opts_mod.EcnCodepoint,
+        now_us: u64,
+    ) Error!void {
+        // Stash the ECN marking for the per-packet handlers below; the
+        // per-packet decryption tail consults it when crediting the
+        // received PN in the level's `PnSpace`. Cleared at handle
+        // exit so a subsequent test driver call can't accidentally
+        // reuse stale state — the cmsg is per-datagram.
+        self.last_recv_ecn = if (self.ecn_enabled) ecn else .not_ect;
+        defer self.last_recv_ecn = .not_ect;
         const entry_state = self.lifecycle.state();
         if (entry_state == .draining or entry_state == .closed) return;
         if (entry_state == .closing and self.lifecycle.pending_close != null) return;

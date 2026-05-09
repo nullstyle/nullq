@@ -16,7 +16,56 @@ const PathState = state_mod.PathState;
 const frame_types = state_mod.frame_types;
 const ack_range_mod = state_mod.ack_range_mod;
 const sent_packets_mod = state_mod.sent_packets_mod;
+const pn_space_mod = state_mod.pn_space_mod;
 const transport_error_protocol_violation = state_mod.transport_error_protocol_violation;
+
+/// Validate the ECN counts trailer of a peer ACK frame against the
+/// rules in RFC 9000 §13.4.2:
+///
+///   * The ECT0 + ECT1 + CE total in the new ACK MUST be at least
+///     as large as the previous ACK's total at this level (each
+///     individual count MUST be monotonically non-decreasing as
+///     well).
+///   * The CE count's increase MAY trigger a congestion event;
+///     ECT0 / ECT1 increases are informational.
+///
+/// Returns a `bool` indicating whether the frame was accepted. On
+/// rejection, the caller flips the level's `validation` to `failed`
+/// so subsequent ACKs at this level stop emitting our own ECN
+/// counts and stop reacting to peer-reported CE bumps.
+fn validateAndApplyAckEcn(
+    pn_space: *pn_space_mod.PnSpace,
+    ecn_counts: ?frame_types.EcnCounts,
+) bool {
+    const counts = ecn_counts orelse return true; // No ECN trailer → no validation.
+    if (pn_space.validation == .failed) return false;
+
+    if (pn_space.peer_ack_ecn_seen) {
+        if (counts.ect0 < pn_space.peer_ack_ect0) return false;
+        if (counts.ect1 < pn_space.peer_ack_ect1) return false;
+        if (counts.ecn_ce < pn_space.peer_ack_ce) return false;
+    }
+    pn_space.peer_ack_ect0 = counts.ect0;
+    pn_space.peer_ack_ect1 = counts.ect1;
+    pn_space.peer_ack_ce = counts.ecn_ce;
+    pn_space.peer_ack_ecn_seen = true;
+    return true;
+}
+
+/// Compute the change in CE count between this ACK and the previous
+/// one at the same level. Returns `null` when no prior ECN counts
+/// were captured (the bump signal isn't meaningful in isolation —
+/// the first count we see is the *running total*, not a delta).
+fn ceDelta(
+    prev_seen: bool,
+    prev_ce: u64,
+    new_counts: ?frame_types.EcnCounts,
+) ?u64 {
+    if (!prev_seen) return null;
+    const c = new_counts orelse return null;
+    if (c.ecn_ce <= prev_ce) return 0;
+    return c.ecn_ce - prev_ce;
+}
 
 pub fn handleAckAtLevel(
     self: *Connection,
@@ -41,6 +90,19 @@ pub fn handleAckAtLevel(
     if (a.largest_acked >= pn_space.next_pn) {
         self.close(true, transport_error_protocol_violation, "ack of unsent packet");
         return;
+    }
+    // RFC 9000 §13.4.2: validate peer-reported ECN counts BEFORE
+    // we walk the ACK ranges, so we can compute the CE delta
+    // against the captured baseline rather than the just-mutated
+    // baseline. Validation that fails here flips the level's
+    // ECN state to `failed`; future outbound ACKs stop emitting
+    // ECN counts at this level (`ecn_enabled` still says yes
+    // overall, but this space is bleached).
+    const prev_ecn_seen = pn_space.peer_ack_ecn_seen;
+    const prev_ce = pn_space.peer_ack_ce;
+    const ecn_ok = if (self.ecn_enabled) validateAndApplyAckEcn(pn_space, a.ecn_counts) else true;
+    if (!ecn_ok) {
+        pn_space.validation = .failed;
     }
     pn_space.onAckReceived(a.largest_acked);
     var largest_acked_send_time_us: ?u64 = null;
@@ -103,6 +165,25 @@ pub fn handleAckAtLevel(
         }
     }
 
+    // RFC 9000 §13.4.2 / RFC 9002 §B.7: a peer-reported CE bump on
+    // application packets is a congestion event; halve cwnd and
+    // arm recovery. We only credit the event when the ACK passed
+    // §13.4.2 validation AND we have a baseline to diff against
+    // (`ceDelta` returns `null` for the very first ECN-bearing ACK
+    // — no monotonicity to compute yet, so no congestion event is
+    // implied either). The largest newly-acked sent time anchors
+    // the recovery period boundary; if no in-flight packets were
+    // matched (an empty-range ACK with bumped CE is technically
+    // legal but never useful), we fall back to `now_us`.
+    if (ecn_ok and lvl == .application) {
+        if (ceDelta(prev_ecn_seen, prev_ce, a.ecn_counts)) |delta| {
+            if (delta > 0) {
+                const ce_anchor = if (newest_acked_sent_time_us != 0) newest_acked_sent_time_us else now_us;
+                self.ccForApplication().onCongestionEvent(ce_anchor);
+            }
+        }
+    }
+
     // Loss detection at the same level — packet-threshold only
     // (time-threshold lives in `tick`).
     try self.detectLossesByPacketThresholdAtLevel(lvl);
@@ -125,6 +206,16 @@ pub fn handleApplicationAckOnPath(
     if (a.largest_acked >= path.app_pn_space.next_pn) {
         self.close(true, transport_error_protocol_violation, "ack of unsent packet");
         return;
+    }
+    // §13.4.2 ECN validation, twin of `handleAckAtLevel`. Multipath
+    // PATH_ACK frames carry the same ECN trailer; we run the same
+    // monotonicity check against the path's app PN space. See the
+    // single-path handler for the per-step rationale.
+    const prev_ecn_seen = path.app_pn_space.peer_ack_ecn_seen;
+    const prev_ce = path.app_pn_space.peer_ack_ce;
+    const ecn_ok = if (self.ecn_enabled) validateAndApplyAckEcn(&path.app_pn_space, a.ecn_counts) else true;
+    if (!ecn_ok) {
+        path.app_pn_space.validation = .failed;
     }
     path.app_pn_space.onAckReceived(a.largest_acked);
     var largest_acked_send_time_us: ?u64 = null;
@@ -174,6 +265,16 @@ pub fn handleApplicationAckOnPath(
     if (any_ack_eliciting_newly_acked) path.pto_count = 0;
     if (in_flight_bytes_acked > 0) {
         path.path.cc.onPacketAcked(in_flight_bytes_acked, newest_acked_sent_time_us);
+    }
+
+    // §13.4.2 ECN-CE → congestion event, twin of `handleAckAtLevel`.
+    if (ecn_ok) {
+        if (ceDelta(prev_ecn_seen, prev_ce, a.ecn_counts)) |delta| {
+            if (delta > 0) {
+                const ce_anchor = if (newest_acked_sent_time_us != 0) newest_acked_sent_time_us else now_us;
+                path.path.cc.onCongestionEvent(ce_anchor);
+            }
+        }
     }
 
     try self.detectLossesByPacketThresholdOnApplicationPath(path);
