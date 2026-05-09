@@ -2288,15 +2288,37 @@ pub const Server = struct {
         // other configured version in preference order.
         //
         // TODO(B3-followup): RFC 9368 §6 compatible-version-negotiation
-        // upgrade. When the client's first Initial is on version A
-        // but its `version_information` transport parameter lists a
-        // version B that the server prefers, the server is allowed
-        // to switch the connection's version to B without an extra
-        // round trip — but doing so means re-deriving Initial keys
-        // under B's salt + labels in the middle of the handshake,
-        // which the current state machine doesn't model. Standalone
-        // v2 (this commit) is the more common case in practice;
-        // upgrade lands in a follow-up.
+        // upgrade. The wire codec is here, but the choice of upgrade
+        // target has to happen BEFORE BoringSSL produces the EE
+        // (which embeds our transport_parameters) — and §5 forces
+        // `chosen_version` in that EE to match the version of the
+        // packet carrying it. So the upgrade decision must complete
+        // BEFORE the server hands the ClientHello to BoringSSL.
+        //
+        // The client's `version_information` transport parameter
+        // (the input to that decision) is INSIDE the ClientHello
+        // we're about to feed BoringSSL. To upgrade spec-compliantly
+        // we need to:
+        //   (a) decrypt the client's Initial under wire-version keys
+        //       (we already do this in `handleInitial`),
+        //   (b) parse the CRYPTO frames out of the decrypted payload
+        //       and reassemble the ClientHello,
+        //   (c) walk TLS extensions to find `quic_transport_parameters`
+        //       (codepoint 0x39),
+        //   (d) decode `version_information` (codepoint 0x11) out of
+        //       that and intersect with `Server.Config.versions`,
+        //   (e) call `setVersion(chosen)` on the Connection BEFORE
+        //       feeding the ClientHello to BoringSSL,
+        //   (f) re-set our outbound transport params with the
+        //       upgraded `chosen_version`.
+        //
+        // The "easier" path of always committing to `versions[0]`
+        // breaks v1-only clients who happen to handshake against a
+        // `versions = [v2, v1]` server, so it's not a viable
+        // shortcut. Standalone v2 (this commit) covers the common
+        // case where embedders configure clients and servers in
+        // matched pairs; the upgrade path is genuinely a focused
+        // session of work and lives in a follow-up.
         if (self.versions.len > 1) {
             var ordered: [16]u32 = undefined;
             ordered[0] = ids.version;

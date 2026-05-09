@@ -617,6 +617,12 @@ fn runServer(
     // signals.
     tuneServerSocket(sock.handle);
 
+    // Enable RFC 9000 §13.4 / RFC 3168 IP ECN signaling so the
+    // runner's `E` testcase exercises the end-to-end ECN path.
+    // Both setsockopts are best-effort; in a sandbox without
+    // CAP_NET_ADMIN we silently degrade to the Not-ECT path.
+    const ecn_active = enableServerEcn(sock.handle);
+
     const cert_pem = try readWholeFile(io, allocator, opts.cert, 1024 * 1024);
     defer allocator.free(cert_pem);
     const key_pem = try readWholeFile(io, allocator, opts.key, 1024 * 1024);
@@ -650,18 +656,45 @@ fn runServer(
     const start = std.Io.Timestamp.now(io, .awake);
     var rx: [64 * 1024]u8 = undefined;
     var tx: [endpoint_udp_payload_size]u8 = undefined;
+    var cmsg_buf: [quic_zig.transport.default_cmsg_buffer_bytes]u8 = undefined;
 
     while (true) {
         var now_us = qnsNowUs(io, start);
-        const maybe_msg = sock.receiveTimeout(io, &rx, .{
-            .duration = .{
-                .raw = std.Io.Duration.fromMilliseconds(5),
-                .clock = .awake,
-            },
-        }) catch |err| switch (err) {
-            error.Timeout => null,
-            else => return err,
-        };
+        // Two recv shapes: when ECN is active we go through
+        // `receiveManyTimeout` so the kernel populates the cmsg
+        // control buffer with IP_TOS / IPV6_TCLASS bytes. Otherwise
+        // the cheaper `receiveTimeout` shape (no control buffer,
+        // no cmsg parse).
+        var maybe_msg: ?Net.IncomingMessage = null;
+        var ecn: quic_zig.transport.EcnCodepoint = .not_ect;
+        if (ecn_active) {
+            var recv_msg: Net.IncomingMessage = .init;
+            recv_msg.control = &cmsg_buf;
+            const buf_slice = (&recv_msg)[0..1];
+            const ret = sock.receiveManyTimeout(io, buf_slice, &rx, .{}, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(5),
+                    .clock = .awake,
+                },
+            });
+            if (ret[0]) |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            } else if (ret[1] == 1) {
+                ecn = quic_zig.transport.parseEcnFromControl(recv_msg.control);
+                maybe_msg = recv_msg;
+            }
+        } else {
+            maybe_msg = sock.receiveTimeout(io, &rx, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(5),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => null,
+                else => return err,
+            };
+        }
         now_us = qnsNowUs(io, start);
 
         if (maybe_msg) |msg| {
@@ -774,7 +807,7 @@ fn runServer(
                 _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "quic_zig qns endpoint v1");
                 sc.transport_params_set = true;
             }
-            try sc.conn.handle(msg.data, netAddressToPathAddress(msg.from), now_us);
+            try sc.conn.handleWithEcn(msg.data, netAddressToPathAddress(msg.from), ecn, now_us);
         }
 
         var i: usize = 0;
@@ -1074,10 +1107,19 @@ fn runClientConnection(
     }
     try conn.advance();
 
+    // Enable RFC 9000 §13.4 / RFC 3168 IP ECN signaling on the
+    // client socket so the runner's `E` testcase exercises the
+    // end-to-end ECN path. Both setsockopts are best-effort; we
+    // silently degrade to the Not-ECT path when the kernel rejects
+    // (typical on sandboxed CI).
+    const ecn_active = enableServerEcn(sock.handle);
+
     const start = std.Io.Timestamp.now(io, .awake);
     var last_progress_us = qnsNowUs(io, start);
     var rx: [64 * 1024]u8 = undefined;
     var tx: [endpoint_udp_payload_size]u8 = undefined;
+    var cmsg_buf: [quic_zig.transport.default_cmsg_buffer_bytes]u8 = undefined;
+    var old_cmsg_buf: [quic_zig.transport.default_cmsg_buffer_bytes]u8 = undefined;
     var key_update_done = !conn_opts.request_key_update;
 
     // Active migration plumbing: when `request_active_migration` is
@@ -1098,18 +1140,39 @@ fn runClientConnection(
         var progressed = false;
         const had_ticket = ticketRequirementMet(conn_opts.wait_for_ticket);
 
-        const maybe_msg = sock.receiveTimeout(io, &rx, .{
-            .duration = .{
-                .raw = std.Io.Duration.fromMilliseconds(1),
-                .clock = .awake,
-            },
-        }) catch |err| switch (err) {
-            error.Timeout => null,
-            else => return err,
-        };
+        var maybe_msg: ?Net.IncomingMessage = null;
+        var ecn: quic_zig.transport.EcnCodepoint = .not_ect;
+        if (ecn_active) {
+            var recv_msg: Net.IncomingMessage = .init;
+            recv_msg.control = &cmsg_buf;
+            const buf_slice = (&recv_msg)[0..1];
+            const ret = sock.receiveManyTimeout(io, buf_slice, &rx, .{}, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(1),
+                    .clock = .awake,
+                },
+            });
+            if (ret[0]) |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            } else if (ret[1] == 1) {
+                ecn = quic_zig.transport.parseEcnFromControl(recv_msg.control);
+                maybe_msg = recv_msg;
+            }
+        } else {
+            maybe_msg = sock.receiveTimeout(io, &rx, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(1),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => null,
+                else => return err,
+            };
+        }
         now_us = qnsNowUs(io, start);
         if (maybe_msg) |msg| {
-            try conn.handle(msg.data, null, now_us);
+            try conn.handleWithEcn(msg.data, null, ecn, now_us);
             progressed = true;
         }
 
@@ -1117,17 +1180,37 @@ fn runClientConnection(
         // to our pre-migration socket. Closed below once the grace
         // window passes.
         if (old_sock) |*old| {
-            const maybe_old_msg = old.receiveTimeout(io, &rx, .{
-                .duration = .{
-                    .raw = std.Io.Duration.fromMilliseconds(0),
-                    .clock = .awake,
-                },
-            }) catch |err| switch (err) {
-                error.Timeout => null,
-                else => null,
-            };
-            if (maybe_old_msg) |msg| {
-                try conn.handle(msg.data, null, qnsNowUs(io, start));
+            var old_maybe_msg: ?Net.IncomingMessage = null;
+            var old_ecn: quic_zig.transport.EcnCodepoint = .not_ect;
+            if (ecn_active) {
+                var recv_msg: Net.IncomingMessage = .init;
+                recv_msg.control = &old_cmsg_buf;
+                const buf_slice = (&recv_msg)[0..1];
+                const ret = old.receiveManyTimeout(io, buf_slice, &rx, .{}, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromMilliseconds(0),
+                        .clock = .awake,
+                    },
+                });
+                if (ret[0]) |_| {
+                    // Timeout / unknown — treat as "no message."
+                } else if (ret[1] == 1) {
+                    old_ecn = quic_zig.transport.parseEcnFromControl(recv_msg.control);
+                    old_maybe_msg = recv_msg;
+                }
+            } else {
+                old_maybe_msg = old.receiveTimeout(io, &rx, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromMilliseconds(0),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => null,
+                    else => null,
+                };
+            }
+            if (old_maybe_msg) |msg| {
+                try conn.handleWithEcn(msg.data, null, old_ecn, qnsNowUs(io, start));
                 progressed = true;
             }
             if (old_sock_close_deadline_us) |deadline| {
@@ -1493,6 +1576,20 @@ fn tuneServerSocket(handle: std.posix.socket_t) void {
             );
         } else |_| {}
     } else |_| {}
+}
+
+/// Set the IP TOS / IPV6 TCLASS sockopt to ECT(0) on outbound and
+/// IP_RECVTOS / IPV6_RECVTCLASS on inbound so the kernel surfaces
+/// the per-datagram TOS byte via cmsg. Both are best-effort: a
+/// kernel that rejects (sandbox without CAP_NET_ADMIN, non-IP
+/// socket, IPV6_TCLASS on a strict-IPv4 socket) makes us fall
+/// through to the Not-ECT path. RFC 9000 §13.4 calls for ECT(0) by
+/// default for QUIC; the runner's `E` testcase observes the
+/// resulting CE marks and ACK ECN counts to verify the path.
+fn enableServerEcn(handle: std.posix.socket_t) bool {
+    quic_zig.transport.setEcnSendMarking(handle, .ect0) catch return false;
+    quic_zig.transport.setEcnRecvEnabled(handle, true) catch return false;
+    return true;
 }
 
 fn findServerConn(conns: []const *ServerConn, bytes: []const u8, from: Net.IpAddress) ?*ServerConn {
