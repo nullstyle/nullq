@@ -5752,6 +5752,50 @@ pub const Connection = struct {
         };
         const app_control_blocked = congestion_blocked or path_response_addr_overrides_current;
 
+        // Peer-initiated migration just queued a PATH_CHALLENGE on this
+        // path: the receive side observed an authenticated datagram from
+        // a fresh 4-tuple, `handlePeerAddressChange` snapshotted the old
+        // state into `migration_rollback`, armed the validator, and
+        // queued the challenge. RFC 9000 §8.2.1 ¶3 says probing-frame
+        // datagrams MUST be padded to 1200 bytes (subject to anti-amp).
+        //
+        // Quiche's path-validation state machine is sensitive to where
+        // PATH_CHALLENGE sits in the FIRST server datagram on the new
+        // tuple: when ACK / MAX_DATA / MAX_STREAMS / NEW_CONNECTION_ID
+        // precede it (the historical drain order), quiche occasionally
+        // misroutes the packet's path-validation handling and stalls
+        // the migration. Detect the freshly-migrated path here and emit
+        // PATH_CHALLENGE FIRST on the next packet — before ACK and
+        // every other queued control frame. This guarantees:
+        //   1. PATH_CHALLENGE leads the packet (deterministic frame
+        //      order across runs);
+        //   2. PATH_CHALLENGE is in the FIRST emitted packet on the
+        //      new path (no slot stolen by an earlier ACK-only packet
+        //      because ACK is reordered behind us).
+        //
+        // The condition is intentionally narrow: the path must have a
+        // queued PATH_CHALLENGE for THIS app_path AND the path must be
+        // in the peer-migration validation window (`pending_migration_reset`
+        // + `validator.status == .pending`). Client-initiated migration
+        // hits the same condition (it also sets `pending_migration_reset`).
+        // PATH_RESPONSE-only paths (peer probed us; we're echoing) and
+        // ordinary CID-rotation paths don't trigger this fast path.
+        const emit_path_challenge_first = blk: {
+            if (lvl != .application) break :blk false;
+            if (path_response_addr_overrides_current) break :blk false;
+            if (self.pending_frames.path_challenge == null) break :blk false;
+            if (self.pending_frames.path_challenge_path_id != app_path.id) break :blk false;
+            if (!app_path.pending_migration_reset) break :blk false;
+            if (app_path.path.validator.status != .pending) break :blk false;
+            // PATH_CHALLENGE is 9 bytes (1 type + 8 token). Anti-amp
+            // may have clamped `max_payload` below that; if so, we
+            // can't emit a probing frame at all this poll. Skip the
+            // fast path; the regular drain path will retry on the
+            // next poll once anti-amp credit accrues.
+            if (max_payload < 9) break :blk false;
+            break :blk true;
+        };
+
         // RFC 9000 §10.2.1 ¶2: "An endpoint MUST NOT send any frames
         // other than CONNECTION_CLOSE in the closing state." Once the
         // connection has flipped `closed` and there is no queued CC
@@ -5901,6 +5945,30 @@ pub const Connection = struct {
             self.emitPacketSent(lvl, pn, @intCast(n_close), 1);
             self.emitConnectionStateIfChanged();
             return n_close;
+        }
+
+        // 0) PATH_CHALLENGE-first on a freshly-migrated path. RFC 9000
+        // §8.2 / §9 — quiche's path-validation state machine expects
+        // PATH_CHALLENGE to lead the first server datagram on the new
+        // tuple; reordering it behind ACK / MAX_DATA / etc. (the
+        // historical drain order, see section 2d below) loses
+        // interop with quiche's `BA` (rebind-addr) test. The fast
+        // path here writes the 9-byte frame BEFORE every other queued
+        // frame so it's first on the wire AND so it can never be
+        // pushed past the per-packet capacity by a fat ACK or a
+        // freshly-queued NEW_CONNECTION_ID. Subsequent frames
+        // (ACK, MAX_DATA, etc.) coalesce behind it as usual.
+        if (emit_path_challenge_first) {
+            const tok = self.pending_frames.path_challenge.?;
+            const wrote = try frame_mod.encode(pl_buf[pl_pos..max_payload], .{
+                .path_challenge = .{ .data = tok },
+            });
+            pl_pos += wrote;
+            try sent_packet.addRetransmitFrame(self.allocator, .{
+                .path_challenge = .{ .data = tok },
+            });
+            self.pending_frames.path_challenge = null;
+            ack_eliciting = true;
         }
 
         // 1) ACK frame (if pending in this level's space).
@@ -6530,7 +6598,23 @@ pub const Connection = struct {
                 // RFC 8899 DPLPMTUD: when a probe is in flight from
                 // this poll, pad to the probed size so the resulting
                 // datagram is exactly that big.
-                .pad_to = if (probe_target_size) |sz| @as(usize, sz) else 0,
+                //
+                // RFC 9000 §8.2.1 ¶3: a datagram containing a
+                // PATH_CHALLENGE MUST be padded to at least 1200 bytes,
+                // unless anti-amplification on the path forbids it. The
+                // anti-amp clamp on `max_payload` upstream already
+                // gates that; when we emitted PATH_CHALLENGE first
+                // (peer-initiated migration) honor the §8.2.1 floor.
+                // The DPLPMTUD probe path takes precedence when both
+                // are set — that path is gated on a validated path,
+                // so the two conditions don't actually overlap, but we
+                // pick the larger of the two for safety.
+                .pad_to = if (probe_target_size) |sz|
+                    @as(usize, sz)
+                else if (emit_path_challenge_first)
+                    @min(default_mtu, dst.len)
+                else
+                    0,
             }),
             .early_data => try long_packet_mod.sealZeroRtt(dst, .{
                 .version = self.version,

@@ -11,6 +11,27 @@ breaking changes; see notes per release.
 
 ### Fixed
 
+- **Interop server × `rebind-addr` × quiche** — the server's packet
+  builder now emits `PATH_CHALLENGE` as the FIRST frame of the first
+  datagram on a freshly-migrated path (peer-initiated migration). The
+  historical drain order in `pollLevelOnPath`
+  (`src/conn/state.zig`) placed the probing frame after ACK,
+  MAX_DATA, MAX_STREAMS, NEW_CONNECTION_ID, etc. Under quiche's
+  tight rebind cadence the per-packet capacity (especially anti-amp-
+  clamped on an unvalidated migrated path) occasionally pushed
+  `PATH_CHALLENGE` either to a later frame slot or out of the
+  packet entirely; quiche's path-validation state machine stalled
+  in either case. The fix detects the peer-migration window
+  (`pending_migration_reset` + `validator.status == .pending` + a
+  queued challenge for the active app path) and writes the 9-byte
+  frame BEFORE the ACK block. The same path also now pads the
+  resulting datagram to 1200 bytes per RFC 9000 §8.2.1 ¶3 (subject
+  to anti-amp). Two new unit tests pin the behavior:
+  `peer-initiated migration emits PATH_CHALLENGE as the first frame
+  even with backlogged ACKs and MAX_DATA` (positive case) and
+  `non-migration polls do not pad short-header datagrams to 1200
+  bytes` (regression guard so ordinary heartbeats stay small). The
+  interop matrix needs a re-run to confirm the cell flip end-to-end.
 - **Interop client × `rebind-addr` × {quic-go, quiche} (partial)** —
   the qns client driver (`interop/qns_endpoint.zig`) now mirrors its
   server-side `queueServerConnectionIds` once the handshake completes:
