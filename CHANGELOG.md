@@ -51,7 +51,17 @@ pins `ARG ZIG_VERSION=0.16.0` while `mise.toml` uses `zig = "master"`
 (0.17-dev) and HEAD's source needs the latter. Bumping the Dockerfile
 pin is a small follow-up; meanwhile, `mise run interop-build-image`
 fails and embedders need to host-build `qns-endpoint` and
-hand-COPY the binary into the runner image.
+hand-COPY the binary into the runner image. **Resolved below** — the
+pin is now `0.17.0-dev.269+ebff43698`, sourced from `/builds/`.
+
+### Changed
+
+- **interop(qns): pin Dockerfile to current 0.17-dev tarball.**
+  `interop/qns/Dockerfile` now pins
+  `ARG ZIG_VERSION=0.17.0-dev.269+ebff43698` and downloads from
+  `https://ziglang.org/builds/zig-${arch}-${ZIG_VERSION}.tar.xz`
+  (dev tarballs are not under `/download/<ver>/`). Unblocks
+  `mise run interop-build-image`.
 
 ### Added
 

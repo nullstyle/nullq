@@ -125,13 +125,13 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   needs interactive packet-order tracing.
 
 **Build infra note**: the qns Dockerfile (`interop/qns/Dockerfile`)
-pins `ARG ZIG_VERSION=0.16.0`, but `mise.toml` sets `zig = "master"`
-(currently 0.17-dev) and HEAD's source uses 0.17-only forms.
-`mise run interop-build-image` will fail until the Dockerfile is
-bumped to a matching 0.17-dev tarball. Workaround: build
-`zig build qns-endpoint -Doptimize=ReleaseSafe` on the host with
-the same Zig the rest of the tree uses, then COPY the resulting
-binary into a hand-rolled image. Tracked as a follow-up.
+is now pinned to `ARG ZIG_VERSION=0.17.0-dev.269+ebff43698`, matching
+the 0.17-dev `mise.toml` `zig = "master"` and HEAD's 0.17-only source
+forms. The download URL was switched from
+`https://ziglang.org/download/<ver>/...` to
+`https://ziglang.org/builds/...` because dev tarballs are not served
+under a per-version subdirectory. `mise run interop-build-image` is
+unblocked.
 
 Four cells reported "unsupported" by the peer image, not the
 quic-zig endpoint, and are excluded from regression tracking:
