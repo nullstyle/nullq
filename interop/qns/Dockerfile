@@ -1,7 +1,11 @@
 FROM martenseemann/quic-network-simulator-endpoint:latest AS build
 
 ARG TARGETPLATFORM
-ARG ZIG_VERSION=0.16.0
+# Pinned to a 0.17.0-dev master tarball because mise.toml tracks Zig master
+# and HEAD uses 0.17-only forms; tagged 0.16.0 is no longer ABI-compatible.
+# Dev tarballs live under /builds/ (no per-version subdirectory), unlike
+# tagged releases which are served from /download/<version>/.
+ARG ZIG_VERSION=0.17.0-dev.269+ebff43698
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils cmake ninja-build clang git python3 perl \
@@ -11,7 +15,7 @@ RUN case "$TARGETPLATFORM" in \
         "linux/arm64") zig_arch="aarch64-linux" ;; \
         *) zig_arch="x86_64-linux" ;; \
     esac \
-    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz \
+    && curl -fsSL "https://ziglang.org/builds/zig-${zig_arch}-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz \
     && mkdir -p /opt/zig \
     && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
     && rm /tmp/zig.tar.xz
