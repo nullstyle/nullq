@@ -1188,7 +1188,17 @@ fn runClientConnection(
         }
         now_us = qnsNowUs(io, start);
         if (maybe_msg) |msg| {
-            try conn.handleWithEcn(msg.data, null, ecn, now_us);
+            // RFC 9000 §9: forward the inbound source address into the
+            // connection so it can detect a peer-side address rebind.
+            // The runner's `rebind-addr` testcase rewrites source IPs
+            // transparently in the ns-3 simulator; from the client's
+            // POV the server's source tuple changes mid-connection.
+            // Without the `from` argument, `Connection.handleWithEcn`
+            // receives `null`, `peerAddressChangeCandidate` short-
+            // circuits, and the migration / PATH_CHALLENGE flow never
+            // arms — the client keeps sending to the original
+            // `server_addr` and the runner declares the test failed.
+            try conn.handleWithEcn(msg.data, netAddressToPathAddress(msg.from), ecn, now_us);
             progressed = true;
         }
 
@@ -1226,7 +1236,12 @@ fn runClientConnection(
                 };
             }
             if (old_maybe_msg) |msg| {
-                try conn.handleWithEcn(msg.data, null, old_ecn, qnsNowUs(io, start));
+                // Same source-address forwarding rationale as the
+                // primary recv branch above. Datagrams the server
+                // addressed to our pre-migration socket carry the
+                // peer's then-current source tuple; let the connection
+                // observe it.
+                try conn.handleWithEcn(msg.data, netAddressToPathAddress(msg.from), old_ecn, qnsNowUs(io, start));
                 progressed = true;
             }
             if (old_sock_close_deadline_us) |deadline| {
@@ -1325,8 +1340,8 @@ fn runClientConnection(
             progressed = true;
         }
 
-        while (try conn.poll(&tx, now_us)) |n| {
-            const first_byte: u8 = if (n > 0) tx[0] else 0;
+        while (try conn.pollDatagram(&tx, now_us)) |out| {
+            const first_byte: u8 = if (out.len > 0) tx[0] else 0;
             const long = (first_byte & 0x80) != 0;
             const long_type: u2 = @intCast((first_byte >> 4) & 0x03);
             const tag: []const u8 = if (!long) "1RTT" else switch (long_type) {
@@ -1337,9 +1352,17 @@ fn runClientConnection(
             };
             std.debug.print(
                 "[diag-send] t={d}us len={d} {s} b0=0x{x:0>2}\n",
-                .{ now_us, n, tag, first_byte },
+                .{ now_us, out.len, tag, first_byte },
             );
-            sock.send(io, &server_addr, tx[0..n]) catch |err| {
+            // Honor the per-datagram destination produced by the core.
+            // After a peer-initiated rebind (`rebind-addr` testcase),
+            // the active path's `peer_addr` swings to the new server
+            // tuple; `pollDatagram.to` reflects that. Falling back to
+            // `server_addr` covers the early handshake before the path
+            // address is set and any internal callsite that emits
+            // without an explicit destination.
+            const dest = pathAddressToNetAddress(out.to) orelse server_addr;
+            sock.send(io, &dest, tx[0..out.len]) catch |err| {
                 std.debug.print("[diag-send] FAILED err={s}\n", .{@errorName(err)});
                 return err;
             };
@@ -1377,7 +1400,10 @@ fn runClientConnection(
     var flushes: u8 = 0;
     while (flushes < 8) : (flushes += 1) {
         const now_us = qnsNowUs(io, start);
-        while (try conn.poll(&tx, now_us)) |n| try sock.send(io, &server_addr, tx[0..n]);
+        while (try conn.pollDatagram(&tx, now_us)) |out| {
+            const dest = pathAddressToNetAddress(out.to) orelse server_addr;
+            try sock.send(io, &dest, tx[0..out.len]);
+        }
         try conn.tick(now_us);
     }
 }
@@ -1706,6 +1732,33 @@ fn netAddressToPathAddress(addr: Net.IpAddress) quic_zig.conn.path.Address {
         },
     }
     return out;
+}
+
+/// Inverse of `netAddressToPathAddress`. Returns `null` for the
+/// zero-tag default (a `path.Address` that the core never set), so
+/// callers can fall back to a default destination — typically the
+/// connection's original target address. Mirrors the helper that
+/// lives in `src/transport/udp_server.zig` for `runUdpClient`.
+fn pathAddressToNetAddress(addr: ?quic_zig.conn.path.Address) ?Net.IpAddress {
+    const a = addr orelse return null;
+    switch (a.bytes[0]) {
+        4 => {
+            var ip4_bytes: [4]u8 = undefined;
+            @memcpy(&ip4_bytes, a.bytes[1..5]);
+            const port = std.mem.readInt(u16, a.bytes[5..7], .big);
+            return .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
+        },
+        6 => {
+            var ip6_bytes: [16]u8 = undefined;
+            @memcpy(&ip6_bytes, a.bytes[1..17]);
+            const port = std.mem.readInt(u16, a.bytes[17..19], .big);
+            const flow: u32 = (@as(u32, a.bytes[19]) << 16) |
+                (@as(u32, a.bytes[20]) << 8) |
+                @as(u32, a.bytes[21]);
+            return .{ .ip6 = .{ .bytes = ip6_bytes, .port = port, .flow = flow } };
+        },
+        else => return null,
+    }
 }
 
 fn writeVersionNegotiation(

@@ -3574,6 +3574,86 @@ test "authenticated NAT rebinding starts validation and resets recovery after re
     try std.testing.expect(conn.pending_frames.path_challenge == null);
 }
 
+test "client peer-address rebind: pollDatagram exposes the new server tuple after migration" {
+    // RFC 9000 §9 / interop `rebind-addr`: the network simulator can
+    // rewrite source addresses transparently below the embedder
+    // socket. From the QUIC client's POV the server's apparent
+    // source 4-tuple changes mid-connection. The transport contract
+    // is that an embedder forwarding the inbound source address into
+    // `Connection.handle*` triggers PATH_CHALLENGE on the active
+    // path AND that the next `pollDatagram` reflects the new peer
+    // address, so the embedder's `sock.send` lands on the post-rebind
+    // tuple instead of the original `connect()` target.
+    //
+    // This test pins both halves of the contract: passive detection
+    // of the new tuple and the post-detection `out.to` reflecting it
+    // — the second is the half a stale qns client driver missed
+    // (it called `conn.poll` and routed to a hardcoded target,
+    // ignoring the migration). Without the source-address forwarding
+    // and the pollDatagram-based send loop, `client × {quic-go,
+    // quiche} × rebind-addr` failed end-to-end because outbound 1-RTT
+    // packets continued to land on the pre-rebind 4-tuple even after
+    // the server validated the new path.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try installTestApplicationReadSecret(&conn);
+    try installTestApplicationWriteSecret(&conn);
+    // Same `test_only_force_handshake_for_migration` opt-in as
+    // "authenticated NAT rebinding ...": this test exercises the
+    // post-handshake migration window without driving an actual TLS
+    // handshake.
+    conn.test_only_force_handshake_for_migration = true;
+    try conn.setLocalScid(&.{0xa0});
+    try conn.setPeerDcid(&.{0xaa});
+    const old_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 7, 7, 7, 7 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+
+    // Inject an authenticated 1-RTT datagram from the *new* server
+    // tuple — the wire-level shape that arrives after the simulator
+    // rewrites the server's source address.
+    var payload: [16]u8 = undefined;
+    const payload_len = try frame_mod.encode(payload[0..], .{ .ping = .{} });
+    const keys = (try conn.packetKeys(.application, .read)).?;
+    var packet_buf: [default_mtu]u8 = undefined;
+    const packet_len = try short_packet_mod.seal1Rtt(&packet_buf, .{
+        .dcid = conn.local_scid.slice(),
+        .pn = 0,
+        .payload = payload[0..payload_len],
+        .keys = &keys,
+    });
+
+    try conn.handle(packet_buf[0..packet_len], new_addr, 1_000_000);
+
+    // Detection half: the active path observed the new tuple and
+    // queued PATH_CHALLENGE.
+    try std.testing.expect(Address.eql(new_addr, path.path.peer_addr));
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expectEqual(@as(u32, 0), conn.pending_frames.path_challenge_path_id);
+
+    // Routing half: the next `pollDatagram` MUST hand the embedder
+    // the new tuple as `out.to` — this is the per-datagram destination
+    // that an embedder routes through `sock.send`. A driver that
+    // ignored `out.to` (or used `conn.poll` which drops it) would
+    // continue addressing the original `server_addr`, the runner's
+    // `rebind-addr` failure mode.
+    var tx_buf: [default_mtu]u8 = undefined;
+    const datagram = (try conn.pollDatagram(&tx_buf, 1_001_000)).?;
+    try std.testing.expect(datagram.to != null);
+    try std.testing.expect(Address.eql(new_addr, datagram.to.?));
+
+    // Sanity: the path migration is still pending (PATH_CHALLENGE in
+    // flight). The embedder's send-side fix is what carries the
+    // PATH_CHALLENGE packet to the new tuple in the first place.
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+}
+
 test "unvalidated rebound path obeys anti-amplification before polling" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
