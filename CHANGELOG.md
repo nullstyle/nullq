@@ -36,6 +36,24 @@ breaking changes; see notes per release.
   `tests/e2e/quic_v2_handshake.zig` (a `[v2,v1]` server flips to v2
   for a v1-wire ClientHello carrying `version_information=[v1,v2]`,
   and stays on v1 for a legacy v1-only client).
+- **QNS endpoint opts in to multi-version on `TESTCASE=versionnegotiation`** —
+  `interop/qns_endpoint.zig` now flips its server-role wire-format
+  version list to `[QUIC_V2, QUIC_V1]` and its client-role list to
+  `[QUIC_V1, QUIC_V2]` when the runner sets
+  `TESTCASE=versionnegotiation`. The server runs the RFC 9368 §6
+  pre-parse (replicated against the public
+  `quic_zig.wire.vneg_preparse` helpers so the qns endpoint stays a
+  pure embedder of the library API), advertises the chosen version
+  via `params.setCompatibleVersions`, and applies the pending
+  upgrade after the first wire-version Initial via
+  `Connection.applyPendingVersionUpgrade`. The client offers
+  `version_information=[v1, v2]` so a multi-version server can
+  upgrade. Two new unit tests pin (a) the per-role version list
+  selected for each TESTCASE value and (b) the multi-version
+  membership-test the dispatch loop uses to gate Version
+  Negotiation responses. The interop matrix's
+  `versionnegotiation` cell will only flip PASS once the parallel
+  client-side upgrade-consumption branch lands.
 
 ### Fixed
 

@@ -130,6 +130,17 @@ const ServerOptions = struct {
     /// `interop/qns/run_endpoint.sh` only when
     /// `TESTCASE=connectionmigration`.
     pref_addr: ?[]const u8 = null,
+    /// QUIC wire-format versions this server accepts. The first
+    /// entry is the server's preferred wire version; remaining
+    /// entries are alternates the server is willing to advertise via
+    /// the `version_information` (codepoint 0x11) transport parameter
+    /// for RFC 9368 §6 compatible-version-negotiation upgrade. Defaults
+    /// to v1-only so legacy interop testcases keep their historical
+    /// posture; `TESTCASE=versionnegotiation` flips this to
+    /// `[QUIC_V2, QUIC_V1]` so the server advertises v2 as preferred
+    /// and upgrades any v1-wire ClientHello whose `version_information`
+    /// includes v2.
+    versions: []const u32 = &.{quic_zig.QUIC_VERSION_1},
 };
 
 const ClientOptions = struct {
@@ -140,7 +151,50 @@ const ClientOptions = struct {
     testcase: []const u8 = "",
     keylog_file: ?[]const u8 = null,
     qlog_dir: ?[]const u8 = null,
+    /// QUIC wire-format versions this client offers. The first entry
+    /// is the wire version of the outbound Initial; remaining entries
+    /// are alternates emitted in the `version_information` (codepoint
+    /// 0x11) transport parameter (RFC 9368 §5) so a multi-version
+    /// server can pick the highest-priority overlap and upgrade.
+    /// Defaults to v1-only; `TESTCASE=versionnegotiation` flips this
+    /// to `[QUIC_V1, QUIC_V2]` so the client sends a v1 wire Initial
+    /// while advertising v2 as a compatible upgrade target.
+    versions: []const u32 = &.{quic_zig.QUIC_VERSION_1},
 };
+
+/// Pick the QUIC wire-format version list for the server role given a
+/// runner-supplied `TESTCASE` value. Returns `[QUIC_V2, QUIC_V1]` for
+/// `versionnegotiation` (server prefers v2; if the client offers v2 in
+/// `version_information`, the server upgrades), and the v1-only default
+/// otherwise. The caller is expected to pass the env-var contents
+/// verbatim — empty string maps to "default".
+fn serverVersionsForTestcase(testcase: []const u8) []const u32 {
+    if (std.mem.eql(u8, testcase, "versionnegotiation")) {
+        return &qns_versions_v2_first;
+    }
+    return &.{quic_zig.QUIC_VERSION_1};
+}
+
+/// Pick the QUIC wire-format version list for the client role given a
+/// runner-supplied `TESTCASE` value. Returns `[QUIC_V1, QUIC_V2]` for
+/// `versionnegotiation` (client sends a v1 wire Initial but advertises
+/// v2 as a compatible target via `version_information`), and the v1-only
+/// default otherwise. Note the inverse ordering vs.
+/// `serverVersionsForTestcase`: the first entry is the wire version,
+/// not the preferred version, so `[v1, v2]` keeps the wire compatible
+/// with v1-only servers while letting a multi-version server upgrade.
+fn clientVersionsForTestcase(testcase: []const u8) []const u32 {
+    if (std.mem.eql(u8, testcase, "versionnegotiation")) {
+        return &qns_versions_v1_first;
+    }
+    return &.{quic_zig.QUIC_VERSION_1};
+}
+
+/// Module-level constant slices so the `versionsForTestcase` helpers
+/// can return a stable `[]const u32` view rather than constructing a
+/// fresh array each call.
+const qns_versions_v2_first = [_]u32{ quic_zig.QUIC_VERSION_2, quic_zig.QUIC_VERSION_1 };
+const qns_versions_v1_first = [_]u32{ quic_zig.QUIC_VERSION_1, quic_zig.QUIC_VERSION_2 };
 
 const ClientMode = enum {
     normal,
@@ -188,6 +242,14 @@ const ClientConnectionOptions = struct {
     /// CRYPTO bytes get stranded on the pre-rebind 4-tuple). Default
     /// false; the embedder flips it on for longrtt only.
     apply_simulator_warmup: bool = false,
+    /// QUIC wire-format versions this client offers. The first entry
+    /// drives the wire version of the outbound Initial; remaining
+    /// entries flow into `params.compatibleVersions` (the
+    /// `version_information` codepoint 0x11 transport parameter, RFC
+    /// 9368 §5) so a multi-version server can pick the highest-
+    /// priority overlap and upgrade. Defaults to v1-only;
+    /// `TESTCASE=versionnegotiation` flips this to `[QUIC_V1, QUIC_V2]`.
+    versions: []const u32 = &.{quic_zig.QUIC_VERSION_1},
 };
 
 var keylog_io: ?std.Io = null;
@@ -555,6 +617,14 @@ pub fn main(init: std.process.Init) !void {
         var opts: ServerOptions = .{};
         if (init.environ_map.get("SSLKEYLOGFILE")) |path| opts.keylog_file = path;
         if (init.environ_map.get("QLOGDIR")) |path| opts.qlog_dir = path;
+        // RFC 9368 §6 opt-in for `TESTCASE=versionnegotiation`: the
+        // runner doesn't pass `-testcase` to the server side via
+        // `interop/qns/run_endpoint.sh`, so we read the env var
+        // directly. Any non-versionnegotiation value (or unset)
+        // leaves `opts.versions` at its v1-only default.
+        if (init.environ_map.get("TESTCASE")) |testcase| {
+            opts.versions = serverVersionsForTestcase(testcase);
+        }
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "-listen")) {
                 opts.listen = args.next() orelse return error.MissingListenAddress;
@@ -584,7 +654,16 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "client")) {
         var opts: ClientOptions = .{};
         if (init.environ_map.get("REQUESTS")) |requests| opts.requests = requests;
-        if (init.environ_map.get("TESTCASE")) |testcase| opts.testcase = testcase;
+        if (init.environ_map.get("TESTCASE")) |testcase| {
+            opts.testcase = testcase;
+            // RFC 9368 §5 opt-in for `TESTCASE=versionnegotiation`:
+            // the env-var value flows through both the existing
+            // `opts.testcase` (which still drives 0-RTT / resumption /
+            // keyupdate / chacha20 mode selection elsewhere) and the
+            // new `opts.versions` slot consulted by `runClientConnection`
+            // when building the transport parameters.
+            opts.versions = clientVersionsForTestcase(testcase);
+        }
         if (init.environ_map.get("SSLKEYLOGFILE")) |path| opts.keylog_file = path;
         if (init.environ_map.get("QLOGDIR")) |path| opts.qlog_dir = path;
         while (args.next()) |arg| {
@@ -938,8 +1017,8 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
     var server_conn = findServerConn(conns.items, msg.data, msg.from);
     if (server_conn == null) {
         const ids = peekLongHeaderIds(msg.data) orelse return;
-        if (ids.version != quic_zig.QUIC_VERSION_1) {
-            const n = try writeVersionNegotiation(tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
+        if (!isVersionSupported(opts.versions, ids.version)) {
+            const n = try writeVersionNegotiation(tx, msg.data, opts.versions);
             try sock.send(io, &msg.from, tx[0..n]);
             return;
         }
@@ -975,8 +1054,8 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
     sc.last_recv_socket = @intCast(ctx.sock_idx);
     if (!sc.transport_params_set) {
         const ids = peekLongHeaderIds(msg.data) orelse return;
-        if (ids.version != quic_zig.QUIC_VERSION_1) {
-            const n = try writeVersionNegotiation(tx, msg.data, &.{quic_zig.QUIC_VERSION_1});
+        if (!isVersionSupported(opts.versions, ids.version)) {
+            const n = try writeVersionNegotiation(tx, msg.data, opts.versions);
             try sock.send(io, &msg.from, tx[0..n]);
             return;
         }
@@ -1038,7 +1117,7 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
         else
             null;
 
-        const params: quic_zig.tls.TransportParams = .{
+        var params: quic_zig.tls.TransportParams = .{
             .original_destination_connection_id = original_dcid,
             .initial_source_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&sc.initial_server_cid),
             .retry_source_connection_id = retry_source,
@@ -1053,11 +1132,50 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
             .active_connection_id_limit = endpoint_active_connection_id_limit,
             .preferred_address = preferred_address,
         };
+
+        // RFC 9368 §5/§6 compatible-version-negotiation upgrade. When
+        // the server is configured with multiple versions, pre-parse
+        // the inbound Initial under wire-version keys to extract the
+        // client's `version_information` (codepoint 0x11) transport
+        // parameter, intersect with `opts.versions`, and pick the
+        // first server-preferred version that also appears in the
+        // client's `available_versions`. If that differs from the
+        // wire version, advertise the upgrade target as
+        // `chosen_version` (so the EE BoringSSL produces matches §5)
+        // and stash the target via `setPendingVersionUpgrade` so the
+        // post-`handleWithEcn` flip seals the response Initial under
+        // the upgrade-target keys (mirrors `Server.dispatchToSlot`).
+        //
+        // Pre-parse failures (decrypt auth, fragmented ClientHello,
+        // missing extension) fall back to the wire version, which is
+        // always spec-compliant.
+        const upgrade_target = preparseUpgradeTarget(opts.versions, msg.data, ids.version);
+        const chosen_version: u32 = upgrade_target orelse ids.version;
+        if (opts.versions.len > 1) {
+            var ordered: [16]u32 = undefined;
+            ordered[0] = chosen_version;
+            var n_versions: usize = 1;
+            for (opts.versions) |v| {
+                if (v == chosen_version) continue;
+                if (n_versions >= ordered.len) break;
+                ordered[n_versions] = v;
+                n_versions += 1;
+            }
+            try params.setCompatibleVersions(ordered[0..n_versions]);
+        }
         try sc.conn.acceptInitial(msg.data, params);
+        if (upgrade_target) |upgraded| {
+            if (upgraded != ids.version) sc.conn.setPendingVersionUpgrade(upgraded);
+        }
         _ = try sc.conn.setEarlyDataContextForParams(params, hq_alpn, "quic_zig qns endpoint v1");
         sc.transport_params_set = true;
     }
     try sc.conn.handleWithEcn(msg.data, netAddressToPathAddress(msg.from), ecn, now_us);
+    // Apply any pending RFC 9368 §6 version upgrade now that the
+    // wire-version Initial has been opened under wire-version keys.
+    // The next outbound `poll` will seal the response under the
+    // chosen-version keys. Idempotent / no-op when nothing pending.
+    _ = sc.conn.applyPendingVersionUpgrade();
 }
 
 fn runClient(
@@ -1148,6 +1266,7 @@ fn runClient(
                 .request_key_update = request_key_update,
                 .request_active_migration = request_active_migration,
                 .apply_simulator_warmup = apply_simulator_warmup,
+                .versions = opts.versions,
             },
         ),
         .resumption, .zerortt => {
@@ -1165,6 +1284,7 @@ fn runClient(
                     .qlog_sink = if (qlog_sink) |*sink| sink else null,
                     .new_token_store = &new_tokens,
                     .apply_simulator_warmup = apply_simulator_warmup,
+                    .versions = opts.versions,
                 },
             );
             var session = try tickets.session(client_tls);
@@ -1184,6 +1304,7 @@ fn runClient(
                     .new_token_store = &new_tokens,
                     .initial_token = new_tokens.latest,
                     .apply_simulator_warmup = apply_simulator_warmup,
+                    .versions = opts.versions,
                 },
             );
         },
@@ -1314,7 +1435,7 @@ fn runClientConnection(
     try conn.setInitialDcid(&initial_dcid);
     try conn.setPeerDcid(&initial_dcid);
 
-    const params: quic_zig.tls.TransportParams = .{
+    var params: quic_zig.tls.TransportParams = .{
         .initial_source_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&client_scid),
         .max_idle_timeout_ms = 30_000,
         .initial_max_data = endpoint_connection_receive_window,
@@ -1326,6 +1447,17 @@ fn runClientConnection(
         .max_udp_payload_size = endpoint_udp_payload_size,
         .active_connection_id_limit = endpoint_active_connection_id_limit,
     };
+    // RFC 9368 §5: when the client offers more than one wire-format
+    // version, advertise the full list (chosen first, alternates
+    // following) via the `version_information` (codepoint 0x11)
+    // transport parameter so a multi-version server can pick the
+    // highest-priority overlap and drive a §6 compatible-version
+    // upgrade. The first entry is treated as `chosen_version` —
+    // matching the wire version of the outbound Initial — by RFC
+    // 9368 §5.
+    if (conn_opts.versions.len > 1) {
+        try params.setCompatibleVersions(conn_opts.versions);
+    }
     try conn.setTransportParams(params);
 
     var requests_enabled = false;
@@ -1998,6 +2130,78 @@ fn writeVersionNegotiation(
     } });
 }
 
+/// Returns true when `version` is one of the wire-format versions in
+/// `supported`. Linear scan; `supported` is bounded at 16 entries by
+/// `writeVersionNegotiation` and the broader RFC 9368 §5
+/// `version_information` cap.
+fn isVersionSupported(supported: []const u32, version: u32) bool {
+    for (supported) |v| {
+        if (v == version) return true;
+    }
+    return false;
+}
+
+/// RFC 9368 §6 server-side compatible-version-negotiation pre-parse.
+/// Mirrors `Server.preparseUpgradeTarget` in `src/server.zig` but uses
+/// only the public `quic_zig.wire.vneg_preparse` helpers so the qns
+/// endpoint stays a pure embedder of the library API.
+///
+/// Returns `null` when:
+///   * The configured `supported` list has 0 or 1 entries (no upgrade
+///     is possible with a single version).
+///   * The wire `version` is not Initial-key derivable (RFC 9001 §5.2 /
+///     RFC 9368 §3.3.1 — only v1 and v2 are pre-parseable today).
+///   * Any pre-parse step fails (decrypt auth, fragmented ClientHello,
+///     missing `quic_transport_parameters` extension, missing
+///     `version_information` parameter, no overlap with `supported`).
+///
+/// Returns the upgrade target version when the highest-priority overlap
+/// between the server's `supported` list and the client's
+/// `available_versions` differs from the wire version. The caller MUST
+/// then advertise the target as the leading entry of
+/// `params.compatibleVersions` (so the EE BoringSSL produces matches §5)
+/// and stash it via `Connection.setPendingVersionUpgrade` so the next
+/// outbound `poll` seals under the upgrade-target keys.
+///
+/// Defensive throughout: any error path returns `null` and the caller
+/// falls back to "use the wire version", which is always spec-compliant
+/// per §6's graceful-degradation clause.
+fn preparseUpgradeTarget(
+    supported: []const u32,
+    bytes: []const u8,
+    wire_version: u32,
+) ?u32 {
+    if (supported.len <= 1) return null;
+    if (!quic_zig.wire.initial.isSupportedVersion(wire_version)) return null;
+
+    const ids = peekLongHeaderIds(bytes) orelse return null;
+
+    // Make a private copy of the inbound bytes so `openInitial`'s
+    // in-place header-protection strip doesn't disturb the caller's
+    // buffer — `Connection.handleWithEcn` will re-process the same
+    // bytes through its normal Initial-handling flow.
+    var pkt_copy: [quic_zig.conn.state.max_recv_plaintext]u8 = undefined;
+    if (bytes.len > pkt_copy.len) return null;
+    @memcpy(pkt_copy[0..bytes.len], bytes);
+
+    // Derive client-direction Initial keys for the wire version.
+    const init_keys = quic_zig.wire.initial.deriveInitialKeysFor(wire_version, ids.dcid, false) catch return null;
+    const r_keys = quic_zig.wire.short_packet.derivePacketKeys(.aes128_gcm_sha256, &init_keys.secret) catch return null;
+
+    var pt_buf: [quic_zig.conn.state.max_recv_plaintext]u8 = undefined;
+    const opened = quic_zig.wire.long_packet.openInitial(&pt_buf, pkt_copy[0..bytes.len], .{
+        .keys = &r_keys,
+        .largest_received = 0,
+    }) catch return null;
+
+    var ch_buf: [quic_zig.wire.vneg_preparse.max_client_hello_bytes]u8 = undefined;
+    const ch = quic_zig.wire.vneg_preparse.reassembleClientHello(&ch_buf, opened.payload) orelse return null;
+    const qtp = quic_zig.wire.vneg_preparse.findQuicTransportParamsExt(ch) orelse return null;
+    const info = quic_zig.wire.vneg_preparse.findVersionInformation(qtp) orelse return null;
+
+    return quic_zig.wire.vneg_preparse.chooseUpgradeVersion(supported, info.available());
+}
+
 fn randomServerCid(io: std.Io) [server_cid_len]u8 {
     var cid: [server_cid_len]u8 = undefined;
     @memcpy(cid[0..server_cid_prefix.len], &server_cid_prefix);
@@ -2467,6 +2671,69 @@ test "QNS client mode follows TESTCASE" {
     try std.testing.expectEqual(ClientMode.normal, clientMode("transfer"));
     try std.testing.expectEqual(ClientMode.resumption, clientMode("resumption"));
     try std.testing.expectEqual(ClientMode.zerortt, clientMode("zerortt"));
+}
+
+test "QNS server/client versions follow TESTCASE=versionnegotiation" {
+    // Default (TESTCASE unset or any non-`versionnegotiation` value):
+    // both roles fall back to v1-only so legacy interop testcases keep
+    // their historical wire posture.
+    const default_server = serverVersionsForTestcase("");
+    try std.testing.expectEqual(@as(usize, 1), default_server.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, default_server[0]);
+
+    const default_client = clientVersionsForTestcase("");
+    try std.testing.expectEqual(@as(usize, 1), default_client.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, default_client[0]);
+
+    // Sanity-check a couple of unrelated TESTCASE values to make sure
+    // they don't accidentally trip the v2 opt-in. `transfer` is the
+    // generic "happy path" testcase; `connectionmigration` already
+    // overloads other env handling and we want to confirm the
+    // version-selection path stays orthogonal to it.
+    const transfer_server = serverVersionsForTestcase("transfer");
+    try std.testing.expectEqual(@as(usize, 1), transfer_server.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, transfer_server[0]);
+
+    const cm_client = clientVersionsForTestcase("connectionmigration");
+    try std.testing.expectEqual(@as(usize, 1), cm_client.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, cm_client[0]);
+
+    // `versionnegotiation`: server prefers v2 first so it advertises
+    // v2 as `chosen_version` to a v1-wire client whose
+    // `version_information` includes v2; the v1 entry remains in the
+    // list as a fallback for legacy clients with no `version_information`.
+    const vn_server = serverVersionsForTestcase("versionnegotiation");
+    try std.testing.expectEqual(@as(usize, 2), vn_server.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_2, vn_server[0]);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, vn_server[1]);
+
+    // `versionnegotiation`: client puts v1 first because that's the
+    // wire version of its outbound Initial; v2 is the upgrade target
+    // it offers via `version_information`. The asymmetry vs. the
+    // server (v2-first) is intentional — see the helper docstrings.
+    const vn_client = clientVersionsForTestcase("versionnegotiation");
+    try std.testing.expectEqual(@as(usize, 2), vn_client.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, vn_client[0]);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_2, vn_client[1]);
+}
+
+test "isVersionSupported scans the configured list" {
+    // Single-version (v1-only default): only v1 hits.
+    try std.testing.expect(isVersionSupported(&.{quic_zig.QUIC_VERSION_1}, quic_zig.QUIC_VERSION_1));
+    try std.testing.expect(!isVersionSupported(&.{quic_zig.QUIC_VERSION_1}, quic_zig.QUIC_VERSION_2));
+    try std.testing.expect(!isVersionSupported(&.{quic_zig.QUIC_VERSION_1}, 0xdeadbeef));
+
+    // Multi-version (`TESTCASE=versionnegotiation` posture): both v1
+    // and v2 hit; an unknown version misses so the dispatch path
+    // sends a Version Negotiation rather than passing the bytes
+    // through to `Connection.acceptInitial`.
+    const both = serverVersionsForTestcase("versionnegotiation");
+    try std.testing.expect(isVersionSupported(both, quic_zig.QUIC_VERSION_1));
+    try std.testing.expect(isVersionSupported(both, quic_zig.QUIC_VERSION_2));
+    try std.testing.expect(!isVersionSupported(both, 0xdeadbeef));
+    // Empty list: nothing matches (defensive — production code never
+    // hits this since the env-derived defaults guarantee >= 1 entry).
+    try std.testing.expect(!isVersionSupported(&.{}, quic_zig.QUIC_VERSION_1));
 }
 
 test "queueClientConnectionIds issues a fresh CID once handshake completes" {
