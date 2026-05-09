@@ -3011,6 +3011,54 @@ pub const Connection = struct {
         return true;
     }
 
+    /// RFC 9368 §6 client-side hook: accept a compatible-version
+    /// upgrade signaled by the server's first Initial response carrying
+    /// a wire version that differs from the one the client put on its
+    /// outgoing Initial. The candidate `version` MUST appear in the
+    /// client's locally-advertised `version_information.available_versions`
+    /// (see `local_transport_params.compatibleVersions()` — entry 0 is
+    /// the wire/preferred version, the remaining entries are the
+    /// compatible set). Validates the candidate against the client's
+    /// list and against `wire.initial.isSupportedVersion`, then flips
+    /// `self.version` (which re-derives Initial keys via `setVersion`).
+    ///
+    /// Returns:
+    ///  - `true` on a successful flip; the caller should re-derive
+    ///    Initial keys (which `setVersion` zeroes) and retry decryption
+    ///    of the inbound Initial.
+    ///  - `false` when the upgrade is rejected (wrong role, no
+    ///    advertised compatible-versions list, candidate not on the
+    ///    client's list, candidate's keys aren't derivable, or the
+    ///    state machine has already moved past the Initial-level
+    ///    decision window). Caller treats this as "leave version
+    ///    alone"; the inbound packet will then fail AEAD auth and be
+    ///    dropped, which is the spec-compliant fallback.
+    pub fn clientAcceptCompatibleVersion(self: *Connection, version: u32) bool {
+        if (self.role != .client) return false;
+        // Same-version is reported as "nothing to do" (false) so
+        // callers can distinguish a real flip from a no-op.
+        if (version == self.version) return false;
+        // The decision window closes once Initial keys are dropped
+        // (discardInitialKeys, post-handshake-confirm) — beyond that,
+        // flipping `self.version` would desync the long-header type-bit
+        // decoder against in-flight packets.
+        if (self.initial_keys_discarded) return false;
+        if (self.inner.handshakeDone()) return false;
+        // Defensive: only accept versions whose Initial keys we can
+        // derive. RFC 9368 §6 only defines v1↔v2; an unknown version
+        // here would have been a configuration accident upstream.
+        if (!initial_keys_mod.isSupportedVersion(version)) return false;
+        // The candidate MUST appear in the locally-advertised
+        // `available_versions` list (RFC 9368 §6 ¶6: "a server SHOULD
+        // pick one of the versions" the client listed). The list
+        // includes the wire version at index 0 plus every
+        // compatible_version from `Client.Config`.
+        const advertised = self.local_transport_params.compatibleVersions();
+        if (std.mem.indexOfScalar(u32, advertised, version) == null) return false;
+        self.setVersion(version);
+        return true;
+    }
+
     /// Open a new bidirectional stream with the given id. The id
     /// is caller-supplied. RFC 9000 §2.1 says the low two bits of
     /// a stream id encode (initiator, direction):
@@ -4430,6 +4478,28 @@ pub const Connection = struct {
                 // the safer of the two.
                 if (params.alternative_address) {
                     self.close(true, transport_error_transport_parameter, "server sent alternative_address");
+                    return;
+                }
+                // RFC 9368 §6 ¶6/¶7 downgrade-attack guard: when the
+                // server advertises `version_information`, the first
+                // entry (the server's `chosen_version`) MUST equal
+                // the wire version we currently see on the response
+                // carrying it — otherwise a path attacker could
+                // splice a v1 ClientHello into a v2 Initial response
+                // and steer the client onto a weaker version. Since
+                // these transport parameters are surfaced through TLS
+                // EncryptedExtensions only after our active
+                // `self.version` has been adopted (see the
+                // compatible-version upgrade hook in
+                // `handleInitial`), the check is just `chosen ==
+                // self.version`.
+                const advertised_versions = params.compatibleVersions();
+                if (advertised_versions.len > 0 and advertised_versions[0] != self.version) {
+                    self.close(
+                        true,
+                        transport_error_transport_parameter,
+                        "server chosen_version mismatches wire version",
+                    );
                     return;
                 }
             },

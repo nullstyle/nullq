@@ -304,6 +304,8 @@ test "[v2,v1] server upgrades a v1-wire ClientHello that lists v2 [RFC9368 §6]"
     // advertises `version_information = [v1, v2]` in its transport
     // parameters; the server is configured `versions = [v2, v1]`,
     // so the highest-priority overlap is v2 and the server upgrades.
+    // The client follows the upgrade signal in its first inbound
+    // Initial via `Connection.clientAcceptCompatibleVersion`.
     const allocator = std.testing.allocator;
     const protos = [_][]const u8{"hq-test"};
     const srv_versions = [_]u32{ QUIC_V2, QUIC_V1 };
@@ -330,22 +332,20 @@ test "[v2,v1] server upgrades a v1-wire ClientHello that lists v2 [RFC9368 §6]"
     defer cli.deinit();
 
     const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xab) };
-    // Drive at least one client→server pump so the server has
-    // observed the v1-wire Initial and committed to its upgrade
-    // decision. The full handshake won't finish here because the
-    // client side doesn't yet respond to the server's upgrade signal
-    // (that path is tracked on the client follow-up); the upgrade
-    // assertion lives on the server side.
-    var rx: [4096]u8 = undefined;
-    try cli.conn.advance();
-    _ = try pumpClientToServer(&cli, &srv, &rx, peer_addr, 0);
+    const outcome = try driveHandshake(&cli, &srv, peer_addr, 32);
+    try std.testing.expect(outcome.completed);
 
-    // The server should now have a slot whose connection version is
-    // the upgrade target (v2), and the outbound transport_params
-    // should advertise chosen=v2 first.
+    // Both sides committed to the upgrade target (v2): the server's
+    // first Initial response was sealed under v2 keys, and the client
+    // followed that signal mid-flight before the AEAD open ran.
     try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
     const slot = srv.iterator()[0];
     try std.testing.expectEqual(QUIC_V2, slot.conn.version);
+    try std.testing.expectEqual(QUIC_V2, cli.conn.version);
+
+    // ALPN survived the upgrade.
+    try std.testing.expectEqualStrings("hq-test", cli.conn.inner.alpnSelected().?);
+    try std.testing.expectEqualStrings("hq-test", slot.conn.inner.alpnSelected().?);
 }
 
 test "[v2,v1] server with v1-only client commits to v1, no upgrade [RFC9368 §6]" {

@@ -11,6 +11,37 @@ breaking changes; see notes per release.
 
 ### Added
 
+- **Client-side RFC 9368 §6 compatible-version-negotiation consumption** —
+  a multi-version `Client.Config.compatible_versions` (e.g.
+  `preferred_version = QUIC_VERSION_1, compatible_versions =
+  [QUIC_VERSION_2]`) now follows a server-driven upgrade signal
+  carried on the first inbound Initial. New
+  `Connection.clientAcceptCompatibleVersion` (in
+  `src/conn/state.zig`), wired into
+  `conn_recv_packet_handlers.handleInitial`, detects a long-header
+  version mismatch on the very first Initial response, validates the
+  candidate against the client's locally-advertised
+  `version_information.available_versions`, and flips
+  `Connection.version` (re-deriving Initial keys via `setVersion`)
+  before the AEAD open runs. The hook is gated on the receive-side
+  Initial space being empty so a stale on-wire-version Initial can't
+  flip the version back; rejection is silent (the inbound packet then
+  fails AEAD auth, which is the spec-compliant fallback). Once the
+  handshake produces the server's EncryptedExtensions, a new RFC 9368
+  §6 ¶6/¶7 downgrade-attack guard in `validatePeerTransportRole`
+  closes the connection with TRANSPORT_PARAMETER_ERROR (0x08) when
+  the server's `chosen_version` (the first entry of the peer
+  `version_information` parameter) does not match the wire version
+  of the response carrying it. Replaces the prior `//
+  TODO(B3-followup):` placeholder on
+  `Client.Config.compatible_versions`. New unit tests in
+  `src/conn/_state_tests.zig` cover the upgrade-accept / -reject /
+  no-op paths and the chosen_version guard; the existing `[v2,v1]
+  server upgrades a v1-wire ClientHello that lists v2` e2e test in
+  `tests/e2e/quic_v2_handshake.zig` now drives the full handshake to
+  completion (it previously stopped after the server's commit
+  because the client side was still v1-only on the receive path).
+
 - **Server-side RFC 9368 §6 compatible-version-negotiation upgrade** —
   a multi-version `Server.Config.versions` (e.g. `[QUIC_VERSION_2,
   QUIC_VERSION_1]`) now drives an upgrade decision per inbound Initial
