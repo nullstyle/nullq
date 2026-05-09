@@ -627,6 +627,13 @@ pub const PathState = struct {
     /// configured `probe_step` and `max_mtu`, or null if no further
     /// probe is permitted (search complete / disabled / upper-bound
     /// reached). RFC 8899 §5.3.1 search algorithm.
+    ///
+    /// The upper bound is interpreted as a CLOSED ceiling — probes
+    /// never re-try a size we already declared lost
+    /// `probe_threshold` times. `max_mtu` is the OPEN ceiling: a
+    /// probe at exactly `max_mtu` is allowed (e.g. to tighten on a
+    /// 1500-byte ethernet path with 28 bytes of IPv4+UDP overhead
+    /// already accounted for).
     pub fn pmtudNextProbeSize(
         self: *const PathState,
         probe_step: u16,
@@ -634,14 +641,13 @@ pub const PathState = struct {
     ) ?u16 {
         if (self.pmtu_state != .search) return null;
         if (self.pmtu_probe_pn != null) return null;
-        const ceiling: u16 = if (self.pmtu_upper_bound) |ub|
-            @min(ub, max_mtu)
-        else
-            max_mtu;
         const cur: u32 = @intCast(self.pmtu);
         const step: u32 = probe_step;
         const candidate: u32 = cur + step;
-        if (candidate > @as(u32, ceiling)) return null;
+        if (self.pmtu_upper_bound) |ub| {
+            if (candidate >= @as(u32, ub)) return null;
+        }
+        if (candidate > @as(u32, max_mtu)) return null;
         return @intCast(candidate);
     }
 
@@ -671,12 +677,15 @@ pub const PathState = struct {
         self.pmtu_probed_size = 0;
         self.pmtu_fail_count = 0;
         self.pmtu_consecutive_regular_losses = 0;
-        const ceiling: u16 = if (self.pmtu_upper_bound) |ub|
-            @min(ub, max_mtu)
-        else
-            max_mtu;
         const next: u32 = @as(u32, probed) + probe_step;
-        if (next > @as(u32, ceiling)) {
+        // Termination: stop searching when the next probe size
+        // would land at or above a recorded upper bound, or strictly
+        // above max_mtu (the OPEN ceiling).
+        const upper_bound_blocks = if (self.pmtu_upper_bound) |ub|
+            next >= @as(u32, ub)
+        else
+            false;
+        if (upper_bound_blocks or next > @as(u32, max_mtu)) {
             self.pmtu_state = .search_complete;
         }
         return self.pmtu;
@@ -703,8 +712,11 @@ pub const PathState = struct {
             else
                 new_ub;
             self.pmtu_fail_count = 0;
-            // If the bound is at or below current pmtu we cannot
-            // probe further upward — search is effectively complete.
+            // If the bound is at or below current pmtu the search
+            // can never advance — transition to search_complete. The
+            // upper bound is interpreted as a CLOSED ceiling
+            // (matching `pmtudNextProbeSize`), so equality also
+            // blocks further search.
             if (@as(u32, self.pmtu_upper_bound.?) <= @as(u32, @intCast(self.pmtu))) {
                 self.pmtu_state = .search_complete;
             }
@@ -1123,7 +1135,7 @@ test "DPLPMTUD: probe ack flips to search_complete at the ceiling" {
 
 test "DPLPMTUD: probe loss bumps fail_count, threshold records upper bound" {
     var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
-    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1500, .probe_step = 100, .probe_threshold = 3 });
+    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1500, .probe_step = 50, .probe_threshold = 3 });
 
     // Loss 1, 2: just bump counter.
     ps.pmtudOnProbeSent(1, 1300);
@@ -1141,8 +1153,9 @@ test "DPLPMTUD: probe loss bumps fail_count, threshold records upper bound" {
     // pmtu stays at floor (1200), state stays search but ceiling now 1300.
     try testing.expectEqual(@as(usize, 1200), ps.pmtu);
     try testing.expectEqual(PmtudState.search, ps.pmtu_state);
-    // Next probe size is bounded by the new upper bound.
-    try testing.expectEqual(@as(?u16, 1300), ps.pmtudNextProbeSize(100, 1500));
+    // Next probe size is bounded by the new upper bound. Upper bound
+    // is CLOSED — 1200+50=1250 < 1300, so 1250 is the next candidate.
+    try testing.expectEqual(@as(?u16, 1250), ps.pmtudNextProbeSize(50, 1500));
 }
 
 test "DPLPMTUD: probe loss at floor with bound at floor → search_complete" {

@@ -36,6 +36,7 @@ test {
     _ = @import("conformance/rfc9001_tls.zig");
     _ = @import("conformance/rfc9002_loss_recovery.zig");
     _ = @import("conformance/rfc9221_datagram.zig");
+    _ = @import("conformance/rfc8899_dplpmtud.zig");
     // Fixture-internal sanity tests for `_handshake_fixture.zig`.
     // The FIXTURE_SANITY-prefixed tests inside it are not
     // RFC-traceable conformance tests — they are regression coverage
