@@ -2618,8 +2618,20 @@ pub const Connection = struct {
         if (self.role != .server) return Error.NotServerContext;
         if (bytes.len < 6) return Error.InsufficientBytes;
         if ((bytes[0] & 0x80) == 0) return Error.NotInitialPacket; // bit 7 clear → short header
+        // RFC 9368 §3.2: the v2 long-header type rotation puts Initial
+        // at 0b01 instead of 0b00. Resolve through `longTypeFromBits`
+        // so a v2 ClientHello survives this gate.
+        const version = std.mem.readInt(u32, bytes[1..5], .big);
         const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
-        if (long_type_bits != 0) return Error.NotInitialPacket; // long header but type ≠ Initial
+        if (wire_header.longTypeFromBits(version, long_type_bits) != .initial) {
+            return Error.NotInitialPacket;
+        }
+        // Adopt the peer's version so subsequent Initial-key
+        // derivation (`ensureInitialKeys`), header encoding, and
+        // Retry-tag construction all key off the right RFC 9001 §5
+        // / RFC 9368 §3.3 constants. Invalidates any pre-existing
+        // Initial keys via `setVersion`.
+        if (version != self.version) self.setVersion(version);
 
         const dcid_len = bytes[5];
         if (dcid_len > path_mod.max_cid_len) return Error.DcidTooLong;

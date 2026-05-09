@@ -136,6 +136,29 @@ const ConfigImpl = struct {
     /// `Connection.setNewTokenCallback` for the lifetime contract.
     new_token_callback: ?conn_mod.NewTokenCallback = null,
     new_token_user_data: ?*anyopaque = null,
+
+    /// QUIC wire-format version the client puts on its first
+    /// Initial. RFC 9000 §15: defaults to v1
+    /// (`quic_zig.QUIC_VERSION_1`). Embedders that want v2
+    /// standalone set this to `quic_zig.QUIC_VERSION_2`; the
+    /// client's Initial-key salt + HKDF labels (RFC 9368 §3.3.1 /
+    /// §3.3.2), long-header type bits (§3.2), and Retry-tag
+    /// constants (§3.3.3) follow.
+    preferred_version: u32 = 0x00000001,
+
+    /// Optional list of additional QUIC versions the client is
+    /// willing to upgrade to via the RFC 9368 §5 compatible-version
+    /// negotiation mechanism. Empty (the default) suppresses the
+    /// `version_information` (codepoint 0x11) transport parameter,
+    /// keeping the on-wire posture indistinguishable from a v0.x
+    /// client. When non-empty, the client advertises
+    /// `[preferred_version, compatible_versions...]` so a server
+    /// that supports a different overlapping version can opt in to
+    /// a compatible upgrade. (Server-driven upgrade is currently
+    /// detected only — the client emits its first Initial under
+    /// `preferred_version` and the upgrade path itself is tracked
+    /// as `// TODO(B3-followup):` work.)
+    compatible_versions: []const u32 = &.{},
 };
 
 /// Errors produced by `Client.connect`. Distinct from
@@ -200,6 +223,16 @@ pub const Client = struct {
         if (config.alpn_protocols.len == 0) return Error.InvalidConfig;
         if (config.initial_dcid_len < 8 or config.initial_dcid_len > 20) return Error.InvalidConfig;
         if (config.local_cid_len == 0 or config.local_cid_len > 20) return Error.InvalidConfig;
+        // The version drives the Initial-key salt + HKDF labels
+        // (RFC 9001 §5.2 v1 / RFC 9368 §3.3.1 v2) — only the wire
+        // versions this implementation knows how to derive keys for
+        // are accepted here.
+        const wire_initial = @import("wire/initial.zig");
+        if (!wire_initial.isSupportedVersion(config.preferred_version)) return Error.InvalidConfig;
+        if (config.compatible_versions.len > 16) return Error.InvalidConfig;
+        for (config.compatible_versions) |v| {
+            if (!wire_initial.isSupportedVersion(v)) return Error.InvalidConfig;
+        }
 
         // Build (or borrow) the TLS context first — both branches
         // need to feed `Session.fromBytes` for 0-RTT.
@@ -256,6 +289,11 @@ pub const Client = struct {
         errdefer conn_ptr.deinit();
         conn_ptr.reveal_close_reason_on_wire = config.reveal_close_reason_on_wire;
         conn_ptr.delayed_ack_packet_threshold = config.delayed_ack_packet_threshold;
+        // RFC 9368 §3 / §5: pick the wire-format version *before*
+        // any Initial keys are derived. `setVersion` is a no-op when
+        // the value is already current, so this works for the v1
+        // default path too.
+        conn_ptr.setVersion(config.preferred_version);
 
         if (config.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, config.qlog_user_data);
 
@@ -316,6 +354,18 @@ pub const Client = struct {
 
         var params = config.transport_params;
         params.initial_source_connection_id = ConnectionId.fromSlice(client_scid);
+        // RFC 9368 §5: advertise the chosen version + compatible
+        // versions so a server that supports a different version
+        // can opt into a compatible upgrade. Empty
+        // `compatible_versions` keeps the parameter absent, which
+        // matches v0.x wire posture for embedders that don't opt in.
+        if (config.compatible_versions.len > 0) {
+            var ordered: [16]u32 = undefined;
+            ordered[0] = config.preferred_version;
+            const cv_count = @min(config.compatible_versions.len, ordered.len - 1);
+            @memcpy(ordered[1..][0..cv_count], config.compatible_versions[0..cv_count]);
+            try params.setCompatibleVersions(ordered[0 .. 1 + cv_count]);
+        }
         try conn_ptr.setTransportParams(params);
 
         return .{

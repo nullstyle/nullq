@@ -43,10 +43,11 @@
 //!    echoes a valid token in a follow-up Initial, no `Connection`
 //!    is allocated. Set this to gate the 3x amplification window
 //!    behind a proof-of-address round trip.
-//! 3. Long-header packets carrying any version other than
-//!    `quic_zig.QUIC_VERSION_1` always trigger a Version Negotiation
-//!    response (RFC 9000 §6 / RFC 8999 §6); this is unconditional
-//!    and requires no `Config` opt-in.
+//! 3. Long-header packets carrying any version not in
+//!    `Config.versions` (which defaults to QUIC v1 only) always
+//!    trigger a Version Negotiation response (RFC 9000 §6 / RFC
+//!    8999 §6 / RFC 9368 §6); this is unconditional and requires
+//!    no further `Config` opt-in.
 //!
 //! Stateless responses (Retry, Version Negotiation) are queued on
 //! the `Server` and surfaced via `drainStatelessResponse`. The
@@ -91,7 +92,6 @@ const ConnectionId = conn_mod.path.ConnectionId;
 const Address = conn_mod.path.Address;
 const QlogCallback = conn_mod.QlogCallback;
 const RetryTokenKey = conn_mod.RetryTokenKey;
-const QUIC_VERSION_1: u32 = 0x00000001;
 
 /// Maximum byte size of a single queued stateless response (Version
 /// Negotiation or Retry). Both packet types fit comfortably inside
@@ -687,6 +687,23 @@ const ConfigImpl = struct {
     /// global ceiling on null-source events should put one in their
     /// own log_callback.
     max_log_events_per_source_per_window: ?u32 = 16,
+
+    /// QUIC wire-format versions this server accepts on inbound
+    /// Initials. RFC 9000 §6 / RFC 8999 §6: any long-header packet
+    /// whose declared version isn't in this list earns a Version
+    /// Negotiation response listing the configured set. Must be
+    /// non-empty.
+    ///
+    /// Defaults to `&.{ 0x00000001 }` (QUIC v1 only) so v0.x embedders
+    /// keep the same wire posture they had before RFC 9368 v2 support
+    /// landed. Adding `0x6b3343cf` (`quic_zig.QUIC_VERSION_2`) opts
+    /// the server into v2: incoming v2 Initials are accepted under
+    /// the §3.3.1 salt + §3.3.2 labels, outgoing Retries / VN frames
+    /// echo the negotiated version, and the optional
+    /// `version_information` (codepoint 0x11) transport parameter
+    /// advertises the full list to the peer for compatible-version
+    /// upgrade.
+    versions: []const u32 = &.{0x00000001},
 };
 
 /// Argument to `Server.replaceTlsContext`. Either fresh PEM bytes
@@ -837,10 +854,10 @@ const FeedOutcomeImpl = enum {
     /// reaped.
     table_full,
     /// The datagram carried a long-header packet with a version
-    /// other than `quic_zig.QUIC_VERSION_1`. A Version Negotiation
+    /// that is not in `Config.versions`. A Version Negotiation
     /// response was queued for the embedder to drain via
     /// `drainStatelessResponse`. No `Connection` was created.
-    /// RFC 9000 §6 / RFC 8999 §6.
+    /// RFC 9000 §6 / RFC 8999 §6 / RFC 9368 §6.
     version_negotiated,
     /// `Config.retry_token_key` is set and this Initial either
     /// carried no token or carried one that is not the one we
@@ -1016,6 +1033,13 @@ pub const Server = struct {
     /// disables the per-source log rate limit. Hardening guide §9.4.
     max_log_events_per_source: ?u32,
 
+    /// Captured `Config.versions`. Drives both the Version Negotiation
+    /// gate (any inbound long-header packet whose declared version is
+    /// not in this list earns a VN response listing the entries here)
+    /// and the per-Initial version selection in `openSlotFromInitial`
+    /// (the slot's connection adopts the matching incoming version).
+    versions: []const u32,
+
     /// Snapshot of the most recent `feed`'s `now_us` argument. Threaded
     /// to `emitLog` so the per-source log rate limit fires its sliding
     /// window against in-feed time even though `emitLog` itself takes
@@ -1144,6 +1168,18 @@ pub const Server = struct {
             if (config.source_rate_window_us == 0) return Error.InvalidConfig;
             if (config.source_rate_table_capacity == 0) return Error.InvalidConfig;
         }
+        // The version list drives the VN gate and per-slot version
+        // adoption; an empty list would mean the server rejects every
+        // inbound Initial, which is almost never what an embedder
+        // wants. Every entry must be a wire-format version we know
+        // how to derive Initial keys for (RFC 9001 §5.2 v1 / RFC
+        // 9368 §3.3.1 v2). Reject `version == 0` outright because
+        // the wire reserves it for Version Negotiation packets.
+        if (config.versions.len == 0) return Error.InvalidConfig;
+        for (config.versions) |v| {
+            if (v == 0) return Error.InvalidConfig;
+            if (!wire.initial.isSupportedVersion(v)) return Error.InvalidConfig;
+        }
 
         var tls_ctx: boringssl.tls.Context = undefined;
         var owns_tls = false;
@@ -1238,6 +1274,7 @@ pub const Server = struct {
             .listener_rate_window_us = config.listener_rate_window_us,
             .max_bytes_per_source_per_second = config.max_bytes_per_source_per_second,
             .max_log_events_per_source = config.max_log_events_per_source_per_window,
+            .versions = config.versions,
             .stateless_responses = .empty,
         };
     }
@@ -1402,7 +1439,7 @@ pub const Server = struct {
         // handshake Initials that would otherwise route to an existing
         // slot.
         //
-        // Gated on `version == QUIC_VERSION_1` so unsupported-version
+        // Gated on `Config.versions` membership so unsupported-version
         // probes still flow into the Version Negotiation path below
         // (whose response is governed by RFC 9000 §6, not §14). The
         // size check keys off the leading packet's long-header type
@@ -1412,13 +1449,14 @@ pub const Server = struct {
         // inner-Initial would still ride a leading packet large
         // enough to push the datagram past 1200, so this covers the
         // practical attack surface.
-        if (isInitialLongHeader(bytes) and bytes.len < conn_mod.state.min_quic_udp_payload_size) {
-            if (peekLongHeaderIds(bytes)) |ids| {
-                if (ids.version == QUIC_VERSION_1) {
-                    self.feeds_initial_too_small += 1;
-                    self.feeds_dropped += 1;
-                    return .dropped;
-                }
+        if (peekLongHeaderIds(bytes)) |ids| {
+            if (isInitialLongHeader(bytes, ids.version) and
+                bytes.len < conn_mod.state.min_quic_udp_payload_size and
+                self.versionAccepted(ids.version))
+            {
+                self.feeds_initial_too_small += 1;
+                self.feeds_dropped += 1;
+                return .dropped;
             }
         }
 
@@ -1441,18 +1479,20 @@ pub const Server = struct {
 
         // Long-header packets reach the version-negotiation gate
         // first: any long-header packet whose declared version is
-        // not QUIC v1 earns a VN response, regardless of the
-        // long-type bits. Per RFC 9000 §6 this catches non-Initial
-        // long-header probes (0-RTT, Handshake) too.
+        // not in `Config.versions` earns a VN response, regardless
+        // of the long-type bits. Per RFC 9000 §6 / RFC 9368 §6 this
+        // catches non-Initial long-header probes (0-RTT, Handshake)
+        // too.
         if (peekLongHeaderIds(bytes)) |ids| {
-            if (ids.version != QUIC_VERSION_1) {
+            if (!self.versionAccepted(ids.version)) {
                 if (from) |addr| {
                     // Per-source VN-rate gate (hardening guide §4.4):
                     // legitimate clients fix their version and retry
-                    // with QUIC v1 after one VN response, so even a
-                    // small cap is non-disruptive. This blunts the
-                    // VN-flood amplification surface where one source
-                    // fills the global stateless-response queue.
+                    // with one of our supported versions after one VN
+                    // response, so even a small cap is non-disruptive.
+                    // This blunts the VN-flood amplification surface
+                    // where one source fills the global
+                    // stateless-response queue.
                     if (self.max_vn_per_source) |cap| {
                         if (!self.acceptVnRate(addr, cap, now_us)) {
                             self.feeds_vn_rate_limited += 1;
@@ -1483,8 +1523,19 @@ pub const Server = struct {
             }
         }
 
-        // New connection candidate: must be a long-header Initial.
-        if (!isInitialLongHeader(bytes)) {
+        // New connection candidate: must be a long-header Initial
+        // under one of our supported versions. The version-list gate
+        // upstream already filtered unsupported versions to VN; here
+        // we just translate the long-header type bits to an abstract
+        // `LongType` and require Initial. We can't use `peekLongHeaderIds`
+        // here because it rejects DCID-len > 20 — the source-rate
+        // gate downstream wants to charge those datagrams too.
+        if (bytes.len < 5 or (bytes[0] & 0x80) == 0) {
+            self.feeds_dropped += 1;
+            return .dropped;
+        }
+        const candidate_version = std.mem.readInt(u32, bytes[1..5], .big);
+        if (!isInitialLongHeader(bytes, candidate_version)) {
             self.feeds_dropped += 1;
             return .dropped;
         }
@@ -1874,6 +1925,25 @@ pub const Server = struct {
         if (retry_ctx) |_| {
             params.retry_source_connection_id = ConnectionId.fromSlice(local_scid);
         }
+        // RFC 9368 §5: when the embedder configured more than one
+        // version, advertise the full set as `version_information`.
+        // The chosen version (first entry) is the peer's declared
+        // version — we already gated on `versionAccepted` upstream,
+        // so it's guaranteed to be in our configured list. Build the
+        // list with the chosen version first, followed by every
+        // other configured version in preference order.
+        if (self.versions.len > 1) {
+            var ordered: [16]u32 = undefined;
+            ordered[0] = ids.version;
+            var n: usize = 1;
+            for (self.versions) |v| {
+                if (v == ids.version) continue;
+                if (n >= ordered.len) break;
+                ordered[n] = v;
+                n += 1;
+            }
+            try params.setCompatibleVersions(ordered[0..n]);
+        }
         try conn_ptr.acceptInitial(bytes, params);
 
         slot.* = .{
@@ -2258,14 +2328,22 @@ pub const Server = struct {
 
     // -- Version Negotiation -------------------------------------------
 
+    /// True if `version` is one of the wire-format versions this
+    /// server is configured to accept. Drives the VN gate in `feed`.
+    fn versionAccepted(self: *const Server, version: u32) bool {
+        for (self.versions) |v| {
+            if (v == version) return true;
+        }
+        return false;
+    }
+
     /// Encode a Version Negotiation packet into the response queue.
     /// Errors propagate from the encoder (`InsufficientBytes`) or
     /// the queue allocator (`OutOfMemory`); on either, `feed` falls
-    /// back to `.dropped`. The encoder mirrors the QNS endpoint's
-    /// `writeVersionNegotiation` (line 1149): supported_versions is
-    /// the single-element list `{QUIC_VERSION_1}`, the response
-    /// echoes the client's CIDs swapped, and the unused bits are
-    /// left as the encoder default per RFC 8999 §6.
+    /// back to `.dropped`. The supported_versions list mirrors
+    /// `Config.versions`; the response echoes the client's CIDs
+    /// swapped (RFC 8999 §6) and the unused bits are left as the
+    /// encoder default.
     fn queueVersionNegotiation(
         self: *Server,
         dst_addr: Address,
@@ -2274,16 +2352,19 @@ pub const Server = struct {
         const ids = peekLongHeaderIds(client_packet) orelse return error.InvalidVersionNegotiation;
         var entry: StatelessResponse = .{ .dst = dst_addr, .len = 0, .kind = .version_negotiation };
 
-        // Single supported version: QUIC v1. We encode through the
-        // wire-level helper directly so we don't have to keep a
-        // long-lived Connection just for this side-channel.
-        var versions_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, versions_bytes[0..4], QUIC_VERSION_1, .big);
+        // Pack our configured versions into a u32-aligned buffer; the
+        // wire-level VN encoder handles the rest. Capped at 16 entries
+        // so we don't overflow the inline `entry.bytes` budget.
+        var versions_bytes: [16 * 4]u8 = undefined;
+        const count = @min(self.versions.len, 16);
+        for (self.versions[0..count], 0..) |v, i| {
+            std.mem.writeInt(u32, versions_bytes[i * 4 ..][0..4], v, .big);
+        }
 
         const written = try wire.header.encode(&entry.bytes, .{ .version_negotiation = .{
             .dcid = try wire.header.ConnId.fromSlice(ids.scid),
             .scid = try wire.header.ConnId.fromSlice(ids.dcid),
-            .versions_bytes = versions_bytes[0..],
+            .versions_bytes = versions_bytes[0 .. count * 4],
         } });
         entry.len = written;
         try self.queueStatelessResponse(entry);
@@ -2790,13 +2871,16 @@ fn peekLongHeaderIds(bytes: []const u8) ?LongHeaderIds {
     return .{ .version = version, .dcid = dcid, .scid = scid };
 }
 
-fn isInitialLongHeader(bytes: []const u8) bool {
+/// True if `bytes` looks like a long-header Initial under the
+/// supplied wire-format version. RFC 9368 §3.2 puts Initial at
+/// 0b01 under v2 vs 0b00 under v1, so the caller has to pre-resolve
+/// the version field — typically via `peekLongHeaderIds`.
+fn isInitialLongHeader(bytes: []const u8, version: u32) bool {
     if (bytes.len == 0 or (bytes[0] & 0x80) == 0) return false;
     if (bytes.len < 5) return false;
-    const version = std.mem.readInt(u32, bytes[1..5], .big);
     if (version == 0) return false; // version negotiation
     const long_type_bits: u2 = @intCast((bytes[0] >> 4) & 0x03);
-    return long_type_bits == 0;
+    return wire.header.longTypeFromBits(version, long_type_bits) == .initial;
 }
 
 /// Peek the DCID from either header form. Long headers carry an
@@ -2963,17 +3047,27 @@ test "peekLongHeaderIds rejects too-short" {
 }
 
 test "isInitialLongHeader recognizes Initial type bits" {
-    // Long header, type=0 (Initial), version=1.
-    const bytes = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
-    try std.testing.expect(isInitialLongHeader(&bytes));
+    // Long header, type=0b00 (Initial under v1), version=1.
+    const v1_bytes = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0, 0 };
+    try std.testing.expect(isInitialLongHeader(&v1_bytes, 0x00000001));
 
-    // Version negotiation (version=0) is *not* an Initial.
+    // Long header, type=0b01 (Initial under v2 per RFC 9368 §3.2),
+    // version = 0x6b3343cf. The same bit pattern is 0-RTT under v1
+    // and Initial under v2, so the helper has to consult `version`.
+    const v2_bytes = [_]u8{ 0xd0, 0x6b, 0x33, 0x43, 0xcf, 0, 0 };
+    try std.testing.expect(isInitialLongHeader(&v2_bytes, 0x6b3343cf));
+    try std.testing.expect(!isInitialLongHeader(&v2_bytes, 0x00000001));
+
+    // Version negotiation (version=0) is *not* an Initial under
+    // either version. The caller is expected to pass `version=0`
+    // here (matching the bytes' version field); the helper rejects
+    // outright.
     const vn = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0, 0 };
-    try std.testing.expect(!isInitialLongHeader(&vn));
+    try std.testing.expect(!isInitialLongHeader(&vn, 0));
 
     // Short header.
     const sh = [_]u8{ 0x40, 0, 0, 0, 0, 0, 0, 0, 0 };
-    try std.testing.expect(!isInitialLongHeader(&sh));
+    try std.testing.expect(!isInitialLongHeader(&sh, 0x00000001));
 }
 
 test "cidKey round-trips identical CIDs" {
@@ -3024,7 +3118,10 @@ fn fuzzIsInitialLongHeader(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buf: [256]u8 = undefined;
     const len = smith.slice(&input_buf);
     const input = input_buf[0..len];
-    _ = isInitialLongHeader(input);
+    // Drive the helper under both versions so the v1 and v2 long-type
+    // rotations are both exercised on the same input bytes.
+    _ = isInitialLongHeader(input, 0x00000001);
+    _ = isInitialLongHeader(input, 0x6b3343cf);
 }
 
 test "fuzz: peekDcidForServer never panics across all CID lengths" {
