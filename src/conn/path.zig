@@ -215,6 +215,69 @@ pub const Path = struct {
     }
 };
 
+/// RFC 8899 §5.2 DPLPMTUD configuration. Threaded onto every
+/// `Connection` via `Server.Config.pmtud` / `Client.Config.pmtud`. The
+/// transport applies these values at connection creation time and per
+/// path; embedders can flip `enable=false` to keep the historical
+/// static-MTU behaviour.
+///
+/// **Field semantics**:
+/// - `initial_mtu`: the floor below which DPLPMTUD will never lower the
+///   PMTU. Matches the RFC 9000 §14 / §14.3 minimum (1200 bytes).
+/// - `max_mtu`: the ceiling. Search-mode probes never exceed this size.
+/// - `probe_step`: how much the probed size grows above the current
+///   PMTU on each search-mode probe.
+/// - `probe_threshold`: RFC 8899 §5.1.4 / §5.1.5 fail counter. After
+///   `probe_threshold` consecutive losses of the same probe size, the
+///   probed size is recorded as the upper bound; after `probe_threshold`
+///   consecutive REGULAR (non-probe) packet losses at the current PMTU,
+///   the connection enters black-hole detection (§4.4) and halves the
+///   PMTU back toward `initial_mtu`.
+/// - `enable`: master switch. When false, no probes are scheduled and
+///   the per-path PMTU stays at `initial_mtu`.
+pub const PmtudConfig = struct {
+    /// Floor PMTU. Matches RFC 9000 §14 MIN_MAX_DATAGRAM_SIZE (1200).
+    initial_mtu: u16 = 1200,
+    /// Ceiling PMTU. Search will not probe larger than this size.
+    /// 1452 is the QUIC-friendly default for PMTU on most internet
+    /// paths (1500 IPv4 MTU minus 20 IP + 8 UDP + 20 fudge).
+    max_mtu: u16 = 1452,
+    /// Probe size increment in bytes (RFC 8899 §5.3.1 "search step").
+    probe_step: u16 = 64,
+    /// Consecutive-loss threshold before a probe size is recorded as
+    /// the upper bound, AND the consecutive-regular-loss threshold
+    /// before black-hole detection halves the PMTU (RFC 8899 §4.4).
+    probe_threshold: u16 = 3,
+    /// Master switch. False keeps the historical static-MTU path.
+    enable: bool = true,
+};
+
+/// RFC 8899 §5.2 DPLPMTUD probe-state-machine phase. The connection
+/// initialises every path in `disabled` (no probes); `Connection.init*`
+/// flips the active path's state to `search` if the embedder set
+/// `PmtudConfig.enable = true`.
+///
+/// State transitions:
+///   disabled        — `enable=false` master switch.
+///   search          — probe scheduler may build a PADDING+PING probe
+///                     when no probe is in flight. Successful probe
+///                     lifts `pmtu`; loss bumps `pmtu_fail_count`. Once
+///                     `probe_step` past the upper bound, transitions
+///                     to `search_complete`.
+///   search_complete — at the ceiling (`max_mtu` or recorded upper
+///                     bound). No further probes scheduled.
+///   error_state     — every probe at `initial_mtu` failed. Disable
+///                     further probes; PMTU stays at `initial_mtu`.
+///                     Currently unused — reserved for future extensions
+///                     where the embedder can re-enter search via a
+///                     manual call.
+pub const PmtudState = enum {
+    disabled,
+    search,
+    search_complete,
+    error_state,
+};
+
 /// Phase the per-path congestion controller is currently in. Surfaced
 /// to qlog and `PathStats`.
 pub const CongestionState = enum {
@@ -269,6 +332,19 @@ pub const PathStats = struct {
     ssthresh: ?u64 = null,
     /// Current congestion-control phase.
     congestion_window_state: CongestionState = .slow_start,
+
+    // -- RFC 8899 DPLPMTUD observability ----------------------------
+    /// Current path MTU floor in bytes — the maximum datagram size the
+    /// transport will build outbound on this path.
+    pmtu: usize = 0,
+    /// Probe state-machine phase.
+    pmtu_state: PmtudState = .disabled,
+    /// Number of in-flight DPLPMTUD probes (0 or 1).
+    pmtu_probes_in_flight: u16 = 0,
+    /// Consecutive probe-loss counter at the current probe size.
+    pmtu_fail_count: u16 = 0,
+    /// Upper-bound size discovered via §5.1.5 probe-loss exhaustion.
+    pmtu_upper_bound: ?u16 = null,
 };
 
 /// Snapshot of pre-migration path state, kept until the new 4-tuple
@@ -295,6 +371,53 @@ pub const PathState = struct {
     pending_ping: bool = false,
     pto_probe_count: u8 = 0,
     pmtu: usize = 1200,
+
+    // -- RFC 8899 DPLPMTUD per-path state --------------------------
+    //
+    // The send path consults `pmtu_state` and `pmtu_probe_pn` on each
+    // `pollLevelOnPath` call: when state is `search` and no probe is
+    // in flight (probe_pn == null), it builds a PADDING+PING packet at
+    // size `pmtu + probe_step` (capped at `pmtu_upper_bound` /
+    // `max_mtu`) and stamps the resulting packet number in
+    // `pmtu_probe_pn`. Probe ack / probe loss fire from
+    // `Connection.onPacketAcked` / `requeueLostPacketOnPath` to clear
+    // the in-flight slot and update `pmtu` (or `pmtu_fail_count`).
+    //
+    // **`pmtu_consecutive_regular_losses`** drives RFC 8899 §4.4
+    // black-hole detection: every regular (non-probe) loss at the
+    // current `pmtu` increments it; once it crosses `probe_threshold`,
+    // the connection halves `pmtu` (down to `initial_mtu`) and
+    // re-enters `search`.
+
+    /// RFC 8899 probe-state-machine phase. Defaults to `disabled`;
+    /// `Connection.init*` sets to `search` if PmtudConfig.enable.
+    pmtu_state: PmtudState = .disabled,
+    /// Packet number of the in-flight probe, or null if none. Only
+    /// one probe is permitted in flight at a time per path (RFC 8899
+    /// §5.3.2: the search algorithm runs probes serially).
+    pmtu_probe_pn: ?u64 = null,
+    /// Size in bytes the in-flight probe was padded to. Matches the
+    /// resulting datagram size. Valid iff `pmtu_probe_pn != null`.
+    pmtu_probed_size: u16 = 0,
+    /// Consecutive-loss counter for the current probe size. Resets on
+    /// any successful probe ack.
+    pmtu_fail_count: u16 = 0,
+    /// Recorded upper bound: the smallest probe size that has been
+    /// declared lost `probe_threshold` times in a row. Probes never
+    /// attempt sizes >= this value. Null = no upper bound discovered;
+    /// search ceiling stays at `PmtudConfig.max_mtu`.
+    pmtu_upper_bound: ?u16 = null,
+    /// Number of in-flight probes ever transmitted on this path. The
+    /// embedder reads this via `PathStats.pmtu_probes_in_flight` to
+    /// confirm DPLPMTUD is active. Value reflects "currently in
+    /// flight" (0 or 1) for symmetry with the existing PTO / PING
+    /// counters.
+    pmtu_probes_in_flight: u16 = 0,
+    /// Consecutive regular-packet losses at the current PMTU for
+    /// RFC 8899 §4.4 black-hole detection. Reset on any successful
+    /// regular ack.
+    pmtu_consecutive_regular_losses: u16 = 0,
+
     peer_addr_set: bool = false,
     local_addr_set: bool = false,
     retire_deadline_us: ?u64 = null,
@@ -477,7 +600,175 @@ pub const PathState = struct {
             .min_rtt_us = rtt.min_rtt_us,
             .ssthresh = cc.ssthresh,
             .congestion_window_state = phase,
+            .pmtu = self.pmtu,
+            .pmtu_state = self.pmtu_state,
+            .pmtu_probes_in_flight = self.pmtu_probes_in_flight,
+            .pmtu_fail_count = self.pmtu_fail_count,
+            .pmtu_upper_bound = self.pmtu_upper_bound,
         };
+    }
+
+    // -- RFC 8899 DPLPMTUD helpers ----------------------------------
+    //
+    // These are the small, unit-testable mutations the connection
+    // calls from its send / ack / loss hot paths. Splitting them into
+    // named methods keeps `state.zig` readable and lets the inline
+    // tests below pin the state machine without standing up a full
+    // Connection.
+
+    /// True iff DPLPMTUD probing is enabled and the current state is
+    /// `search`. `Connection.pollLevelOnPath` consults this to decide
+    /// whether to emit a probe at the next opportunity.
+    pub fn pmtudIsSearching(self: *const PathState) bool {
+        return self.pmtu_state == .search and self.pmtu_probe_pn == null;
+    }
+
+    /// Return the next probe size in bytes given the embedder's
+    /// configured `probe_step` and `max_mtu`, or null if no further
+    /// probe is permitted (search complete / disabled / upper-bound
+    /// reached). RFC 8899 §5.3.1 search algorithm.
+    ///
+    /// The upper bound is interpreted as a CLOSED ceiling — probes
+    /// never re-try a size we already declared lost
+    /// `probe_threshold` times. `max_mtu` is the OPEN ceiling: a
+    /// probe at exactly `max_mtu` is allowed (e.g. to tighten on a
+    /// 1500-byte ethernet path with 28 bytes of IPv4+UDP overhead
+    /// already accounted for).
+    pub fn pmtudNextProbeSize(
+        self: *const PathState,
+        probe_step: u16,
+        max_mtu: u16,
+    ) ?u16 {
+        if (self.pmtu_state != .search) return null;
+        if (self.pmtu_probe_pn != null) return null;
+        const cur: u32 = @intCast(self.pmtu);
+        const step: u32 = probe_step;
+        const candidate: u32 = cur + step;
+        if (self.pmtu_upper_bound) |ub| {
+            if (candidate >= @as(u32, ub)) return null;
+        }
+        if (candidate > @as(u32, max_mtu)) return null;
+        return @intCast(candidate);
+    }
+
+    /// Stamp a freshly-emitted probe's metadata. Called by the send
+    /// path after the packet is sealed onto the wire. `pn` is the
+    /// QUIC packet number the probe occupies; `size` is the resulting
+    /// datagram size in bytes.
+    pub fn pmtudOnProbeSent(self: *PathState, pn: u64, size: u16) void {
+        self.pmtu_probe_pn = pn;
+        self.pmtu_probed_size = size;
+        self.pmtu_probes_in_flight = 1;
+    }
+
+    /// Probe ack: lift `pmtu` to the probed size and reset the fail
+    /// counter. If the next probe step would exceed the ceiling,
+    /// transition to `search_complete` (RFC 8899 §5.3.1 termination).
+    /// Returns the new pmtu value.
+    pub fn pmtudOnProbeAcked(
+        self: *PathState,
+        probe_step: u16,
+        max_mtu: u16,
+    ) usize {
+        const probed = self.pmtu_probed_size;
+        self.pmtu = probed;
+        self.pmtu_probe_pn = null;
+        self.pmtu_probes_in_flight = 0;
+        self.pmtu_probed_size = 0;
+        self.pmtu_fail_count = 0;
+        self.pmtu_consecutive_regular_losses = 0;
+        const next: u32 = @as(u32, probed) + probe_step;
+        // Termination: stop searching when the next probe size
+        // would land at or above a recorded upper bound, or strictly
+        // above max_mtu (the OPEN ceiling).
+        const upper_bound_blocks = if (self.pmtu_upper_bound) |ub|
+            next >= @as(u32, ub)
+        else
+            false;
+        if (upper_bound_blocks or next > @as(u32, max_mtu)) {
+            self.pmtu_state = .search_complete;
+        }
+        return self.pmtu;
+    }
+
+    /// Probe loss: bump `pmtu_fail_count`. Once it reaches
+    /// `probe_threshold`, record the probed size as the upper bound
+    /// (no further probes at or above this value) and reset for the
+    /// NEXT probe at the current `pmtu`. RFC 8899 §5.1.4 / §5.1.5.
+    /// Returns true iff the upper bound was just recorded.
+    pub fn pmtudOnProbeLost(self: *PathState, probe_threshold: u16) bool {
+        const probed = self.pmtu_probed_size;
+        self.pmtu_probe_pn = null;
+        self.pmtu_probes_in_flight = 0;
+        self.pmtu_probed_size = 0;
+        self.pmtu_fail_count +|= 1;
+        if (self.pmtu_fail_count >= probe_threshold) {
+            // Record the upper bound and stay in search at current pmtu.
+            // If a tighter bound was already known (e.g. peer
+            // max_udp_payload_size), keep the smaller one.
+            const new_ub: u16 = probed;
+            self.pmtu_upper_bound = if (self.pmtu_upper_bound) |old|
+                @min(old, new_ub)
+            else
+                new_ub;
+            self.pmtu_fail_count = 0;
+            // If the bound is at or below current pmtu the search
+            // can never advance — transition to search_complete. The
+            // upper bound is interpreted as a CLOSED ceiling
+            // (matching `pmtudNextProbeSize`), so equality also
+            // blocks further search.
+            if (@as(u32, self.pmtu_upper_bound.?) <= @as(u32, @intCast(self.pmtu))) {
+                self.pmtu_state = .search_complete;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// Regular-packet (non-probe) ack: reset the consecutive
+    /// regular-loss counter. Black-hole detection only fires on a
+    /// SUSTAINED run of regular losses with no acks in between.
+    pub fn pmtudOnRegularAcked(self: *PathState) void {
+        self.pmtu_consecutive_regular_losses = 0;
+    }
+
+    /// Regular-packet loss at the current pmtu — increments the
+    /// consecutive-loss counter and, once it reaches `probe_threshold`,
+    /// halves the pmtu (down to `initial_mtu`) and re-enters `search`.
+    /// RFC 8899 §4.4 black-hole detection. Returns true iff the
+    /// black-hole branch fired.
+    pub fn pmtudOnRegularLost(
+        self: *PathState,
+        probe_threshold: u16,
+        initial_mtu: u16,
+    ) bool {
+        if (self.pmtu_state == .disabled) return false;
+        self.pmtu_consecutive_regular_losses +|= 1;
+        if (self.pmtu_consecutive_regular_losses < probe_threshold) return false;
+        // Halve the PMTU but never go below the floor.
+        const halved: usize = @max(self.pmtu / 2, @as(usize, initial_mtu));
+        self.pmtu = halved;
+        self.pmtu_consecutive_regular_losses = 0;
+        self.pmtu_fail_count = 0;
+        self.pmtu_upper_bound = null;
+        self.pmtu_probe_pn = null;
+        self.pmtu_probes_in_flight = 0;
+        self.pmtu_probed_size = 0;
+        self.pmtu_state = .search;
+        return true;
+    }
+
+    /// Initialise the PMTUD state machine from the embedder's config.
+    /// Called from `Connection.init*` once the primary path exists.
+    pub fn pmtudInit(self: *PathState, cfg: PmtudConfig) void {
+        self.pmtu = cfg.initial_mtu;
+        self.pmtu_state = if (cfg.enable) .search else .disabled;
+        self.pmtu_probe_pn = null;
+        self.pmtu_probes_in_flight = 0;
+        self.pmtu_probed_size = 0;
+        self.pmtu_fail_count = 0;
+        self.pmtu_consecutive_regular_losses = 0;
+        self.pmtu_upper_bound = null;
     }
 
     /// Apply an incoming PATH_AVAILABLE / PATH_BACKUP frame
@@ -786,4 +1077,134 @@ test "PathSet opens and abandons additional paths" {
     try testing.expect(set.abandon(id));
     try testing.expectEqual(State.retiring, set.get(id).?.path.state);
     try testing.expectEqual(@as(u32, 0), set.active().id);
+}
+
+// -- RFC 8899 DPLPMTUD inline state-machine tests -----------------
+
+test "DPLPMTUD: pmtudInit configures floor and search state" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{
+        .initial_mtu = 1200,
+        .max_mtu = 1452,
+        .probe_step = 64,
+        .probe_threshold = 3,
+        .enable = true,
+    });
+    try testing.expectEqual(@as(usize, 1200), ps.pmtu);
+    try testing.expectEqual(PmtudState.search, ps.pmtu_state);
+    try testing.expectEqual(@as(?u64, null), ps.pmtu_probe_pn);
+    try testing.expect(ps.pmtudIsSearching());
+}
+
+test "DPLPMTUD: enable=false leaves state disabled" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .enable = false });
+    try testing.expectEqual(PmtudState.disabled, ps.pmtu_state);
+    try testing.expect(!ps.pmtudIsSearching());
+}
+
+test "DPLPMTUD: pmtudNextProbeSize advances by probe_step until ceiling" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1280, .probe_step = 50 });
+    try testing.expectEqual(@as(?u16, 1250), ps.pmtudNextProbeSize(50, 1280));
+    ps.pmtu = 1250;
+    try testing.expectEqual(@as(?u16, null), ps.pmtudNextProbeSize(50, 1280));
+}
+
+test "DPLPMTUD: probe ack lifts pmtu and resets fail counter" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1452, .probe_step = 64 });
+    ps.pmtudOnProbeSent(7, 1264);
+    ps.pmtu_fail_count = 2; // pretend we'd had earlier losses
+    _ = ps.pmtudOnProbeAcked(64, 1452);
+    try testing.expectEqual(@as(usize, 1264), ps.pmtu);
+    try testing.expectEqual(@as(?u64, null), ps.pmtu_probe_pn);
+    try testing.expectEqual(@as(u16, 0), ps.pmtu_fail_count);
+    try testing.expectEqual(PmtudState.search, ps.pmtu_state);
+}
+
+test "DPLPMTUD: probe ack flips to search_complete at the ceiling" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1300, .probe_step = 64 });
+    ps.pmtudOnProbeSent(11, 1264);
+    _ = ps.pmtudOnProbeAcked(64, 1300);
+    try testing.expectEqual(@as(usize, 1264), ps.pmtu);
+    // 1264 + 64 = 1328 > 1300 ceiling → search_complete.
+    try testing.expectEqual(PmtudState.search_complete, ps.pmtu_state);
+}
+
+test "DPLPMTUD: probe loss bumps fail_count, threshold records upper bound" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1500, .probe_step = 50, .probe_threshold = 3 });
+
+    // Loss 1, 2: just bump counter.
+    ps.pmtudOnProbeSent(1, 1300);
+    try testing.expect(!ps.pmtudOnProbeLost(3));
+    try testing.expectEqual(@as(u16, 1), ps.pmtu_fail_count);
+
+    ps.pmtudOnProbeSent(2, 1300);
+    try testing.expect(!ps.pmtudOnProbeLost(3));
+    try testing.expectEqual(@as(u16, 2), ps.pmtu_fail_count);
+
+    // Loss 3: record upper bound.
+    ps.pmtudOnProbeSent(3, 1300);
+    try testing.expect(ps.pmtudOnProbeLost(3));
+    try testing.expectEqual(@as(?u16, 1300), ps.pmtu_upper_bound);
+    // pmtu stays at floor (1200), state stays search but ceiling now 1300.
+    try testing.expectEqual(@as(usize, 1200), ps.pmtu);
+    try testing.expectEqual(PmtudState.search, ps.pmtu_state);
+    // Next probe size is bounded by the new upper bound. Upper bound
+    // is CLOSED — 1200+50=1250 < 1300, so 1250 is the next candidate.
+    try testing.expectEqual(@as(?u16, 1250), ps.pmtudNextProbeSize(50, 1500));
+}
+
+test "DPLPMTUD: probe loss at floor with bound at floor → search_complete" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1500, .probe_step = 100, .probe_threshold = 1 });
+    // First loss with threshold=1: record bound and check the
+    // search_complete branch when bound <= pmtu. Probed size 1200 is
+    // exactly the floor.
+    ps.pmtudOnProbeSent(1, 1200);
+    _ = ps.pmtudOnProbeLost(1);
+    try testing.expectEqual(@as(?u16, 1200), ps.pmtu_upper_bound);
+    try testing.expectEqual(PmtudState.search_complete, ps.pmtu_state);
+}
+
+test "DPLPMTUD: black-hole detection halves pmtu after probe_threshold regular losses" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .initial_mtu = 1200, .max_mtu = 1452, .probe_step = 64, .probe_threshold = 3 });
+    // Pretend pmtu was lifted to 1400 via prior probes.
+    ps.pmtu = 1400;
+    ps.pmtu_state = .search_complete;
+    try testing.expect(!ps.pmtudOnRegularLost(3, 1200));
+    try testing.expectEqual(@as(u16, 1), ps.pmtu_consecutive_regular_losses);
+    try testing.expect(!ps.pmtudOnRegularLost(3, 1200));
+    try testing.expect(ps.pmtudOnRegularLost(3, 1200));
+    // 1400 / 2 = 700, but never below floor 1200.
+    try testing.expectEqual(@as(usize, 1200), ps.pmtu);
+    try testing.expectEqual(PmtudState.search, ps.pmtu_state);
+    try testing.expectEqual(@as(u16, 0), ps.pmtu_consecutive_regular_losses);
+}
+
+test "DPLPMTUD: a regular ack resets the consecutive-loss counter" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{});
+    ps.pmtu = 1300;
+    _ = ps.pmtudOnRegularLost(3, 1200);
+    _ = ps.pmtudOnRegularLost(3, 1200);
+    try testing.expectEqual(@as(u16, 2), ps.pmtu_consecutive_regular_losses);
+    ps.pmtudOnRegularAcked();
+    try testing.expectEqual(@as(u16, 0), ps.pmtu_consecutive_regular_losses);
+    // Now another loss is below threshold → no halving.
+    try testing.expect(!ps.pmtudOnRegularLost(3, 1200));
+    try testing.expectEqual(@as(usize, 1300), ps.pmtu);
+}
+
+test "DPLPMTUD: disabled state never enters black-hole detection" {
+    var ps = PathState.init(0, .{}, .{}, testCid(&.{1}), testCid(&.{2}), .{});
+    ps.pmtudInit(.{ .enable = false });
+    try testing.expect(!ps.pmtudOnRegularLost(1, 1200));
+    try testing.expect(!ps.pmtudOnRegularLost(1, 1200));
+    try testing.expect(!ps.pmtudOnRegularLost(1, 1200));
+    try testing.expectEqual(PmtudState.disabled, ps.pmtu_state);
 }

@@ -381,6 +381,11 @@ pub const SealOptions = struct {
     /// When set, use draft-ietf-quic-multipath-21 §2.4's
     /// path-ID-aware nonce for 1-RTT packet protection.
     multipath_path_id: ?u32 = null,
+    /// Pad the resulting protected datagram to at least this many
+    /// bytes by appending PADDING frames (0x00 bytes) inside the AEAD
+    /// payload. RFC 8899 DPLPMTUD probe packets use this to inflate a
+    /// PADDING+PING bundle to the probed size. 0 disables (default).
+    pad_to: usize = 0,
 };
 
 /// Build a fully-protected 1-RTT packet into `dst`. Returns the
@@ -398,7 +403,21 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
     // pn_offset + 4) lands in ciphertext.  pt_len + tag(16) must be
     // >= 4 + (4 - pn_len) = 8 - pn_len. So pt_len >= 4 - pn_len.
     const min_pt: usize = if (pn_len < 4) @as(usize, 4 - pn_len) else 0;
-    const pt_len: usize = @max(opts.payload.len, min_pt);
+    var pt_len: usize = @max(opts.payload.len, min_pt);
+
+    // RFC 8899 DPLPMTUD probe sizing: pad inside the AEAD payload so
+    // the resulting protected datagram reaches `opts.pad_to` bytes.
+    // The header (without PN) is `1 + dcid_len`; the PN occupies
+    // `pn_len`; the AEAD tag is 16. Therefore:
+    //   total = 1 + dcid_len + pn_len + pt_len + 16
+    // and the plaintext we need is `pad_to - 1 - dcid_len - pn_len - 16`.
+    if (opts.pad_to > 0) {
+        const fixed_overhead: usize = 1 + opts.dcid.len + pn_len + 16;
+        if (opts.pad_to > fixed_overhead) {
+            const target_pt: usize = opts.pad_to - fixed_overhead;
+            if (target_pt > pt_len) pt_len = target_pt;
+        }
+    }
 
     const total_required = 1 + opts.dcid.len + pn_len + pt_len + 16;
     if (dst.len < total_required) return Error.OutputTooSmall;
@@ -426,16 +445,17 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
     } });
 
     // Stage the plaintext if we need to pad. Common case (no padding)
-    // hands the caller's slice straight through.
-    var pad_buf: [4]u8 = @splat(0);
-    var staged_buf: [4]u8 = undefined;
+    // hands the caller's slice straight through. Staging buffer is
+    // sized for the max QUIC v1 datagram (~1500 B); DPLPMTUD probes
+    // (RFC 8899) push pt_len up close to that ceiling. The 4-byte
+    // sample-floor pad needed by RFC 9001 §5.4.2 still fits trivially.
+    var staged_buf: [2048]u8 = undefined;
     const pt_slice: []const u8 = if (pt_len == opts.payload.len)
         opts.payload
     else blk: {
         std.debug.assert(pt_len <= staged_buf.len);
         @memcpy(staged_buf[0..opts.payload.len], opts.payload);
-        const pad_n = pt_len - opts.payload.len;
-        @memcpy(staged_buf[opts.payload.len..pt_len], pad_buf[0..pad_n]);
+        @memset(staged_buf[opts.payload.len..pt_len], 0);
         break :blk staged_buf[0..pt_len];
     };
 

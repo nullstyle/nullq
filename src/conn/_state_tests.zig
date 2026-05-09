@@ -1092,7 +1092,7 @@ test "poll helper emits one draft multipath control frame with retransmit metada
         .in_flight = false,
     };
     defer packet.deinit(allocator);
-    var payload: [default_mtu]u8 = undefined;
+    var payload: [max_recv_plaintext]u8 = undefined;
     var pos: usize = 0;
 
     try std.testing.expect(try conn.emitOnePendingMultipathFrame(&packet, &payload, &pos, default_mtu));
@@ -1125,7 +1125,7 @@ test "poll helper coalesces draft multipath control frames with retransmit metad
         .in_flight = false,
     };
     defer packet.deinit(allocator);
-    var payload: [default_mtu]u8 = undefined;
+    var payload: [max_recv_plaintext]u8 = undefined;
     var pos: usize = 0;
 
     try std.testing.expect(try conn.emitPendingMultipathFrames(&packet, &payload, &pos, default_mtu));
