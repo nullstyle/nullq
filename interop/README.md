@@ -132,10 +132,18 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   `src/tls/transport_params.zig`, the wiring is unfinished.
   **Deferred** to a follow-up session (needs an alt-port
   listening socket and runner-IP introspection).
-- **Server `BA` (rebind-addr) × quiche** — the FIRST server
-  packet on a freshly-migrated path occasionally lacks
-  PATH_CHALLENGE under quiche's tight rebind cadence. **Deferred**;
-  needs interactive packet-order tracing.
+- **Server `BA` (rebind-addr) × quiche** — fix landed on
+  `followup-path-challenge-order` (2026-05-09): the server's
+  packet builder now emits `PATH_CHALLENGE` as the FIRST frame of
+  the first datagram on a peer-migrated path (and pads the
+  datagram to 1200 bytes per RFC 9000 §8.2.1 ¶3, subject to
+  anti-amp). The historical drain order placed `PATH_CHALLENGE`
+  behind ACK / MAX_DATA / NEW_CONNECTION_ID etc., which under
+  quiche's tight rebind cadence occasionally pushed the probing
+  frame out of the first packet entirely. Two new unit tests in
+  `src/conn/_state_tests.zig` pin the new ordering and the
+  non-migration packet-size invariant. **Re-running the interop
+  matrix is needed to confirm the cell actually flips PASS.**
 
 **Build infra note**: the qns Dockerfile (`interop/qns/Dockerfile`)
 is now pinned to `ARG ZIG_VERSION=0.17.0-dev.269+ebff43698`, matching

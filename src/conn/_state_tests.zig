@@ -3792,6 +3792,138 @@ test "PATH_RESPONSE during pending rebinding is sent to the challenge address" {
     try std.testing.expect(path.path.bytes_sent > 0);
 }
 
+test "peer-initiated migration emits PATH_CHALLENGE as the first frame even with backlogged ACKs and MAX_DATA" {
+    // Reproduces the interop bug surfaced by `server × quiche × rebind-addr`:
+    // when the server's primary path receives a peer-rebind, the FIRST
+    // datagram emitted on the new tuple MUST lead with PATH_CHALLENGE.
+    // The historical drain order placed PATH_CHALLENGE behind ACK,
+    // MAX_DATA, MAX_STREAMS, NEW_CONNECTION_ID etc. — quiche's
+    // path-validation state machine misroutes the packet when the
+    // probing frame isn't first.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    try conn.setLocalScid(&.{0xc1});
+    conn.test_only_force_handshake_for_migration = true;
+
+    const old_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ @as([18]u8, @splat(0)) };
+    const new_addr = Address{ .bytes = .{ 10, 0, 0, 2 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(old_addr);
+    path.path.markValidated();
+    // Substantial anti-amp credit so the seal can fit a 1200-byte datagram.
+    path.path.bytes_received = 4_000;
+
+    // Pre-queue a fat ACK and a connection-level MAX_DATA so the
+    // historical drain order would push PATH_CHALLENGE to (at best)
+    // the third frame in the packet — and at worst out of the
+    // packet entirely.
+    path.app_pn_space.recordReceived(0, 1_000_000);
+    path.app_pn_space.recordReceived(2, 1_000_010);
+    path.app_pn_space.recordReceived(4, 1_000_020);
+    path.app_pn_space.recordReceived(7, 1_000_030);
+    conn.pending_frames.max_data = 65_536;
+    conn.pending_frames.max_streams_bidi = 256;
+    conn.pending_frames.max_streams_uni = 100;
+
+    // Trigger the peer-initiated migration. `handlePeerAddressChange`
+    // queues PATH_CHALLENGE on this path AFTER the receive side has
+    // already populated the ACK / MAX_* backlogs above.
+    try conn.handlePeerAddressChange(path, new_addr, 1200, 1_000_100);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expect(path.pending_migration_reset);
+
+    // Drive one poll. The fast-path emission MUST put PATH_CHALLENGE
+    // first in the resulting packet.
+    var packet_buf: [default_mtu]u8 = undefined;
+    const datagram = (try conn.pollDatagram(&packet_buf, 1_000_200)).?;
+    try std.testing.expect(datagram.to != null);
+    try std.testing.expect(Address.eql(new_addr, datagram.to.?));
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+
+    var plaintext: [max_recv_plaintext]u8 = undefined;
+    const keys = (try conn.packetKeys(.application, .write)).?;
+    const opened = try short_packet_mod.open1Rtt(&plaintext, packet_buf[0..datagram.len], .{
+        .dcid_len = 1,
+        .keys = &keys,
+        .largest_received = 0,
+    });
+
+    // The FIRST decoded frame must be PATH_CHALLENGE (modulo a leading
+    // PADDING run — quiche tolerates pre-PADDING but it's never emitted
+    // here, so we assert on the strict invariant).
+    var it = frame_mod.iter(opened.payload);
+    const first_frame = (try it.next()).?;
+    try std.testing.expect(first_frame == .path_challenge);
+
+    // Also assert no STREAM / CRYPTO / DATAGRAM frames precede the
+    // probing frame. The iterator already consumed the first frame
+    // above; walk the rest and confirm no app-data ahead of where
+    // PATH_CHALLENGE landed (which is impossible by construction since
+    // it's first, but the explicit walk pins the property for future
+    // refactors that might reintroduce a coalesced STREAM ahead of
+    // path_challenge).
+    var saw_app_data_after_pc = false;
+    while (try it.next()) |f| switch (f) {
+        .stream, .crypto, .datagram => saw_app_data_after_pc = true,
+        else => {},
+    };
+    // App-data after PATH_CHALLENGE is fine — quiche's complaint is
+    // about WHAT'S BEFORE the probing frame, not after. But on a freshly
+    // migrated path the server has no in-flight streams (the path is
+    // unvalidated; `congestionBlockedOnPath` rejects fresh stream sends
+    // until validation completes), so app-data after PATH_CHALLENGE
+    // shouldn't actually appear under this scenario either.
+    try std.testing.expect(!saw_app_data_after_pc);
+
+    // RFC 9000 §8.2.1 ¶3: a datagram carrying a PATH_CHALLENGE MUST be
+    // padded to at least 1200 bytes (subject to anti-amp). Anti-amp
+    // here is 3 * 1200 = 3600 bytes (margin we set above), well above
+    // the floor. Confirm the seal honored the §8.2.1 floor.
+    try std.testing.expect(datagram.len >= default_mtu);
+}
+
+test "non-migration polls do not pad short-header datagrams to 1200 bytes" {
+    // Regression guard for the PATH_CHALLENGE-first fix: when no
+    // peer migration is active, ordinary 1-RTT packets MUST NOT be
+    // forced to 1200 bytes. The ACK-only flush below would balloon
+    // every keepalive heartbeat from ~30 bytes to 1200 if the
+    // pad-to-1200 logic leaked outside the migration window.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{0xaa});
+    try conn.setLocalScid(&.{0xc1});
+
+    const peer_addr = Address{ .bytes = .{ 10, 0, 0, 1 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(peer_addr);
+    path.path.markValidated();
+    path.path.bytes_received = 4_000;
+
+    // Queue a single ACK; that's the only frame the server owes the
+    // peer right now, no migration in progress.
+    path.app_pn_space.recordReceived(0, 1_000_000);
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+    try std.testing.expect(!path.pending_migration_reset);
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const datagram = (try conn.pollDatagram(&packet_buf, 1_000_100)).?;
+
+    // The resulting datagram MUST be small (an ACK frame only),
+    // not padded out to 1200 bytes.
+    try std.testing.expect(datagram.len < 200);
+}
+
 test "queued path CIDs participate in incoming short-header routing and retirement" {
     const allocator = std.testing.allocator;
     var ctx = try boringssl.tls.Context.initClient(.{});
