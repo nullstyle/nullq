@@ -60,7 +60,18 @@ const endpoint_udp_payload_size = 1350;
 const endpoint_connection_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
-const endpoint_bidi_stream_limit: u64 = 1000;
+// Sized to accommodate the quic-interop-runner `multiplexing` test
+// (2000 concurrent bidi streams) without ever needing a MAX_STREAMS
+// replenishment round-trip. quiche's client pipelines its 2000-
+// stream burst aggressively enough that the first replenishment
+// (queued by `maybeQueueBatchedMaxStreams` once `remaining <
+// batch/2`) doesn't reach the wire before the burst hits the cap;
+// the connection deadlocks. quic-go and ngtcp2 also send 2000 but
+// their pipelining is gentler and they recover before timeout.
+// 2500 gives margin without requiring tuning the core watermark
+// (`src/conn/state.zig` `maybeQueueBatchedMaxStreams`), which would
+// affect every embedder, not just the qns harness.
+const endpoint_bidi_stream_limit: u64 = 2500;
 const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 2;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
@@ -129,6 +140,15 @@ const ClientConnectionOptions = struct {
     /// has flowed. Subsequent `poll` output and inbound recvs are
     /// routed via the new socket.
     request_active_migration: bool = false,
+    /// Sleep 750ms before binding the client socket to dodge the
+    /// quic-network-simulator's bridge / ns-3-boot packet-drop race.
+    /// Only useful for `TESTCASE=longrtt` where the runner's harness
+    /// asserts ≥2 ClientHellos on the wire and the dropped PTO retx
+    /// causes a false negative. Harmful for `rebind-addr` (the warmup
+    /// pushes the first CH into the rebind window so the handshake
+    /// CRYPTO bytes get stranded on the pre-rebind 4-tuple). Default
+    /// false; the embedder flips it on for longrtt only.
+    apply_simulator_warmup: bool = false,
 };
 
 var keylog_io: ?std.Io = null;
@@ -845,6 +865,12 @@ fn runClient(
     // the SERVER address or the SERVER_NAME env var, we know the
     // client is expected to perform an active migration mid-transfer.
     const request_active_migration = clientShouldActivelyMigrate(opts);
+    // Apply the qns simulator-bridge warmup only on `longrtt`; the
+    // 2026-05-09 matrix run showed it actively breaks `rebind-addr`
+    // (handshake collapses inside the rebind window). See
+    // `ClientConnectionOptions.apply_simulator_warmup` for the full
+    // rationale.
+    const apply_simulator_warmup = std.mem.eql(u8, opts.testcase, "longrtt");
 
     switch (mode) {
         .normal => try runClientConnection(
@@ -860,6 +886,7 @@ fn runClient(
                 .new_token_store = &new_tokens,
                 .request_key_update = request_key_update,
                 .request_active_migration = request_active_migration,
+                .apply_simulator_warmup = apply_simulator_warmup,
             },
         ),
         .resumption, .zerortt => {
@@ -876,6 +903,7 @@ fn runClient(
                     .wait_for_ticket = &tickets,
                     .qlog_sink = if (qlog_sink) |*sink| sink else null,
                     .new_token_store = &new_tokens,
+                    .apply_simulator_warmup = apply_simulator_warmup,
                 },
             );
             var session = try tickets.session(client_tls);
@@ -894,6 +922,7 @@ fn runClient(
                     .qlog_sink = if (qlog_sink) |*sink| sink else null,
                     .new_token_store = &new_tokens,
                     .initial_token = new_tokens.latest,
+                    .apply_simulator_warmup = apply_simulator_warmup,
                 },
             );
         },
@@ -983,14 +1012,25 @@ fn runClientConnection(
     // 750ms of warmup is enough to push the first CH (and therefore
     // the +999ms PTO retx) past the bad window in every run we
     // tested. 100ms is not enough; we did not narrow the lower bound
-    // beyond that. This delay is harmless for non-longrtt tests:
-    // their RTT is 30ms, so adding 750ms to handshake start adds
-    // 750ms to total runtime — well within test timeouts.
+    // beyond that. The warmup is gated on `apply_simulator_warmup`
+    // (set only for `TESTCASE=longrtt`): we previously applied it
+    // unconditionally on the assumption it was harmless. The
+    // 2026-05-09 interop matrix run proved that wrong for
+    // `rebind-addr` — the runner's `--first-rebind=1s` lands exactly
+    // when the warmup-delayed CH hits the wire, the handshake CRYPTO
+    // bytes get stranded on the pre-rebind 4-tuple, and the
+    // handshake collapses into bare retransmits. Other testcases
+    // either don't rebind (so the warmup is a free 750ms idle) or
+    // already have RTTs / timeouts that absorb the sleep without
+    // affecting outcomes; either way, only `longrtt` *needs* the
+    // workaround.
     //
     // If/when the simulator harness is fixed (see
     // https://github.com/marten-seemann/quic-network-simulator), this
     // sleep can be deleted.
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(750), .awake) catch {};
+    if (conn_opts.apply_simulator_warmup) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(750), .awake) catch {};
+    }
 
     var conn = try quic_zig.Connection.initClient(allocator, client_tls, server_name_z);
     defer conn.deinit();
@@ -1661,6 +1701,17 @@ fn retryTokenValidationResult(
 }
 
 fn retryAddressContext(dst: []u8, peer: Net.IpAddress) []const u8 {
+    // The bound context fits inside `retry_token.max_address_len`
+    // (22 bytes, mirroring `path.Address.bytes`). The v6 form is
+    // 1 (family) + 16 (addr) + 2 (port) = 19 bytes; we deliberately
+    // omit the 4-byte IPv6 flow label so the budget is met. Including
+    // the flow label was the original shape but pushed the v6 form to
+    // 23 bytes — `validateBoundInputs` (`src/conn/retry_token.zig`)
+    // returns `Error.ContextTooLong`, and the qns server crashed on
+    // every IPv4-mapped-IPv6 client (every quic-interop-runner peer
+    // since the wrapper started inheriting the binary's `[::]:443`
+    // dual-stack default). The flow label adds no useful binding —
+    // it's a hint for ECMP routing, not part of peer identity.
     var pos: usize = 0;
     switch (peer) {
         .ip4 => |ip4| {
@@ -1678,8 +1729,6 @@ fn retryAddressContext(dst: []u8, peer: Net.IpAddress) []const u8 {
             pos += ip6.bytes.len;
             std.mem.writeInt(u16, dst[pos..][0..2], ip6.port, .big);
             pos += 2;
-            std.mem.writeInt(u32, dst[pos..][0..4], ip6.flow, .big);
-            pos += 4;
         },
     }
     return dst[0..pos];
