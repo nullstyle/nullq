@@ -33,6 +33,7 @@ test {
     _ = @import("conformance/rfc9000_streams_flow.zig");
     _ = @import("conformance/rfc9000_negotiation_validation.zig");
     _ = @import("conformance/rfc9000_packetization.zig");
+    _ = @import("conformance/rfc9000_ecn.zig");
     _ = @import("conformance/rfc9001_tls.zig");
     _ = @import("conformance/rfc9002_loss_recovery.zig");
     _ = @import("conformance/rfc9221_datagram.zig");

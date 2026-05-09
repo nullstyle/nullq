@@ -38,8 +38,254 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
+/// Platform-specific IP-layer constants. `posix.IP` / `posix.IPV6`
+/// resolve to `void` on macOS / Darwin (the `std.c` switch elides
+/// Apple), so we hard-code the numeric values from the kernel
+/// headers — these are wire-stable ABI on every Unix we run on.
+const ip_consts = blk: {
+    if (builtin.os.tag == .linux) {
+        // include/uapi/linux/in.h
+        break :blk struct {
+            pub const ip_proto: u32 = 0;
+            pub const ipv6_proto: u32 = 41;
+            pub const ip_tos: u32 = 1;
+            pub const ip_recvtos: u32 = 13;
+            pub const ipv6_tclass: u32 = 67;
+            pub const ipv6_recvtclass: u32 = 66;
+        };
+    } else if (builtin.os.tag.isDarwin()) {
+        // bsd/netinet/in.h, bsd/netinet6/in6.h
+        break :blk struct {
+            pub const ip_proto: u32 = 0;
+            pub const ipv6_proto: u32 = 41;
+            pub const ip_tos: u32 = 3;
+            pub const ip_recvtos: u32 = 27;
+            pub const ipv6_tclass: u32 = 36;
+            pub const ipv6_recvtclass: u32 = 35;
+        };
+    } else {
+        // Unknown platform — pretend the constants are unset so the
+        // setter helpers below fall through to `error.Unsupported`.
+        break :blk struct {
+            pub const ip_proto: u32 = 0;
+            pub const ipv6_proto: u32 = 0;
+            pub const ip_tos: u32 = 0;
+            pub const ip_recvtos: u32 = 0;
+            pub const ipv6_tclass: u32 = 0;
+            pub const ipv6_recvtclass: u32 = 0;
+        };
+    }
+};
+
+/// True iff the build target exposes IP TOS / IPV6 TCLASS sockopts.
+/// Both setter helpers degrade to `error.Unsupported` on platforms
+/// where this is `false`.
+const has_ip_ecn_sockopts: bool = builtin.os.tag == .linux or builtin.os.tag.isDarwin();
+
 /// Underlying socket handle type; matches `std.Io.net.Socket.Handle`.
 pub const Handle = posix.socket_t;
+
+/// IETF ECN codepoint (RFC 3168 §5). The two low bits of the IPv4
+/// TOS byte / IPv6 TCLASS byte. QUIC uses these for path-level
+/// congestion signaling (RFC 9000 §13.4):
+/// * `not_ect` (0b00) — endpoint is opting out of ECN.
+/// * `ect0` (0b10) — ECN-Capable, codepoint 0; quic_zig's default for
+///   1-RTT and 0-RTT packets.
+/// * `ect1` (0b01) — ECN-Capable, codepoint 1; quic_zig only ever
+///   parses, never emits, this on the send side (per QUIC consensus).
+/// * `ce` (0b11) — Congestion Experienced; only ever set by routers
+///   on the path. A QUIC endpoint that emits CE itself is broken.
+pub const EcnCodepoint = enum(u2) {
+    not_ect = 0b00,
+    ect1 = 0b01,
+    ect0 = 0b10,
+    ce = 0b11,
+};
+
+/// Recommended size for the per-recv cmsg control buffer that the
+/// loop hands `Socket.receiveTimeout`. 64 bytes is comfortably big
+/// enough for both `IP_TOS` (Linux IP_TOS / macOS RECVTOS) and
+/// `IPV6_TCLASS` cmsgs in one datagram, including alignment padding;
+/// production QUIC embedders rarely enable other ancillary data
+/// (PKTINFO etc.) on the QUIC socket, so the 64-byte ceiling is
+/// generous.
+pub const default_cmsg_buffer_bytes: usize = 64;
+
+/// Errors raised by the ECN socket-option helpers. They wrap the
+/// same `setsockopt` error space as the buffer helpers above.
+pub const SetEcnError = error{
+    /// The platform does not expose either `IP_TOS` or `IPV6_TCLASS`.
+    /// Embedders that must run on such a platform should fall back to
+    /// disabling ECN at the `Connection.Config` / `Server.Config`
+    /// level rather than treating this as fatal.
+    Unsupported,
+    /// `setsockopt` rejected the value.
+    InvalidValue,
+    /// The current process lacks the privileges to set the socket
+    /// option (rare; sometimes seen in restrictive container
+    /// sandboxes).
+    PermissionDenied,
+} || posix.UnexpectedError;
+
+/// Set the outgoing IP-layer ECN codepoint for every datagram
+/// emitted on `handle`. Sets both `IP_TOS` (IPv4) and `IPV6_TCLASS`
+/// (IPv6) so the same socket carries the marking on dual-stack
+/// listeners. Failures on the IPv6 setter when the socket is
+/// AF_INET-only (and vice versa) collapse to "first success wins"
+/// — the QUIC stack tolerates one of the two failing as long as
+/// the address family it actually uses got the marking.
+///
+/// Only the low two bits of the TOS byte are touched; quic_zig
+/// leaves the DSCP bits at zero (the kernel default).
+pub fn setEcnSendMarking(handle: Handle, codepoint: EcnCodepoint) SetEcnError!void {
+    if (!has_ip_ecn_sockopts) return error.Unsupported;
+    const tos: c_int = @intFromEnum(codepoint);
+    const tos_bytes = std.mem.asBytes(&tos);
+
+    var any_ok = false;
+    setsockoptIntChecked(handle, ip_consts.ip_proto, ip_consts.ip_tos, tos_bytes) catch |err| switch (err) {
+        // OS treats the option as inapplicable for this socket family
+        // — that's fine if the v6 setter below succeeds.
+        error.Unsupported => {},
+        else => |e| return e,
+    };
+    any_ok = true;
+
+    // Some platforms expose IPV6_TCLASS only when the socket is
+    // bound IPv6; on a strict-IPv4 socket the call returns EINVAL
+    // / ENOPROTOOPT. Try anyway and swallow those failures.
+    setsockoptIntChecked(handle, ip_consts.ipv6_proto, ip_consts.ipv6_tclass, tos_bytes) catch |err| switch (err) {
+        error.Unsupported => {},
+        else => |e| {
+            // If IPv4 also failed (any_ok would be false), surface
+            // the v6 error. Otherwise the v4 setter already won.
+            if (!any_ok) return e;
+        },
+    };
+    if (!any_ok) return error.Unsupported;
+}
+
+/// Enable ancillary delivery of the received IP TOS byte via cmsg
+/// on `handle`. Sets `IP_RECVTOS` (Linux/BSD/macOS) and
+/// `IPV6_RECVTCLASS` so a recvmsg with a control buffer surfaces
+/// the per-datagram TOS. Same dual-stack tolerance as
+/// `setEcnSendMarking` — at least one address family must succeed.
+pub fn setEcnRecvEnabled(handle: Handle, enabled: bool) SetEcnError!void {
+    if (!has_ip_ecn_sockopts) return error.Unsupported;
+    const value: c_int = if (enabled) 1 else 0;
+    const value_bytes = std.mem.asBytes(&value);
+
+    var any_ok = false;
+    setsockoptIntChecked(handle, ip_consts.ip_proto, ip_consts.ip_recvtos, value_bytes) catch |err| switch (err) {
+        error.Unsupported => {},
+        else => |e| return e,
+    };
+    any_ok = true;
+    setsockoptIntChecked(handle, ip_consts.ipv6_proto, ip_consts.ipv6_recvtclass, value_bytes) catch |err| switch (err) {
+        error.Unsupported => {},
+        else => |e| {
+            if (!any_ok) return e;
+        },
+    };
+    if (!any_ok) return error.Unsupported;
+}
+
+fn setsockoptIntChecked(handle: Handle, level: u32, optname: u32, opt_bytes: []const u8) SetEcnError!void {
+    // We can't use `posix.setsockopt` here: it panics on EINVAL,
+    // and EINVAL is the documented "IPv6 option on an AF_INET
+    // socket" / "IPv4 option on an AF_INET6 V6ONLY socket" return
+    // — which is exactly the dual-stack-tolerant behavior the
+    // ECN setters above rely on. Map the errnos ourselves and
+    // surface them as `error.Unsupported` so the caller falls
+    // through to the other address family.
+    const rc = std.c.setsockopt(handle, @intCast(level), optname, opt_bytes.ptr, @intCast(opt_bytes.len));
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        .INVAL,
+        .NOPROTOOPT,
+        .OPNOTSUPP,
+        .AFNOSUPPORT,
+        .PROTONOSUPPORT,
+        => return error.Unsupported,
+        .PERM, .ACCES => return error.PermissionDenied,
+        .NOMEM, .NOBUFS => return error.InvalidValue,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+/// Walk a populated `recvmsg` control buffer and extract the IP
+/// ECN codepoint, if present. Returns `not_ect` when no IP_TOS /
+/// IPV6_TCLASS cmsg was found — that's the conservative choice
+/// (no ECN marking observed). The walker tolerates malformed cmsg
+/// payloads (zero-length data, oversized `cmsg_len`) by skipping
+/// them; QUIC peers can't influence our control buffer so the
+/// guards are belt-and-suspenders for kernel quirks.
+pub fn parseEcnFromControl(control: []const u8) EcnCodepoint {
+    // cmsghdr layout differs between glibc Linux (`size_t` len, two
+    // `int`) and BSD/macOS (`socklen_t` len, two `int`). We read both
+    // by reaching into `std.c.cmsghdr` (the `extern struct` defined
+    // for every supported OS) and projecting the byte offsets via
+    // `@offsetOf` / `@sizeOf`. CMSG_DATA pads the header to
+    // pointer-alignment; CMSG_NXTHDR pads `cmsg_len` to the same.
+    const Cmsg = std.c.cmsghdr;
+    const header_size: usize = @sizeOf(Cmsg);
+    const len_off: usize = @offsetOf(Cmsg, "len");
+    const level_off: usize = @offsetOf(Cmsg, "level");
+    const type_off: usize = @offsetOf(Cmsg, "type");
+    const len_size: usize = @sizeOf(@FieldType(Cmsg, "len"));
+    const align_to: usize = @sizeOf(usize);
+
+    var pos: usize = 0;
+    while (pos + header_size <= control.len) {
+        const cmsg_len: usize = blk: {
+            if (len_size == @sizeOf(usize)) {
+                break :blk std.mem.readInt(usize, control[pos + len_off ..][0..@sizeOf(usize)], native_endian);
+            } else {
+                break :blk @intCast(std.mem.readInt(u32, control[pos + len_off ..][0..@sizeOf(u32)], native_endian));
+            }
+        };
+        if (cmsg_len < header_size or pos + cmsg_len > control.len) break;
+        const cmsg_level = std.mem.readInt(i32, control[pos + level_off ..][0..4], native_endian);
+        const cmsg_type = std.mem.readInt(i32, control[pos + type_off ..][0..4], native_endian);
+
+        const data_off = pos + header_size;
+        const data_len = cmsg_len - header_size;
+
+        if (cmsg_level == @as(i32, @intCast(ip_consts.ip_proto)) and
+            (cmsg_type == @as(i32, @intCast(ip_consts.ip_tos)) or
+                cmsg_type == @as(i32, @intCast(ip_consts.ip_recvtos))))
+        {
+            // The IP TOS byte may be carried as a single u8 (Linux
+            // / macOS) or as a 4-byte int (some BSDs). Either way
+            // the low byte holds the TOS.
+            if (data_len >= 1 and data_off < control.len) {
+                const tos_byte: u8 = control[data_off];
+                return @enumFromInt(@as(u2, @truncate(tos_byte & 0x03)));
+            }
+        }
+        if (cmsg_level == @as(i32, @intCast(ip_consts.ipv6_proto)) and cmsg_type == @as(i32, @intCast(ip_consts.ipv6_tclass))) {
+            // IPV6_TCLASS is documented as a 4-byte int across all
+            // major Unixes; the low byte holds the TCLASS (DSCP +
+            // ECN), of which we only consume the low two ECN bits.
+            if (data_len >= 4 and data_off + 4 <= control.len) {
+                const tclass = std.mem.readInt(i32, control[data_off..][0..4], native_endian);
+                return @enumFromInt(@as(u2, @truncate(@as(u32, @bitCast(tclass)) & 0x03)));
+            }
+            if (data_len >= 1 and data_off < control.len) {
+                const tos_byte: u8 = control[data_off];
+                return @enumFromInt(@as(u2, @truncate(tos_byte & 0x03)));
+            }
+        }
+
+        // Advance to the next cmsg, aligned per `CMSG_ALIGN`.
+        const aligned = std.mem.alignForward(usize, cmsg_len, align_to);
+        if (aligned == 0) break;
+        pos += aligned;
+    }
+    return .not_ect;
+}
+
+const native_endian = @import("builtin").cpu.arch.endian();
 
 /// Recommended `SO_RCVBUF` for a QUIC server on the open internet.
 ///
@@ -361,4 +607,94 @@ test "default tuning constants are reasonable" {
     // QNS test will silently regress, so make it a unit test.
     try testing.expect(default_server_recv_buffer_bytes >= 1 * 1024 * 1024);
     try testing.expect(default_server_send_buffer_bytes >= 1 * 1024 * 1024);
+}
+
+test "EcnCodepoint two-bit encoding matches RFC 3168" {
+    try testing.expectEqual(@as(u2, 0b00), @intFromEnum(EcnCodepoint.not_ect));
+    try testing.expectEqual(@as(u2, 0b01), @intFromEnum(EcnCodepoint.ect1));
+    try testing.expectEqual(@as(u2, 0b10), @intFromEnum(EcnCodepoint.ect0));
+    try testing.expectEqual(@as(u2, 0b11), @intFromEnum(EcnCodepoint.ce));
+}
+
+test "setEcnSendMarking applies ECT(0) without erroring on loopback" {
+    var ts = try TestSocket.init();
+    defer ts.deinit();
+    setEcnSendMarking(ts.handle(), .ect0) catch |err| switch (err) {
+        // Some sandboxes refuse to set IP options at all; accept.
+        error.PermissionDenied,
+        error.Unsupported,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+}
+
+test "setEcnRecvEnabled enables IP_RECVTOS without erroring on loopback" {
+    var ts = try TestSocket.init();
+    defer ts.deinit();
+    setEcnRecvEnabled(ts.handle(), true) catch |err| switch (err) {
+        error.PermissionDenied,
+        error.Unsupported,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    setEcnRecvEnabled(ts.handle(), false) catch |err| switch (err) {
+        error.PermissionDenied,
+        error.Unsupported,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+}
+
+test "parseEcnFromControl: empty buffer is not_ect" {
+    try testing.expectEqual(EcnCodepoint.not_ect, parseEcnFromControl(&.{}));
+}
+
+test "parseEcnFromControl: hand-rolled IP_TOS cmsg returns the codepoint" {
+    if (!has_ip_ecn_sockopts) return error.SkipZigTest;
+    const Cmsg = std.c.cmsghdr;
+    const header_size: usize = @sizeOf(Cmsg);
+    const align_to: usize = @sizeOf(usize);
+    const data_len: usize = 1;
+    const cmsg_total = std.mem.alignForward(usize, header_size + data_len, align_to);
+    var buf: [64]u8 = @splat(0);
+    const len_off: usize = @offsetOf(Cmsg, "len");
+    const level_off: usize = @offsetOf(Cmsg, "level");
+    const type_off: usize = @offsetOf(Cmsg, "type");
+    const len_size: usize = @sizeOf(@FieldType(Cmsg, "len"));
+    if (len_size == @sizeOf(usize)) {
+        std.mem.writeInt(usize, buf[len_off..][0..@sizeOf(usize)], header_size + data_len, native_endian);
+    } else {
+        std.mem.writeInt(u32, buf[len_off..][0..@sizeOf(u32)], @as(u32, @intCast(header_size + data_len)), native_endian);
+    }
+    std.mem.writeInt(i32, buf[level_off..][0..4], @as(i32, @intCast(ip_consts.ip_proto)), native_endian);
+    std.mem.writeInt(i32, buf[type_off..][0..4], @as(i32, @intCast(ip_consts.ip_tos)), native_endian);
+    // ECT(0) on the wire is the byte 0x02 (low two bits of TOS).
+    buf[header_size] = 0x02;
+    const out = parseEcnFromControl(buf[0..cmsg_total]);
+    try testing.expectEqual(EcnCodepoint.ect0, out);
+}
+
+test "parseEcnFromControl: hand-rolled IPV6_TCLASS cmsg returns the codepoint" {
+    if (!has_ip_ecn_sockopts) return error.SkipZigTest;
+    const Cmsg = std.c.cmsghdr;
+    const header_size: usize = @sizeOf(Cmsg);
+    const align_to: usize = @sizeOf(usize);
+    const data_len: usize = 4;
+    const cmsg_total = std.mem.alignForward(usize, header_size + data_len, align_to);
+    var buf: [64]u8 = @splat(0);
+    const len_off: usize = @offsetOf(Cmsg, "len");
+    const level_off: usize = @offsetOf(Cmsg, "level");
+    const type_off: usize = @offsetOf(Cmsg, "type");
+    const len_size: usize = @sizeOf(@FieldType(Cmsg, "len"));
+    if (len_size == @sizeOf(usize)) {
+        std.mem.writeInt(usize, buf[len_off..][0..@sizeOf(usize)], header_size + data_len, native_endian);
+    } else {
+        std.mem.writeInt(u32, buf[len_off..][0..@sizeOf(u32)], @as(u32, @intCast(header_size + data_len)), native_endian);
+    }
+    std.mem.writeInt(i32, buf[level_off..][0..4], @as(i32, @intCast(ip_consts.ipv6_proto)), native_endian);
+    std.mem.writeInt(i32, buf[type_off..][0..4], @as(i32, @intCast(ip_consts.ipv6_tclass)), native_endian);
+    // CE = 0b11.
+    std.mem.writeInt(i32, buf[header_size..][0..4], 0x03, native_endian);
+    const out = parseEcnFromControl(buf[0..cmsg_total]);
+    try testing.expectEqual(EcnCodepoint.ce, out);
 }

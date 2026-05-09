@@ -674,6 +674,14 @@ const ConfigImpl = struct {
     /// peer PTOs. Threaded onto every Connection at slot-open time.
     delayed_ack_packet_threshold: u8 = conn_mod.state.application_ack_eliciting_threshold,
 
+    /// Enable IETF ECN signaling (RFC 9000 §13.4 / RFC 3168) on every
+    /// Connection the Server creates. Default `true` — production
+    /// QUIC reaps modest goodput wins by reacting to router-driven
+    /// CE marks. Flip to `false` only in environments known to
+    /// bleach ECN bits (some legacy NATs / firewalls). Threaded onto
+    /// every Connection's `ecn_enabled` field at slot-open time.
+    enable_ecn: bool = true,
+
     /// Listener-level packet rate limit (hardening guide §4.1):
     /// drop incoming UDP datagrams when the global per-window count
     /// exceeds this cap. Off by default (`null`) so embedders
@@ -1062,6 +1070,11 @@ pub const Server = struct {
     /// every Connection at slot-open time. RFC 9000 §13.2.1.
     delayed_ack_packet_threshold: u8,
 
+    /// Captured `Config.enable_ecn` — threaded onto every Connection
+    /// at slot-open time. RFC 9000 §13.4 IETF ECN signaling. Default
+    /// true; flip to false in environments known to bleach ECN bits.
+    ecn_enabled: bool,
+
     /// Captured `Config.max_datagrams_per_window`. Null disables the
     /// listener-level packet rate limit; otherwise gates *every*
     /// inbound datagram (existing-slot routes included) at the very
@@ -1107,6 +1120,13 @@ pub const Server = struct {
     /// no clock argument. Set at the top of every `feed`; reads are
     /// only valid inside the feed's call frame.
     last_feed_now_us: u64 = 0,
+
+    /// IP-layer ECN codepoint observed on the datagram currently being
+    /// processed by `feedWithEcn`. Threaded to `dispatchToSlot` so the
+    /// per-Connection `handleWithEcn` call gets the right marking.
+    /// `not_ect` outside an active feed; mutating outside `feed*`
+    /// (e.g. via test scaffolding) is undefined behavior.
+    last_feed_ecn: conn_mod.state.socket_opts_mod.EcnCodepoint = .not_ect,
 
     /// Bounded FIFO of stateless responses (VN, Retry) queued for
     /// the embedder to drain via `drainStatelessResponse`. Bounded
@@ -1375,6 +1395,7 @@ pub const Server = struct {
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .max_connection_memory = config.max_connection_memory,
             .delayed_ack_packet_threshold = config.delayed_ack_packet_threshold,
+            .ecn_enabled = config.enable_ecn,
             .max_datagrams_per_window = config.max_datagrams_per_window,
             .max_bytes_per_window = config.max_bytes_per_window,
             .listener_rate_window_us = config.listener_rate_window_us,
@@ -1571,6 +1592,30 @@ pub const Server = struct {
         from: ?Address,
         now_us: u64,
     ) Error!FeedOutcome {
+        return self.feedWithEcn(bytes, from, .not_ect, now_us);
+    }
+
+    /// Like `feed`, but also carries the IP-layer ECN codepoint the
+    /// embedder peeled off the datagram's TOS byte. The codepoint
+    /// flows down to `Connection.handleWithEcn` so per-PN-space ECN
+    /// counters can be bumped on successful decrypt (RFC 9000
+    /// §13.4.1). Embedders that aren't running cmsg parsing should
+    /// keep using `feed` (which passes `not_ect`).
+    pub fn feedWithEcn(
+        self: *Server,
+        bytes: []u8,
+        from: ?Address,
+        ecn: conn_mod.state.socket_opts_mod.EcnCodepoint,
+        now_us: u64,
+    ) Error!FeedOutcome {
+        // Set the ingress ECN for any subsequent dispatch into a
+        // slot's Connection. Stateless / pre-slot processing
+        // (Version Negotiation, Retry minting, table_full) doesn't
+        // care about the marking — only the per-Connection handlers
+        // do. Cleared at function exit so a malformed/dropped feed
+        // doesn't leave a stale codepoint visible to the next call.
+        self.last_feed_ecn = ecn;
+        defer self.last_feed_ecn = .not_ect;
         // Stamp the feed's `now_us` so `emitLog` can run its per-source
         // log rate limit against in-feed time without taking a separate
         // clock argument.
@@ -2179,6 +2224,7 @@ pub const Server = struct {
         conn_ptr.reveal_close_reason_on_wire = self.reveal_close_reason_on_wire;
         conn_ptr.max_connection_memory = self.max_connection_memory;
         conn_ptr.delayed_ack_packet_threshold = self.delayed_ack_packet_threshold;
+        conn_ptr.ecn_enabled = self.ecn_enabled;
 
         try conn_ptr.bind();
         if (self.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, self.qlog_user_data);
@@ -2285,7 +2331,7 @@ pub const Server = struct {
         const seq_opt: ?u64 = if (dcid_opt) |d| slot.conn.findLocalCidSequence(d) else null;
         slot.conn.setIncomingLocalCidSeq(seq_opt);
         defer slot.conn.setIncomingLocalCidSeq(null);
-        slot.conn.handle(bytes, from, now_us) catch |err| switch (err) {
+        slot.conn.handleWithEcn(bytes, from, self.last_feed_ecn, now_us) catch |err| switch (err) {
             // OOM is fatal for the whole server — propagate. The
             // surrounding `feed` will return `OutOfMemory` to the
             // embedder, who can decide whether to retry, scale, or

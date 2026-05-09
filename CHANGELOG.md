@@ -418,6 +418,57 @@ breaking changes; see notes per release.
   read via the v1 mapping; both now route through
   `wire_header.longTypeFromBits(version, bits)`.
 
+- **B1 — IP ECN signaling (RFC 9000 §13.4 / RFC 3168).** End-to-end
+  Explicit Congestion Notification: outgoing 1-RTT and 0-RTT
+  packets are marked ECT(0) by default, incoming datagrams have
+  their TOS byte parsed off cmsg, the four IETF codepoints
+  (`Not-ECT` / `ECT(0)` / `ECT(1)` / `CE`) accumulate into
+  per-PN-space `recv_ect0` / `recv_ect1` / `recv_ce` counters, and
+  outgoing ACK frames switch to type `0x03` (with the §19.3.2 ECN
+  trailer) whenever a level has observed any ECN-marked packet.
+  Inbound ACKs are validated per §13.4.2 monotonicity; a CE-count
+  bump halves cwnd via the new `NewReno.onCongestionEvent`
+  (mirror of `onPacketLost` with no byte budget). A non-monotonic
+  ECN report flips the level's `validation` to `failed` and stops
+  emitting ECN counts on outbound ACKs from that space.
+
+  Public surface additions:
+    * `quic_zig.transport.EcnCodepoint` /
+      `setEcnSendMarking` / `setEcnRecvEnabled` /
+      `parseEcnFromControl` / `default_cmsg_buffer_bytes`.
+    * `Connection.ecn_enabled: bool = true` (kill-switch),
+      `Connection.handleWithEcn(bytes, from, ecn, now_us)`.
+    * `Server.feedWithEcn(bytes, from, ecn, now_us)`.
+    * `RunUdpOptions.enable_ecn: bool = true`,
+      `ecn_send_codepoint`, `cmsg_buffer_bytes` — the bundled
+      `runUdpServer` loop sets the IP TOS / IPV6 TCLASS sockopts
+      and parses cmsgs into the Connection automatically.
+    * `PnSpace.recv_ect0` / `recv_ect1` / `recv_ce` /
+      `peer_ack_*` / `validation` /
+      `onPacketReceivedWithEcn` / `hasObservedEcn`.
+    * `AckTracker.toAckFrame*WithEcn` overloads passing through
+      the §19.3.2 ECN trailer.
+    * `NewReno.onCongestionEvent(ce_packet_sent_time_us)`.
+
+  New conformance suite at `tests/conformance/rfc9000_ecn.zig`
+  pins the §19.3.2 wire shape, the §13.4.2 validation /
+  CE-bump-fires-onCongestionEvent / non-monotonic-counts-fails
+  flow, and the on-by-default policy. Legacy `Connection.handle`
+  / `Server.feed` are preserved as `Not-ECT` thunks so embedders
+  that haven't plumbed cmsg yet stay source-compatible.
+
+  macOS workarounds shipped: hard-coded `IP_TOS=3` /
+  `IPV6_TCLASS=36` constants keyed on `builtin.os.tag` (std
+  `posix.IP` / `posix.IPV6` resolve to `void` on Darwin), plus a
+  `setsockoptIntChecked` mapping `EINVAL` / `ENOPROTOOPT` /
+  `OPNOTSUPP` to `error.Unsupported`. The kqueue I/O backend's
+  `netReceive` is `@panic("TODO")` upstream, so the cmsg-aware
+  path only runs on the Threaded backend (Linux QNS, `std.testing`
+  default). Follow-up: `interop/qns_endpoint.zig` still uses the
+  legacy `Connection.handle` and `Server.feed` thunks; pumping
+  the qns endpoint through the ECN-aware paths would let the
+  runner's `E` testcase exercise them.
+
 ### Hardening (security-relevant)
 
 - **§17.2.1 / §17.3 — Reserved Bits enforced on receive.**

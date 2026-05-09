@@ -135,6 +135,7 @@ pub fn handleShort(
         return bytes.len;
     }
     Connection.recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload, self.delayed_ack_packet_threshold);
+    app_pn_space.onPacketReceivedWithEcn(self.last_recv_ecn);
     self.qlog_packets_received +|= 1;
     self.emitPacketReceived(.application, opened.pn, @intCast(bytes.len), Connection.countFrames(opened.payload));
     try self.dispatchFrames(.application, opened.payload, now_us);
@@ -225,7 +226,11 @@ pub fn handleInitial(
         self.scanForPeerCloseFrame(opened.payload, now_us);
         return opened.bytes_consumed;
     }
-    self.pnSpaceForLevel(.initial).recordReceivedPacket(opened.pn, now_us / 1000, Connection.packetPayloadAckEliciting(opened.payload));
+    {
+        const initial_space = self.pnSpaceForLevel(.initial);
+        initial_space.recordReceivedPacket(opened.pn, now_us / 1000, Connection.packetPayloadAckEliciting(opened.payload));
+        initial_space.onPacketReceivedWithEcn(self.last_recv_ecn);
+    }
     self.qlog_packets_received +|= 1;
     self.emitPacketReceived(.initial, opened.pn, @intCast(opened.bytes_consumed), Connection.countFrames(opened.payload));
     try self.dispatchFrames(.initial, opened.payload, now_us);
@@ -335,6 +340,7 @@ pub fn handleZeroRtt(
         return opened.bytes_consumed;
     }
     Connection.recordApplicationReceivedPacket(app_pn_space, opened.pn, now_us, opened.payload, self.delayed_ack_packet_threshold);
+    app_pn_space.onPacketReceivedWithEcn(self.last_recv_ecn);
     self.qlog_packets_received +|= 1;
     self.emitPacketReceived(.early_data, opened.pn, @intCast(opened.bytes_consumed), Connection.countFrames(opened.payload));
     try self.dispatchFrames(.early_data, opened.payload, now_us);
@@ -388,7 +394,11 @@ pub fn handleHandshake(
         self.scanForPeerCloseFrame(opened.payload, now_us);
         return opened.bytes_consumed;
     }
-    self.pnSpaceForLevel(.handshake).recordReceivedPacket(opened.pn, now_us / 1000, Connection.packetPayloadAckEliciting(opened.payload));
+    {
+        const handshake_space = self.pnSpaceForLevel(.handshake);
+        handshake_space.recordReceivedPacket(opened.pn, now_us / 1000, Connection.packetPayloadAckEliciting(opened.payload));
+        handshake_space.onPacketReceivedWithEcn(self.last_recv_ecn);
+    }
     self.qlog_packets_received +|= 1;
     self.emitPacketReceived(.handshake, opened.pn, @intCast(opened.bytes_consumed), Connection.countFrames(opened.payload));
     try self.dispatchFrames(.handshake, opened.payload, now_us);
