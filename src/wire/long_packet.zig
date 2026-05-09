@@ -701,6 +701,42 @@ fn fillSecret(dst: []u8, seed: u8) void {
     }
 }
 
+test "Initial seal/open round-trip under QUIC v2 keys [RFC9368 §3.3]" {
+    // Round-trip a v2 Initial through seal/open. Failure here means
+    // the v2 Initial-key derivation, the v2 long-header type bit
+    // rotation, or the AEAD nonce / HP mask plumbing diverged.
+    const dcid = fromHex("8394c8f03e515708");
+    const init_keys = try initial_mod.deriveInitialKeysFor(0x6b3343cf, &dcid, false);
+    const keys = try short_packet.derivePacketKeys(.aes128_gcm_sha256, &init_keys.secret);
+
+    const scid: [4]u8 = .{ 1, 2, 3, 4 };
+    const payload = "v2 Initial CRYPTO frame bytes";
+
+    var packet: [2048]u8 = undefined;
+    const len = try sealInitial(&packet, .{
+        .version = 0x6b3343cf,
+        .dcid = &dcid,
+        .scid = &scid,
+        .pn = 2,
+        .payload = payload,
+        .keys = &keys,
+    });
+
+    // Sanity: the long-header type bits must be 0b01 under v2 (RFC 9368 §3.2).
+    const type_bits: u2 = @intCast((packet[0] >> 4) & 0x03);
+    try testing.expectEqual(@as(u2, 0b01), type_bits);
+
+    var pt: [2048]u8 = undefined;
+    const opened = try openInitial(&pt, packet[0..len], .{
+        .keys = &keys,
+        .largest_received = 1,
+    });
+    try testing.expectEqual(@as(u64, 2), opened.pn);
+    try testing.expectEqualSlices(u8, payload, opened.payload[0..payload.len]);
+    try testing.expectEqualSlices(u8, &dcid, opened.dcid.slice());
+    try testing.expectEqualSlices(u8, &scid, opened.scid.slice());
+}
+
 test "Initial seal/open round-trip with §A.1 client keys" {
     const dcid = fromHex("8394c8f03e515708");
     const init_keys = try initial_mod.deriveInitialKeys(&dcid, false);

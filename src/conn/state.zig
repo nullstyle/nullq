@@ -6743,16 +6743,26 @@ pub const Connection = struct {
             return try self.handleShort(bytes, now_us);
         }
 
-        if (bytes.len >= 5 and std.mem.readInt(u32, bytes[1..5], .big) == 0) {
+        if (bytes.len < 5) return 0;
+        const version = std.mem.readInt(u32, bytes[1..5], .big);
+        if (version == 0) {
             return self.handleVersionNegotiation(bytes, now_us);
         }
 
+        // RFC 9368 §3.2: long-header type bits rotate between v1 and
+        // v2. Resolve through `longTypeFromBits` so a v2 packet with
+        // wire bits 0b01 dispatches to `handleInitial`, not
+        // `handleZeroRtt` (the v1 slot for that bit pattern). For
+        // versions we don't recognize, the v1 mapping is the safest
+        // default — those packets will fail downstream version /
+        // AEAD gates anyway.
         const long_type_bits: u2 = @intCast((first >> 4) & 0x03);
-        return switch (long_type_bits) {
-            0 => try self.handleInitial(bytes, now_us),
-            1 => try self.handleZeroRtt(bytes, now_us),
-            2 => try self.handleHandshake(bytes, now_us),
-            3 => try self.handleRetry(bytes, now_us),
+        const long_type = wire_header.longTypeFromBits(version, long_type_bits);
+        return switch (long_type) {
+            .initial => try self.handleInitial(bytes, now_us),
+            .zero_rtt => try self.handleZeroRtt(bytes, now_us),
+            .handshake => try self.handleHandshake(bytes, now_us),
+            .retry => try self.handleRetry(bytes, now_us),
         };
     }
 
