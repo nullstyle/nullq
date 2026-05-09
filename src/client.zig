@@ -121,6 +121,13 @@ const ConfigImpl = struct {
     /// peer PTOs.
     delayed_ack_packet_threshold: u8 = conn_mod.state.application_ack_eliciting_threshold,
 
+    /// Enable IETF ECN signaling (RFC 9000 §13.4 / RFC 3168) on the
+    /// underlying Connection. Default `true`. Flip to `false` only
+    /// in environments known to bleach ECN bits (some legacy NATs /
+    /// firewalls); see `Connection.ecn_enabled` for the per-connection
+    /// kill-switch this maps onto.
+    enable_ecn: bool = true,
+
     /// Optional NEW_TOKEN bytes from a prior connection to the same
     /// server (RFC 9000 §8.1.3). When set, the client embeds the
     /// token in its first Initial's long-header Token field so the
@@ -256,6 +263,7 @@ pub const Client = struct {
         errdefer conn_ptr.deinit();
         conn_ptr.reveal_close_reason_on_wire = config.reveal_close_reason_on_wire;
         conn_ptr.delayed_ack_packet_threshold = config.delayed_ack_packet_threshold;
+        conn_ptr.ecn_enabled = config.enable_ecn;
 
         if (config.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, config.qlog_user_data);
 

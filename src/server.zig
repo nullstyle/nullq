@@ -626,6 +626,14 @@ const ConfigImpl = struct {
     /// peer PTOs. Threaded onto every Connection at slot-open time.
     delayed_ack_packet_threshold: u8 = conn_mod.state.application_ack_eliciting_threshold,
 
+    /// Enable IETF ECN signaling (RFC 9000 §13.4 / RFC 3168) on every
+    /// Connection the Server creates. Default `true` — production
+    /// QUIC reaps modest goodput wins by reacting to router-driven
+    /// CE marks. Flip to `false` only in environments known to
+    /// bleach ECN bits (some legacy NATs / firewalls). Threaded onto
+    /// every Connection's `ecn_enabled` field at slot-open time.
+    enable_ecn: bool = true,
+
     /// Listener-level packet rate limit (hardening guide §4.1):
     /// drop incoming UDP datagrams when the global per-window count
     /// exceeds this cap. Off by default (`null`) so embedders
@@ -984,6 +992,11 @@ pub const Server = struct {
     /// every Connection at slot-open time. RFC 9000 §13.2.1.
     delayed_ack_packet_threshold: u8,
 
+    /// Captured `Config.enable_ecn` — threaded onto every Connection
+    /// at slot-open time. RFC 9000 §13.4 IETF ECN signaling. Default
+    /// true; flip to false in environments known to bleach ECN bits.
+    ecn_enabled: bool,
+
     /// Captured `Config.max_datagrams_per_window`. Null disables the
     /// listener-level packet rate limit; otherwise gates *every*
     /// inbound datagram (existing-slot routes included) at the very
@@ -1240,6 +1253,7 @@ pub const Server = struct {
             .reveal_close_reason_on_wire = config.reveal_close_reason_on_wire,
             .max_connection_memory = config.max_connection_memory,
             .delayed_ack_packet_threshold = config.delayed_ack_packet_threshold,
+            .ecn_enabled = config.enable_ecn,
             .max_datagrams_per_window = config.max_datagrams_per_window,
             .max_bytes_per_window = config.max_bytes_per_window,
             .listener_rate_window_us = config.listener_rate_window_us,
@@ -1868,6 +1882,7 @@ pub const Server = struct {
         conn_ptr.reveal_close_reason_on_wire = self.reveal_close_reason_on_wire;
         conn_ptr.max_connection_memory = self.max_connection_memory;
         conn_ptr.delayed_ack_packet_threshold = self.delayed_ack_packet_threshold;
+        conn_ptr.ecn_enabled = self.ecn_enabled;
 
         try conn_ptr.bind();
         if (self.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, self.qlog_user_data);
