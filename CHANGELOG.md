@@ -9,6 +9,26 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Added
+
+- **RFC 9287 — Greasing the QUIC Bit.** New `grease_quic_bit`
+  transport parameter (codepoint `0x2ab2`, zero-length flag) lands on
+  `tls.TransportParams` with a `false` default; non-empty values on
+  the wire reject as `InvalidValue`. New
+  `Connection.peerSupportsGreaseQuicBit()` predicate fires only when
+  *both* sides advertised the flag, parallel to
+  `multipathNegotiated()`. Once it returns true, every outgoing
+  long- or short-header packet draws bit 6 of the first byte (the
+  QUIC Bit) at random per packet via BoringSSL's `RAND_bytes`; the
+  wire decoder has always accepted any value for that bit.
+  Long- and short-header structs (`Initial`, `ZeroRtt`, `Handshake`,
+  `Retry`, `OneRtt`) and the matching seal-options structs gain a
+  `quic_bit: u1 = 1` field; the default reproduces the v1 wire
+  exactly, so embedders that don't opt in see no change.
+  Conformance: 13 new tests in
+  `tests/conformance/rfc9287_grease_quic_bit.zig` covering §3 wire
+  format and §6.1 transport parameter.
+
 ### Hardening (security-relevant)
 
 - **§17.2.1 / §17.3 — Reserved Bits enforced on receive.**
