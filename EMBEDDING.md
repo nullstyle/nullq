@@ -266,7 +266,24 @@ RFC 8446 §8.
 - **HTTP/3 / QPACK.** Out of scope — quic-zig is transport-only. Layer your
   own H3 implementation on top of `Connection` streams.
 - **Multipath QUIC.** quic-zig tracks `draft-ietf-quic-multipath-21`; expect
-  API churn until the spec is published as an RFC.
+  API churn until the spec is published as an RFC. The draft is in the
+  RFC Editor queue (IESG-approved) so the codepoints are stable.
+- **Alternative server addresses
+  (`draft-munizaga-quic-alternative-server-address-00`).** Codec,
+  transport-parameter negotiation, server emit, and a typed receive
+  surface ship today via `Connection.advertiseAlternative*Address`,
+  `ConnectionEvent.alternative_server_address`, and the `quic_zig.alt_addr`
+  helper namespace. The `alt_addr/root.zig` module-level docstring
+  walks through the recommended embedder integration shape (address
+  book + Preferred-driven migration with the §9 random-delay helper).
+  Driver-level path-opening on receipt remains embedder policy.
+- **QUIC-LB connection-ID generation
+  (`draft-ietf-quic-load-balancers-21`).** Server-side helpers ship via
+  `quic_zig.lb` and `Server.Config.quic_lb` for embedders deploying
+  behind a coordinated load balancer; the IETF draft itself is
+  expired and pinned indefinitely at -21, so the codepoints are a
+  private agreement between server and LB rather than a path to
+  formal IANA allocation.
 - **Tuning recv/send buffers for 100k+ connections.** Not yet documented;
   the `transport.ServerTuning` defaults (4 MiB each) target a 10k-conn
   workload.

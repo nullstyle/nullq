@@ -16,8 +16,9 @@ echoes, Retry integrity tags, retry transport parameters, and re-arm
 Initial CRYPTO with the Retry token; server embedders get
 `writeRetry`, `writeVersionNegotiation`, and stateless
 `retry_token` HMAC helpers for address-bound Retry validation.
-nullq-peer now verifies live quic-go Retry and v2-to-v1 Version
-Negotiation scenarios with those helpers. Application key updates now
+The `interop/` external runner verifies live quic-go Retry and
+v2-to-v1 Version Negotiation scenarios end-to-end with those helpers.
+Application key updates now
 keep previous/current/next read epochs, discard old keys after 3x-PTO,
 support local initiation, and enforce cross-suite AEAD packet/auth
 limits across all Application paths. Packet protection now supports all
@@ -30,9 +31,10 @@ frame tracking. `zig build test` also runs deterministic parser/property
 fuzz smokes for varints, frames, transport parameters, packet headers,
 ACK ranges, and CRYPTO/STREAM reassembly. Transport-parameter handling
 now includes typed `preferred_address` codec coverage plus duplicate
-parameter rejection. 0-RTT now has early STREAM/DATAGRAM transport
-plumbing plus accepted and rejected go-quic-peer resumption smokes,
-while deeper mismatch/loss hardening still needs work. Multipath also
+parameter rejection. 0-RTT ships with the §5.2 anti-replay tracker,
+ALPN/SNI/early-data-context binding, and accepted-vs-rejected
+resumption coverage end-to-end against quic-go (see
+`docs/hardening-status.md` §5.2 for the full audit). Multipath also
 has embedder-driven path CID replenishment, abandoned-path 3x-PTO
 retention coverage, and a deterministic two-path transfer stress test.
 go-quic-peer single-path, 0-RTT, and path-switch smoke tests are
@@ -40,8 +42,8 @@ maintained as interop gates. The first official QUIC interop-runner
 gate is also scaffolded under `interop/`: `qns-endpoint` is a
 server-side HTTP/0.9 `hq-interop` endpoint with Docker/run-wrapper
 support for quic-zig-as-server testing against external clients. See
-[INTEROP_STATUS.md](INTEROP_STATUS.md) for the current verification log
-and remaining production gaps.
+[`interop/README.md`](interop/README.md) for the current verification
+matrix and remaining production gaps.
 
 ```sh
 mise install
@@ -338,6 +340,10 @@ at the open internet.
 - **Server SCIDs are CSPRNG draws.** Every server-issued connection
   ID comes from `boringssl.crypto.rand.fillBytes` — no deployment
   metadata (shard, region, tenant, timestamp) leaks on the wire.
+  Embedders that need LB-routable CIDs can opt into
+  draft-ietf-quic-load-balancers-21 via `Server.Config.quic_lb`; see
+  the dedicated entry in "Off by default" below for the security
+  trade-off this introduces.
 - **Per-stream send queue capped.** `default_max_buffered_send =
   1 MiB` per stream (`src/conn/send_stream.zig`); `write` short-writes
   to apply back-pressure when the cap is hit. Override per-stream via
@@ -403,6 +409,27 @@ arbitrary peers. All are on `Server.Config` unless noted.
   Wires the BoringSSL pre-accept callback so resumed sessions hash
   to a tracker `Id` and replays return `false` (denied at the TLS
   layer). Override-mode embedders install their own callback.
+- `quic_lb: ?lb.LbConfig = null` — opts every locally-issued SCID
+  into [draft-ietf-quic-load-balancers-21][quic-lb] format so an
+  external layer-4 load balancer can decode the routing identity
+  from any datagram (including post-migration ones with brand-new
+  CIDs). **This deliberately inverts the CSPRNG-by-default
+  guarantee above:** every minted CID encodes the configured
+  `server_id`, and in plaintext mode (no `LbConfig.key`) any on-path
+  observer between client and LB can read it. Treat the load
+  balancer as the trust boundary. Plaintext mode also auto-enables
+  `disable_active_migration` per draft §3 ¶3 (servers without a key
+  SHOULD NOT issue extra CIDs via NEW_CONNECTION_ID, which would
+  leak `server_id` further). All three encoder modes are wired:
+  §5.2 plaintext (no key), §5.4.1 single-pass AES-128-ECB
+  (key configured, `server_id_len + nonce_len == 16`), and §5.4.2
+  four-pass Feistel (key configured, any other supported length).
+  Encrypted modes use a counter-based nonce seeded from the CSPRNG
+  so the same nonce is never reused under the same key. Pinned to
+  draft revision 21 via `quic_zig.quic_lb_draft_version`; bumping
+  is a deliberate scoped change.
+
+  [quic-lb]: https://datatracker.ietf.org/doc/draft-ietf-quic-load-balancers/
 
 ### Build mode
 
@@ -466,14 +493,70 @@ Defaults can't fill these in for you — they're application policy:
 
 In scope for v0.1:
 - IETF QUIC v1 transport from RFCs 8999 / 9000 / 9001 / 9002.
-- 0-RTT (RFC 9001 §4.5/4.6) — initial implementation landed; rejection
-  hardening still in progress.
-- Connection migration (RFC 9000 §9) — landed; broader external soak
-  still in progress.
+- 0-RTT (RFC 9001 §4.5/4.6) — landed end-to-end. Anti-replay tracker,
+  early-data-context binding, accept/reject path coverage; see
+  `docs/hardening-status.md` §5.2 for the audit.
+- Connection migration (RFC 9000 §9) — landed. External soak against
+  ngtcp2 / quiche servers beyond H/D is still ongoing; the
+  `interop/` runner is the gate.
 - Multipath QUIC (draft-ietf-quic-multipath) — tracks
   draft-ietf-quic-multipath-21 (`initial_max_path_id`,
-  `multipath_draft_version = 21`); expect API churn until the spec is
-  published as an RFC.
+  `multipath_draft_version = 21`). Draft-21 is in the RFC Editor
+  queue (IESG-approved as of early 2026); we'll switch from the
+  draft pin to the published RFC once the document is assigned an
+  RFC number. Wire-format changes between -21 and the RFC are not
+  expected.
+- QUIC-LB connection-ID generation (draft-ietf-quic-load-balancers) —
+  tracks draft-ietf-quic-load-balancers-21 (`quic_zig.lb`,
+  `quic_lb_draft_version = 21`). **The IETF draft expired in early
+  2026 without progressing past -21**; quic-zig stays pinned at -21
+  indefinitely. Codepoints are provisional and may never be
+  formally allocated; deployments using QUIC-LB should treat the
+  config as a private agreement between server and load balancer.
+  Off by default; opt in via
+  `Server.Config.quic_lb`. All three encoder modes ship: §5.2
+  plaintext, §5.4.1 single-pass AES-128-ECB (`combined == 16`), and
+  §5.4.2 four-pass Feistel (any other supported length). Runtime
+  rotation via `Server.installLbConfig` (auto-pushes
+  NEW_CONNECTION_ID frames to live peers when
+  `Server.Config.stateless_reset_key` is set), the §3.1 unroutable
+  fallback via `lb.mintUnroutable` plus auto-fallback on nonce
+  exhaustion in `Server.mintLocalScid`, and a complete LB-side
+  decoder via `lb.decode` covering all three modes. The Retry
+  Service was split into a separate IETF draft and is out of scope.
+- Alternative Server Address frames
+  (draft-munizaga-quic-alternative-server-address) — tracks
+  draft-munizaga-quic-alternative-server-address-00
+  (`alt_server_address_draft_version = 0`). Codec, transport-
+  parameter negotiation, server emit, and a typed client-side
+  receive surface ship today. The §6 ALTERNATIVE_V4_ADDRESS /
+  ALTERNATIVE_V6_ADDRESS frames and the §4 `alternative_address`
+  transport parameter (codepoint `0xff0969d85c`) round-trip through
+  `frame.encode` / `frame.decode` and `transport_params.Params`.
+  Server emit lives at `Connection.advertiseAlternativeV4Address` /
+  `advertiseAlternativeV6Address` — both allocate a fresh, shared,
+  monotonically-increasing Status Sequence Number per §6 ¶5 and
+  queue the frame for transmission at the application encryption
+  level (§7). The API is gated on server role (§4 ¶2) and on the
+  peer having advertised `alternative_address = true` (so a
+  mis-call doesn't force a peer PROTOCOL_VIOLATION close). The
+  receiver surfaces accepted frames via
+  `ConnectionEvent.alternative_server_address`, a tagged V4/V6
+  payload with the address, port, sequence number, and flag bits;
+  §6 ¶5 monotonicity is enforced (duplicate sequences are absorbed
+  silently as retransmits, lower sequences are absorbed as out-of-
+  order delivery), and the receive arm closes with
+  PROTOCOL_VIOLATION when the connection isn't negotiated.
+  Clients also close with TRANSPORT_PARAMETER_ERROR (per §4 ¶2) on
+  a server-authored `alternative_address` parameter. Embedders
+  MUST clear the `alternative_address` field before installing
+  peer transport parameters as a 0-RTT context (§4 ¶3). The
+  §9 thundering-herd mitigation is plumbed via
+  `quic_zig.alt_addr.recommendedMigrationDelayMs(min_ms, max_ms)`
+  — a CSPRNG-backed uniform draw embedders fold into their auto-
+  migration scheduler. Composable with multipath (§8): an
+  `initial_max_path_id`-negotiated client receiving §6 frames
+  surfaces them through the same event channel.
 
 Out of scope: HTTP/3, QPACK, Windows, FIPS, ECN, DPLPMTUD, BBR,
 performance optimizations. See `CHANGELOG.md` for what has shipped

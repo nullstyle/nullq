@@ -9,6 +9,342 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Changed
+
+- **boringssl-zig dep bumped to 0.6.0** (commit `8080b8a`) for
+  `Aes128.initDecrypt` / `decryptBlock`, which back LB-6's
+  single-pass decoder. Briefly switched to a local `../boringssl-zig`
+  path dep during co-development; restored to the URL+hash form
+  once 0.6.0 was tagged and pushed.
+
+### Interop
+
+- **External-interop matrix audit, 2026-05-09.** Ran the full
+  `core+retry` matrix against quic-go, ngtcp2, and quiche in both
+  roles (72 cells, 32 min wall). 58 cells pass; 10 transport
+  failures clustered into 5 distinct bugs; 4 cells were peer-side
+  "unsupported." Three small fixes landed against the audit
+  (re-verification of the matrix is in flight):
+  - **`interop/qns_endpoint.zig` `retryAddressContext` —
+    drop the IPv6 flow label from the bound retry-token address
+    context.** The v6 form was 1+16+2+4 = 23 bytes; that exceeds
+    `retry_token.max_address_len = 22`. Once the wrapper inherited
+    the binary's `[::]:443` dual-stack default (W2 below), every
+    runner peer arrived as IPv4-mapped IPv6, hit the v6 branch,
+    and `validateBoundInputs` returned `Error.ContextTooLong` —
+    server crashed on every Retry. The flow label adds no useful
+    binding (it's an ECMP routing hint, not peer identity); the
+    new 19-byte form fits the budget. Expected to unlock
+    server × {quic-go, ngtcp2, quiche} × `retry` (3 cells).
+  - **`interop/qns_endpoint.zig` 750ms client warmup is now
+    gated on `TESTCASE=longrtt`.** The warmup was a workaround
+    for a quic-network-simulator bridge / ns-3-boot packet-drop
+    race that only matters for `longrtt` (the runner asserts
+    ≥2 ClientHellos on the wire). It was unconditionally applied
+    on the assumption it was harmless — but for `rebind-addr`
+    the warmup pushed the first ClientHello into the runner's
+    1s rebind window, stranding the handshake CRYPTO bytes on
+    the pre-rebind 4-tuple. Now opt-in via
+    `ClientConnectionOptions.apply_simulator_warmup`. Expected to
+    unlock client × {quic-go, quiche} × `rebind-addr` (2 cells).
+  - **`interop/qns_endpoint.zig` `endpoint_bidi_stream_limit`
+    raised from 1000 to 2500.** quiche's `multiplexing` test
+    pipelines 2000 streams faster than
+    `maybeQueueBatchedMaxStreams` (`src/conn/state.zig`) returns
+    credit at the `remaining > batch / 2` watermark, deadlocking
+    the connection. quic-go and ngtcp2 don't trip the timing. The
+    qns-endpoint-only constant change avoids tuning the core
+    watermark for every embedder. Expected to unlock server ×
+    quiche × `multiplexing` (1 cell).
+
+  Two transport bugs deferred to a focused follow-up session:
+  - **Server-side `preferred_address` advertise** is unwired in
+    `interop/qns_endpoint.zig` (the codec at
+    `src/tls/transport_params.zig` exists). Blocks server ×
+    `connectionmigration` × all three peers (3 cells). Needs an
+    alt-port listening socket and runner-IP introspection.
+  - **PATH_CHALLENGE-first ordering on a freshly-migrated path**
+    fails under quiche's tight rebind cadence. Blocks server ×
+    quiche × `rebind-addr` (1 cell). Needs interactive
+    packet-order tracing.
+
+  Two interop-wrapper bugs landed alongside the transport-side
+  fixes:
+  - **W1 — `interop/qns/run_endpoint.sh` TESTCASE allowlist
+    expanded** to include `connectionmigration`,
+    `amplificationlimit`, `ipv6`, `rebind-addr`, `rebind-port`,
+    `crosstraffic`, `versionnegotiation`, `goodput`, `throughput`,
+    and `v2`. Previously these all `exit 127`-ed at the wrapper,
+    forcing the runner to skip them entirely.
+  - **W2 — `interop/qns/run_endpoint.sh` server invocation no
+    longer pins `-listen 0.0.0.0:443`**, so the binary's
+    `[::]:443` dual-stack default at `interop/qns_endpoint.zig:76`
+    finally takes effect. Required for the `ipv6` testcase and
+    surfaced the `retryAddressContext` v6 bug above.
+
+  README + EMBEDDING.md interop-claim staleness corrected: the
+  previous "✓(H,DC,C20,S,R,Z,M) vs quic-go in both roles" line was
+  sourced from a since-deleted `INTEROP_STATUS.md` (last seen at
+  commit `7bd187b`, 2026-05-05) and had drifted from on-disk
+  evidence. The new bullets reflect actual `interop/results/` +
+  `interop/logs/` content as of 2026-05-09.
+
+### Hardening (security-relevant)
+
+- **draft-munizaga-quic-alternative-server-address-00 hardening
+  pass.** Three resolutions after a self-audit of the workstream:
+  - **0-RTT defense-in-depth.** ALTERNATIVE_V4/V6_ADDRESS frames
+    are now in `frameAllowedInEarlyData`'s reject list, so a peer
+    that ships them in a 0-RTT packet trips the "forbidden frame
+    in 0-RTT" close (clearer diagnostic) at the same time as the
+    inner negotiation gate — §4 ¶3 forbids remembering the
+    `alternative_address` parameter for 0-RTT, so a server can't
+    legally have completed the §4 negotiation by the time a 0-RTT
+    packet is processed. New conformance test pins the close
+    reason to PROTOCOL_VIOLATION (0x0a).
+  - **Sequence-exhaustion fail-closed.** ALT-3 originally
+    saturated `next_alternative_address_sequence` at u64::max,
+    reusing the maximum value across subsequent advertisements.
+    That silently violates §6 ¶5 (monotonically-increasing
+    Status Sequence Numbers) — the receiver dedupes equal
+    sequence numbers as retransmits and drops the second
+    distinct update on the floor.
+    `Connection.advertiseAlternative*Address` now returns the
+    new `Error.AlternativeAddressSequenceExhausted` once the
+    counter hits the cap, matching `next_datagram_id`'s
+    fail-closed pattern. The boundary is unreachable in practice
+    (2^64 advertise calls per connection), but the wire contract
+    can never silently break.
+  - **Strict-close on server-authored `alternative_address`.**
+    `validatePeerTransportRole`'s client branch closes a
+    connection whose server-authored transport-parameter blob
+    carries `alternative_address`, regardless of whether the
+    local client advertised support. §4 ¶2 only mandates this
+    for "supporting" clients; closing on non-supporting clients
+    too is the safer of the two spec-conformant choices and is
+    documented inline as deliberate.
+
+### Added
+
+- **draft-munizaga-quic-alternative-server-address-00 receive event
+  surface + thundering-herd helper + multipath interaction (ALT-4,
+  ALT-5).** New `ConnectionEvent.alternative_server_address` variant
+  surfaces parsed §6 frames to the embedder via
+  `Connection.pollEvent`. The payload is a tagged
+  `AlternativeServerAddressEvent { v4: V4Event, v6: V6Event }`
+  carrying the address bytes, port, sequence number, and Preferred /
+  Retire flag bits; convenience accessors `statusSequenceNumber()`,
+  `preferred()`, `retire()` ride on the union for embedders that
+  don't want to pattern-match.
+
+  The receive arm in `state.zig` now enforces §6 ¶5 monotonicity:
+  events are surfaced only for Status Sequence Numbers strictly
+  greater than every previously-seen value. Equal numbers (RFC 9000
+  §13.3 retransmits of the same frame) and lower numbers (QUIC's
+  app-PN-space packet reordering) are absorbed silently — no
+  re-emission, no protocol violation. The high-watermark is exposed
+  via `Connection.highestAlternativeAddressSequenceSeen()`.
+
+  The events queue is bounded at `max_alternative_address_events`
+  (16, mirroring `max_connection_id_events`) so a misbehaving peer
+  can't pin proportional connection memory by spraying updates.
+
+  New `quic_zig.alt_addr` namespace ships
+  `recommendedMigrationDelayMs(min_ms, max_ms)`, the §9
+  thundering-herd mitigation: a CSPRNG-backed uniform draw embedders
+  plug into their migration scheduler so concurrently-notified
+  clients don't synchronize their PATH_CHALLENGE probes at the
+  victim address. Degenerate / inverted ranges fail soft (return
+  `min_ms`) rather than panic.
+
+  Receive integration is composable with multipath (§8): a
+  conformance test pairs an `initial_max_path_id`-negotiated
+  handshake with an `alternative_address`-supporting client and
+  verifies the receive arm + event surfacing behave identically.
+
+  New `Connection` API:
+  `handleAlternativeAddressV4` / `handleAlternativeAddressV6`
+  (called from the frame dispatcher; pub for direct tests),
+  `highestAlternativeAddressSequenceSeen`. New public type
+  re-exports at `quic_zig.AlternativeServerAddressEvent` /
+  `AlternativeServerAddressV4Event` /
+  `AlternativeServerAddressV6Event`. Inline state tests (5)
+  cover event delivery, V4/V6 sequence-space sharing,
+  idempotent-retransmit dedup, and stale-reorder drop. Conformance
+  suite gains 5 tests covering negotiated end-to-end event
+  delivery, retransmit dedup over the wire, stale-reorder drop, §8
+  multipath composability, and the §9 helper.
+
+- **draft-munizaga-quic-alternative-server-address-00 server emit
+  (ALT-3).** New `Connection.advertiseAlternativeV4Address(addr, port, opts)`
+  / `advertiseAlternativeV6Address(addr, port, opts)` allocate a
+  fresh `Status Sequence Number` from a connection-wide
+  monotonically-increasing counter (shared between V4 and V6 per
+  §6 ¶5) and queue the §6 frame for transmission at the
+  application encryption level. The frame is ack-eliciting (§7)
+  and retransmitted on loss with its original sequence number;
+  `dispatchLostControlFramesOnPath` requeues a lost frame, and
+  `pollLevel` drains the queue one frame per packet (matching the
+  NEW_CONNECTION_ID drain pattern). Two embedder gates protect the
+  peer: the API returns `Error.NotServerContext` when called on a
+  client connection (§4 ¶2 forbids client-side emission), and
+  `Error.AlternativeAddressNotNegotiated` when the peer hasn't
+  advertised the §4 transport parameter (calling anyway would
+  force a peer PROTOCOL_VIOLATION close). The receive arm in
+  `state.zig` now accepts the frame as a no-op when the local
+  endpoint advertised support — ALT-4 will replace the no-op with
+  a typed `ConnectionEvent` and Status-Sequence-Number monotonicity
+  enforcement at receive time. Clients now also close with
+  TRANSPORT_PARAMETER_ERROR (per §4 ¶2) when the server's
+  transport-parameter blob carries `alternative_address`, surfaced
+  from `validatePeerTransportRole`. New helpers:
+  `Connection.peerSupportsAlternativeAddress` and
+  `Connection.localAdvertisedAlternativeAddress`. New retransmit
+  variants `RetransmitFrame.alternative_v4_address` /
+  `alternative_v6_address`. New pending queue
+  `pending_frames.alternative_addresses` (FIFO of
+  `PendingAlternativeAddress` tagged unions). Inline state tests
+  (6) cover the role gate, negotiation gate, monotonic
+  sequence allocation, V4/V6 sequence-space sharing, loss-recovery
+  requeue for both frame variants, and saturation at u64 max.
+  Conformance suite gains 6 tests (negotiated end-to-end pump,
+  server-emit through `step`, role gate, negotiation gate,
+  TRANSPORT_PARAMETER_ERROR on a server-authored param, and the
+  preserved PROTOCOL_VIOLATION-when-not-negotiated assertion).
+  New error codepoints: `Connection.Error.AlternativeAddressNotNegotiated`.
+
+- **draft-munizaga-quic-alternative-server-address-00 codec
+  (ALT-1, ALT-2).** New `frame.types.AlternativeV4Address` /
+  `AlternativeV6Address` plus encode/decode dispatch wire the §6
+  frames (type bytes `0x1d5845e2` / `0x1d5845e3`, both 4-byte
+  varints). The flag byte's high bit is `Preferred`, the next bit is
+  `Retire`, and the low 6 bits stay unused (zero on encode, ignored
+  on decode). The §4 transport parameter `alternative_address`
+  (codepoint `0xff0969d85c`) lands as a zero-length flag on
+  `transport_params.Params`; `decodeAs` enforces §4 ¶2 by rejecting
+  any server-authored blob that carries the parameter
+  (`Error.TransportParameterError` → TRANSPORT_PARAMETER_ERROR
+  connection close on the client side). The §4 ¶3 0-RTT exclusion
+  is anchored by the field's `false` default — embedders that
+  resume from cached peer parameters MUST clear it before
+  installing them as 0-RTT context. Pinned via
+  `quic_zig.alt_server_address_draft_version: u32 = 0`; bumping is
+  a deliberate scoped change. New conformance suite at
+  `tests/conformance/draft_munizaga_alt_addr_00.zig` (18 tests).
+  Receive-side state-machine integration is **not yet wired**: the
+  per-frame dispatch in `conn.state` closes the connection with
+  PROTOCOL_VIOLATION on receipt today, locked in by a fixture-driven
+  test using `_handshake_fixture.injectFrameAtClient`. The follow-up
+  drops (ALT-3 server emit, ALT-4 client receive) flip that gate to
+  a real `altAddressNegotiated()` predicate.
+
+- **QUIC-LB draft-21 rotation auto-push (LB-4 follow-up).** New
+  `Server.Config.stateless_reset_key: ?conn.stateless_reset.Key`
+  unlocks server-driven rotation. When set, `installLbConfig`
+  automatically walks every live slot via the new
+  `Server.rotateLiveSlotCids` and queues a NEW_CONNECTION_ID frame
+  with the new factory's CID and an HMAC-derived stateless-reset
+  token (`conn.stateless_reset.derive`). `retire_prior_to` is set
+  to the next-issued sequence so peers drop every pre-rotation CID
+  on their next datagram. Per-slot push failures are swallowed so a
+  single bad slot can't abort the rotation; OOM during a per-slot
+  push leaves that slot on its old CIDs and the operator can retry
+  via `Server.rotateLiveSlotCids` directly. Without
+  `stateless_reset_key`, rotation stays lazy and embedders drive
+  replenishment through the existing `connection_ids_needed` flow.
+  The key bytes get `secureZero`-ed in `Server.deinit` alongside
+  the other secret-key fields.
+- **QUIC-LB draft-21 nonce-exhaustion auto-fallback.** `Server`'s
+  internal SCID minter (`mintLocalScid`, now `pub` so conformance
+  can exercise the branch directly) now falls back to
+  `lb.mintUnroutable` when the active LB factory's nonce counter
+  wraps. The Server keeps minting well-formed CIDs (config_id
+  `0b111` with self-encoded length) until the operator rotates to a
+  fresh configuration via `installLbConfig`. The fallback is
+  conditioned on `local_cid_len >= lb.min_unroutable_cid_len` (8
+  octets, per draft §3.1 SHOULD); shorter configurations surface
+  `Error.RandFailed` so the surrounding feed/poll loop bails on
+  the Initial. New §3 ¶3 / §3.1 conformance tests cover both
+  branches.
+- **QUIC-LB draft-21 configuration rotation (LB-4).** New
+  `Server.installLbConfig(new_cfg)` swaps the active QUIC-LB factory
+  in place; the previous factory's key bytes are `secureZero`-ed
+  before the swap. Subsequent SCID mints (post-Initial Slot SCIDs
+  and Retry SCIDs) use the new configuration; CIDs already in the
+  routing table remain valid until peers organically retire them.
+  The minimum supports key rotation under a fixed deployment shape:
+  `installLbConfig` rejects configurations whose `cidLength` differs
+  from the server's existing `local_cid_len`. Pushing
+  NEW_CONNECTION_ID frames to live peers is operational and remains
+  embedder-driven via the existing `connection_ids_needed` event.
+- **QUIC-LB draft-21 unroutable CID fallback (LB-5).** New free
+  function `quic_zig.lb.mintUnroutable(dst, len)` writes a §3.1
+  unroutable CID: first octet `0b111_xxxxx` with the low 5 bits
+  encoding `cid_len - 1`, plus `len - 1` CSPRNG bytes. Length is
+  constrained to 8..20 octets to honour the §3.1 SHOULD that
+  unroutable CIDs carry at least 7 octets of entropy after the first
+  byte. Embedders call this directly when they decide unroutable
+  mode is appropriate (rotation gap, nonce exhaustion); the §5.5
+  decoder also recognises 0b111 first octets and surfaces them as
+  `DecodeError.UnroutableCid`.
+- **QUIC-LB draft-21 LB-side decode helper (LB-6, complete).** New
+  `quic_zig.lb.decode(cid, cfg) → Decoded { config_id, server_id,
+  nonce }` recovers the routing identity from a minted CID. All
+  three modes are operational: plaintext (§5.5), single-pass
+  AES-128-ECB-decrypt (§5.5.1), and four-pass Feistel (§5.5.2).
+  Single-pass decode required `Aes128.initDecrypt` /
+  `decryptBlock` from boringssl-zig 0.6.0; quic-zig pins
+  boringssl-zig as a local path dep until 0.6.0 ships as a tagged
+  release. Round-trip property tests cover every supported
+  `(sid_len, nonce_len)` split, plus a byte-exact KAT decoding
+  draft Appendix B.2 vector #2.
+- **QUIC-LB draft-21 four-pass Feistel encryption (LB-3).** Adds the
+  §5.4.2 four-pass mode in a new `quic_zig.lb.feistel` module: when
+  the embedder configures `Server.Config.quic_lb` with a 16-byte AES
+  key and the plaintext block isn't 16 octets, every minted CID body
+  becomes a length-preserving Feistel encryption of `server_id ||
+  nonce` over four AES-128-ECB rounds whose distinct inputs come from
+  the §5.4.2.2 `expand(combined, pass, half)` function. Odd-length
+  plaintexts get the boundary-nibble clearing of §5.4.2.3 so the
+  half-byte at the split doesn't appear in both halves. The
+  §5.4.2.4 worked example (3+4 server_id/nonce, key
+  `fdf726a9893ec05c0632d3956680baf0`) is locked in as a byte-exact
+  conformance KAT, plus a length-preservation property test across
+  every supported `combined` and an encrypt/decrypt round-trip
+  property test. `feistel.decrypt` ships alongside encrypt so
+  ops/test tooling and future LB-side decode helpers (LB-6) can
+  recover the plaintext. `Server.init` now accepts every valid
+  encrypted-mode configuration; the visible-debt skip for §5.4.2 is
+  retired.
+- **QUIC-LB draft-21 single-pass AES-128-ECB encryption (LB-2).**
+  Adds the §5.4.1 single-pass mode to `quic_zig.lb`: when an embedder
+  configures `Server.Config.quic_lb` with a 16-byte AES-128 key and
+  the plaintext block sums to exactly 16 octets
+  (`server_id_len + nonce_len == 16`), every minted CID body becomes
+  `AES-128-ECB(key, server_id || nonce)` while the first octet stays
+  in the clear. New `lb.NonceCounter` seeds from the CSPRNG and
+  advances by one per mint so the same nonce is never reused under
+  the same key (§5.4 ¶3); `Factory.mint` returns
+  `error.NonceExhausted` on counter wrap. `Factory.deinit`
+  `secureZero`s the embedded key and counter buffer; `Server.deinit`
+  calls into it. KAT for draft Appendix B.2 vector #2 added to
+  `tests/conformance/quic_lb_draft21.zig`. (Four-pass Feistel for
+  `combined != 16` followed in LB-3 — see entry above.)
+- **QUIC-LB draft-21 server-side, plaintext mode (LB-1).** New
+  `quic_zig.lb` module
+  ([draft-ietf-quic-load-balancers-21](https://datatracker.ietf.org/doc/draft-ietf-quic-load-balancers/))
+  encodes the load-balancer routing identity into every locally-issued
+  SCID. Off by default; opt in via `Server.Config.quic_lb`. When set,
+  `Server.init` resolves `local_cid_len` from the LB configuration
+  (`1 + server_id_len + nonce_len`) and routes both the post-Initial
+  Slot SCID and the Retry SCID through `lb.Factory.mint`. Plaintext
+  mode (§5.2) auto-enables `disable_active_migration` per draft §3 ¶3
+  unless the embedder already set it. Pinned to draft revision 21 via
+  `quic_zig.quic_lb_draft_version`. **Hardening note:** opting in
+  deliberately inverts the "Server SCIDs are CSPRNG draws" default;
+  treat the load balancer as the trust boundary. The Retry Service
+  was split into a separate IETF draft and is out of scope here.
+
 ### Hardening (security-relevant)
 
 - **§17.2.1 / §17.3 — Reserved Bits enforced on receive.**

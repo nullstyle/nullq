@@ -56,20 +56,58 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
 
 ## Latest local results
 
-- `quic-go`, `ngtcp2`, and `quiche` all pass quic-zig-as-server
-  handshake and transfer: `✓(H,DC)`.
-- `quic-go` passes the feature matrix:
-  `✓(H,DC,C20,S,R,Z,M)`.
-- `quic-go`, `ngtcp2`, and `quiche` all pass quic-zig-as-client
-  handshake and transfer: `✓(H,DC)`.
-- `quic-go` passes quic-zig-as-client feature coverage:
-  `✓(H,DC,C20,S,R,Z,M)`. The `chacha20` client testcase uses the
-  `boringssl-zig` AES-hardware testing override so BoringSSL prefers
-  ChaCha on AES-capable hosts.
-- When both endpoints expose valid keylogs, quic-zig's wrapper merges them
-  in the throwaway runner overlay before trace analysis. This keeps
-  0-RTT decryption clean when the selected client keylog lacks
-  `CLIENT_EARLY_TRAFFIC_SECRET` but the server keylog has it.
+**Matrix run, 2026-05-09 (72 cells over 4 runner invocations,
+~32 min wall):**
+
+- 58 of 72 cells passed.
+- Server role (quic-zig × {quic-go, ngtcp2, quiche} clients):
+  - quic-go × {H, DC, C20, R, Z, M, U, LR, B, BA}.
+  - ngtcp2 × {H, DC, C20, R, Z, M, U, LR, B, BA}.
+  - quiche × {H, DC, R, Z, LR, B}.
+- Client role (quic-zig × {quic-go, ngtcp2, quiche} servers):
+  - quic-go × {H, DC, C20, S, R, Z, M, U, LR, B}.
+  - ngtcp2 × {H, DC, C20, S, R, Z, M, CM, U, LR, B, BA}.
+  - quiche × {H, DC, C20, S, R, Z, M, U, LR, B}.
+
+**Known gaps from the run:**
+
+- **Server `S` (retry) × all three peers** — `retryAddressContext`
+  built a 23-byte v6 bound context that exceeded
+  `retry_token.max_address_len = 22`; the v4-mapped-v6 peer paths
+  (every runner peer once `[::]:443` took effect) tripped
+  `Error.ContextTooLong`. **Landed fix**: drop the IPv6 flow label
+  from the bound context (now 19 bytes). Re-verification pending.
+- **Client `BA` (rebind-addr) × {quic-go, quiche}** — the
+  unconditional 750ms client warmup pushed the first ClientHello
+  into the runner's 1s rebind window; handshake CRYPTO bytes got
+  stranded on the pre-rebind 4-tuple. **Landed fix**: gate the
+  warmup on `TESTCASE=longrtt` only. Re-verification pending.
+- **Server `M` (multiplexing) × quiche** — quiche pipelines its
+  2000 streams faster than `maybeQueueBatchedMaxStreams` returns
+  credit; quic-go and ngtcp2 do not. **Landed fix**: raise the
+  qns endpoint's `endpoint_bidi_stream_limit` from 1000 to 2500
+  so the burst fits inside initial credit. Re-verification
+  pending.
+- **Server `CM` (connectionmigration) × all three peers** —
+  `qns_endpoint.zig` does not advertise `preferred_address` in
+  the server's transport-parameter blob; the codec exists in
+  `src/tls/transport_params.zig`, the wiring is unfinished.
+  **Deferred** to a follow-up session (needs an alt-port
+  listening socket and runner-IP introspection).
+- **Server `BA` (rebind-addr) × quiche** — the FIRST server
+  packet on a freshly-migrated path occasionally lacks
+  PATH_CHALLENGE under quiche's tight rebind cadence. **Deferred**;
+  needs interactive packet-order tracing.
+
+Four cells reported "unsupported" by the peer image, not the
+quic-zig endpoint, and are excluded from regression tracking:
+`quiche × C20 (server-role)`, `quiche × U (server-role)`,
+`{quic-go, quiche} × CM (client-role)`.
+
+When both endpoints expose valid keylogs, quic-zig's wrapper merges
+them in the throwaway runner overlay before trace analysis. This
+keeps 0-RTT decryption clean when the selected client keylog lacks
+`CLIENT_EARLY_TRAFFIC_SECRET` but the server keylog has it.
 
 ## Requirements
 
