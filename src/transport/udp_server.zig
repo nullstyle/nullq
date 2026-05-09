@@ -92,6 +92,30 @@ pub const RunUdpOptions = struct {
     /// embedders pick smaller (embedded targets) or larger (10G NIC)
     /// buffers without disabling tuning altogether.
     tuning: socket_opts.ServerTuning = .{},
+
+    /// Enable IETF ECN signaling (RFC 9000 §13.4). When `true`, the
+    /// loop sets `IP_TOS` / `IPV6_TCLASS` to ECT(0) on the bound
+    /// socket and `IP_RECVTOS` / `IPV6_RECVTCLASS` so the kernel
+    /// surfaces the per-datagram TOS byte via cmsg. The parsed
+    /// codepoint is plumbed into `Server.feedWithEcn`. On by default
+    /// — production QUIC reaps modest goodput wins by reacting to
+    /// router-driven CE marks. Embedders on environments that bleach
+    /// ECN can flip this off and the loop falls through to the plain
+    /// `Server.feed` (Not-ECT) path.
+    enable_ecn: bool = true,
+    /// Send-side ECN codepoint applied to the bound socket when
+    /// `enable_ecn = true`. Defaults to ECT(0) (RFC 9000 §13.4
+    /// recommends ECT(0) for QUIC). `not_ect` disables marking;
+    /// `ect1` and `ce` are reserved.
+    ecn_send_codepoint: socket_opts.EcnCodepoint = .ect0,
+    /// Per-recv cmsg control buffer size. Each iteration allocates a
+    /// stack-local buffer of this many bytes for the kernel to
+    /// populate with TOS / TCLASS cmsgs. 64 bytes is comfortably
+    /// large enough for both `IP_TOS` and `IPV6_TCLASS` cmsgs in
+    /// the same datagram with alignment slack. Bump only if
+    /// pipelining other ancillary data (PKTINFO, etc.) onto the same
+    /// socket is in scope.
+    cmsg_buffer_bytes: usize = socket_opts.default_cmsg_buffer_bytes,
     /// Optional shutdown signal. The loop calls `flag.load(.acquire)`
     /// at the top of every iteration; once it observes `true`, it
     /// calls `Server.shutdown(0, "")`, drains outgoing CONNECTION_CLOSE
@@ -176,11 +200,36 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
         };
     }
 
+    // Enable IP-layer ECN if the embedder asked for it. Both setters
+    // are best-effort: if the kernel rejects (e.g. a sandbox without
+    // CAP_NET_RAW for some platforms, or a non-IP socket), we fall
+    // through to the no-ECN path silently rather than aborting the
+    // whole server. The Connection-side ECN counters degrade
+    // gracefully when no codepoint ever arrives.
+    var ecn_active = options.enable_ecn;
+    if (ecn_active) {
+        socket_opts.setEcnSendMarking(sock.handle, options.ecn_send_codepoint) catch {
+            ecn_active = false;
+        };
+        if (ecn_active) {
+            socket_opts.setEcnRecvEnabled(sock.handle, true) catch {
+                ecn_active = false;
+            };
+        }
+    }
+
     const allocator = server.allocator;
     const rx = try allocator.alloc(u8, options.rx_buffer_bytes);
     defer allocator.free(rx);
     const tx = try allocator.alloc(u8, options.tx_buffer_bytes);
     defer allocator.free(tx);
+    const cmsg_buf_len: usize = if (ecn_active) options.cmsg_buffer_bytes else 0;
+    var empty_cmsg_buf: [0]u8 = undefined;
+    const cmsg_buf: []u8 = if (cmsg_buf_len > 0)
+        try allocator.alloc(u8, cmsg_buf_len)
+    else
+        empty_cmsg_buf[0..0];
+    defer if (cmsg_buf_len > 0) allocator.free(cmsg_buf);
 
     const start = std.Io.Timestamp.now(options.io, .awake);
     var iteration_count: u32 = 0;
@@ -215,15 +264,42 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
         // next `tick` call, which is what drives QUIC PTO. Exactly
         // one datagram per iteration per
         // `max_datagrams_per_loop_iteration` (hardening §8).
-        const maybe_msg = sock.receiveTimeout(options.io, rx, .{
-            .duration = .{
-                .raw = options.receive_timeout,
-                .clock = .awake,
-            },
-        }) catch |err| switch (err) {
-            error.Timeout => null,
-            else => return err,
-        };
+        //
+        // Two paths: when ECN is active we go through
+        // `receiveManyTimeout` so we can hand the kernel a control
+        // buffer for IP_TOS / IPV6_TCLASS cmsgs. Otherwise we keep
+        // the cheaper `receiveTimeout` shape (no control buffer
+        // alloc, no cmsg parse).
+        var maybe_msg: ?Net.IncomingMessage = null;
+        var ecn: socket_opts.EcnCodepoint = .not_ect;
+        if (ecn_active) {
+            var msg: Net.IncomingMessage = .init;
+            msg.control = cmsg_buf;
+            const buf_slice = (&msg)[0..1];
+            const ret = sock.receiveManyTimeout(options.io, buf_slice, rx, .{}, .{
+                .duration = .{
+                    .raw = options.receive_timeout,
+                    .clock = .awake,
+                },
+            });
+            if (ret[0]) |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            } else if (ret[1] == 1) {
+                ecn = socket_opts.parseEcnFromControl(msg.control);
+                maybe_msg = msg;
+            }
+        } else {
+            maybe_msg = sock.receiveTimeout(options.io, rx, .{
+                .duration = .{
+                    .raw = options.receive_timeout,
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => null,
+                else => return err,
+            };
+        }
 
         // Refresh time after the (possibly-blocking) receive call.
         // Don't reuse the pre-receive timestamp: tick / poll need to
@@ -237,7 +313,7 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
             // failure for the loop. The FeedOutcome is informational —
             // production embedders may want to plumb it into a metrics
             // counter, but the default loop just lets it ride.
-            _ = try server.feed(msg.data, from_addr, now_us);
+            _ = try server.feedWithEcn(msg.data, from_addr, ecn, now_us);
 
             // Drain any Version Negotiation / Retry packets that
             // `feed` queued. Sending these via the same socket the

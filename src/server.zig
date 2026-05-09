@@ -1023,6 +1023,13 @@ pub const Server = struct {
     /// only valid inside the feed's call frame.
     last_feed_now_us: u64 = 0,
 
+    /// IP-layer ECN codepoint observed on the datagram currently being
+    /// processed by `feedWithEcn`. Threaded to `dispatchToSlot` so the
+    /// per-Connection `handleWithEcn` call gets the right marking.
+    /// `not_ect` outside an active feed; mutating outside `feed*`
+    /// (e.g. via test scaffolding) is undefined behavior.
+    last_feed_ecn: conn_mod.state.socket_opts_mod.EcnCodepoint = .not_ect,
+
     /// Bounded FIFO of stateless responses (VN, Retry) queued for
     /// the embedder to drain via `drainStatelessResponse`. Bounded
     /// at `stateless_response_queue_capacity`; on overflow the
@@ -1311,6 +1318,30 @@ pub const Server = struct {
         from: ?Address,
         now_us: u64,
     ) Error!FeedOutcome {
+        return self.feedWithEcn(bytes, from, .not_ect, now_us);
+    }
+
+    /// Like `feed`, but also carries the IP-layer ECN codepoint the
+    /// embedder peeled off the datagram's TOS byte. The codepoint
+    /// flows down to `Connection.handleWithEcn` so per-PN-space ECN
+    /// counters can be bumped on successful decrypt (RFC 9000
+    /// §13.4.1). Embedders that aren't running cmsg parsing should
+    /// keep using `feed` (which passes `not_ect`).
+    pub fn feedWithEcn(
+        self: *Server,
+        bytes: []u8,
+        from: ?Address,
+        ecn: conn_mod.state.socket_opts_mod.EcnCodepoint,
+        now_us: u64,
+    ) Error!FeedOutcome {
+        // Set the ingress ECN for any subsequent dispatch into a
+        // slot's Connection. Stateless / pre-slot processing
+        // (Version Negotiation, Retry minting, table_full) doesn't
+        // care about the marking — only the per-Connection handlers
+        // do. Cleared at function exit so a malformed/dropped feed
+        // doesn't leave a stale codepoint visible to the next call.
+        self.last_feed_ecn = ecn;
+        defer self.last_feed_ecn = .not_ect;
         // Stamp the feed's `now_us` so `emitLog` can run its per-source
         // log rate limit against in-feed time without taking a separate
         // clock argument.
@@ -1913,7 +1944,7 @@ pub const Server = struct {
         const seq_opt: ?u64 = if (dcid_opt) |d| slot.conn.findLocalCidSequence(d) else null;
         slot.conn.setIncomingLocalCidSeq(seq_opt);
         defer slot.conn.setIncomingLocalCidSeq(null);
-        slot.conn.handle(bytes, from, now_us) catch |err| switch (err) {
+        slot.conn.handleWithEcn(bytes, from, self.last_feed_ecn, now_us) catch |err| switch (err) {
             // OOM is fatal for the whole server — propagate. The
             // surrounding `feed` will return `OutOfMemory` to the
             // embedder, who can decide whether to retry, scale, or
