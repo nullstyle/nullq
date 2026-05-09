@@ -59,6 +59,36 @@ pub const retry_integrity_nonce_v1: [12]u8 = .{
     0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 };
 
+/// QUIC v2 Retry integrity key (RFC 9368 §3.3.3).
+pub const retry_integrity_key_v2: [16]u8 = .{
+    0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2,
+    0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92,
+};
+
+/// QUIC v2 Retry integrity nonce (RFC 9368 §3.3.3).
+pub const retry_integrity_nonce_v2: [12]u8 = .{
+    0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c,
+    0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a,
+};
+
+/// Look up the Retry integrity key for `version`. Falls back to v1
+/// for unknown versions.
+pub fn retryIntegrityKeyFor(version: u32) *const [16]u8 {
+    return switch (version) {
+        header.quic_version_2 => &retry_integrity_key_v2,
+        else => &retry_integrity_key_v1,
+    };
+}
+
+/// Look up the Retry integrity nonce for `version`. Falls back to v1
+/// for unknown versions.
+pub fn retryIntegrityNonceFor(version: u32) *const [12]u8 {
+    return switch (version) {
+        header.quic_version_2 => &retry_integrity_nonce_v2,
+        else => &retry_integrity_nonce_v1,
+    };
+}
+
 const retry_pseudo_packet_max: usize = 4096;
 
 /// Inputs to `sealRetry`. Server-side construction of a Retry packet
@@ -417,10 +447,12 @@ pub fn openHandshake(pt_dst: []u8, src: []u8, opts: InitialOpenOptions) Error!Lo
 
 // -- Retry ---------------------------------------------------------------
 
-/// Compute the 16-byte Retry integrity tag (RFC 9001 §5.8) over the
-/// pseudo-packet formed from the Original DCID length, the ODCID
-/// bytes, and the Retry packet bytes preceding the tag.
-pub fn retryIntegrityTag(original_dcid: []const u8, retry_without_tag: []const u8) Error![16]u8 {
+/// Compute the 16-byte Retry integrity tag (RFC 9001 §5.8 / RFC 9368
+/// §3.3.3) over the pseudo-packet formed from the Original DCID
+/// length, the ODCID bytes, and the Retry packet bytes preceding the
+/// tag. The AEAD key/nonce is version-specific: v1 uses the §5.8
+/// constants, v2 uses §3.3.3.
+pub fn retryIntegrityTag(version: u32, original_dcid: []const u8, retry_without_tag: []const u8) Error![16]u8 {
     if (original_dcid.len > header.max_cid_len) return Error.DcidTooLong;
     if (1 + original_dcid.len + retry_without_tag.len > retry_pseudo_packet_max) {
         return Error.OutputTooSmall;
@@ -435,10 +467,10 @@ pub fn retryIntegrityTag(original_dcid: []const u8, retry_without_tag: []const u
     @memcpy(pseudo[pos .. pos + retry_without_tag.len], retry_without_tag);
     pos += retry_without_tag.len;
 
-    var aead = try AesGcm128.init(&retry_integrity_key_v1);
+    var aead = try AesGcm128.init(retryIntegrityKeyFor(version));
     defer aead.deinit();
     var out: [16]u8 = undefined;
-    const n = try aead.seal(&out, &retry_integrity_nonce_v1, pseudo[0..pos], "");
+    const n = try aead.seal(&out, retryIntegrityNonceFor(version), pseudo[0..pos], "");
     // BoringSSL contract: AesGcm128.seal with empty plaintext writes
     // exactly the 16-byte tag. Reachable from peer-input via Retry
     // integrity validation; surface as a typed error rather than
@@ -464,16 +496,20 @@ pub fn sealRetry(dst: []u8, opts: RetrySealOptions) Error!usize {
         .integrity_tag = zero_tag,
         .unused_bits = opts.unused_bits,
     } });
-    const tag = try retryIntegrityTag(opts.original_dcid, dst[0 .. len - 16]);
+    const tag = try retryIntegrityTag(opts.version, opts.original_dcid, dst[0 .. len - 16]);
     @memcpy(dst[len - 16 .. len], &tag);
     return len;
 }
 
 /// Verify the Retry integrity tag on `retry_packet` against the
-/// client's original DCID. Returns true on a match, false otherwise.
+/// client's original DCID. The version is read from the packet's
+/// version field (bytes 1..5) so the right §5.8 / §3.3.3 constants
+/// are used. Returns true on a match, false otherwise.
 pub fn validateRetryIntegrity(original_dcid: []const u8, retry_packet: []const u8) Error!bool {
     if (retry_packet.len < 16) return Error.PayloadTooShort;
-    const expected = try retryIntegrityTag(original_dcid, retry_packet[0 .. retry_packet.len - 16]);
+    if (retry_packet.len < 5) return Error.InsufficientBytes;
+    const version = std.mem.readInt(u32, retry_packet[1..5], .big);
+    const expected = try retryIntegrityTag(version, original_dcid, retry_packet[0 .. retry_packet.len - 16]);
     // Constant-time compare: per RFC 9001 §5.8 the tag is AEAD-derived
     // so a partial-match timing oracle on the wire would let a peer
     // bias forgery attempts byte-by-byte.
@@ -490,15 +526,18 @@ fn openLongHeader(
     largest_received: u64,
     expected_type: header.LongType,
 ) Error!LongOpenResult {
-    if (src.len < 1) return Error.InsufficientBytes;
+    if (src.len < 5) return Error.InsufficientBytes;
     if (src[0] & 0x80 == 0) {
         return unexpectedPacketType(expected_type);
     }
+    // Read the version field (bytes 1..5) so we can decode long-type
+    // bits under the right RFC 9000 §17.2 / RFC 9368 §3.2 layout.
+    const version = std.mem.readInt(u32, src[1..5], .big);
     // Long-type bits (5-4 of the first byte) are NOT covered by HP
     // (which masks only bits 3-0 for long headers, RFC 9001 §5.4.1),
     // so we can check the type before any decryption.
     const long_type_bits_pre: u2 = @intCast((src[0] >> 4) & 0x03);
-    const pre_type: header.LongType = @enumFromInt(long_type_bits_pre);
+    const pre_type: header.LongType = header.longTypeFromBits(version, long_type_bits_pre);
     if (pre_type != expected_type) {
         return unexpectedPacketType(expected_type);
     }
@@ -510,7 +549,6 @@ fn openLongHeader(
     // are still HP-masked, so we ignore the parser's pn_length /
     // pn_truncated for now and re-derive them after HP is removed.
     var pos: usize = 1;
-    if (src.len < pos + 4) return Error.InsufficientBytes;
     pos += 4; // version
 
     if (src.len < pos + 1) return Error.InsufficientBytes;
@@ -562,7 +600,7 @@ fn openLongHeader(
 
     // Now sanity-check actual_type. Bits 5-4 of the cleaned first byte.
     const long_type_bits: u2 = @intCast((src[0] >> 4) & 0x03);
-    const actual_type: header.LongType = @enumFromInt(long_type_bits);
+    const actual_type: header.LongType = header.longTypeFromBits(version, long_type_bits);
     if (actual_type != expected_type) {
         return unexpectedPacketType(expected_type);
     }
