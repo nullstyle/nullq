@@ -69,25 +69,50 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   - ngtcp2 × {H, DC, C20, S, R, Z, M, CM, U, LR, B, BA}.
   - quiche × {H, DC, C20, S, R, Z, M, U, LR, B}.
 
-**Known gaps from the run:**
+**Verification (2026-05-09 post-fix matrix re-run):**
 
-- **Server `S` (retry) × all three peers** — `retryAddressContext`
-  built a 23-byte v6 bound context that exceeded
-  `retry_token.max_address_len = 22`; the v4-mapped-v6 peer paths
-  (every runner peer once `[::]:443` took effect) tripped
-  `Error.ContextTooLong`. **Landed fix**: drop the IPv6 flow label
-  from the bound context (now 19 bytes). Re-verification pending.
-- **Client `BA` (rebind-addr) × {quic-go, quiche}** — the
-  unconditional 750ms client warmup pushed the first ClientHello
-  into the runner's 1s rebind window; handshake CRYPTO bytes got
-  stranded on the pre-rebind 4-tuple. **Landed fix**: gate the
-  warmup on `TESTCASE=longrtt` only. Re-verification pending.
-- **Server `M` (multiplexing) × quiche** — quiche pipelines its
-  2000 streams faster than `maybeQueueBatchedMaxStreams` returns
-  credit; quic-go and ngtcp2 do not. **Landed fix**: raise the
-  qns endpoint's `endpoint_bidi_stream_limit` from 1000 to 2500
-  so the burst fits inside initial credit. Re-verification
-  pending.
+| Cell | Pre-fix | Predicted | Post-fix | Note |
+|---|---|---|---|---|
+| server × {3} × retry | FAIL | PASS | **PASS** | Fix #1 verified |
+| client × {quic-go, quiche} × rebind-addr | FAIL | PASS | **FAIL** | Fix #2 narrative wrong |
+| server × quiche × multiplexing | FAIL | PASS | FAIL | Fix #3 reverted |
+| server × {quic-go, ngtcp2} × multiplexing | PASS | PASS | (PASS again after revert) | Fix #3 was a regression |
+
+**Re-scoped fix narratives:**
+
+- **Fix #1 `retryAddressContext`** — verified clean. 3 cells flipped
+  FAIL→PASS as predicted.
+- **Fix #2 `apply_simulator_warmup` gating** — the warmup race is
+  gone (handshake completes cleanly), but the client × rebind-addr
+  cells still fail because of a SEPARATE deeper bug: the quic-zig
+  client never delivers a NEW_CONNECTION_ID frame for the migrated
+  path, and the runner's quic-go server logs `skipping validation
+  of new path … since no connection ID is available`. Quiche
+  validates the new path successfully but the client keeps sending
+  from the OLD socket. Both are client-side active-migration /
+  CID-issuance bugs, not warmup-related. The warmup fix itself
+  stays — it's still the right behavior — but the CHANGELOG /
+  README claim that it would unlock 2 cells was wrong.
+- **Fix #3 `endpoint_bidi_stream_limit` 1000→2500** — REVERTED.
+  The runner's `multiplexing` testcase explicitly validates
+  `initial_max_streams_bidi <= 1000`
+  (`testcases_quic.py:286-288`); raising the cap broke 2
+  previously-passing cells (server × {quic-go, ngtcp2} ×
+  multiplexing). The proper fix is in `maybeQueueBatchedMaxStreams`
+  (`src/conn/state.zig`) — lower the credit-return watermark from
+  `remaining > batch / 2` to a lower threshold so dynamic
+  `MAX_STREAMS` issuance reaches the peer before quiche's pipelined
+  burst exhausts the initial allotment.
+
+**Known gaps still open:**
+
+- **Server `M` (multiplexing) × quiche** — original quiche-only
+  failure mode reverts to its 2026-05-09 morning state. The core
+  watermark fix above is the path forward.
+- **Client `BA` (rebind-addr) × {quic-go, quiche}** — client-side
+  active-migration + NEW_CONNECTION_ID-for-new-path issuance
+  surfaced by the verification matrix. Distinct from the warmup
+  workaround.
 - **Server `CM` (connectionmigration) × all three peers** —
   `qns_endpoint.zig` does not advertise `preferred_address` in
   the server's transport-parameter blob; the codec exists in
@@ -98,6 +123,15 @@ H=handshake, D=transfer, C=chacha20, S=retry, R=resumption, Z=zerortt, M=multipl
   packet on a freshly-migrated path occasionally lacks
   PATH_CHALLENGE under quiche's tight rebind cadence. **Deferred**;
   needs interactive packet-order tracing.
+
+**Build infra note**: the qns Dockerfile (`interop/qns/Dockerfile`)
+pins `ARG ZIG_VERSION=0.16.0`, but `mise.toml` sets `zig = "master"`
+(currently 0.17-dev) and HEAD's source uses 0.17-only forms.
+`mise run interop-build-image` will fail until the Dockerfile is
+bumped to a matching 0.17-dev tarball. Workaround: build
+`zig build qns-endpoint -Doptimize=ReleaseSafe` on the host with
+the same Zig the rest of the tree uses, then COPY the resulting
+binary into a hand-rolled image. Tracked as a follow-up.
 
 Four cells reported "unsupported" by the peer image, not the
 quic-zig endpoint, and are excluded from regression tracking:

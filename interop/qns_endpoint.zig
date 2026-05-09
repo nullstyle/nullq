@@ -60,18 +60,21 @@ const endpoint_udp_payload_size = 1350;
 const endpoint_connection_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_stream_receive_window: u64 = 16 * 1024 * 1024;
 const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
-// Sized to accommodate the quic-interop-runner `multiplexing` test
-// (2000 concurrent bidi streams) without ever needing a MAX_STREAMS
-// replenishment round-trip. quiche's client pipelines its 2000-
-// stream burst aggressively enough that the first replenishment
-// (queued by `maybeQueueBatchedMaxStreams` once `remaining <
-// batch/2`) doesn't reach the wire before the burst hits the cap;
-// the connection deadlocks. quic-go and ngtcp2 also send 2000 but
-// their pipelining is gentler and they recover before timeout.
-// 2500 gives margin without requiring tuning the core watermark
-// (`src/conn/state.zig` `maybeQueueBatchedMaxStreams`), which would
-// affect every embedder, not just the qns harness.
-const endpoint_bidi_stream_limit: u64 = 2500;
+// Capped at 1000 because the quic-interop-runner's `multiplexing`
+// testcase asserts `initial_max_streams_bidi <= 1000`
+// (`testcases_quic.py:286-288`: "Server set a stream limit > 1000.").
+// Raising the initial cap to absorb quiche's 2000-stream pipelined
+// burst was tried briefly (commit 77e6bed) and reverted after the
+// 2026-05-09 verification matrix showed it broke server ×
+// multiplexing × {quic-go, ngtcp2} — the runner deliberately
+// validates that servers issue `MAX_STREAMS` dynamically rather
+// than statically advertising a huge floor. The proper fix lives
+// in `maybeQueueBatchedMaxStreams` in `src/conn/state.zig` —
+// lower the `remaining > batch / 2` watermark to `> batch / 4`
+// (or smaller) so credit-return reaches the peer before quiche's
+// pipelined burst exhausts the initial allotment. Tracked as a
+// follow-up in `interop/README.md`.
+const endpoint_bidi_stream_limit: u64 = 1000;
 const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 2;
 const endpoint_server_cid_desired_last_seq: u8 = 1;

@@ -9,6 +9,50 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Interop verification (2026-05-09 follow-up)
+
+The 2026-05-09 post-fix matrix re-run revealed that two of the
+three landed interop fixes did NOT flip their predicted cells:
+
+- **Fix #1 (retry IPv4-mapped IPv6)**: verified clean. server ×
+  {quic-go, ngtcp2, quiche} × `retry` all flipped FAIL → PASS as
+  predicted.
+- **Fix #2 (warmup gating)**: the warmup race is gone — handshakes
+  now complete cleanly through the rebind window — but
+  client × rebind-addr × {quic-go, quiche} still FAIL because of a
+  SEPARATE client-side bug. quic-zig's client never delivers a
+  NEW_CONNECTION_ID frame for the migrated path (quic-go's logs:
+  `skipping validation of new path … since no connection ID is
+  available`); quiche's path validation succeeds but the client
+  keeps sending from the OLD socket. The warmup fix itself stays
+  — it's still the right behavior — but the original CHANGELOG
+  claim that it would unlock 2 cells was wrong. The actual gap
+  is client-side active migration + per-path NEW_CONNECTION_ID
+  issuance, which is a separate piece of work.
+- **Fix #3 (`endpoint_bidi_stream_limit` 1000→2500)**: REVERTED
+  in this follow-up. The runner's `multiplexing` test explicitly
+  validates `initial_max_streams_bidi <= 1000`
+  (`testcases_quic.py:286-288`: "Server set a stream limit > 1000."),
+  so raising the cap broke 2 previously-passing cells
+  (server × {quic-go, ngtcp2} × `multiplexing`). The proper fix
+  is in `maybeQueueBatchedMaxStreams` (`src/conn/state.zig`):
+  lower the credit-return watermark from `remaining > batch / 2`
+  to a smaller threshold so dynamic `MAX_STREAMS` issuance reaches
+  the peer before quiche's pipelined burst exhausts the initial
+  allotment. Tracked as a follow-up.
+
+Net interop delta from the recent landed work: **+3 cells**
+(retry × 3 peers); 0 regressions; 0 of the 2 rebind-addr cells the
+warmup fix was predicted to unlock. The interop README has the
+detailed verification table and re-scoped narratives.
+
+Build-infra note (also from the verification): `interop/qns/Dockerfile`
+pins `ARG ZIG_VERSION=0.16.0` while `mise.toml` uses `zig = "master"`
+(0.17-dev) and HEAD's source needs the latter. Bumping the Dockerfile
+pin is a small follow-up; meanwhile, `mise run interop-build-image`
+fails and embedders need to host-build `qns-endpoint` and
+hand-COPY the binary into the runner image.
+
 ### Added
 
 - **C2 — `quic_zig.transport.runUdpClient`.** Opinionated
