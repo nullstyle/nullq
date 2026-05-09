@@ -124,6 +124,31 @@ pub fn build(b: *std.Build) void {
     const qns_step = b.step("qns-endpoint", "Build the QUIC interop-runner endpoint");
     qns_step.dependOn(&qns_install.step);
 
+    // Reference embedder for the alternative-server-address receive
+    // surface. Builds as both a runnable example
+    // (`zig build examples`) and a test target
+    // (`zig build test` walks its inline tests via `test_step`).
+    const alt_addr_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/alt_addr_embedder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    alt_addr_example_mod.addImport("quic_zig", quic_zig_mod);
+    alt_addr_example_mod.addImport("boringssl", boringssl_mod);
+
+    const alt_addr_example_exe = b.addExecutable(.{
+        .name = "alt-addr-embedder-example",
+        .root_module = alt_addr_example_mod,
+    });
+    const alt_addr_example_install = b.addInstallArtifact(alt_addr_example_exe, .{});
+
+    const alt_addr_example_tests = b.addTest(.{ .root_module = alt_addr_example_mod });
+    const run_alt_addr_example_tests = b.addRunArtifact(alt_addr_example_tests);
+    test_step.dependOn(&run_alt_addr_example_tests.step);
+
+    const examples_step = b.step("examples", "Build the embedder example programs");
+    examples_step.dependOn(&alt_addr_example_install.step);
+
     const interop_tool_mod = b.createModule(.{
         .root_source_file = b.path("tools/external_interop.zig"),
         .target = target,

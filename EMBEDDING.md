@@ -275,8 +275,11 @@ RFC 8446 §8.
   `ConnectionEvent.alternative_server_address`, and the `quic_zig.alt_addr`
   helper namespace. The `alt_addr/root.zig` module-level docstring
   walks through the recommended embedder integration shape (address
-  book + Preferred-driven migration with the §9 random-delay helper).
-  Driver-level path-opening on receipt remains embedder policy.
+  book + Preferred-driven migration with the §9 random-delay helper);
+  `examples/alt_addr_embedder.zig` ships a runnable reference
+  implementation with `AddressBook`, `MigrationScheduler`, and
+  `Embedder.pump` types embedders can copy or import. Driver-level
+  path-opening on receipt remains embedder policy.
 - **QUIC-LB connection-ID generation
   (`draft-ietf-quic-load-balancers-21`).** Server-side helpers ship via
   `quic_zig.lb` and `Server.Config.quic_lb` for embedders deploying
@@ -298,9 +301,13 @@ RFC 8446 §8.
   `server.iterator()`, which makes the "minimal complete server" example
   more cognitively expensive than it should be. A `Handler`-style hook
   fired after each `feed`/`poll`/`tick` would close the gap.
-- **No `runUdpClient`.** Symmetric to `runUdpServer` for the dialing
-  side; tracked as a TODO in `src/client.zig`. Embedders today
-  hand-roll the four-call cycle even for trivial clients.
+- **`runUdpClient` shares `runUdpServer`'s callback-less shape.**
+  The opinionated `quic_zig.transport.runUdpClient` is the dialing
+  mirror to `runUdpServer`: same `bind` / `tune` / `poll` / `recv` /
+  `tick` loop, same threading model, same lack of an application
+  callback. Embedders running per-stream logic still drive
+  `client.conn` from a separate thread. A `Handler`-style hook
+  would close the same gap on both sides.
 - **Stream IDs are caller-allocated.** `openBidi(id)` / `openUni(id)`
   require the embedder to track the next legal id for their role per RFC
   9000 §2.1. A `nextLocalBidiId()` / `openNextBidi()` helper would remove

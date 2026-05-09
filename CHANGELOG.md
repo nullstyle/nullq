@@ -9,6 +9,45 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Added
+
+- **C2 — `quic_zig.transport.runUdpClient`.** Opinionated
+  `std.Io`-based UDP client loop that mirrors `runUdpServer`. Takes a
+  freshly-constructed `*Client` and a `RunUdpClientOptions` literal
+  (target, optional bind, ECN knobs, shutdown flag) and runs the
+  `bind` → `advance` → `poll` → `receive` → `handle` → `tick` loop
+  on a monotonic clock until the connection closes or the embedder
+  flips the shutdown flag. Same threading model as the server side —
+  application work runs on a separate thread. `client.zig`'s
+  `TODO(api): runUdpClient` is gone. Three shared helpers
+  (`monotonicNowUs`, `ipAddressToPathAddress`, `pathAddressToIpAddress`)
+  in `src/transport/udp_server.zig` flipped from `fn` to `pub fn` so
+  the client loop can reuse them. Six smoke tests in
+  `tests/e2e/client_loop_smoke.zig` cover the option-surface defaults,
+  malformed-target / malformed-bind / zero-buffer rejection, and the
+  pre-set-shutdown-flag fast exit (parallel to the server's
+  `server_loop_smoke.zig`).
+
+- **C1 — alt-address reference embedder example.** New
+  `examples/alt_addr_embedder.zig` ships three composable types
+  embedders can copy or import:
+    * `AddressBook` — fixed-capacity (16 entries) keyed-by-tuple
+      store of received `ALTERNATIVE_V4/V6_ADDRESS` updates with
+      idempotent `apply`, `currentPreferred()`, and an
+      `entries_view()` slice for inspection.
+    * `MigrationScheduler` — wraps
+      `quic_zig.alt_addr.recommendedMigrationDelayMs` to randomize
+      the migration window per the §9 thundering-herd guidance
+      (default 50..500 ms; embedders pick their own bounds).
+    * `Embedder.pump` — drains every `ConnectionEvent`, dispatches
+      `alternative_server_address` to the book + scheduler, and
+      forwards non-alt-addr events to a caller-supplied callback so
+      the example composes with any existing `pollEvent` loop.
+  Wired into the build as an `examples` step (`zig build examples`
+  installs `alt-addr-embedder-example`); the 9 inline tests run as
+  part of `zig build test`. EMBEDDING.md scope row points at the
+  example for embedders that want a copy-paste starting point.
+
 ### Changed
 
 - **boringssl-zig dep bumped to 0.6.0** (commit `8080b8a`) for

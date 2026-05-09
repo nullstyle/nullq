@@ -14,6 +14,8 @@
 pub const socket_opts = @import("socket_opts.zig");
 /// Submodule of the opinionated `std.Io`-based UDP server loop.
 pub const udp_server = @import("udp_server.zig");
+/// Submodule of the opinionated `std.Io`-based UDP client loop.
+pub const udp_client = @import("udp_client.zig");
 
 /// Re-export of `socket_opts.ServerTuning`, the buffer-size knob struct.
 pub const ServerTuning = socket_opts.ServerTuning;
@@ -56,7 +58,19 @@ pub const RunUdpOptions = udp_server.RunUdpOptions;
 /// Re-export of `udp_server.RunError`.
 pub const RunError = udp_server.RunError;
 
+/// Re-export of `udp_client.runUdpClient` — the opinionated
+/// `std.Io`-based UDP client loop, mirror to `runUdpServer`. See
+/// `udp_client.zig` for the full option surface.
+pub const runUdpClient = udp_client.runUdpClient;
+/// Re-export of `udp_client.RunUdpClientOptions`.
+pub const RunUdpClientOptions = udp_client.RunUdpClientOptions;
+/// Re-export of `udp_client.RunError` (note: distinct from the
+/// server's `RunError` because the underlying error sets diverge —
+/// `Connection.Error` vs. `Server.Error`).
+pub const RunUdpClientError = udp_client.RunError;
+
 test {
     _ = socket_opts;
     _ = udp_server;
+    _ = udp_client;
 }

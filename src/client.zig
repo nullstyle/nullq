@@ -18,8 +18,13 @@
 //! embedders without those constraints should reach for `Client`
 //! first. See `README.md` for a typical send-loop example.
 //!
-//! TODO(api): `runUdpClient` helper analogous to a future
-//! `Server.runUdp`, optional client-side path migration helper.
+//! For embedders who don't want to hand-roll the bind/poll/recv/tick
+//! loop, `quic_zig.transport.runUdpClient` is the opinionated
+//! mirror to `runUdpServer`. It owns the UDP socket, drives the
+//! state machine on a monotonic clock, and exits cleanly when the
+//! connection closes (or an embedder-supplied shutdown flag
+//! flips). See `src/transport/udp_client.zig` for the option
+//! surface.
 
 const std = @import("std");
 const boringssl = @import("boringssl");

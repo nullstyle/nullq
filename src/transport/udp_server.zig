@@ -382,8 +382,8 @@ fn drainSlot(
 /// Convert the loop's monotonic-clock origin into a microsecond
 /// offset suitable for `Server.feed` / `Server.tick`. Mirrors the
 /// QNS endpoint's `qnsNowUs` so the two stay numerically consistent
-/// when both are running.
-fn monotonicNowUs(io: std.Io, start: std.Io.Timestamp) u64 {
+/// when both are running. Also reused by `runUdpClient`.
+pub fn monotonicNowUs(io: std.Io, start: std.Io.Timestamp) u64 {
     const now = std.Io.Timestamp.now(io, .awake);
     const delta = start.durationTo(now).toMicroseconds();
     if (delta <= 0) return 0;
@@ -391,9 +391,9 @@ fn monotonicNowUs(io: std.Io, start: std.Io.Timestamp) u64 {
 }
 
 /// Project a `std.Io.net.IpAddress` into quic_zig's bag-of-bytes
-/// `path.Address`. Mirrors the QNS endpoint's `netAddressToPathAddress`
-/// — kept private here because the only consumer is the loop itself.
-fn ipAddressToPathAddress(addr: Net.IpAddress) Address {
+/// `path.Address`. Mirrors the QNS endpoint's `netAddressToPathAddress`.
+/// Also reused by `runUdpClient`.
+pub fn ipAddressToPathAddress(addr: Net.IpAddress) Address {
     var out: Address = .{};
     switch (addr) {
         .ip4 => |ip4| {
@@ -417,7 +417,8 @@ fn ipAddressToPathAddress(addr: Net.IpAddress) Address {
 /// `std.Io.net.IpAddress` for the outgoing `Socket.send` call.
 /// Returns `null` for a zero-initialized / unrecognized tag — the
 /// loop treats that as "no usable destination" and skips the send.
-fn pathAddressToIpAddress(addr: Address) ?Net.IpAddress {
+/// Also reused by `runUdpClient`.
+pub fn pathAddressToIpAddress(addr: Address) ?Net.IpAddress {
     switch (addr.bytes[0]) {
         4 => {
             var ip4_bytes: [4]u8 = undefined;

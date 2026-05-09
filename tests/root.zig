@@ -6,6 +6,7 @@ test {
     _ = @import("e2e/server_smoke.zig");
     _ = @import("e2e/server_loop_smoke.zig");
     _ = @import("e2e/client_smoke.zig");
+    _ = @import("e2e/client_loop_smoke.zig");
     _ = @import("e2e/server_client_handshake.zig");
     _ = @import("e2e/zero_rtt_replay_smoke.zig");
     _ = @import("e2e/path_challenge_flood_smoke.zig");
