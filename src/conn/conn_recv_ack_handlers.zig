@@ -32,6 +32,10 @@ pub fn handleAckAtLevel(
     // side-table is the obvious next optimization.
     const pn_space = self.pnSpaceForLevel(lvl);
     const sent = self.sentForLevel(lvl);
+    // The path that owns 1-RTT in-flight bookkeeping. For Initial /
+    // Handshake we still consult it (the primary) so RFC 8899
+    // counters stay coherent, but no probes ride those levels.
+    const ack_path: *PathState = self.primaryPath();
     // RFC 9000 §13.1 / RFC 9002 §A.3: an ACK that claims a packet
     // number we never sent (largest_acked >= next_pn) is a
     // PROTOCOL_VIOLATION. We must reject it before updating
@@ -48,6 +52,9 @@ pub fn handleAckAtLevel(
     var any_ack_eliciting_newly_acked = false;
     var in_flight_bytes_acked: u64 = 0;
     var newest_acked_sent_time_us: u64 = 0;
+    // RFC 8899 DPLPMTUD probe-ack vs regular-ack tracking.
+    var pmtud_probe_acked = false;
+    var any_regular_acked = false;
 
     var ack_it = ack_range_mod.iter(a);
     while (try ack_it.next()) |interval| {
@@ -76,7 +83,18 @@ pub fn handleAckAtLevel(
                     newest_acked_sent_time_us = acked.sent_time_us;
                 }
             }
+            // RFC 8899 §5.1 probe-vs-regular ack classification —
+            // 1-RTT only.
             if (lvl == .application) {
+                if (ack_path.pmtu_probe_pn) |probe_pn| {
+                    if (probe_pn == acked.pn) {
+                        pmtud_probe_acked = true;
+                    } else {
+                        any_regular_acked = true;
+                    }
+                } else {
+                    any_regular_acked = true;
+                }
                 self.onApplicationPacketAckedForKeys(&acked, now_us);
                 self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
             }
@@ -84,6 +102,16 @@ pub fn handleAckAtLevel(
             self.dispatchAckedControlFrames(&acked);
             self.recordDatagramAcked(&acked);
         }
+    }
+    // Fold PMTUD ack outcomes back into path state.
+    if (lvl == .application) {
+        if (pmtud_probe_acked) {
+            _ = ack_path.pmtudOnProbeAcked(
+                self.pmtud_config.probe_step,
+                self.pmtud_config.max_mtu,
+            );
+        }
+        if (any_regular_acked) ack_path.pmtudOnRegularAcked();
     }
     if (largest_acked_send_time_us) |sent_time_us| {
         if (largest_acked_ack_eliciting and now_us >= sent_time_us) {
@@ -132,6 +160,10 @@ pub fn handleApplicationAckOnPath(
     var any_ack_eliciting_newly_acked = false;
     var in_flight_bytes_acked: u64 = 0;
     var newest_acked_sent_time_us: u64 = 0;
+    // RFC 8899 DPLPMTUD probe vs regular tracking — see
+    // `handleAckAtLevel` for the matching code path on the primary.
+    var pmtud_probe_acked = false;
+    var any_regular_acked = false;
 
     var ack_it = ack_range_mod.iter(a);
     while (try ack_it.next()) |interval| {
@@ -153,6 +185,16 @@ pub fn handleApplicationAckOnPath(
                     newest_acked_sent_time_us = acked.sent_time_us;
                 }
             }
+            // RFC 8899 §5.1 probe-vs-regular ack classification.
+            if (path.pmtu_probe_pn) |probe_pn| {
+                if (probe_pn == acked.pn) {
+                    pmtud_probe_acked = true;
+                } else {
+                    any_regular_acked = true;
+                }
+            } else {
+                any_regular_acked = true;
+            }
             self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
             self.onApplicationPacketAckedForKeys(&acked, now_us);
             self.discardSentCryptoForPacket(.application, acked.pn);
@@ -160,6 +202,13 @@ pub fn handleApplicationAckOnPath(
             self.recordDatagramAcked(&acked);
         }
     }
+    if (pmtud_probe_acked) {
+        _ = path.pmtudOnProbeAcked(
+            self.pmtud_config.probe_step,
+            self.pmtud_config.max_mtu,
+        );
+    }
+    if (any_regular_acked) path.pmtudOnRegularAcked();
     if (largest_acked_send_time_us) |sent_time_us| {
         if (largest_acked_ack_eliciting and now_us >= sent_time_us) {
             const ack_delay_us = a.ack_delay << self.peerAckDelayExponent();

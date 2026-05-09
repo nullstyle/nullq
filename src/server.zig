@@ -687,6 +687,14 @@ const ConfigImpl = struct {
     /// global ceiling on null-source events should put one in their
     /// own log_callback.
     max_log_events_per_source_per_window: ?u32 = 16,
+
+    /// RFC 8899 DPLPMTUD configuration applied to every accepted
+    /// connection. The default config (1200 floor, 1452 ceiling,
+    /// 64-byte step, 3-strike threshold, enabled) matches the
+    /// QUIC v1 minimum-MTU floor and the typical 1500-byte internet
+    /// MTU. Set `enable = false` to keep the historical static-MTU
+    /// behaviour (PMTU stays at `initial_mtu`).
+    pmtud: conn_mod.PmtudConfig = .{},
 };
 
 /// Argument to `Server.replaceTlsContext`. Either fresh PEM bytes
@@ -984,6 +992,10 @@ pub const Server = struct {
     /// every Connection at slot-open time. RFC 9000 §13.2.1.
     delayed_ack_packet_threshold: u8,
 
+    /// Captured `Config.pmtud` — applied to every Connection at
+    /// slot-open time. RFC 8899 DPLPMTUD.
+    pmtud_config: conn_mod.PmtudConfig,
+
     /// Captured `Config.max_datagrams_per_window`. Null disables the
     /// listener-level packet rate limit; otherwise gates *every*
     /// inbound datagram (existing-slot routes included) at the very
@@ -1238,6 +1250,7 @@ pub const Server = struct {
             .listener_rate_window_us = config.listener_rate_window_us,
             .max_bytes_per_source_per_second = config.max_bytes_per_source_per_second,
             .max_log_events_per_source = config.max_log_events_per_source_per_window,
+            .pmtud_config = config.pmtud,
             .stateless_responses = .empty,
         };
     }
@@ -1837,6 +1850,11 @@ pub const Server = struct {
         conn_ptr.reveal_close_reason_on_wire = self.reveal_close_reason_on_wire;
         conn_ptr.max_connection_memory = self.max_connection_memory;
         conn_ptr.delayed_ack_packet_threshold = self.delayed_ack_packet_threshold;
+        // RFC 8899 DPLPMTUD: thread the embedder config to the
+        // connection. setPmtudConfig also re-initialises every
+        // existing path (only the primary at this point), so the
+        // per-path pmtu / pmtu_state lands consistent with the config.
+        conn_ptr.setPmtudConfig(self.pmtud_config);
 
         try conn_ptr.bind();
         if (self.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, self.qlog_user_data);

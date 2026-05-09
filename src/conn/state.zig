@@ -71,6 +71,10 @@ pub const PathSet = path_mod.PathSet;
 pub const PathState = path_mod.PathState;
 /// Per-path counters (datagrams sent/received, loss, RTT inputs).
 pub const PathStats = path_mod.PathStats;
+/// RFC 8899 DPLPMTUD probe-state-machine phase (re-export).
+pub const PmtudState = path_mod.PmtudState;
+/// RFC 8899 DPLPMTUD embedder configuration (re-export).
+pub const PmtudConfig = path_mod.PmtudConfig;
 /// Multipath scheduler that picks which path an outgoing datagram uses.
 pub const Scheduler = path_mod.Scheduler;
 /// QUIC connection ID — variable-length opaque identifier (RFC 9000 §5.1).
@@ -1185,8 +1189,17 @@ pub const Connection = struct {
     /// Total UDP payload bytes the peer has sent us.
     qlog_bytes_received: u64 = 0,
 
-    /// Local datagram budget for outgoing packets.
+    /// Local datagram budget for outgoing packets. Functions as the
+    /// connection-wide ceiling: per-path PMTU values discovered via
+    /// RFC 8899 DPLPMTUD must not exceed this. Negotiated peer
+    /// `max_udp_payload_size` lowers this in `validatePeerTransportLimits`.
     mtu: usize = default_mtu,
+
+    /// RFC 8899 DPLPMTUD configuration. Threaded onto every
+    /// `PathState` at creation time. Defaults match the QUIC v1
+    /// minimum-floor / 1500-friendly-ceiling shape; embedders that
+    /// want to disable probing flip `enable=false`.
+    pmtud_config: path_mod.PmtudConfig = .{},
 
     /// Local parameters handed to BoringSSL. Kept here too so ACK
     /// delay and idle timers can use the negotiated local values.
@@ -1311,6 +1324,12 @@ pub const Connection = struct {
         // matching server policy: the server leaves it unvalidated and
         // flips it on the first authenticated Handshake from peer.)
         conn.primaryPath().path.markValidated();
+        // RFC 8899 DPLPMTUD: install the default config on the primary
+        // path. Embedders that supply a non-default config must call
+        // `setPmtudConfig` after `init*` (the wrapper helpers
+        // `Server.Config.pmtud` / `Client.Config.pmtud` thread it
+        // automatically).
+        conn.primaryPath().pmtudInit(conn.pmtud_config);
         return conn;
     }
 
@@ -1329,7 +1348,29 @@ pub const Connection = struct {
         };
         errdefer conn.inner.deinit();
         try conn.paths.ensurePrimary(allocator, .{ .max_datagram_size = default_mtu });
+        // RFC 8899 DPLPMTUD on the primary path. See `initClient` for
+        // the embedder-config plumbing path.
+        conn.primaryPath().pmtudInit(conn.pmtud_config);
         return conn;
+    }
+
+    /// Replace the connection-wide `PmtudConfig` and re-initialise the
+    /// PMTUD state on every existing path. Embedders pass a config via
+    /// `Server.Config.pmtud` / `Client.Config.pmtud`; this entry point
+    /// is reachable directly for tests and for embedders that want to
+    /// retune at runtime.
+    pub fn setPmtudConfig(self: *Connection, cfg: path_mod.PmtudConfig) void {
+        self.pmtud_config = cfg;
+        for (self.paths.paths.items) |*p| {
+            p.pmtudInit(cfg);
+        }
+    }
+
+    /// RFC 8899 DPLPMTUD: current PMTU floor (in bytes) for the active
+    /// application-data path. The send path consults this when sizing
+    /// outbound 1-RTT packets; embedders surface it via observability.
+    pub fn pmtu(self: *const Connection) usize {
+        return self.paths.activeConst().pmtu;
     }
 
     /// Bind this Connection to its underlying SSL. Must be called
@@ -3702,6 +3743,10 @@ pub const Connection = struct {
             peer_cid,
             .{ .max_datagram_size = self.mtu },
         );
+        // Seed RFC 8899 PMTUD state on the freshly-opened path.
+        if (self.paths.get(opened_path_id)) |new_path| {
+            new_path.pmtudInit(self.pmtud_config);
+        }
         try _internal.rememberLocalCid(self,opened_path_id, 0, 0, local_cid, @splat(0));
         return opened_path_id;
     }
@@ -5275,13 +5320,47 @@ pub const Connection = struct {
         else
             &self.peer_dcid;
         const packet_scid = self.longHeaderScid();
+
+        // RFC 8899 DPLPMTUD probe scheduler: when the active path is in
+        // `search` and no probe is in flight, build a PADDING+PING
+        // packet sized to `pmtu + probe_step` (capped at the upper
+        // bound). The probe rides at .application level only; Initial
+        // / Handshake follow their own padding / size rules
+        // (§14 minimum-MTU 1200 floor on first-flight Initials).
+        var probe_target_size: ?u16 = null;
+        if (lvl == .application and
+            self.pmtud_config.enable and
+            app_path.pmtudIsSearching() and
+            app_path.path.isValidated())
+        {
+            if (app_path.pmtudNextProbeSize(
+                self.pmtud_config.probe_step,
+                self.pmtud_config.max_mtu,
+            )) |sz| {
+                // Don't probe larger than the connection-wide ceiling
+                // or the embedder's caller buffer.
+                const conn_ceiling: usize = @min(self.mtu, dst.len);
+                if (@as(usize, sz) <= conn_ceiling) probe_target_size = sz;
+            }
+        }
+
         const max_payload: usize = blk: {
             const dcid_len: usize = packet_dcid.len;
             const scid_len: usize = packet_scid.len;
             const long_overhead: usize = 1 + 4 + 1 + dcid_len + 1 + scid_len + 8 + 4 + 16 + 8; // ample
             const short_overhead: usize = 1 + dcid_len + 4 + 16;
             const overhead: usize = if (lvl == .application) short_overhead else long_overhead;
-            var packet_capacity = @min(self.mtu, dst.len);
+            // The PMTU floor / search ceiling decides how big this
+            // packet may become. For .application we read it off the
+            // chosen path; for Initial/Handshake we still use
+            // self.mtu (the connection-wide ceiling).
+            const path_mtu: usize = if (lvl == .application) app_path.pmtu else self.mtu;
+            var packet_capacity = @min(@min(path_mtu, self.mtu), dst.len);
+            // When we've decided to emit a DPLPMTUD probe, the probe
+            // size IS the packet capacity for this build (we want the
+            // resulting datagram to be exactly that size). The probe
+            // size is already capped at `self.mtu` above.
+            if (probe_target_size) |sz| packet_capacity = @min(@as(usize, sz), dst.len);
             // RFC 9000 §8.1: anti-amplification applies to ALL bytes the
             // endpoint sends on an unvalidated path, not just 1-RTT.
             // Initial and Handshake bytes count too — otherwise an off-path
@@ -5522,6 +5601,25 @@ pub const Connection = struct {
             pl_pos += ping_len;
             pending_ping.* = false;
             ack_eliciting = true;
+        }
+
+        // 1a-pmtud) RFC 8899 DPLPMTUD probe PING. Always pairs with
+        // PADDING below to inflate the datagram to `probe_target_size`.
+        // The probe is structurally identical to a PTO PING (frame
+        // type 0x01, 1 byte) but the in-flight bookkeeping is
+        // DPLPMTUD-specific (recorded via `pmtudOnProbeSent` after the
+        // seal so loss detection can route the loss outcome to
+        // `pmtudOnProbeLost` instead of normal CC). The packet is
+        // ack-eliciting per RFC 9000 §14.4 and §13.2.1.
+        var pmtud_probe_emitted = false;
+        if (probe_target_size != null and pl_pos + 1 <= max_payload) {
+            const ping_len = try frame_mod.encode(
+                pl_buf[pl_pos..max_payload],
+                .{ .ping = .{} },
+            );
+            pl_pos += ping_len;
+            ack_eliciting = true;
+            pmtud_probe_emitted = true;
         }
 
         // 1b) Server handshake confirmation. HANDSHAKE_DONE is
@@ -6015,6 +6113,10 @@ pub const Connection = struct {
                 .keys = &keys,
                 .key_phase = self.applicationWriteKeyPhase(),
                 .multipath_path_id = if (self.multipathNegotiated()) app_path.id else null,
+                // RFC 8899 DPLPMTUD: when a probe is in flight from
+                // this poll, pad to the probed size so the resulting
+                // datagram is exactly that big.
+                .pad_to = if (probe_target_size) |sz| @as(usize, sz) else 0,
             }),
             .early_data => try long_packet_mod.sealZeroRtt(dst, .{
                 .dcid = packet_dcid.slice(),
@@ -6065,6 +6167,18 @@ pub const Connection = struct {
         {
             app_path.pto_probe_count -= 1;
         }
+
+        // RFC 8899 DPLPMTUD: stamp the in-flight probe metadata. The
+        // recorded `sent_packet` already carries `bytes = n`, but the
+        // probe-size field is independent of the post-seal byte count
+        // (n equals the probe size when `pad_to` is set, but on the
+        // off-chance the path-specific overhead miscounted by a byte
+        // we want the definitive value the probe scheduler asked for).
+        if (lvl == .application) if (probe_target_size) |sz| {
+            if (pmtud_probe_emitted) {
+                app_path.pmtudOnProbeSent(pn, sz);
+            }
+        };
 
         // qlog hooks for the outgoing packet.
         self.qlog_packets_sent +|= 1;
@@ -7906,6 +8020,36 @@ pub const Connection = struct {
         }
     }
 
+    /// RFC 8899 DPLPMTUD probe-loss handler. If `lost.pn` matches the
+    /// in-flight probe on `path`, account it as a probe loss (clears
+    /// the probe slot, bumps `pmtu_fail_count`, possibly records the
+    /// upper bound) and return true so the caller skips normal
+    /// congestion-control processing. RFC 8899 §4.4 explicitly says
+    /// probe loss MUST NOT trigger CC reactions.
+    fn pmtudHandleProbeLossIfMatches(
+        self: *Connection,
+        path: *PathState,
+        lost: *const sent_packets_mod.SentPacket,
+    ) bool {
+        const probe_pn = path.pmtu_probe_pn orelse return false;
+        if (probe_pn != lost.pn) return false;
+        _ = path.pmtudOnProbeLost(self.pmtud_config.probe_threshold);
+        return true;
+    }
+
+    /// RFC 8899 §4.4 black-hole detection: invoke for every regular
+    /// (non-probe) packet declared lost on this path. Increments the
+    /// consecutive-regular-loss counter; at the threshold, halves
+    /// `pmtu` (down to `initial_mtu`) and re-enters search.
+    fn pmtudHandleRegularLoss(self: *Connection, path: *PathState) void {
+        if (!self.pmtud_config.enable) return;
+        if (path.pmtu_state == .disabled) return;
+        _ = path.pmtudOnRegularLost(
+            self.pmtud_config.probe_threshold,
+            self.pmtud_config.initial_mtu,
+        );
+    }
+
     pub fn detectLossesByPacketThresholdAtLevel(
         self: *Connection,
         lvl: EncryptionLevel,
@@ -7916,6 +8060,11 @@ pub const Connection = struct {
         if (largest_acked_opt == null) return;
         const largest_acked = largest_acked_opt.?;
         const threshold: u64 = loss_recovery_mod.packet_threshold;
+        // 1-RTT in-flight bookkeeping is owned by the primary path
+        // until the multipath split (per `sentForLevel`). RFC 8899
+        // probes only ride .application, so we only consult the
+        // probe state when this is the application level.
+        const path: *PathState = self.primaryPath();
 
         var i: u32 = 0;
         var stats: LossStats = .{};
@@ -7924,8 +8073,15 @@ pub const Connection = struct {
             if (p.pn <= largest_acked and (largest_acked - p.pn) >= threshold) {
                 var lost = sent.removeAt(i);
                 defer lost.deinit(self.allocator);
-                stats.add(lost);
                 self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .packet_threshold);
+                if (lvl == .application and self.pmtudHandleProbeLossIfMatches(path, &lost)) {
+                    // Probe loss is accounted separately (RFC 8899
+                    // §4.4): no LossStats add → no CC reaction, no
+                    // requeue (the probe carried only PADDING+PING).
+                    continue;
+                }
+                stats.add(lost);
+                if (lvl == .application) self.pmtudHandleRegularLoss(path);
                 _ = try self.requeueLostPacket(lvl, &lost);
                 continue;
             }
@@ -7953,8 +8109,12 @@ pub const Connection = struct {
             if (p.pn <= largest_acked and (largest_acked - p.pn) >= threshold) {
                 var lost = path.sent.removeAt(i);
                 defer lost.deinit(self.allocator);
-                stats.add(lost);
                 self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .packet_threshold);
+                if (self.pmtudHandleProbeLossIfMatches(path, &lost)) {
+                    continue;
+                }
+                stats.add(lost);
+                self.pmtudHandleRegularLoss(path);
                 _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
                 continue;
             }
@@ -7983,6 +8143,7 @@ pub const Connection = struct {
         const pn_space = self.pnSpaceForLevel(lvl);
         const sent = self.sentForLevel(lvl);
         const largest_acked_opt = pn_space.largest_acked_sent;
+        const path: *PathState = self.primaryPath();
 
         var i: u32 = 0;
         var stats: LossStats = .{};
@@ -7992,8 +8153,12 @@ pub const Connection = struct {
             if (eligible and p.sent_time_us < cutoff) {
                 var lost = sent.removeAt(i);
                 defer lost.deinit(self.allocator);
-                stats.add(lost);
                 self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .time_threshold);
+                if (lvl == .application and self.pmtudHandleProbeLossIfMatches(path, &lost)) {
+                    continue;
+                }
+                stats.add(lost);
+                if (lvl == .application) self.pmtudHandleRegularLoss(path);
                 _ = try self.requeueLostPacket(lvl, &lost);
                 continue;
             }
@@ -8029,8 +8194,12 @@ pub const Connection = struct {
             if (eligible and p.sent_time_us < cutoff) {
                 var lost = path.sent.removeAt(i);
                 defer lost.deinit(self.allocator);
-                stats.add(lost);
                 self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .time_threshold);
+                if (self.pmtudHandleProbeLossIfMatches(path, &lost)) {
+                    continue;
+                }
+                stats.add(lost);
+                self.pmtudHandleRegularLoss(path);
                 _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
                 continue;
             }
@@ -8047,6 +8216,7 @@ pub const Connection = struct {
         lvl: EncryptionLevel,
     ) Error!bool {
         const sent = self.sentForLevel(lvl);
+        const path: *PathState = self.primaryPath();
         var i: u32 = 0;
         while (i < sent.count) : (i += 1) {
             const p = sent.packets[i];
@@ -8054,9 +8224,19 @@ pub const Connection = struct {
 
             var lost = sent.removeAt(i);
             defer lost.deinit(self.allocator);
+            self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .pto_probe);
+            // RFC 8899 §4.4: a probe expired by PTO counts as a probe
+            // loss, NOT a regular loss; CC stays unaffected. This is
+            // before the LossStats add so the persistent-congestion
+            // detector also sees zero ack-eliciting losses for the
+            // probe.
+            if (lvl == .application and self.pmtudHandleProbeLossIfMatches(path, &lost)) {
+                self.pendingPingForLevel(lvl).* = false;
+                self.ptoCountForLevel(lvl).* +|= 1;
+                return true;
+            }
             var stats: LossStats = .{};
             stats.add(lost);
-            self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .pto_probe);
             const requeued = try self.requeueLostPacket(lvl, &lost);
             self.qlog_packets_lost +|= stats.count;
             self.emitLossDetected(lvl, stats, .pto_probe);
@@ -8080,9 +8260,14 @@ pub const Connection = struct {
 
             var lost = path.sent.removeAt(i);
             defer lost.deinit(self.allocator);
+            self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .pto_probe);
+            if (self.pmtudHandleProbeLossIfMatches(path, &lost)) {
+                path.pending_ping = false;
+                path.pto_count +|= 1;
+                return true;
+            }
             var stats: LossStats = .{};
             stats.add(lost);
-            self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .pto_probe);
             const requeued = try self.requeueLostPacketOnPath(.application, &lost, path.id);
             self.qlog_packets_lost +|= stats.count;
             self.emitLossDetected(.application, stats, .pto_probe);

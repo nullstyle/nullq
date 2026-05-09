@@ -165,6 +165,10 @@ pub const PathState = path.PathState;
 pub const PathStats = path.PathStats;
 /// Multipath scheduling policy (primary / round-robin / lowest-RTT-cwnd).
 pub const Scheduler = path.Scheduler;
+/// RFC 8899 DPLPMTUD embedder configuration (re-export).
+pub const PmtudConfig = path.PmtudConfig;
+/// RFC 8899 DPLPMTUD probe-state-machine phase (re-export).
+pub const PmtudState = path.PmtudState;
 /// 32-byte stateless Retry token (re-export).
 pub const RetryToken = retry_token.Token;
 /// 32-byte HMAC-SHA256 key for Retry token mint/validate (re-export).

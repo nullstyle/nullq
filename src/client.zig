@@ -136,6 +136,14 @@ const ConfigImpl = struct {
     /// `Connection.setNewTokenCallback` for the lifetime contract.
     new_token_callback: ?conn_mod.NewTokenCallback = null,
     new_token_user_data: ?*anyopaque = null,
+
+    /// RFC 8899 DPLPMTUD configuration applied to the underlying
+    /// `Connection`. The default (1200 floor, 1452 ceiling, 64-byte
+    /// step, 3-strike threshold, enabled) matches the QUIC v1
+    /// minimum-MTU floor and the typical 1500-byte internet MTU.
+    /// Set `enable = false` to keep the historical static-MTU
+    /// behaviour.
+    pmtud: conn_mod.PmtudConfig = .{},
 };
 
 /// Errors produced by `Client.connect`. Distinct from
@@ -256,6 +264,9 @@ pub const Client = struct {
         errdefer conn_ptr.deinit();
         conn_ptr.reveal_close_reason_on_wire = config.reveal_close_reason_on_wire;
         conn_ptr.delayed_ack_packet_threshold = config.delayed_ack_packet_threshold;
+        // RFC 8899 DPLPMTUD: apply the embedder config and
+        // re-initialise the per-path PMTUD state.
+        conn_ptr.setPmtudConfig(config.pmtud);
 
         if (config.qlog_callback) |cb| conn_ptr.setQlogCallback(cb, config.qlog_user_data);
 
