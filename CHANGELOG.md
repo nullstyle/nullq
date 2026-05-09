@@ -9,6 +9,36 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Interop client × `rebind-addr` × {quic-go, quiche} (partial)** —
+  the qns client driver (`interop/qns_endpoint.zig`) now mirrors its
+  server-side `queueServerConnectionIds` once the handshake completes:
+  a new `queueClientConnectionIds` helper queues a fresh client SCID
+  at sequence 1 (with a deterministic stateless reset token, same
+  pattern as the server). Without this, the only client-issued CID
+  was the initial one (sequence 0), which left the server with no
+  fresh DCID to use when it observed the client's source address
+  change in the runner's network simulator — quic-go's logs flagged
+  it as `skipping validation of new path … since no connection ID
+  is available`. The fix is mechanical and matches RFC 9000 §5.1.2 ¶1
+  / §9.5; it gates on the peer's `active_connection_id_limit`
+  (we advertise 2; the helper no-ops when the budget is saturated)
+  and is idempotent across loop iterations. Two unit tests in
+  `interop/qns_endpoint.zig` cover the happy path and the
+  budget-exhausted no-op. Pre-handshake calls are filtered upstream
+  by `runClientConnection`, which only invokes the helper after
+  `handshakeDone()` returns true. **Pending follow-up:** the second
+  arm of the `rebind-addr` failure — quiche validates the new path
+  but quic-zig "keeps sending from the OLD socket" — is unaddressed
+  by this commit. The qns client driver does not detect the SIM-side
+  source rebind (it has no observability hook for it), and the
+  runner's `--rebind-addr` scenario rewrites source addresses
+  transparently below the client socket. Fixing that requires
+  either a transport-level rebind callback or recognising it
+  passively from server-issued PATH_CHALLENGE on the new tuple;
+  both are larger pieces of work tracked in `interop/README.md`.
+
 ### Interop verification (2026-05-09 follow-up)
 
 The 2026-05-09 post-fix matrix re-run revealed that two of the

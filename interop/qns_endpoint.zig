@@ -77,6 +77,15 @@ const endpoint_bidi_stream_limit: u64 = 1000;
 const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 2;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
+// Symmetric to `endpoint_server_cid_desired_last_seq`: the client
+// also issues one extra SCID (sequence 1) once the handshake
+// completes so the server has a fresh DCID available for path
+// rotation under RFC 9000 §5.1.2 ¶1 / §9.5. Without this, the
+// `rebind-addr` testcase fails on the server side (e.g. quic-go
+// logs `skipping validation of new path … since no connection ID
+// is available`) because the only client-issued CID is the initial
+// one and the server cannot reuse it on a new path.
+const endpoint_client_cid_desired_last_seq: u8 = 1;
 const max_qns_server_connections = 128;
 const qns_time_base_us: u64 = 1_000_000;
 
@@ -1137,6 +1146,11 @@ fn runClientConnection(
     var old_sock_close_deadline_us: ?u64 = null;
     defer if (old_sock) |*s| s.close(io);
 
+    // Track whether we've issued the spare client SCIDs the server
+    // needs for path rotation. Bumped from 1 to whatever
+    // `queueClientConnectionIds` queues once the handshake completes.
+    var next_client_cid_seq: u8 = 1;
+
     while ((!allDownloadsComplete(downloads) or !ticketRequirementMet(conn_opts.wait_for_ticket)) and !conn.isClosed()) {
         var now_us = qnsNowUs(io, start);
         var progressed = false;
@@ -1226,6 +1240,21 @@ fn runClientConnection(
 
         if (conn.handshakeDone() and !requests_enabled) {
             requests_enabled = true;
+        }
+
+        // RFC 9000 §5.1.2 ¶1 / §9.5 client CID issuance: once the
+        // handshake completes, hand the server a spare DCID so it can
+        // rotate when a new client path appears (e.g. the runner's
+        // `rebind-addr` testcase rewriting our source address in the
+        // sim layer). Idempotent — once `next_client_cid_seq` passes
+        // the desired-last-seq cursor, subsequent calls no-op.
+        if (conn.handshakeDone() and next_client_cid_seq <= endpoint_client_cid_desired_last_seq) {
+            try queueClientConnectionIds(
+                &conn,
+                &next_client_cid_seq,
+                endpoint_client_cid_desired_last_seq,
+                &client_scid,
+            );
         }
 
         if (requests_enabled) {
@@ -1741,6 +1770,57 @@ fn statelessResetToken(cid: []const u8, seq: u8) [16]u8 {
     return token;
 }
 
+/// Client-side mirror of `queueServerConnectionIds`. Once the
+/// handshake completes, queue extra NEW_CONNECTION_ID frames so the
+/// peer (server) has a fresh DCID available when it needs to rotate
+/// per RFC 9000 §5.1.2 ¶1 / §9.5. The runner's `rebind-addr` testcase
+/// stresses this: the network simulator rewrites the client's source
+/// address mid-transfer, the server detects the new path and would
+/// validate it, but if quic-zig only ever issued the initial SCID
+/// (sequence 0) the server has no CID to rotate to and the
+/// validation is skipped (e.g. quic-go's `skipping validation of new
+/// path … since no connection ID is available`).
+///
+/// `next_seq` is the next-sequence cursor — after the first call it
+/// advances by however many provisions were accepted. Idempotent
+/// across retries: when the issue budget is exhausted (the peer's
+/// `active_connection_id_limit` is already saturated), the call is a
+/// no-op and `next_seq` is unchanged.
+///
+/// The client's initial SCID is at sequence 0 (`setLocalScid` registers
+/// it implicitly). We start issuing at `next_seq.*` and stop at
+/// `desired_last_seq` inclusive. Stateless reset tokens are derived
+/// deterministically from the CID and sequence — same pattern as the
+/// server side.
+fn queueClientConnectionIds(
+    conn: *quic_zig.Connection,
+    next_seq: *u8,
+    desired_last_seq: u8,
+    base_cid: *const [8]u8,
+) !void {
+    const budget = conn.localConnectionIdIssueBudget(0);
+    if (budget == 0 or next_seq.* > desired_last_seq) return;
+
+    var cid_storage: [8][8]u8 = undefined;
+    var provisions: [8]quic_zig.ConnectionIdProvision = undefined;
+    var count: usize = 0;
+    var seq = next_seq.*;
+    while (seq <= desired_last_seq and count < provisions.len and count < budget) {
+        cid_storage[count] = base_cid.*;
+        cid_storage[count][7] +%= seq;
+        provisions[count] = .{
+            .connection_id = cid_storage[count][0..],
+            .stateless_reset_token = statelessResetToken(&cid_storage[count], seq),
+        };
+        count += 1;
+        seq += 1;
+    }
+    if (count == 0) return;
+
+    const queued = try conn.replenishConnectionIds(provisions[0..count]);
+    next_seq.* += @as(u8, @intCast(queued));
+}
+
 fn retrySourceCid(base_cid: *const [server_cid_len]u8) [server_cid_len]u8 {
     var cid = base_cid.*;
     cid[7] +%= 0x80;
@@ -2082,4 +2162,73 @@ test "QNS client mode follows TESTCASE" {
     try std.testing.expectEqual(ClientMode.normal, clientMode("transfer"));
     try std.testing.expectEqual(ClientMode.resumption, clientMode("resumption"));
     try std.testing.expectEqual(ClientMode.zerortt, clientMode("zerortt"));
+}
+
+test "queueClientConnectionIds issues a fresh CID once handshake completes" {
+    // RFC 9000 §5.1.2 ¶1 / §9.5: a client must hand the server at
+    // least one extra CID via NEW_CONNECTION_ID so the server has a
+    // fresh DCID to use when the client's path appears at a new
+    // tuple. Without this, the runner's `rebind-addr` testcase trips
+    // the server-side "skipping validation of new path … since no
+    // connection ID is available" path (verified against quic-go on
+    // 2026-05-09).
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try quic_zig.Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // The peer's `active_connection_id_limit` governs how many of
+    // OUR CIDs we may issue. The qns endpoint advertises 2, matching
+    // the floor we receive from quic-go / quiche / ngtcp2 in interop.
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 2 };
+
+    const base_cid = [_]u8{ 0xc1, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde };
+    try conn.setLocalScid(&base_cid);
+
+    // Sequence 0 is the initial SCID we just registered. The helper
+    // should issue sequence 1 (and stop there because
+    // `endpoint_client_cid_desired_last_seq = 1`).
+    var next_seq: u8 = 1;
+    try queueClientConnectionIds(&conn, &next_seq, endpoint_client_cid_desired_last_seq, &base_cid);
+    try std.testing.expectEqual(@as(u8, 2), next_seq);
+
+    // One NEW_CONNECTION_ID frame queued for emission.
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.new_connection_ids.items.len);
+    const queued = conn.pending_frames.new_connection_ids.items[0];
+    try std.testing.expectEqual(@as(u64, 1), queued.sequence_number);
+    try std.testing.expectEqual(@as(u64, 0), queued.retire_prior_to);
+    try std.testing.expectEqual(@as(u8, base_cid.len), queued.connection_id.len);
+
+    // Idempotent on second call: cursor doesn't advance, queue
+    // doesn't grow.
+    try queueClientConnectionIds(&conn, &next_seq, endpoint_client_cid_desired_last_seq, &base_cid);
+    try std.testing.expectEqual(@as(u8, 2), next_seq);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_frames.new_connection_ids.items.len);
+}
+
+test "queueClientConnectionIds no-ops when peer's CID limit is saturated" {
+    // The helper consults `localConnectionIdIssueBudget`; if the peer
+    // hasn't budgeted room for an extra SCID, the helper must be
+    // silent rather than sending a frame the peer would treat as a
+    // CONNECTION_ID_LIMIT_ERROR.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try quic_zig.Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Peer permits exactly one active CID at a time — the initial
+    // one. Any call to issue a sequence >0 is over-budget.
+    conn.cached_peer_transport_params = .{ .active_connection_id_limit = 1 };
+
+    const base_cid = [_]u8{ 0xc2, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde };
+    try conn.setLocalScid(&base_cid);
+
+    var next_seq: u8 = 1;
+    try queueClientConnectionIds(&conn, &next_seq, endpoint_client_cid_desired_last_seq, &base_cid);
+
+    // No frame queued; cursor unchanged.
+    try std.testing.expectEqual(@as(u8, 1), next_seq);
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_frames.new_connection_ids.items.len);
 }
