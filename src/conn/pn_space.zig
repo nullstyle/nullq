@@ -8,12 +8,25 @@
 
 const std = @import("std");
 const ack_tracker_mod = @import("ack_tracker.zig");
+const socket_opts = @import("../transport/socket_opts.zig");
 
 /// Re-export of the underlying received-PN tracker.
 pub const AckTracker = ack_tracker_mod.AckTracker;
+/// Re-export of the IETF ECN codepoint enum (RFC 3168 §5).
+pub const EcnCodepoint = socket_opts.EcnCodepoint;
 
 /// Maximum PN value (RFC 9000 §12.3): 2^62 - 1.
 pub const max_pn: u64 = (1 << 62) - 1;
+
+/// Per-PN-space ECN validation state (RFC 9000 §13.4.2). The state
+/// machine is tiny:
+///   * `testing` (the default): we believe ECN works on this path.
+///     We mark outgoing packets ECT(0) and emit ECN counts on
+///     outgoing ACKs.
+///   * `failed`: the §13.4.2 monotonicity check rejected one of the
+///     peer's ECN reports. We stop emitting ECN counts on ACKs and
+///     stop reacting to peer-reported CE for this space.
+pub const EcnValidationState = enum { testing, failed };
 
 /// One QUIC packet number space. Tracks the next outgoing PN, the
 /// largest PN we've seen acknowledged, and the received-PN bookkeeping
@@ -28,6 +41,33 @@ pub const PnSpace = struct {
     /// Bookkeeping for received PNs. Populated whenever the
     /// receiver successfully decrypts a packet at this level.
     received: AckTracker = .{},
+
+    /// Cumulative count of received packets with the named IP ECN
+    /// codepoint (RFC 9000 §13.4.1). Emitted in our own outgoing ACK
+    /// frames at type 0x03 / 0x03-PATH so the peer's congestion
+    /// controller can react to CE marks observed on our path.
+    recv_ect0: u64 = 0,
+    recv_ect1: u64 = 0,
+    recv_ce: u64 = 0,
+
+    /// Latest peer-reported ECN counts seen in an ACK frame at this
+    /// level. Used by §13.4.2 monotonicity validation: a fresh ACK
+    /// whose ECT0/ECT1/CE total has gone backward (or whose CE
+    /// dropped) indicates a peer or middlebox bug; we react by
+    /// flipping `validation` to `failed`.
+    peer_ack_ect0: u64 = 0,
+    peer_ack_ect1: u64 = 0,
+    peer_ack_ce: u64 = 0,
+    /// True once the first ECN-bearing peer ACK has populated the
+    /// `peer_ack_*` fields. Until then, monotonicity comparisons
+    /// trivially pass.
+    peer_ack_ecn_seen: bool = false,
+
+    /// Per-space ECN validation state. Starts at `testing`; flips to
+    /// `failed` on any §13.4.2 violation and never recovers (the
+    /// path is presumed ECN-bleached for the remainder of the
+    /// connection).
+    validation: EcnValidationState = .testing,
 
     /// Allocate the next outgoing PN. Returns null if the space is
     /// exhausted (a connection-fatal condition per RFC 9000 §12.3).
@@ -71,6 +111,26 @@ pub const PnSpace = struct {
         if (self.largest_acked_sent == null or ack_largest_acked > self.largest_acked_sent.?) {
             self.largest_acked_sent = ack_largest_acked;
         }
+    }
+
+    /// Increment the receive-side ECN counter for the named codepoint
+    /// (RFC 9000 §13.4.1). `not_ect` is a no-op — only ECN-marked
+    /// packets are counted. Saturates at u64.max so a pathological
+    /// long-lived connection doesn't wrap.
+    pub fn onPacketReceivedWithEcn(self: *PnSpace, codepoint: EcnCodepoint) void {
+        switch (codepoint) {
+            .not_ect => {},
+            .ect0 => self.recv_ect0 +|= 1,
+            .ect1 => self.recv_ect1 +|= 1,
+            .ce => self.recv_ce +|= 1,
+        }
+    }
+
+    /// True iff at least one received packet at this level carried a
+    /// non-Not-ECT marking. Drives whether outgoing ACKs at this
+    /// level emit type 0x03 (with ECN counts) or stay at 0x02.
+    pub fn hasObservedEcn(self: *const PnSpace) bool {
+        return self.recv_ect0 != 0 or self.recv_ect1 != 0 or self.recv_ce != 0;
     }
 };
 
@@ -144,4 +204,28 @@ test "onAckReceived tracks the largest ack sent" {
     try std.testing.expectEqual(@as(?u64, 5), s.largest_acked_sent);
     s.onAckReceived(10);
     try std.testing.expectEqual(@as(?u64, 10), s.largest_acked_sent);
+}
+
+test "onPacketReceivedWithEcn bumps the counter for the codepoint" {
+    var s: PnSpace = .{};
+    try std.testing.expect(!s.hasObservedEcn());
+    s.onPacketReceivedWithEcn(.not_ect);
+    try std.testing.expect(!s.hasObservedEcn());
+    try std.testing.expectEqual(@as(u64, 0), s.recv_ect0);
+
+    s.onPacketReceivedWithEcn(.ect0);
+    s.onPacketReceivedWithEcn(.ect0);
+    try std.testing.expectEqual(@as(u64, 2), s.recv_ect0);
+    try std.testing.expect(s.hasObservedEcn());
+
+    s.onPacketReceivedWithEcn(.ect1);
+    s.onPacketReceivedWithEcn(.ce);
+    try std.testing.expectEqual(@as(u64, 1), s.recv_ect1);
+    try std.testing.expectEqual(@as(u64, 1), s.recv_ce);
+}
+
+test "validation defaults to testing" {
+    const s: PnSpace = .{};
+    try std.testing.expectEqual(EcnValidationState.testing, s.validation);
+    try std.testing.expect(!s.peer_ack_ecn_seen);
 }

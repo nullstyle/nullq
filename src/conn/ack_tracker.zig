@@ -162,6 +162,19 @@ pub const AckTracker = struct {
         ack_delay_scaled: u64,
         ranges_bytes_buf: []u8,
     ) Error!frame_types.Ack {
+        return self.toAckFrameWithEcn(ack_delay_scaled, ranges_bytes_buf, null);
+    }
+
+    /// Same as `toAckFrame`, but the `ecn_counts` argument lets the
+    /// caller stamp the §19.3.2 ECN-counts trailer onto the frame.
+    /// Pass `null` for the standard 0x02 frame; pass a populated
+    /// `EcnCounts` to emit 0x03.
+    pub fn toAckFrameWithEcn(
+        self: *const AckTracker,
+        ack_delay_scaled: u64,
+        ranges_bytes_buf: []u8,
+        ecn_counts: ?frame_types.EcnCounts,
+    ) Error!frame_types.Ack {
         if (self.range_count == 0) return Error.Empty;
 
         const top = self.ranges[self.range_count - 1];
@@ -189,7 +202,7 @@ pub const AckTracker = struct {
             .first_range = first_range,
             .range_count = @as(u64, @intCast(self.range_count - 1)),
             .ranges_bytes = ranges_bytes_buf[0..pos],
-            .ecn_counts = null,
+            .ecn_counts = ecn_counts,
         };
     }
 
@@ -204,11 +217,12 @@ pub const AckTracker = struct {
         ranges_bytes_buf: []u8,
         max_ranges_bytes: usize,
     ) Error!frame_types.Ack {
-        return self.toAckFrameLimitedRanges(
+        return self.toAckFrameLimitedRangesWithEcn(
             ack_delay_scaled,
             ranges_bytes_buf,
             max_ranges_bytes,
             std.math.maxInt(u64),
+            null,
         );
     }
 
@@ -221,6 +235,29 @@ pub const AckTracker = struct {
         ranges_bytes_buf: []u8,
         max_ranges_bytes: usize,
         max_lower_ranges: u64,
+    ) Error!frame_types.Ack {
+        return self.toAckFrameLimitedRangesWithEcn(
+            ack_delay_scaled,
+            ranges_bytes_buf,
+            max_ranges_bytes,
+            max_lower_ranges,
+            null,
+        );
+    }
+
+    /// Same as `toAckFrameLimitedRanges`, but lets the caller stamp
+    /// §19.3.2 ECN counts onto the frame so the encoder emits the
+    /// 0x03 wire variant. The ranges-budget logic accounts for the
+    /// extra varints in the ECN trailer when sizing the available
+    /// space; if even the trailer doesn't fit, the frame ships with
+    /// no ranges and just the leading `first_range`.
+    pub fn toAckFrameLimitedRangesWithEcn(
+        self: *const AckTracker,
+        ack_delay_scaled: u64,
+        ranges_bytes_buf: []u8,
+        max_ranges_bytes: usize,
+        max_lower_ranges: u64,
+        ecn_counts: ?frame_types.EcnCounts,
     ) Error!frame_types.Ack {
         if (self.range_count == 0) return Error.Empty;
 
@@ -251,7 +288,7 @@ pub const AckTracker = struct {
             .first_range = first_range,
             .range_count = included_ranges,
             .ranges_bytes = ranges_bytes_buf[0..pos],
-            .ecn_counts = null,
+            .ecn_counts = ecn_counts,
         };
     }
 

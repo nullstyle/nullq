@@ -143,6 +143,28 @@ pub const NewReno = struct {
         self.bytes_acked_in_ca = 0;
     }
 
+    /// Process a peer-reported ECN-CE event for a packet whose newest
+    /// in-flight peer was sent at `ce_packet_sent_time_us` (RFC 9000
+    /// §13.4.2 / RFC 9002 §B.7). Mirrors `onPacketLost`'s ssthresh /
+    /// cwnd halving and recovery-period start without consuming a
+    /// byte budget — packets aren't actually lost from the
+    /// in-flight pool by an ECN-CE report, just the controller window
+    /// shrinks.
+    pub fn onCongestionEvent(self: *NewReno, ce_packet_sent_time_us: u64) void {
+        // Suppress re-entry into recovery for ECN events that report
+        // CE on packets sent before the current recovery period.
+        if (self.recovery_start_time_us) |rec_start| {
+            if (ce_packet_sent_time_us <= rec_start) return;
+        }
+        self.recovery_start_time_us = ce_packet_sent_time_us;
+        self.ssthresh = @max(
+            self.cwnd * loss_reduction_factor_num / loss_reduction_factor_den,
+            self.cfg.minWindow(),
+        );
+        self.cwnd = self.ssthresh.?;
+        self.bytes_acked_in_ca = 0;
+    }
+
     /// Are we allowed to send `bytes_in_flight` worth of data right
     /// now? Returns the cwnd headroom (bytes that can still be sent
     /// before hitting the limit). 0 means "wait."
@@ -232,4 +254,24 @@ test "persistent congestion resets cwnd to min_window" {
     nr.cwnd = 30000;
     nr.onPersistentCongestion();
     try std.testing.expectEqual(nr.cfg.minWindow(), nr.cwnd);
+}
+
+test "onCongestionEvent halves cwnd to ssthresh and arms recovery" {
+    var nr = NewReno.init(.{ .max_datagram_size = 1200 });
+    nr.cwnd = 12000;
+    nr.onCongestionEvent(1_000_000);
+    try std.testing.expectEqual(@as(?u64, 6000), nr.ssthresh);
+    try std.testing.expectEqual(@as(u64, 6000), nr.cwnd);
+    try std.testing.expectEqual(@as(?u64, 1_000_000), nr.recovery_start_time_us);
+}
+
+test "onCongestionEvent suppresses re-entry within an existing recovery period" {
+    var nr = NewReno.init(.{ .max_datagram_size = 1200 });
+    nr.cwnd = 12000;
+    nr.onCongestionEvent(1_000_000);
+    const cwnd_after_first = nr.cwnd;
+    // A second CE on a packet sent before the recovery boundary is
+    // a duplicate signal — shouldn't shrink cwnd further.
+    nr.onCongestionEvent(999_999);
+    try std.testing.expectEqual(cwnd_after_first, nr.cwnd);
 }

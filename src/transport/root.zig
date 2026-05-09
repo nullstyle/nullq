@@ -34,6 +34,18 @@ pub const applyServerTuning = socket_opts.applyServerTuning;
 pub const default_server_recv_buffer_bytes = socket_opts.default_server_recv_buffer_bytes;
 /// Re-export of `socket_opts.default_server_send_buffer_bytes` (4 MiB).
 pub const default_server_send_buffer_bytes = socket_opts.default_server_send_buffer_bytes;
+/// Re-export of `socket_opts.EcnCodepoint` — RFC 3168 §5 codepoints
+/// quic_zig translates between `IP_TOS` / `IPV6_TCLASS` and the QUIC
+/// state machine's per-PN-space ECN counters.
+pub const EcnCodepoint = socket_opts.EcnCodepoint;
+/// Re-export of `socket_opts.setEcnSendMarking`.
+pub const setEcnSendMarking = socket_opts.setEcnSendMarking;
+/// Re-export of `socket_opts.setEcnRecvEnabled`.
+pub const setEcnRecvEnabled = socket_opts.setEcnRecvEnabled;
+/// Re-export of `socket_opts.parseEcnFromControl`.
+pub const parseEcnFromControl = socket_opts.parseEcnFromControl;
+/// Re-export of `socket_opts.default_cmsg_buffer_bytes`.
+pub const default_cmsg_buffer_bytes = socket_opts.default_cmsg_buffer_bytes;
 
 /// Re-export of `udp_server.runUdpServer` — the opinionated
 /// `std.Io`-based UDP server loop. See `udp_server.zig` for the full
