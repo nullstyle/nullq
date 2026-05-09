@@ -8,19 +8,27 @@ case "${TESTCASE:-}" in
     # Most testcase names are runner-side hints (the runner injects
     # the named network simulator profile and validates outcomes
     # from the qlog / pcap); the qns endpoint's behaviour is
-    # generic. Three exceptions are still routed by the wrapper:
+    # generic. Four exceptions are routed by the wrapper:
     #   - retry            → adds the server `-retry` flag below.
-    #   - connectionmigration → handled inside the binary via the
+    #   - connectionmigration → server-side: adds `-pref-addr [::]:444`
+    #                       so the server binds an alt-port socket and
+    #                       advertises a `preferred_address` transport
+    #                       parameter (RFC 9000 §18.2). Client-side:
+    #                       handled inside the binary via the
     #                       `server46` hostname heuristic at
-    #                       `qns_endpoint.zig:921`.
+    #                       `qns_endpoint.zig:921` — same TESTCASE
+    #                       value, the wrapper hands the runner's
+    #                       ROLE choice back to the binary.
     #   - keyupdate        → currently client-side only via
     #                       `ClientConnectionOptions.request_key_update`;
     #                       server-side latch is a known gap.
     ;;
   preferredaddress|http3)
-    # preferredaddress: server-side `preferred_address` advertise
-    #   wiring is a known gap in `qns_endpoint.zig` (the codec is
-    #   present in `src/tls/transport_params.zig`).
+    # preferredaddress: deliberately not wired — the runner's
+    #   `connectionmigration` testcase already exercises the
+    #   server-side `preferred_address` advertise via the `CM` cell
+    #   above. `preferredaddress` as a standalone testcase name is
+    #   not part of the official interop runner's matrix today.
     # http3: out of scope — quic-zig is transport-only and the
     #   qns endpoint speaks the `hq-interop` HTTP/0.9 ALPN.
     echo "quic-zig qns endpoint does not yet support TESTCASE=${TESTCASE}" >&2
@@ -38,6 +46,16 @@ case "${ROLE:-server}" in
     if [ "${TESTCASE:-}" = "retry" ]; then
       retry_arg="-retry"
     fi
+    # `connectionmigration` (server-side) needs the server to
+    # advertise a `preferred_address` transport parameter
+    # (RFC 9000 §18.2) and to be reachable on the alt-port. We
+    # bind `[::]:444` and let the binary fill in the runner's
+    # statically-allocated v4/v6 IPs (see
+    # `interop_runner_server_ipv4` / `_ipv6` in `qns_endpoint.zig`).
+    pref_addr_arg=""
+    if [ "${TESTCASE:-}" = "connectionmigration" ]; then
+      pref_addr_arg="[::]:444"
+    fi
     # Inherit the binary's dual-stack default (`[::]:443`); pinning
     # `0.0.0.0:443` here would mask `qns_endpoint.zig:76` and break
     # the runner's `ipv6` testcase. The IPv6 wildcard accepts IPv4
@@ -52,6 +70,9 @@ case "${ROLE:-server}" in
     fi
     if [ -n "${retry_arg}" ]; then
       set -- "$@" "${retry_arg}"
+    fi
+    if [ -n "${pref_addr_arg}" ]; then
+      set -- "$@" -pref-addr "${pref_addr_arg}"
     fi
     exec "$@"
     ;;

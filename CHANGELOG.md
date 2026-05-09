@@ -11,6 +11,37 @@ breaking changes; see notes per release.
 
 ### Fixed
 
+- **Interop server × `connectionmigration` × {quic-go, ngtcp2, quiche}** —
+  the qns endpoint (`interop/qns_endpoint.zig`) now advertises a
+  `preferred_address` transport parameter (RFC 9000 §18.2) and binds
+  a second UDP socket on the alt-port so the runner-driven client can
+  migrate to it. A new `-pref-addr [::]:444` server flag (wired in by
+  `interop/qns/run_endpoint.sh` only when
+  `TESTCASE=connectionmigration`) opts in: when set, the server
+  binds a second listener on that port, derives a sequence-1 server
+  CID + stateless reset token in lockstep with
+  `queueServerConnectionIds` (so the seq-1 NEW_CONNECTION_ID frame
+  the server still emits is treated as a duplicate by the client per
+  `registerPeerCid`'s idempotent same-tuple branch in
+  `src/conn/state.zig`), populates the IPv4 + IPv6 addresses with
+  the runner's static `rightnet` assignment, and embeds all six
+  fields in the `preferred_address` transport parameter. The recv
+  loop polls both sockets per iteration; per-connection
+  `last_recv_socket` tracks which listener last received an
+  authenticated datagram so the outbound drain routes replies
+  through the same socket the client most recently sent on. Three
+  new unit tests pin (a) the alignment between `buildPreferredAddress`
+  and `queueServerConnectionIds(seq=1)`, (b) the codec round-trip
+  via `Params.encode` + `Params.decode`, and (c) the
+  `last_recv_socket = 0` default. The runner's
+  `connectionmigration` testcase shells through to its
+  `TestCasePortRebinding` parent on the wire, so the existing
+  server-side peer-migration detection (peer-addr change →
+  PATH_CHALLENGE-as-first-frame, fixed in
+  `followup-path-challenge-order`) continues to drive the
+  `PATH_CHALLENGE` frame on the post-migration path. **Pending
+  matrix re-run** to confirm the three CM cells flip
+  FAIL → PASS as predicted.
 - **Interop client × `rebind-addr` × quiche (second half)** — the qns
   client driver (`interop/qns_endpoint.zig`) now forwards the inbound
   source address to `Connection.handleWithEcn` and uses
