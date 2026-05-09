@@ -112,6 +112,11 @@ pub const InitialSealOptions = struct {
     /// packets that exercise the receiver-side gate (§17.2.1 ¶17).
     /// Defaults to 0 — production callers MUST NOT change it.
     reserved_bits: u2 = 0,
+    /// QUIC Bit (RFC 9000 §17.2 / RFC 9287 §3). Defaults to 1 so v1
+    /// peers that don't understand grease still parse the packet.
+    /// Once both peers advertised `grease_quic_bit`, the connection
+    /// layer flips this on per packet.
+    quic_bit: u1 = 1,
 };
 
 /// Build a fully-protected Initial packet into `dst`. Returns total
@@ -187,6 +192,7 @@ pub fn sealInitial(dst: []u8, opts: InitialSealOptions) Error!usize {
         .pn_truncated = truncated,
         .payload_length = length_field_value,
         .reserved_bits = opts.reserved_bits,
+        .quic_bit = opts.quic_bit,
     } });
     const pn_offset = hdr_len - pn_len;
 
@@ -272,6 +278,8 @@ pub const ZeroRttSealOptions = struct {
     payload: []const u8,
     keys: *const PacketKeys,
     pn_length_override: ?u8 = null,
+    /// QUIC Bit. See `InitialSealOptions.quic_bit`.
+    quic_bit: u1 = 1,
 };
 
 /// Build a fully-protected 0-RTT packet into `dst`. Returns total
@@ -306,6 +314,7 @@ pub fn sealZeroRtt(dst: []u8, opts: ZeroRttSealOptions) Error!usize {
         .pn_truncated = truncated,
         .payload_length = length_field_value,
         .reserved_bits = 0,
+        .quic_bit = opts.quic_bit,
     } });
     const pn_offset = hdr_len - pn_len;
 
@@ -350,6 +359,8 @@ pub const HandshakeSealOptions = struct {
     payload: []const u8,
     keys: *const PacketKeys,
     pn_length_override: ?u8 = null,
+    /// QUIC Bit. See `InitialSealOptions.quic_bit`.
+    quic_bit: u1 = 1,
 };
 
 /// Build a fully-protected Handshake packet into `dst`. Returns total
@@ -384,6 +395,7 @@ pub fn sealHandshake(dst: []u8, opts: HandshakeSealOptions) Error!usize {
         .pn_truncated = truncated,
         .payload_length = length_field_value,
         .reserved_bits = 0,
+        .quic_bit = opts.quic_bit,
     } });
     const pn_offset = hdr_len - pn_len;
 
