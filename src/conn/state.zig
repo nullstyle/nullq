@@ -1593,6 +1593,14 @@ pub const Connection = struct {
         }
     }
 
+    /// Snapshot of the parameters most recently passed to
+    /// `setTransportParams`. Useful for callers (e.g. RFC 9368 §6
+    /// multi-Initial pre-parse) that need to mutate one or two
+    /// fields and re-push without rebuilding the full struct.
+    pub fn localTransportParams(self: *const Connection) TransportParams {
+        return self.local_transport_params;
+    }
+
     /// Encode `params` (RFC 9000 §18 + RFC 9221) and hand the blob
     /// to BoringSSL for transmission inside CRYPTO frames during the
     /// handshake. Must be called before the first `advance`.

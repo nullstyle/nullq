@@ -36,6 +36,33 @@ breaking changes; see notes per release.
   `tests/e2e/quic_v2_handshake.zig` (a `[v2,v1]` server flips to v2
   for a v1-wire ClientHello carrying `version_information=[v1,v2]`,
   and stays on v1 for a legacy v1-only client).
+- **Multi-Initial fragmented ClientHello reassembly for the §6
+  upgrade decision** — when the client's ClientHello spans two or
+  more Initial packets (the upper-bound case for a real-world TLS 1.3
+  CH that grows past the 1200-byte UDP floor), the server-side §6
+  pre-parse no longer falls back to the wire version. New
+  `wire.vneg_preparse.ChReassembler` is a streaming, offset-based
+  CRYPTO reassembler that accepts fragments in arbitrary order,
+  merges overlapping retransmits, and surfaces a contiguous CH the
+  moment the declared `[0..total_len)` range is covered. Each new
+  slot whose first Initial carried only a CH prefix gets a per-slot
+  `PendingUpgradeState` (allocated lazily, freed eagerly) that drives
+  the reassembler across subsequent routed Initials; once the CH
+  completes the upgrade decision lands and BoringSSL's outbound
+  transport_params are updated *before* the EE is serialized, so
+  §5's `chosen_version` invariant still holds. DoS-bounded by
+  `PendingUpgradeState.max_initial_packets` (4 Initials per slot)
+  and `max_client_hello_bytes` (4 KiB per reassembler); any failure
+  (decrypt, malformed framing, conflicting overlap, exhausted
+  budget) drops the pending state and falls back to the wire
+  version. New unit tests in `src/wire/vneg_preparse.zig` cover
+  in-order, out-of-order, duplicated, holed, oversized,
+  three-fragment, and conflicting-overlap scenarios; the
+  `tests/e2e/quic_v2_handshake.zig` end-to-end test exercises the
+  wire-up by feeding a hand-crafted, two-Initial fragmented v1
+  ClientHello carrying `version_information=[v1,v2]` to a `[v2,v1]`
+  server and asserting the slot upgrades to v2 only after the
+  second Initial arrives.
 
 ### Fixed
 
