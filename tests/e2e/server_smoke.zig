@@ -2253,3 +2253,161 @@ test "Server.Config.preferred_address: client sees the parameter on a completed 
     );
     try std.testing.expectEqualSlices(u8, &expected_token, &pa.stateless_reset_token);
 }
+
+test "Connection.acceptInitial: qns code path preserves preferred_address through to client" {
+    // The qns interop endpoint (`interop/qns_endpoint.zig`) uses
+    // `Connection.initServer` + `bind` + `setLocalScid` +
+    // `replenishConnectionIds` (to pre-queue NEW_CONNECTION_ID seq=1)
+    // BEFORE the first `acceptInitial`. The public `Server.feed` path
+    // does NOT pre-queue the NEW_CONNECTION_ID — it queues seq=1
+    // AFTER `acceptInitial` returns.
+    //
+    // This test pins the qns ordering so a future regression in
+    // `acceptInitial` / `setTransportParams` / `replenishConnectionIds`
+    // that drops `preferred_address` from the on-wire blob shows up
+    // here as "the client never sees the parameter".
+    //
+    // 2026-05-09 connectionmigration interop bug: the wire output
+    // didn't carry `preferred_address` even though the server's qns
+    // path passed it to `acceptInitial` — quiche / quic-go / ngtcp2
+    // clients all reported a missing PA after handshake.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var server_tls = try boringssl.tls.Context.initServer(.{
+        .verify = .none,
+        .min_version = boringssl.raw.TLS1_3_VERSION,
+        .max_version = boringssl.raw.TLS1_3_VERSION,
+        .alpn = &protos,
+    });
+    defer server_tls.deinit();
+    try server_tls.loadCertChainAndKey(test_cert_pem, test_key_pem);
+
+    var client_tls = try boringssl.tls.Context.initClient(.{
+        .verify = .none,
+        .min_version = boringssl.raw.TLS1_3_VERSION,
+        .max_version = boringssl.raw.TLS1_3_VERSION,
+        .alpn = &protos,
+    });
+    defer client_tls.deinit();
+
+    var client = try quic_zig.Connection.initClient(allocator, client_tls, "localhost");
+    defer client.deinit();
+    var server = try quic_zig.Connection.initServer(allocator, server_tls);
+    defer server.deinit();
+
+    try client.bind();
+    try server.bind();
+
+    // Mirror the qns sequencing precisely:
+    //   1. setLocalScid(initial_server_cid)
+    //   2. replenishConnectionIds(seq=1 alt-CID) — queues NEW_CONNECTION_ID
+    //   3. (later, on first inbound) acceptInitial(bytes, params)
+    const initial_server_cid = [_]u8{ 'Q', 'N', 'S', '-', 0x11, 0x22, 0x33, 0x44 };
+    try server.setLocalScid(&initial_server_cid);
+
+    // Pre-queue the seq-1 NEW_CONNECTION_ID — same shape as
+    // qns_endpoint.zig's `queueServerConnectionIds`.
+    var alt_cid = initial_server_cid;
+    alt_cid[7] +%= 1;
+    const alt_token: [16]u8 = blk: {
+        var t: [16]u8 = undefined;
+        for (&t, 0..) |*b, i| b.* = 1 ^ @as(u8, @truncate(i * 17)) ^ alt_cid[i % alt_cid.len];
+        break :blk t;
+    };
+    const provision = quic_zig.ConnectionIdProvision{
+        .connection_id = alt_cid[0..],
+        .stateless_reset_token = alt_token,
+    };
+    _ = try server.replenishConnectionIds(&[_]quic_zig.ConnectionIdProvision{provision});
+
+    // Client sends a vanilla baseline params blob.
+    const client_params: quic_zig.tls.TransportParams = .{
+        .max_idle_timeout_ms = 30_000,
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 18,
+        .initial_max_stream_data_bidi_remote = 1 << 18,
+        .initial_max_stream_data_uni = 1 << 18,
+        .initial_max_streams_bidi = 100,
+        .initial_max_streams_uni = 100,
+        .active_connection_id_limit = 4,
+    };
+    const client_scid = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
+    const initial_dcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+    try client.setLocalScid(&client_scid);
+    try client.setInitialDcid(&initial_dcid);
+    try client.setPeerDcid(&initial_dcid);
+    try client.setTransportParams(client_params);
+
+    // Server-side params include `preferred_address` matching the
+    // qns endpoint's `buildPreferredAddress` shape (alt port 444).
+    const preferred_address: quic_zig.tls.transport_params.PreferredAddress = .{
+        .ipv4_address = .{ 193, 167, 100, 100 },
+        .ipv4_port = 444,
+        .ipv6_address = .{
+            0xfd, 0x00, 0xca, 0xfe, 0xca, 0xfe, 0x01, 0x00,
+            0, 0, 0, 0, 0, 0, 0x01, 0x00,
+        },
+        .ipv6_port = 444,
+        .connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&alt_cid),
+        .stateless_reset_token = alt_token,
+    };
+    const server_params: quic_zig.tls.TransportParams = .{
+        .original_destination_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&initial_dcid),
+        .initial_source_connection_id = quic_zig.conn.path.ConnectionId.fromSlice(&initial_server_cid),
+        .max_idle_timeout_ms = 30_000,
+        .initial_max_data = 1 << 20,
+        .initial_max_stream_data_bidi_local = 1 << 18,
+        .initial_max_stream_data_bidi_remote = 1 << 18,
+        .initial_max_stream_data_uni = 1 << 18,
+        .initial_max_streams_bidi = 100,
+        .initial_max_streams_uni = 100,
+        .active_connection_id_limit = 4,
+        .preferred_address = preferred_address,
+    };
+
+    // Drive client to emit ClientHello → first Initial.
+    try client.advance();
+
+    var buf_c2s: [2048]u8 = undefined;
+    var buf_s2c: [2048]u8 = undefined;
+    var iters: u32 = 0;
+    var now_us: u64 = 1_000_000;
+    var server_accepted = false;
+
+    while (iters < 100) : (iters += 1) {
+        if (client.handshakeDone() and server.handshakeDone()) break;
+        if (try client.poll(&buf_c2s, now_us)) |n| {
+            if (!server_accepted) {
+                // Mirror qns: on the first inbound, install transport
+                // params via `acceptInitial` (and feed early-data
+                // context like the qns code does immediately after).
+                try server.acceptInitial(buf_c2s[0..n], server_params);
+                _ = try server.setEarlyDataContextForParams(server_params, "hq-test", "qns-acceptInitial test");
+                server_accepted = true;
+            }
+            try server.handle(buf_c2s[0..n], null, now_us);
+        }
+        if (try server.poll(&buf_s2c, now_us)) |n| {
+            try client.handle(buf_s2c[0..n], null, now_us);
+        }
+        now_us += 10_000;
+    }
+
+    try std.testing.expect(server_accepted);
+    try std.testing.expect(client.handshakeDone());
+    try std.testing.expect(server.handshakeDone());
+
+    // The client's `peerTransportParams` must include the preferred
+    // address the server passed to `acceptInitial`. A regression that
+    // drops it on the wire shows up here.
+    const peer_tp = (try client.peerTransportParams()) orelse return error.NoPeerTransportParams;
+    const pa = peer_tp.preferred_address orelse return error.MissingPreferredAddress;
+
+    try std.testing.expectEqualSlices(u8, &preferred_address.ipv4_address, &pa.ipv4_address);
+    try std.testing.expectEqual(preferred_address.ipv4_port, pa.ipv4_port);
+    try std.testing.expectEqualSlices(u8, &preferred_address.ipv6_address, &pa.ipv6_address);
+    try std.testing.expectEqual(preferred_address.ipv6_port, pa.ipv6_port);
+    try std.testing.expectEqualSlices(u8, preferred_address.connection_id.slice(), pa.connection_id.slice());
+    try std.testing.expectEqualSlices(u8, &preferred_address.stateless_reset_token, &pa.stateless_reset_token);
+}
