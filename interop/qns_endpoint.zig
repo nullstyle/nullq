@@ -75,7 +75,17 @@ const endpoint_uni_stream_receive_window: u64 = 1024 * 1024;
 // pipelined burst exhausts the initial allotment.
 const endpoint_bidi_stream_limit: u64 = 1000;
 const endpoint_uni_stream_limit: u64 = 64;
-const endpoint_active_connection_id_limit: u64 = 2;
+// Higher than the RFC 9000 §18.2 ¶22 minimum of 2 so peers (quiche
+// especially) keep issuing fresh NEW_CONNECTION_ID frames as we
+// rotate per RFC 9000 §5.1.2 ¶1 / §9.5. Targets the runner's
+// `rebind-addr` cell — the simulator rebinds our source address
+// multiple times across the test window; each rebind triggers
+// quiche's server-side §5.1.2 enforcement, which logs `Peer reused
+// cid seq N` and fails the runner's pcap check if we can't rotate
+// to a fresh peer-issued CID. With limit=2 we exhausted the stash
+// after a single rotation; 8 buys us 7 rotations of headroom,
+// plenty for the test's typical 3-5 rebinds.
+const endpoint_active_connection_id_limit: u64 = 8;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
 
 // Stalled-peer keepalive (W1 in `docs/quiche-interop-notes.md`). Targets
