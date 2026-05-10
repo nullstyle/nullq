@@ -11,6 +11,36 @@ breaking changes; see notes per release.
 
 ### Fixed
 
+- **Client rotates peer DCID on inbound PATH_CHALLENGE [RFC 9000
+  §5.1.2 ¶1]** — when our client receives PATH_CHALLENGE on the
+  current active path, the peer believes it has detected a
+  peer-initiated migration on our end (most commonly: the runner's
+  `rebind-addr` simulator rewrites the client's source IP
+  transparently, the kernel socket is unchanged so we never observe
+  the migration locally, but the server sees a new 4-tuple and
+  probes it). The client now matches the peer's view by consuming
+  a fresh peer-issued CID for subsequent outbound packets. Without
+  this, quiche's server-side §5.1.2 enforcement logged "Peer
+  reused cid seq 0 ... on (new tuple)" against every rebind. Paired
+  with bumping qns `endpoint_active_connection_id_limit` from 2 to
+  8 so the peer has headroom to issue enough fresh CIDs for the
+  test's 3-5 rebinds.
+
+### Notes
+
+- **`client × quiche × rebind-addr` no longer fails on protocol but
+  hits the 60s test timeout.** With the DCID-rotation fix above the
+  spec violation is gone — quiche logs `Connection migrated to ...`
+  after each rebind. The cell still fails the runner's `Test failed:
+  took longer than 60s.` check because each rebind drops in-flight
+  packets, quiche's congestion controller halves cwnd, and the 10 MB
+  transfer can't finish before the deadline at the ~1.19 Mbps
+  steady-state quiche achieves through repeated rebinds. The
+  underlying bandwidth bottleneck is in quiche's loss-recovery
+  reaction (server-side, not us) and the runner's strict 60 s
+  deadline. Not fixable from our side without server-side
+  optimization in quiche.
+
 - **`server × quiche × multiplexing` stall — server-side stalled-peer
   keepalive wakes quiche's parked writable-streams iterator.** The
   `interop/qns_endpoint.zig` event loop now arms a single
