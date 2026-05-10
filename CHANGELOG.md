@@ -48,6 +48,32 @@ breaking changes; see notes per release.
 
 ### Added
 
+- **Server-side preferred-address migration detection
+  (`Connection.noteServerLocalAddressChanged`)** — embedders observing
+  an authenticated datagram for a server-role connection arrive on a
+  new local address (typically a peer that followed the
+  `preferred_address` advertise from the primary listener to the
+  alt-port one) call this API to start RFC 9000 §5.1.1 path
+  validation symmetrically with the existing peer-driven
+  `handlePeerAddressChange` path. The new method snapshots
+  pre-migration state, updates the active path's `local_addr`,
+  generates a fresh PATH_CHALLENGE token, arms the validator with a
+  `3 * PTO` timeout, and queues PATH_CHALLENGE for the next `poll`
+  via the existing `emit_path_challenge_first` machinery so the
+  first emitted packet on the new path leads with PATH_CHALLENGE
+  rather than burying it behind ACK/PATH_RESPONSE/STREAM frames.
+  Returns `PreferredAddressNotAdvertised` (new error variant) when
+  no `preferred_address` is configured locally; idempotent on a
+  duplicate call for the same `new_local_addr`. Wired into
+  `transport.runUdpServer` (the public-API runtime helper) and into
+  `interop/qns_endpoint.zig` so any embedder that uses
+  `Server.Config.preferred_address` gets automatic migration
+  detection. Fixes the
+  `server × ngtcp2 × connectionmigration` interop cell where the
+  server's first post-migration packet on the alt-port carried
+  `ACK + PATH_RESPONSE + STREAM` but no `PATH_CHALLENGE`, leaving
+  ngtcp2's path-validation state machine permanently waiting.
+
 - **External-interop wrapper testcase aliases** — `tools/external_interop.zig`
   now recognizes the short forms `BA`, `CM`, `V2`, `V`, `LR`, `IPV6`/`6`, `E`,
   and `A` for the runner's `rebind-addr`, `connectionmigration`, `v2`,

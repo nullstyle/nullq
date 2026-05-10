@@ -5412,6 +5412,266 @@ test "client active migration: PATH_RESPONSE clears migration state and resets r
     try std.testing.expectEqual(expected_cwnd, path.path.cc.cwnd);
 }
 
+// -- noteServerLocalAddressChanged (RFC 9000 §5.1.1 server PA migration) -----
+
+fn testServerPreferredAddress() transport_params_mod.PreferredAddress {
+    // The shape doesn't matter for these tests — the API only
+    // checks that `local_transport_params.preferred_address` is
+    // non-null.
+    return .{
+        .ipv4_address = .{ 10, 0, 0, 1 },
+        .ipv4_port = 4444,
+    };
+}
+
+test "noteServerLocalAddressChanged: queues PATH_CHALLENGE and arms validator on server" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Mark the server as having advertised a preferred_address. The
+    // gate inside `noteServerLocalAddressChanged` only checks that
+    // the field is non-null; we don't need a fully configured value.
+    conn.local_transport_params.preferred_address = testServerPreferredAddress();
+
+    // Server-side migration is post-handshake (RFC 9000 §9.6); we
+    // bypass the real TLS handshake using the test-only override.
+    conn.test_only_force_handshake_for_migration = true;
+
+    const peer_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) };
+    const old_local = Address{ .bytes = .{ 1, 2, 3, 4 } ++ @as([18]u8, @splat(0)) };
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(peer_addr);
+    path.setLocalAddress(old_local);
+    path.path.markValidated();
+    path.path.bytes_received = 12_345;
+    path.path.bytes_sent = 6_789;
+
+    try conn.noteServerLocalAddressChanged(new_local, 1_000_000);
+
+    // PATH_CHALLENGE queued on the active path; validator armed.
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expectEqual(@as(u32, 0), conn.pending_frames.path_challenge_path_id);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+    try std.testing.expectEqual(@as(?u64, 1_000_000), path.path.last_path_challenge_at_us);
+
+    // Local address bookkeeping updated; peer address untouched.
+    try std.testing.expect(Address.eql(new_local, path.path.local_addr));
+    try std.testing.expect(Address.eql(peer_addr, path.path.peer_addr));
+
+    // Rollback snapshot retained so a validation timeout can revert.
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expect(path.migration_rollback != null);
+
+    // Counters NOT zeroed (anti-amp doesn't apply when only the local
+    // address changed and the peer was already validated). Mirrors
+    // `beginClientActiveMigration` rationale.
+    try std.testing.expectEqual(@as(u64, 12_345), path.path.bytes_received);
+    try std.testing.expectEqual(@as(u64, 6_789), path.path.bytes_sent);
+    try std.testing.expect(path.path.isValidated());
+}
+
+test "noteServerLocalAddressChanged: refuses before handshake completion" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.local_transport_params.preferred_address = testServerPreferredAddress();
+    // Note: NOT setting test_only_force_handshake_for_migration; the
+    // gate is what we're testing. handshakeDone() returns false on a
+    // freshly-initialized server connection.
+    try std.testing.expect(!conn.handshakeDone());
+
+    var recorder: TestQlogRecorder = .{};
+    conn.setQlogCallback(TestQlogRecorder.callback, &recorder);
+
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    try std.testing.expectError(
+        error.PathLimitExceeded,
+        conn.noteServerLocalAddressChanged(new_local, 1_000_000),
+    );
+
+    // No mutation; no PATH_CHALLENGE queued.
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+    try std.testing.expect(!conn.primaryPath().pending_migration_reset);
+
+    // qlog: migration_path_failed / pre_handshake.
+    try std.testing.expect(recorder.contains(.migration_path_failed));
+    const evt = recorder.first(.migration_path_failed).?;
+    try std.testing.expectEqual(
+        @as(?QlogMigrationFailReason, .pre_handshake),
+        evt.migration_fail_reason,
+    );
+}
+
+test "noteServerLocalAddressChanged: rejects when no preferred_address advertised" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Deliberately leave local_transport_params.preferred_address null.
+    conn.test_only_force_handshake_for_migration = true;
+
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    try std.testing.expectError(
+        error.PreferredAddressNotAdvertised,
+        conn.noteServerLocalAddressChanged(new_local, 1_000_000),
+    );
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+}
+
+test "noteServerLocalAddressChanged: client-role connection is rejected" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    try std.testing.expectError(
+        error.NotServerContext,
+        conn.noteServerLocalAddressChanged(new_local, 1_000_000),
+    );
+}
+
+test "noteServerLocalAddressChanged: idempotent on the same local address" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.local_transport_params.preferred_address = testServerPreferredAddress();
+    conn.test_only_force_handshake_for_migration = true;
+
+    const peer_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) };
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(peer_addr);
+    path.path.markValidated();
+
+    try conn.noteServerLocalAddressChanged(new_local, 1_000_000);
+    const token_after_first = path.path.validator.pending_token;
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+
+    // A duplicate / stale post-migration datagram lands. The local
+    // addr already matches, so this should no-op (NOT mint a fresh
+    // PATH_CHALLENGE token, which would invalidate the in-flight
+    // validator).
+    try conn.noteServerLocalAddressChanged(new_local, 1_500_000);
+    try std.testing.expect(std.mem.eql(u8, &token_after_first, &path.path.validator.pending_token));
+    try std.testing.expectEqual(@as(?u64, 1_000_000), path.path.last_path_challenge_at_us);
+}
+
+test "noteServerLocalAddressChanged: refuses while a different migration is pending" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.local_transport_params.preferred_address = testServerPreferredAddress();
+    conn.test_only_force_handshake_for_migration = true;
+
+    const peer_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) };
+    const local_a = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    const local_b = Address{ .bytes = .{ 5, 6, 7, 9 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(peer_addr);
+    path.path.markValidated();
+
+    try conn.noteServerLocalAddressChanged(local_a, 1_000_000);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+
+    // Second migration request to a *different* local-addr while the
+    // first is still in flight: refused.
+    try std.testing.expectError(
+        error.PathLimitExceeded,
+        conn.noteServerLocalAddressChanged(local_b, 1_500_000),
+    );
+}
+
+test "noteServerLocalAddressChanged: PATH_CHALLENGE-first emit on the freshly-migrated path" {
+    // E2E-style assertion: after the API call, the very next
+    // application-level packet leads with PATH_CHALLENGE (RFC 9000
+    // §8.2 / §9 — the ngtcp2 connectionmigration interop testcase
+    // expects this). Routes through the existing
+    // `emit_path_challenge_first` machinery which gates on
+    // `pending_migration_reset` + `validator.status == .pending`.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    conn.local_transport_params.preferred_address = testServerPreferredAddress();
+    conn.test_only_force_handshake_for_migration = true;
+
+    // Install application write keys and a peer DCID so pollLevel
+    // can actually seal a 1-RTT packet.
+    try installTestApplicationWriteSecret(&conn);
+    try conn.setPeerDcid(&.{ 0xaa, 0xbb });
+    try conn.setLocalScid(&.{0xcc});
+
+    const peer_addr = Address{ .bytes = .{ 9, 9, 9, 9 } ++ @as([18]u8, @splat(0)) };
+    const new_local = Address{ .bytes = .{ 5, 6, 7, 8 } ++ @as([18]u8, @splat(0)) };
+    const path = conn.primaryPath();
+    path.setPeerAddress(peer_addr);
+    path.path.markValidated();
+
+    // Force a non-trivial bytes_received so anti-amp doesn't clamp
+    // the post-migration poll. Server primary starts unvalidated;
+    // markValidated above lifts that, so anti-amp is moot — but we
+    // also want a realistic budget for the assertion.
+    path.path.bytes_received = 8000;
+    path.path.bytes_sent = 0;
+
+    try conn.noteServerLocalAddressChanged(new_local, 1_000_000);
+    try std.testing.expect(conn.pending_frames.path_challenge != null);
+    try std.testing.expect(path.pending_migration_reset);
+    try std.testing.expectEqual(.pending, path.path.validator.status);
+
+    // Capture the queued PATH_CHALLENGE token so we can confirm it's
+    // first in the packet payload.
+    const expected_token = conn.pending_frames.path_challenge.?;
+
+    var packet_buf: [default_mtu]u8 = undefined;
+    const n = (try conn.pollLevel(.application, &packet_buf, 1_000_500)) orelse {
+        return error.NoPacketEmitted;
+    };
+    try std.testing.expect(n > 0);
+
+    // After the poll, the queued PATH_CHALLENGE has been consumed.
+    try std.testing.expect(conn.pending_frames.path_challenge == null);
+
+    // Decode the sealed packet and confirm the FIRST frame is a
+    // PATH_CHALLENGE bearing `expected_token`. We don't have a
+    // direct decode helper for sealed short-header packets in the
+    // test surface; instead we leverage the fact that the
+    // emit_path_challenge_first branch writes the 9-byte
+    // PATH_CHALLENGE before any other frame into the inner payload.
+    // The retransmit-frame slot on the path's most recent SentPacket
+    // captures the same frame for retransmission, so we can read it
+    // there to confirm ordering.
+    try std.testing.expect(path.sent.count > 0);
+    const last_pkt = &path.sent.packets[path.sent.count - 1];
+    try std.testing.expect(last_pkt.retransmit_frames.items.len > 0);
+    const first_frame = last_pkt.retransmit_frames.items[0];
+    switch (first_frame) {
+        .path_challenge => |pc| {
+            try std.testing.expect(std.mem.eql(u8, &expected_token, &pc.data));
+        },
+        else => return error.FirstFrameNotPathChallenge,
+    }
+}
+
 // -- Connection-level fuzz harnesses (hardening guide §11.1 #8 / #9 / #20) ----
 //
 // These sit one layer above the per-buffer fuzz harnesses landed in

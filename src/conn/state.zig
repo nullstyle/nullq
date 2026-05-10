@@ -172,6 +172,17 @@ pub const Error = error{
     /// teardown is functionally impossible, but failing closed is
     /// the right behavior at the boundary.
     AlternativeAddressSequenceExhausted,
+    /// `Connection.noteServerLocalAddressChanged` was called on a
+    /// connection whose `local_transport_params.preferred_address` is
+    /// null. RFC 9000 §5.1.1 / §18.2: the server-initiated migration
+    /// the API models is only meaningful when the server has advertised
+    /// a `preferred_address` in its handshake transport parameters —
+    /// without one, the client has no signal to migrate to and no
+    /// remote 4-tuple can be authenticated against the advertised
+    /// pair. Embedders hit this when wiring up the API on a server
+    /// that never set `Server.Config.preferred_address`; the fix is
+    /// either to configure a preferred address or to skip the call.
+    PreferredAddressNotAdvertised,
 } || boringssl.tls.Error ||
     boringssl.crypto.rand.Error ||
     short_packet_mod.Error ||
@@ -4970,6 +4981,148 @@ pub const Connection = struct {
         // The path validator still tracks PATH_CHALLENGE in flight so
         // the embedder can observe migration progress; failure rolls
         // back peer_cid via the rollback snapshot above.
+        path.setLocalAddress(new_local_addr);
+        path.pending_migration_reset = true;
+
+        const token = try self.newPathChallengeToken();
+        const timeout_us = saturatingMul(self.ptoDurationForApplicationPath(path), 3);
+        path.path.validator.beginChallenge(token, now_us, timeout_us);
+        path.path.last_path_challenge_at_us = now_us;
+        self.queuePathChallengeOnPath(path.id, token);
+    }
+
+    /// Server-side counterpart to `beginClientActiveMigration`: the
+    /// embedder observed an authenticated datagram for this connection
+    /// arrive on a NEW local address (typically because a peer that
+    /// followed our advertised `preferred_address` flipped from the
+    /// primary listening socket to the alt-port one). RFC 9000 §5.1.1
+    /// requires the server to validate the new path before treating
+    /// it as the active 4-tuple, so this call mirrors
+    /// `handlePeerAddressChange` for the local-side flip — generates
+    /// a fresh PATH_CHALLENGE token, arms the validator, queues
+    /// PATH_CHALLENGE on the active path, and stamps the rate-limit
+    /// clock. The `emit_path_challenge_first` machinery
+    /// (`pending_migration_reset` + `validator.status == .pending`)
+    /// then guarantees the next emitted packet on the new local
+    /// address leads with PATH_CHALLENGE rather than burying it
+    /// behind ACK / PATH_RESPONSE / STREAM frames.
+    ///
+    /// Preconditions:
+    ///   - `role == .server` — clients drive their own migration via
+    ///     `beginClientActiveMigration`.
+    ///   - Handshake is complete (RFC 9000 §9.6: pre-handshake address
+    ///     swaps are forbidden).
+    ///   - `local_transport_params.preferred_address` is set — without
+    ///     a server-advertised PA the embedder has no legitimate
+    ///     trigger for this call. Returns
+    ///     `PreferredAddressNotAdvertised` otherwise so embedder bugs
+    ///     surface at the boundary.
+    ///   - No migration is currently pending (PATH_CHALLENGE
+    ///     outstanding on the active path) — re-firing for the same
+    ///     local-addr on stale buffered datagrams is idempotent.
+    ///
+    /// Effect:
+    ///   - Snapshots current path state into `migration_rollback` so
+    ///     the path can revert if PATH_CHALLENGE times out.
+    ///   - Updates the active path's `local_addr` to `new_local_addr`
+    ///     (informational on the embedder side; nothing in the core
+    ///     routes by local_addr — the embedder picks the outbound
+    ///     socket via its own bookkeeping such as
+    ///     `Server.Slot.last_recv_socket_idx` or the qns endpoint's
+    ///     `last_recv_socket`).
+    ///   - Generates a fresh PATH_CHALLENGE token, arms the validator
+    ///     with a `3 * PTO` timeout (RFC 9000 §8.2.4), and queues
+    ///     PATH_CHALLENGE for the next `poll`.
+    ///   - Sets `pending_migration_reset = true` so a successful
+    ///     PATH_RESPONSE drives `resetRecoveryAfterMigration` (RFC
+    ///     9000 §9.4) and so the `emit_path_challenge_first` gate in
+    ///     the send path fires for the next outbound packet.
+    ///   - Does NOT zero `bytes_received` / `bytes_sent`: the peer
+    ///     already authenticated the datagram on the existing path's
+    ///     keys — the §8.1 anti-amp 3x cap is irrelevant to a
+    ///     local-side address flip (the peer wasn't the entity that
+    ///     moved). This matches the rationale in
+    ///     `beginClientActiveMigration`.
+    ///
+    /// **Idempotence**: a no-op when the active path's `local_addr`
+    /// already equals `new_local_addr` (idempotent under stale
+    /// buffered datagrams that arrive shortly after the first
+    /// post-migration packet) and when the validator is already
+    /// `.pending` for this migration. Returns without error in both
+    /// cases.
+    ///
+    /// Returns `PreferredAddressNotAdvertised` when no server
+    /// `preferred_address` was advertised, `NotServerContext` when
+    /// called on a client connection, and `PathLimitExceeded` when
+    /// the handshake is incomplete or another migration is already
+    /// pending (mirrors the diagnostic shape of
+    /// `beginClientActiveMigration`).
+    pub fn noteServerLocalAddressChanged(
+        self: *Connection,
+        new_local_addr: Address,
+        now_us: u64,
+    ) Error!void {
+        if (self.role != .server) return Error.NotServerContext;
+        // RFC 9000 §5.1.1 / §18.2: only meaningful when the server
+        // has advertised a `preferred_address` to follow. Embedders
+        // that have not configured one shouldn't be calling this API.
+        if (self.local_transport_params.preferred_address == null) {
+            return Error.PreferredAddressNotAdvertised;
+        }
+        const handshake_complete = self.handshakeDone() or self.test_only_force_handshake_for_migration;
+        if (!handshake_complete) {
+            self.emitQlog(.{
+                .name = .migration_path_failed,
+                .path_id = self.activePath().id,
+                .migration_fail_reason = .pre_handshake,
+            });
+            return Error.PathLimitExceeded;
+        }
+        const path = self.activePath();
+
+        // Idempotence: a follow-up datagram for the same migrated
+        // local-addr (e.g. a duplicate or stale buffered packet) just
+        // returns success. Two cases:
+        //   1. The path's local_addr already matches — we already ran
+        //      this body for an earlier call.
+        //   2. The validator is .pending and pending_migration_reset
+        //      is set — a migration is in flight; double-firing
+        //      would mint a fresh token and lose the original
+        //      challenge, breaking the in-flight validation.
+        if (path.local_addr_set and Address.eql(path.path.local_addr, new_local_addr)) {
+            return;
+        }
+        if (path.path.validator.status == .pending and path.pending_migration_reset) {
+            return Error.PathLimitExceeded;
+        }
+
+        // Snapshot pre-migration state for rollback on validator
+        // timeout. We capture the same fields
+        // `beginClientActiveMigration` does so the rollback path is
+        // shared. `peer_addr` doesn't change on a server-side
+        // local-addr flip, but snapshotting it keeps the
+        // `MigrationRollback` shape uniform across migration triggers.
+        if (path.migration_rollback == null) {
+            path.migration_rollback = .{
+                .peer_addr = path.path.peer_addr,
+                .peer_addr_set = path.peer_addr_set,
+                .validated = path.path.isValidated(),
+                .bytes_received = path.path.bytes_received,
+                .bytes_sent = path.path.bytes_sent,
+                .state = path.path.state,
+            };
+        }
+
+        // Update local-address bookkeeping. Like the client-side
+        // counterpart, we deliberately do NOT zero `bytes_received` /
+        // `bytes_sent` — the peer hasn't moved (it just reached us
+        // via a different local socket of ours), so RFC 9000 §8.1
+        // anti-amp doesn't apply and the path stays validated for
+        // outbound bytes. Resetting the counters would clamp the
+        // first post-migration `poll`'s `max_payload` to 0, which is
+        // exactly the bug we're fixing — the migrated path would
+        // never send PATH_CHALLENGE because anti-amp would treat the
+        // path as fresh.
         path.setLocalAddress(new_local_addr);
         path.pending_migration_reset = true;
 

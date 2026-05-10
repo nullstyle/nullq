@@ -2411,3 +2411,119 @@ test "Connection.acceptInitial: qns code path preserves preferred_address throug
     try std.testing.expectEqualSlices(u8, preferred_address.connection_id.slice(), pa.connection_id.slice());
     try std.testing.expectEqualSlices(u8, &preferred_address.stateless_reset_token, &pa.stateless_reset_token);
 }
+
+test "Connection.noteServerLocalAddressChanged: PATH_CHALLENGE leads first packet on migrated path" {
+    // End-to-end pin for the `server × ngtcp2 × connectionmigration`
+    // interop fix: drive a full Server↔Client handshake with
+    // `preferred_address` on, simulate the embedder observing a
+    // datagram on a new local socket (the alt-port a real client
+    // would migrate to), call `Connection.noteServerLocalAddressChanged`
+    // on the server slot, then assert the FIRST application-level
+    // packet the server emits leads with a `PATH_CHALLENGE` frame
+    // (RFC 9000 §8.2 / §9). Without this, the first post-migration
+    // server packet only carries ACK + PATH_RESPONSE + STREAM and
+    // ngtcp2's path-validation state machine never accepts the
+    // migration.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = test_cert_pem,
+        .tls_key_pem = test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+        .stateless_reset_key = @splat(0x42),
+        .preferred_address = .{
+            .ipv4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 4444 },
+        },
+    });
+    defer srv.deinit();
+
+    var cli = try quic_zig.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = defaultParams(),
+    });
+    defer cli.deinit();
+
+    var rx: [4096]u8 = undefined;
+    const peer_addr: quic_zig.conn.path.Address = .{ .bytes = @splat(0xab) };
+    const old_local: quic_zig.conn.path.Address = .{ .bytes = @splat(0x10) };
+    const new_local: quic_zig.conn.path.Address = .{ .bytes = @splat(0x20) };
+    try cli.conn.advance();
+
+    // Drive the handshake to completion under the original 4-tuple.
+    var step: u32 = 0;
+    const max_steps: u32 = 32;
+    while (step < max_steps) : (step += 1) {
+        const now_us: u64 = @as(u64, step) * 1_000;
+        while (try cli.conn.poll(&rx, now_us)) |len| {
+            _ = try srv.feed(rx[0..len], peer_addr, now_us);
+        }
+        while (srv.drainStatelessResponse()) |_| {}
+        for (srv.iterator()) |slot| {
+            while (try slot.conn.poll(&rx, now_us)) |len| {
+                try cli.conn.handle(rx[0..len], null, now_us);
+            }
+        }
+        try srv.tick(now_us);
+        try cli.conn.tick(now_us);
+        if (cli.conn.handshakeDone() and srv.iterator().len > 0 and
+            srv.iterator()[0].conn.handshakeDone()) break;
+    }
+    try std.testing.expect(cli.conn.handshakeDone());
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+    const slot = srv.iterator()[0];
+    try std.testing.expect(slot.conn.handshakeDone());
+
+    // Stamp the active path's local addr so the API can detect a
+    // change. The handshake pumped above doesn't record a local addr
+    // through `setLocalAddress` (the public Server.feed path doesn't
+    // take one — it's only an outbound-routing hint surfaced
+    // through `Slot.last_recv_socket_idx` in the runUdpServer
+    // helper), so we wire it manually here to mirror what an
+    // embedder would do.
+    slot.conn.primaryPath().setLocalAddress(old_local);
+
+    // Drain any pending handshake-completion datagrams (HANDSHAKE_DONE
+    // ACK, MAX_DATA bumps) so the next poll starts on a clean
+    // application packet boundary. The `pending_migration_reset`
+    // gate then fires for the FIRST emit on the new path.
+    var drain_now_us: u64 = @as(u64, max_steps) * 1_000 + 1;
+    while (try slot.conn.poll(&rx, drain_now_us)) |_| {}
+
+    // Now simulate the embedder's runtime detecting a datagram on a
+    // new local addr (the preferred-address alt-listener flip).
+    try slot.conn.noteServerLocalAddressChanged(new_local, drain_now_us);
+
+    // The validator should be armed and a PATH_CHALLENGE queued.
+    const queued_token = slot.conn.pending_frames.path_challenge orelse {
+        return error.PathChallengeNotQueued;
+    };
+
+    // Emit one application packet. The `emit_path_challenge_first`
+    // gate guarantees PATH_CHALLENGE is the FIRST frame in the
+    // payload (verified via the retransmit_frames slot on the most
+    // recent SentPacket, which records frames in emit order).
+    drain_now_us += 1_000;
+    const n = (try slot.conn.poll(&rx, drain_now_us)) orelse {
+        return error.NoPostMigrationPacket;
+    };
+    try std.testing.expect(n > 0);
+
+    // Inspect the most recent SentPacket on the active path. Its
+    // first retransmit_frames entry must be the PATH_CHALLENGE we
+    // queued.
+    const path = slot.conn.primaryPath();
+    try std.testing.expect(path.sent.count > 0);
+    const last_pkt = &path.sent.packets[path.sent.count - 1];
+    try std.testing.expect(last_pkt.retransmit_frames.items.len > 0);
+    switch (last_pkt.retransmit_frames.items[0]) {
+        .path_challenge => |pc| {
+            try std.testing.expect(std.mem.eql(u8, &queued_token, &pc.data));
+        },
+        else => return error.FirstFrameNotPathChallenge,
+    }
+}
