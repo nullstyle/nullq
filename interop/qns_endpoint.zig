@@ -77,6 +77,46 @@ const endpoint_bidi_stream_limit: u64 = 1000;
 const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 2;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
+
+// Stalled-peer keepalive (W1 in `docs/quiche-interop-notes.md`). Targets
+// the `server × quiche × multiplexing` cell: quiche's client
+// `conn.send()` returns `Done` with stream data still pending after the
+// ~1979th of 1999 streams gets responded to (verified in
+// `interop/logs.server-final2/quic-zig_quiche/multiplexing/client/log.txt`,
+// last 30s show only ACK-only packets crossing in either direction
+// before quiche's `idle timeout expired`). Sending an ack-eliciting
+// packet from the server wakes quiche's `conn.recv()` → `conn.send()`
+// cycle, which re-iterates writable streams and (in upstream's testing)
+// flushes the parked ones.
+//
+// Detection rule, per connection: handshake confirmed AND
+// `streamCount > 0` AND we have not put a packet on the wire for at
+// least `stalled_peer_keepalive_idle_us`. When all three hold, queue
+// one application-level PING via `Connection.requestPing()`; the
+// per-iteration poll-drain immediately after picks it up. Rate-limited
+// to one PING every `stalled_peer_keepalive_min_period_us` so a
+// genuinely-dead peer can't make the server burn CPU minting probes
+// faster than the round-trip.
+//
+// The two thresholds together bound spurious noise to roughly
+// (idle_timeout / min_period) PINGs per connection in the
+// quiche-stuck case (~30 / 1 = 30) — well below the conn's idle limit
+// and indistinguishable from healthy keepalive on the wire.
+//
+// Spurious-firing posture: against a well-behaved peer, this only
+// fires when the peer has open streams and we genuinely have nothing
+// to send for 2+ seconds. Healthy implementations either (a) close
+// their streams (drops `streamCount` to 0 and the gate clears) or
+// (b) keep the conversation moving (resets the idle timer).
+//
+// Tunable: 2s idle is the smallest value that still keeps quiche's
+// client out of the gate during the normal pipelined burst (the trace
+// shows quiche idling for 100s of milliseconds between bursts; 2s is
+// 10× that floor). A larger value would risk leaving the runner's
+// 30s deadline with too few wake-up attempts to land one before
+// quiche idle-times out.
+const stalled_peer_keepalive_idle_us: u64 = 2_000_000;
+const stalled_peer_keepalive_min_period_us: u64 = 1_000_000;
 // Lifetime cap on extra client-issued SCIDs the qns driver feeds
 // the server. Tops out the runaway-issuance budget for a single
 // connection: each tick after handshake the driver tops up to the
@@ -631,6 +671,25 @@ const ServerConn = struct {
     /// advertise the parameter and queue the seq-1 frame.
     pa_alt_cid_set: bool = false,
 
+    /// Wall-clock-equivalent timestamp (qns time base; see `qnsNowUs`)
+    /// of the last datagram we put on the wire for this connection.
+    /// Drives the stalled-peer keepalive (`maybeArmStalledPeerKeepalive`):
+    /// we only mint a PING when we've been silent for at least
+    /// `stalled_peer_keepalive_idle_us`. Initialized to the connection's
+    /// creation time so the gate evaluates cleanly from the first tick;
+    /// updated each time the per-connection drain emits a packet. Stays
+    /// 0 only if we never sent anything (the dispatch path discards
+    /// such conns immediately on close).
+    last_outbound_us: u64 = 0,
+    /// Last time we minted a stalled-peer keepalive PING via
+    /// `Connection.requestPing` for this connection. Rate-limits the
+    /// gate so a stuck peer that doesn't acknowledge our wakeup can't
+    /// force us to spam PINGs faster than
+    /// `stalled_peer_keepalive_min_period_us`. Defaults to 0 so the
+    /// first tick that meets the idle gate fires immediately rather
+    /// than waiting an extra `min_period_us`.
+    last_keepalive_us: u64 = 0,
+
     fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -671,6 +730,13 @@ const ServerConn = struct {
         self.pa_alt_cid = @splat(0);
         self.pa_alt_token = @splat(0);
         self.pa_alt_cid_set = false;
+        // Seed the stalled-peer keepalive with `now_us` — we have not
+        // emitted anything yet, but treating creation as a recent send
+        // lets the gate measure idleness from the first opportunity to
+        // send rather than from the (effectively zero) Unix epoch and
+        // arming a spurious PING the very first iteration.
+        self.last_outbound_us = now_us;
+        self.last_keepalive_us = 0;
 
         // Mint the seq-1 preferred-address alt-CID via the CSPRNG and
         // derive its matching stateless-reset token via the public
@@ -1152,6 +1218,14 @@ fn runServer(
                 maybeIssueNewToken(sc, now_us);
             }
             try sc.app.process(&sc.conn);
+            // Stalled-peer keepalive (`server × quiche × multiplexing`
+            // workaround): if we have open streams but have been
+            // outbound-silent for >= `stalled_peer_keepalive_idle_us`,
+            // queue a PING so the next poll() iteration emits an
+            // ack-eliciting packet. Detection runs BEFORE the drain
+            // so the resulting PING ships in this same tick rather
+            // than waiting for the next event-loop iteration.
+            maybeArmStalledPeerKeepalive(sc, now_us);
             // Outbound on the socket the connection most recently
             // received from. Pre-migration that's the main socket
             // (last_recv_socket = 0); once the client follows the
@@ -1162,6 +1236,12 @@ fn runServer(
             const out_sock = sockets[sc.last_recv_socket].handle;
             while (try sc.conn.poll(&tx, now_us)) |n| {
                 try out_sock.send(io, &sc.peer, tx[0..n]);
+                // Stamp the keepalive idleness timer on every datagram
+                // we emit. Both real outbound (responses, ACKs) and
+                // synthetic PINGs reset the gate so the next probe
+                // doesn't fire until the connection has actually been
+                // silent again.
+                sc.last_outbound_us = now_us;
             }
             try sc.conn.tick(now_us);
             if (sc.conn.isClosed()) {
@@ -2793,6 +2873,89 @@ fn maybeIssueNewToken(sc: *ServerConn, now_us: u64) void {
     sc.new_token_emitted = true;
 }
 
+/// Stalled-peer keepalive (`server × quiche × multiplexing` workaround).
+///
+/// Quiche's `conn.send()` returns `Done` with stream data still pending
+/// after responding to the ~1979th of 1999 streams in the runner's
+/// `multiplexing` testcase: its writable-streams iterator parks the
+/// remaining ~20 streams, the connection idles in both directions for
+/// ~30 seconds, and quiche's idle-timeout finally tears down the
+/// connection (verified end-to-end in
+/// `interop/logs.server-final2/quic-zig_quiche/multiplexing/client/log.txt`).
+/// Per `docs/quiche-interop-notes.md` the upstream-reproduced workaround
+/// is a server-emitted ack-eliciting probe that wakes quiche's
+/// `recv()` → `send()` cycle, which re-iterates writable streams and
+/// flushes the parked ones.
+///
+/// Detection rule (must hold ALL three on a single tick):
+///   1. Handshake is confirmed — pre-handshake the runtime has its own
+///      retransmission machinery and PINGs are wasteful.
+///   2. The connection has at least one open stream — if the peer's
+///      streams are all closed, there's nothing for our PING to wake
+///      anyway, and we'd just be perturbing a healthy idle conn.
+///   3. We have not put a packet on the wire for at least
+///      `stalled_peer_keepalive_idle_us`.
+/// Plus a per-connection rate limit
+/// (`stalled_peer_keepalive_min_period_us`) so a stuck peer can't
+/// induce a CPU spin minting probes faster than the round-trip.
+///
+/// Defensive against well-behaved peers: a healthy connection either
+/// closes its streams (drops `streamCount` to 0) or keeps the
+/// conversation moving (resets `last_outbound_us` via the drain stamp),
+/// so the gate never triggers in steady state. The worst case against
+/// a genuinely-stuck quiche peer is ~30 PINGs over the idle window —
+/// well below `idle_timeout_ms`, indistinguishable from RFC 9000 §10.1
+/// keep-alive on the wire.
+fn maybeArmStalledPeerKeepalive(sc: *ServerConn, now_us: u64) void {
+    const inputs: StalledPeerKeepaliveInputs = .{
+        .handshake_done = sc.conn.handshakeDone(),
+        .closed = sc.conn.isClosed(),
+        .stream_count = sc.conn.streamCount(),
+        .last_outbound_us = sc.last_outbound_us,
+        .last_keepalive_us = sc.last_keepalive_us,
+        .now_us = now_us,
+    };
+    if (!shouldArmStalledPeerKeepalive(inputs)) return;
+    sc.conn.requestPing();
+    sc.last_keepalive_us = now_us;
+}
+
+/// Pure-function half of `maybeArmStalledPeerKeepalive`. Captured as
+/// a separate predicate so the gate logic — the part most likely to
+/// regress — can be unit-tested without spinning up a real
+/// `Connection` (the `requestPing()` call has its own coverage in
+/// `src/conn/_state_tests.zig`'s "requestPing queues application PING
+/// on primary path"; this side just decides *whether* to call it).
+const StalledPeerKeepaliveInputs = struct {
+    handshake_done: bool,
+    closed: bool,
+    stream_count: usize,
+    last_outbound_us: u64,
+    last_keepalive_us: u64,
+    now_us: u64,
+};
+
+fn shouldArmStalledPeerKeepalive(inputs: StalledPeerKeepaliveInputs) bool {
+    if (!inputs.handshake_done) return false;
+    if (inputs.closed) return false;
+    if (inputs.stream_count == 0) return false;
+    // Idle gate: only fire when we genuinely haven't sent anything in
+    // a while. `now_us - last_outbound_us` is a saturating subtract
+    // because `last_outbound_us` could only be ahead-of-now in a
+    // clock glitch; treating that as "zero idle" is the safe
+    // (no-fire) read.
+    const idle_us = inputs.now_us -| inputs.last_outbound_us;
+    if (idle_us < stalled_peer_keepalive_idle_us) return false;
+    // Rate limit: don't queue another probe if we just queued one.
+    // `last_keepalive_us == 0` means we've never armed (the default
+    // from `ServerConn.init`); the saturating subtract again yields
+    // a large value, so the first eligible tick fires immediately
+    // rather than waiting an extra `min_period_us`.
+    const since_last_us = inputs.now_us -| inputs.last_keepalive_us;
+    if (since_last_us < stalled_peer_keepalive_min_period_us) return false;
+    return true;
+}
+
 fn peekInitialToken(bytes: []const u8) ?[]const u8 {
     const parsed = quic_zig.wire.header.parse(bytes, 0) catch return null;
     return switch (parsed.header) {
@@ -3358,6 +3521,153 @@ test "buildPreferredAddress projects v4-only / v6-only configs into RFC 9000 §1
     try std.testing.expectEqual(@as(u16, 0), v6_only.ipv4_port);
     try std.testing.expectEqualSlices(u8, &interop_runner_server_ipv6, &v6_only.ipv6_address);
     try std.testing.expectEqual(@as(u16, 444), v6_only.ipv6_port);
+}
+
+test "shouldArmStalledPeerKeepalive only fires when handshake done, streams open, idle window elapsed, and rate-limit window elapsed" {
+    // Pre-handshake — no probe even when everything else lines up.
+    // Pre-handshake the handshake-driven retransmission machinery
+    // already has its own ack-eliciting cadence; an extra PING is
+    // wasted bytes and a regression risk on slow links.
+    try std.testing.expect(!shouldArmStalledPeerKeepalive(.{
+        .handshake_done = false,
+        .closed = false,
+        .stream_count = 5,
+        .last_outbound_us = 0,
+        .last_keepalive_us = 0,
+        .now_us = 60_000_000,
+    }));
+
+    // Handshake done but no open streams — quiche's stuck-scheduler
+    // bug only manifests when there ARE peer-bidi streams parked in
+    // the writable iterator. With nothing to wake we'd just be
+    // perturbing a healthy idle conn.
+    try std.testing.expect(!shouldArmStalledPeerKeepalive(.{
+        .handshake_done = true,
+        .closed = false,
+        .stream_count = 0,
+        .last_outbound_us = 0,
+        .last_keepalive_us = 0,
+        .now_us = 60_000_000,
+    }));
+
+    // Connection is in closing/draining/closed — `requestPing` is a
+    // no-op there anyway, but skipping the call keeps the gate
+    // observably tidy and avoids re-stamping `last_keepalive_us`
+    // on a conn we're about to GC.
+    try std.testing.expect(!shouldArmStalledPeerKeepalive(.{
+        .handshake_done = true,
+        .closed = true,
+        .stream_count = 5,
+        .last_outbound_us = 0,
+        .last_keepalive_us = 0,
+        .now_us = 60_000_000,
+    }));
+
+    // Idle window not yet elapsed — the connection is still talking.
+    // Threshold is `stalled_peer_keepalive_idle_us = 2_000_000`; at
+    // 1.5s of idleness we MUST NOT fire (a healthy quiche bursts
+    // multiple hundreds of milliseconds between flights and this
+    // gate has to stay quiet through normal cadence).
+    try std.testing.expect(!shouldArmStalledPeerKeepalive(.{
+        .handshake_done = true,
+        .closed = false,
+        .stream_count = 5,
+        .last_outbound_us = 1_000_000,
+        .last_keepalive_us = 0,
+        .now_us = 2_500_000,
+    }));
+
+    // Idle window elapsed (2.0s exactly), rate-limit fresh — the
+    // canonical "stalled peer" scenario. Mirrors what the matrix
+    // log shows: 30s of silence with open streams; after 2s the
+    // first probe arms.
+    try std.testing.expect(shouldArmStalledPeerKeepalive(.{
+        .handshake_done = true,
+        .closed = false,
+        .stream_count = 5,
+        .last_outbound_us = 1_000_000,
+        .last_keepalive_us = 0,
+        .now_us = 3_000_000,
+    }));
+
+    // Rate-limit gate: idle window long elapsed but we already armed
+    // a probe within the last `stalled_peer_keepalive_min_period_us =
+    // 1_000_000`. If quiche hasn't responded yet, repeat-firing would
+    // just burn CPU and waste bytes; wait the period out.
+    try std.testing.expect(!shouldArmStalledPeerKeepalive(.{
+        .handshake_done = true,
+        .closed = false,
+        .stream_count = 5,
+        .last_outbound_us = 1_000_000,
+        .last_keepalive_us = 9_500_000,
+        .now_us = 10_000_000,
+    }));
+
+    // Rate-limit gate cleared (1.0s after the last probe) — fire
+    // again. This is the steady-state probe rhythm against a stuck
+    // peer: ~1 PING/s for up to ~30s before quiche idle-times out.
+    try std.testing.expect(shouldArmStalledPeerKeepalive(.{
+        .handshake_done = true,
+        .closed = false,
+        .stream_count = 5,
+        .last_outbound_us = 1_000_000,
+        .last_keepalive_us = 9_000_000,
+        .now_us = 10_000_000,
+    }));
+}
+
+test "shouldArmStalledPeerKeepalive short-circuits on a fresh pre-handshake server Connection" {
+    // End-to-end wiring pin between the gate predicate and the
+    // live `Connection` API. The pure-function predicate above
+    // covers all six gate transitions in isolation; this test
+    // pins the precondition the prod wrapper relies on: a fresh
+    // server `Connection` returns `handshakeDone() = false` /
+    // `streamCount() = 0` / `isClosed() = false`, which
+    // composes to a no-fire outcome no matter how stale the
+    // idle clock looks.
+    //
+    // We deliberately do NOT call `maybeArmStalledPeerKeepalive`
+    // through a `ServerConn` literal here: storing a `Connection`
+    // by value inside the literal aliases the AutoHashMap +
+    // ArrayList pointer headers, and the deferred `conn.deinit()`
+    // would then free buckets the literal still references — a
+    // double-free path easy to introduce by mistake. Reading the
+    // same fields off `conn` directly into `StalledPeerKeepaliveInputs`
+    // achieves the same coverage without that hazard. If a future
+    // refactor flips any of the assertion targets below (e.g. a
+    // `handshakeDone()` precondition change), the test surfaces
+    // the regression here rather than in a flakier integration
+    // path.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try quic_zig.Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    // Pre-handshake invariants. `handshakeDone()` MUST be false
+    // and `streamCount()` MUST be 0 on a fresh server Connection;
+    // a regression that flips either causes the gate predicate to
+    // become handshake-only-but-streams-empty (the second invariant
+    // saves us) or stream-only-but-handshake-incomplete (the first
+    // saves us). Both are independent safety belts.
+    try std.testing.expect(!conn.handshakeDone());
+    try std.testing.expectEqual(@as(usize, 0), conn.streamCount());
+    try std.testing.expect(!conn.isClosed());
+
+    // Setup: clearly-idle scenario (last outbound ages ago, never
+    // armed). The pure-function predicate would say YES for these
+    // inputs IF handshake_done + streams_open were both true; the
+    // precondition we're pinning is that on a real fresh server
+    // Connection neither holds and so the gate short-circuits.
+    const inputs: StalledPeerKeepaliveInputs = .{
+        .handshake_done = conn.handshakeDone(),
+        .closed = conn.isClosed(),
+        .stream_count = conn.streamCount(),
+        .last_outbound_us = 0,
+        .last_keepalive_us = 0,
+        .now_us = 60_000_000,
+    };
+    try std.testing.expect(!shouldArmStalledPeerKeepalive(inputs));
 }
 
 test "ServerConn.last_recv_socket defaults to main on init" {

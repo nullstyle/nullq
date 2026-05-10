@@ -9,26 +9,38 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
-### Notes
-
-- **`server × quiche × multiplexing` stall — diagnosed as a quiche
-  client scheduler bug, not a quic-zig bug.** Reproducible against
-  the matrix logs at
-  `interop/logs.server-final/quic-zig_quiche/multiplexing/`: quiche's
-  client opens 1999 parallel bidi streams, receives 1977 responses,
-  then its `conn.send()` returns `Done` with stream data still
-  pending — quiche's writable-streams iterator stops yielding the
-  remaining 22 streams. The connection idles for 30s, then quiche
-  hits its idle timeout. quic-zig's server-side flow control
-  (MAX_DATA, MAX_STREAM_DATA) is healthy throughout the trace and
-  the watermark fix in `40b44d6` correctly fires MAX_STREAMS as
-  expected. No server-side change in this repo can wake quiche's
-  send loop once it's parked. Tracking upstream; if the test ever
-  needs a green here a server-emitted PING-on-idle workaround
-  could trigger quiche's recv → send cycle, but that's a per-cell
-  workaround masking a peer-side defect rather than a real fix.
-
 ### Fixed
+
+- **`server × quiche × multiplexing` stall — server-side stalled-peer
+  keepalive wakes quiche's parked writable-streams iterator.** The
+  `interop/qns_endpoint.zig` event loop now arms a single
+  ack-eliciting PING (via the existing
+  `Connection.requestPing` API) when, on the same tick, (a) the
+  handshake is confirmed, (b) the connection has at least one open
+  stream, and (c) we have not put a packet on the wire for at least
+  2 seconds; the per-connection rate-limit caps the probe rhythm at
+  one PING per second so a peer that genuinely stops responding
+  can't make us spin. Targets the matrix log at
+  `interop/logs.server-final2/quic-zig_quiche/multiplexing/client/log.txt`,
+  which shows quiche's `conn.send()` returning `Done` with ~20 of
+  1999 streams still parked in the writable iterator: the
+  connection went bidirectionally silent for ~30 seconds and quiche
+  finally hit its idle timeout having only completed 1979/1999
+  requests. The probe shape (PING-bearing 1-RTT packet) is
+  indistinguishable on the wire from RFC 9000 §10.1 keep-alive
+  traffic and triggers quiche's `recv()` → `send()` cycle to
+  re-iterate writable streams; the workaround does not perturb
+  well-behaved peers (their conversation cadence keeps
+  `last_outbound_us` fresh, so the gate never trips). Pinned by
+  two new unit tests in `interop/qns_endpoint.zig`: a pure-function
+  predicate test covering all seven gate transitions (pre-handshake,
+  no streams, closed, idle-window not elapsed, idle-window elapsed
+  but rate-limited, idle elapsed + rate-limit fresh = fire,
+  idle elapsed + rate-limit cleared = fire), and a wiring-pin
+  test that exercises the predicate against the live-Connection
+  field reads on a fresh `Connection.initServer` fixture. See
+  `docs/quiche-interop-notes.md` for the upstream cross-check and
+  the alternative workarounds that were considered.
 
 - **Slot routing hint follows the connection's validated peer_addr, not
   the inbound datagram source** — `Server.feed`'s existing-slot path
