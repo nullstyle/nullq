@@ -9,6 +9,35 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **qns client: per-tick top-up of client-issued SCIDs after retire**
+  — `interop/qns_endpoint.zig`'s `runClient` now keeps replenishing
+  spare client SCIDs after handshake_done instead of stopping at
+  sequence 1. Peers that aggressively retire our seq-0 SCID right
+  after the handshake (verified in
+  `interop/logs.client-final/quic-go_quic-zig/rebind-addr/server/log.txt`,
+  line 54: `RetireConnectionIDFrame{SequenceNumber: 0}`) leave us
+  with exactly one active SCID; when the next `rebind-addr` rebind
+  fires the server has no fresh client-issued DCID to rotate to and
+  reports `skipping validation of new path … since no connection ID
+  is available` (the same log, line 3828+). ngtcp2 happens to keep
+  seq 0 alive so a single post-handshake issuance looked sufficient
+  — a deceptive green that masked the real defect against quic-go
+  and quiche. The driver now calls `queueClientConnectionIds` on
+  every tick after handshake; `localConnectionIdIssueBudget` gates
+  the issuance so the peer's `active_connection_id_limit` (= 2
+  across all interop peers) is never exceeded, and a new
+  `endpoint_client_cid_max_lifetime_count = 8` lifetime cap defends
+  against a pathological peer that retires in a tight loop and
+  would otherwise force unbounded CSPRNG burn through
+  `quic_zig.conn.stateless_reset.derive`. Pinned by the new
+  regression test "queueClientConnectionIds replenishes after peer
+  aggressively retires SCIDs" in `interop/qns_endpoint.zig`, which
+  drives the observed quic-go retire pattern through
+  `Connection.handleRetireConnectionId` and asserts the second
+  top-up mints sequence 2 on the wire.
+
 ### Tests
 
 - **`v2` testcase-name coverage in the qns version-selection unit test**
