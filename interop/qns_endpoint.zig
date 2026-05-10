@@ -159,13 +159,24 @@ const qns_time_base_us: u64 = 1_000_000;
 // useless Handshake-level PTO probes (which the server, per RFC 9001
 // §4.9.2, has already discarded keys for and drops as `invalid`).
 //
-// 250 ms is well above the simulator's per-packet RTT (~30 ms) so
+// 1 s is well above the simulator's per-packet RTT (~30 ms) so
 // the keep-alive doesn't compete with steady-state stream traffic,
-// but tight enough to bridge the runner's 5 s rebind interval inside
-// a single PTO window. A PING-only 1-RTT packet is ~30 bytes — call
-// it 1 KB/s of overhead at this rate, which is below the noise
-// floor of the cells we care about (10+ Mbps transfers).
-const endpoint_client_keepalive_period_us: u64 = 250_000;
+// and well above any reasonable PATH_CHALLENGE/RESPONSE round-trip
+// during connectionmigration's preferred_address handover. The
+// initial 250 ms tuning was too tight: when the runner's
+// `connectionmigration` cell triggered the qns client to migrate to
+// the server's preferred_address, this keep-alive fired ~250 ms
+// after the migration began, queuing a PING-bearing 1-RTT packet
+// from the new local socket BEFORE the server had time to emit its
+// own PATH_CHALLENGE on the new path. The runner's
+// `verify_first_packet_on_new_path` check then saw the server's
+// FIRST packet on the new path was a PATH_RESPONSE (responding to
+// the keep-alive's path-validation companion frame) instead of a
+// PATH_CHALLENGE — failing the cell. 1 s is loose enough that
+// migration / path-validation finishes well before the next probe,
+// and tight enough to bridge the runner's 5 s rebind interval
+// inside the 30 s idle timeout.
+const endpoint_client_keepalive_period_us: u64 = 1_000_000;
 
 // IPv4 + IPv6 addresses the runner statically assigns to the SERVER
 // container on the rightnet bridge (per `docker-compose.yml`). The

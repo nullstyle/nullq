@@ -3426,6 +3426,84 @@ pub const Connection = struct {
         return self.streams.count();
     }
 
+    /// Reclaim entries in `self.streams` whose lifecycle is fully
+    /// terminated in both the relevant directions. Without this the
+    /// map grows monotonically with the number of streams the
+    /// connection has ever seen — a long-lived HTTP/3 session that
+    /// opens many short request streams would accumulate `Stream`
+    /// state (recv reassembly, send chunk ring, ACK ranges) for
+    /// every closed-and-forgotten stream until `Connection.deinit`.
+    ///
+    /// Reclaim criterion (RFC 9000 §3.1 / §3.2 stream lifecycle):
+    /// - bidi streams: both `send.isTerminal()` and
+    ///   `recvFullyTerminated()` are true.
+    /// - uni streams the local opened: only the send side is used
+    ///   (`recv_max_data == 0`), so just `send.isTerminal()`.
+    /// - uni streams the peer opened: only the recv side is used,
+    ///   so just `recvFullyTerminated()`.
+    ///
+    /// The send-terminal states are `data_recvd` (FIN ACKed) and
+    /// `reset_recvd` (peer ACKed our RESET_STREAM); the recv-
+    /// terminal states are `data_recvd`/`data_read` (peer FIN seen
+    /// and bytes drained) and `reset_recvd`/`reset_read` (peer
+    /// RESET_STREAM seen). At the moment all of those land, no
+    /// further frames can advance the stream — the per-stream
+    /// flow-control window, ACK tracker, and reassembly metadata
+    /// are dead weight.
+    ///
+    /// Iteration safety: HashMap iteration invalidates on mutation,
+    /// so we collect ids in a small fixed-size buffer per pass and
+    /// only `fetchRemove` once iteration completes. If more than
+    /// `batch.len` streams reclaim in one tick (rare), the surplus
+    /// rolls to the next tick — still bounded, just not in one
+    /// shot.
+    ///
+    /// Resident-bytes budget: `Stream.send.bytes` and
+    /// `Stream.recv.bytes` may still hold capacity that
+    /// `tryReserveResidentBytes` is tracking. We snapshot the live
+    /// `items.len` before destruction and release that count back
+    /// to the budget so a long-lived connection that GCs many
+    /// streams does not leak budget headroom.
+    fn gcClosedStreams(self: *Connection) void {
+        var batch: [128]u64 = undefined;
+        var n: usize = 0;
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const s = entry.value_ptr.*;
+            const send_done = s.send.isTerminal();
+            const recv_done = s.recvFullyTerminated();
+            const reclaimable = if (streamIsBidi(s.id))
+                send_done and recv_done
+            else if (self.streamInitiatedByLocal(s.id))
+                send_done
+            else
+                recv_done;
+            if (!reclaimable) continue;
+            if (n == batch.len) break;
+            batch[n] = s.id;
+            n += 1;
+        }
+        for (batch[0..n]) |id| {
+            const removed = self.streams.fetchRemove(id) orelse continue;
+            const s = removed.value;
+            const held = s.send.bytes.items.len + s.recv.bytes.items.len;
+            if (held > 0) self.releaseResidentBytes(held);
+            self.emitQlog(.{
+                .name = .stream_state_updated,
+                .stream_id = id,
+                .stream_state = if (s.send.state == .reset_recvd or
+                    s.recv.state == .reset_recvd or
+                    s.recv.state == .reset_read)
+                    .reset
+                else
+                    .closed,
+            });
+            s.send.deinit();
+            s.recv.deinit();
+            self.allocator.destroy(s);
+        }
+    }
+
     /// Pick the next available server-initiated unidirectional
     /// stream id (low 2 bits = 0b11) starting from `start`. Skips
     /// ids that are already open.
@@ -9528,6 +9606,14 @@ pub const Connection = struct {
             if (path.path.state == .failed) continue;
             try self.fireDuePtoOnApplicationPath(path, now_us);
         }
+
+        // Reclaim fully-terminated streams. Done at the tail of `tick`
+        // rather than inside `handle` / `pollDatagram` because those
+        // are reentered with stream pointers held — the GC removes
+        // entries from `self.streams`, which would invalidate any
+        // outstanding `*Stream` borrowed from `streams.get`. `tick`
+        // holds no such borrows.
+        self.gcClosedStreams();
     }
 
     /// One handshake driver step:

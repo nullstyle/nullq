@@ -7503,3 +7503,210 @@ test "tick skips handshake-level PTO once handshake_keys_discarded latches" {
     // the rest of `sent[1]`, so no manual cleanup is needed.
     try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.handshake).count);
 }
+
+// -- gcClosedStreams: per-Connection stream-map GC ------------------
+//
+// `Connection.streams` was monotonic for the connection's lifetime
+// before this fix — every stream the embedder ever opened (or that
+// the peer opened) stayed resident even after both sides hit terminal
+// state. For a long-lived HTTP/3 session that opens many short
+// request streams, the per-stream `Stream` (recv reassembly buffers,
+// send chunk ring, ACK ranges, flow-control bookkeeping) accumulated
+// to a measurable per-iteration leak in the WT memory profiler.
+//
+// The fix is `gcClosedStreams`, called at the tail of `tick`. These
+// tests pin the contract: streams whose lifecycle is fully terminated
+// drop out of `streams` on the next `tick`; partially-closed streams
+// stay live; the iteration is safe across hashmap mutation; and the
+// per-direction definition of "fully terminated" honors the bidi /
+// uni / initiator distinction from RFC 9000 §3.1 / §3.2.
+
+test "gcClosedStreams reclaims bidi streams whose send + recv halves are both terminal" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    const n: u64 = 100;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        const id = i << 2; // client-initiated bidi
+        _ = try conn.openBidi(id);
+        const s = conn.stream(id).?;
+        // Force both halves to terminal without driving real packets.
+        // Send: data_recvd (FIN ACKed, base_offset == final_size).
+        s.send.fin_marked = true;
+        s.send.fin_in_flight = true;
+        s.send.fin_acked = true;
+        s.send.final_size = 0;
+        s.send.state = .data_recvd;
+        // Recv: data_recvd (peer FIN seen, all bytes drained).
+        s.recv.fin_seen = true;
+        s.recv.final_size = 0;
+        s.recv.state = .data_recvd;
+    }
+    try std.testing.expectEqual(@as(usize, n), conn.streamCount());
+
+    try conn.tick(1_000_000);
+    try std.testing.expectEqual(@as(usize, 0), conn.streamCount());
+}
+
+test "gcClosedStreams reclaims bidi streams whose send is reset_recvd and recv is reset_recvd" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    _ = try conn.openBidi(0);
+    const s = conn.stream(0).?;
+    // Local RESET_STREAM, peer ACKed.
+    s.send.reset = .{ .error_code = 0xdead, .final_size = 0, .queued = true, .acked = true };
+    s.send.state = .reset_recvd;
+    // Peer RESET_STREAM observed.
+    s.recv.reset = .{ .error_code = 0xbeef, .final_size = 0 };
+    s.recv.final_size = 0;
+    s.recv.state = .reset_recvd;
+
+    try conn.tick(1_000_000);
+    try std.testing.expectEqual(@as(usize, 0), conn.streamCount());
+}
+
+test "gcClosedStreams keeps streams where only the send half is terminal" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    _ = try conn.openBidi(0);
+    const s = conn.stream(0).?;
+    // Send terminal but recv still .recv (peer hasn't FIN'd).
+    s.send.fin_marked = true;
+    s.send.fin_in_flight = true;
+    s.send.fin_acked = true;
+    s.send.final_size = 0;
+    s.send.state = .data_recvd;
+    // s.recv stays at default `.recv`.
+
+    try conn.tick(1_000_000);
+    try std.testing.expectEqual(@as(usize, 1), conn.streamCount());
+    try std.testing.expect(conn.stream(0) != null);
+}
+
+test "gcClosedStreams keeps streams where only the recv half is terminal" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    _ = try conn.openBidi(0);
+    const s = conn.stream(0).?;
+    // Recv terminal, but local hasn't called streamFinish yet.
+    s.recv.fin_seen = true;
+    s.recv.final_size = 0;
+    s.recv.state = .data_recvd;
+    // s.send stays at default `.ready`.
+
+    try conn.tick(1_000_000);
+    try std.testing.expectEqual(@as(usize, 1), conn.streamCount());
+    try std.testing.expect(conn.stream(0) != null);
+}
+
+test "gcClosedStreams reclaims local-initiated uni streams once send is terminal (recv unused)" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Client-initiated uni: low bits 0b10 (id 2, 6, 10, ...).
+    const id: u64 = 2;
+    _ = try conn.openUni(id);
+    const s = conn.stream(id).?;
+    s.send.fin_marked = true;
+    s.send.fin_in_flight = true;
+    s.send.fin_acked = true;
+    s.send.final_size = 0;
+    s.send.state = .data_recvd;
+    // recv stays at .recv — peer can't send on a local-initiated uni
+    // stream, so the recv half is structurally dead from the start.
+
+    try conn.tick(1_000_000);
+    try std.testing.expectEqual(@as(usize, 0), conn.streamCount());
+}
+
+test "gcClosedStreams reclaims peer-initiated uni streams once recv is terminal (send unused)" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Server-initiated uni from a client connection's POV: low bits 0b11.
+    const id: u64 = 3;
+    // Simulate the receive-side path: bypass `recordPeerStreamOpenOrClose`
+    // by reaching into the private `openStream` to plant a peer-side
+    // entry without driving the full peer-side state machine.
+    const ptr = try allocator.create(Stream);
+    errdefer allocator.destroy(ptr);
+    ptr.* = .{
+        .id = id,
+        .send = SendStream.init(allocator),
+        .recv = RecvStream.init(allocator),
+        .recv_max_data = conn.initialRecvStreamLimit(id),
+        .send_max_data = 0,
+    };
+    try conn.streams.put(allocator, id, ptr);
+
+    const s = conn.stream(id).?;
+    s.recv.fin_seen = true;
+    s.recv.final_size = 0;
+    s.recv.state = .data_recvd;
+    // send stays at .ready — local can't send on a peer-initiated uni.
+
+    try conn.tick(1_000_000);
+    try std.testing.expectEqual(@as(usize, 0), conn.streamCount());
+}
+
+test "gcClosedStreams batch cap rolls surplus to the next tick" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Open one more than the per-pass GC batch cap. The first `tick`
+    // should reclaim exactly the cap; the next `tick` mops up the
+    // remainder. The cap is a private constant inside `gcClosedStreams`
+    // (currently 128); test against the observable contract that the
+    // map shrinks by *some* meaningful chunk per call and reaches zero
+    // within a small number of ticks.
+    const total: u64 = 200;
+    var i: u64 = 0;
+    while (i < total) : (i += 1) {
+        const id = i << 2;
+        _ = try conn.openBidi(id);
+        const s = conn.stream(id).?;
+        s.send.fin_marked = true;
+        s.send.fin_in_flight = true;
+        s.send.fin_acked = true;
+        s.send.final_size = 0;
+        s.send.state = .data_recvd;
+        s.recv.fin_seen = true;
+        s.recv.final_size = 0;
+        s.recv.state = .data_recvd;
+    }
+
+    try conn.tick(1_000_000);
+    // Batch cap is 128 — first pass leaves at most `total - 128`.
+    try std.testing.expect(conn.streamCount() <= total - 128);
+    // Bounded number of follow-up ticks fully drains the map.
+    var ticks: u32 = 0;
+    while (conn.streamCount() > 0 and ticks < 8) : (ticks += 1) {
+        try conn.tick(1_000_000 + ticks * 1000);
+    }
+    try std.testing.expectEqual(@as(usize, 0), conn.streamCount());
+}
