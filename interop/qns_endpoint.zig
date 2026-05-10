@@ -1214,7 +1214,42 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
     const sc = server_conn.?;
     sc.peer = msg.from;
     sc.last_activity_us = now_us;
-    sc.last_recv_socket = @intCast(ctx.sock_idx);
+    // Detect a server-side preferred-address migration: the qns
+    // tracks `last_recv_socket` for outbound routing, and a flip
+    // (from primary 0 to alt-port 1+) means the client just
+    // migrated to our advertised PA. Tell the connection so the
+    // server-side path validator can run (RFC 9000 §5.1.1, §9 —
+    // a server SHOULD validate the new path before treating it as
+    // active). This queues PATH_CHALLENGE on the FIRST emitted
+    // packet of the new path via the existing
+    // `emit_path_challenge_first` machinery; without this call the
+    // first post-migration server packet only carries ACK +
+    // PATH_RESPONSE + STREAM (no PATH_CHALLENGE) and ngtcp2's
+    // `connectionmigration` interop testcase fails because the
+    // server never validates the migrated path.
+    //
+    // Best-effort wiring: a connection without a configured PA, an
+    // incomplete handshake, or a validation already in flight all
+    // return early without disrupting the dispatch. The qns
+    // endpoint only wires this for the alt-listener-flip case;
+    // pre-handshake retransmits and steady-state primary-port
+    // datagrams skip the call entirely.
+    const incoming_sock_idx: u8 = @intCast(ctx.sock_idx);
+    if (sc.last_recv_socket != incoming_sock_idx and incoming_sock_idx != 0) {
+        const new_local_addr = netAddressToPathAddress(sockets[ctx.sock_idx].bind_addr);
+        sc.conn.noteServerLocalAddressChanged(new_local_addr, now_us) catch |err| switch (err) {
+            // PA not advertised, handshake incomplete, or another
+            // validation already in flight — all benign on this
+            // path. Idle through; the migration either isn't
+            // applicable or is already being validated.
+            error.PreferredAddressNotAdvertised,
+            error.NotServerContext,
+            error.PathLimitExceeded,
+            => {},
+            else => return err,
+        };
+    }
+    sc.last_recv_socket = incoming_sock_idx;
     if (!sc.transport_params_set) {
         const ids = peekLongHeaderIds(msg.data) orelse return;
         if (!isVersionSupported(opts.versions, ids.version)) {

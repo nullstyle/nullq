@@ -172,9 +172,14 @@ pub const RunError = error{
 /// is set, indices 1..N hold the alt-port listeners. The
 /// per-listener `ecn_active` flag is set independently because a
 /// kernel that rejects the IPV6_TCLASS / IP_TOS sockopts on one
-/// socket may accept them on another.
+/// socket may accept them on another. `bind_addr` is the literal
+/// the listener was bound to — surfaced to per-connection
+/// `noteServerLocalAddressChanged` calls when the dispatch detects
+/// a peer flipping from primary to alt-listener (the
+/// preferred-address migration trigger).
 const Listener = struct {
     sock: Net.Socket,
+    bind_addr: Net.IpAddress,
     ecn_active: bool,
 };
 
@@ -214,7 +219,11 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
         .mode = .dgram,
         .protocol = .udp,
     });
-    listeners_storage[0] = .{ .sock = primary_sock, .ecn_active = false };
+    listeners_storage[0] = .{
+        .sock = primary_sock,
+        .bind_addr = primary_addr,
+        .ecn_active = false,
+    };
     listeners_len = 1;
 
     // Bind alt listeners from `Config.preferred_address` (if set).
@@ -232,7 +241,11 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
                 .mode = .dgram,
                 .protocol = .udp,
             });
-            listeners_storage[listeners_len] = .{ .sock = alt_sock, .ecn_active = false };
+            listeners_storage[listeners_len] = .{
+                .sock = alt_sock,
+                .bind_addr = bind_v4,
+                .ecn_active = false,
+            };
             listeners_len += 1;
         }
         if (pa.ipv6) |v6| {
@@ -241,7 +254,11 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
                 .mode = .dgram,
                 .protocol = .udp,
             });
-            listeners_storage[listeners_len] = .{ .sock = alt_sock, .ecn_active = false };
+            listeners_storage[listeners_len] = .{
+                .sock = alt_sock,
+                .bind_addr = bind_v6,
+                .ecn_active = false,
+            };
             listeners_len += 1;
         }
     }
@@ -407,7 +424,13 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
             // the .accepted / .routed buckets are equally fine to
             // stamp; the field is purely an outbound hint.
             _ = outcome;
-            stampLastRecvSocket(server, from_addr, @intCast(sock_idx));
+            stampLastRecvSocket(
+                server,
+                from_addr,
+                @intCast(sock_idx),
+                listeners[sock_idx].bind_addr,
+                now_us,
+            );
 
             // Drain any Version Negotiation / Retry packets that
             // `feed` queued. Sending these via the same listener the
@@ -465,11 +488,34 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
 /// drain pass and the field is initialized to 0 (primary listener)
 /// at slot creation, which is the correct default for a fresh
 /// connection that hasn't yet migrated.
-fn stampLastRecvSocket(server: *Server, from: Address, sock_idx: u8) void {
+///
+/// When the receiving listener-index transitions from primary (0)
+/// to an alt-listener (1+), we also call
+/// `Connection.noteServerLocalAddressChanged` so the per-connection
+/// path validator runs (RFC 9000 §5.1.1: a server SHOULD validate
+/// the new path the peer migrated to via `preferred_address`).
+/// The error returns from that API are all benign on this path —
+/// `PreferredAddressNotAdvertised` (PA not configured),
+/// `PathLimitExceeded` (validation already in flight), and
+/// `NotServerContext` (impossible here but cheap to defend against)
+/// all idle through. Out-of-memory is the only real failure shape;
+/// `runUdpServer` already swallows per-connection failures so the
+/// loop's contract is preserved.
+fn stampLastRecvSocket(
+    server: *Server,
+    from: Address,
+    sock_idx: u8,
+    bind_addr: Net.IpAddress,
+    now_us: u64,
+) void {
     for (server.iterator()) |slot| {
         const slot_addr = slot.peer_addr orelse continue;
-        if (slot_addr.eql(from)) {
-            slot.last_recv_socket_idx = sock_idx;
+        if (!slot_addr.eql(from)) continue;
+        const previous = slot.last_recv_socket_idx;
+        slot.last_recv_socket_idx = sock_idx;
+        if (sock_idx != 0 and previous != sock_idx) {
+            const new_local_addr = ipAddressToPathAddress(bind_addr);
+            slot.conn.noteServerLocalAddressChanged(new_local_addr, now_us) catch {};
         }
     }
 }
