@@ -145,6 +145,28 @@ const endpoint_client_cid_max_lifetime_count: u8 = 8;
 const max_qns_server_connections = 128;
 const qns_time_base_us: u64 = 1_000_000;
 
+// Period (microseconds) between unsolicited 1-RTT PING frames the qns
+// client emits while a download is in progress and inbound packets
+// have stalled. The runner's `rebind-addr` cell rewrites the client's
+// source address in the simulator — when the next rebind happens
+// in the middle of a slow transfer (here: against the quiche server,
+// which runs the matrix at ~half the throughput of quic-go/ngtcp2),
+// the simulator drops every server packet that's still addressed to
+// the old binding. The server keeps PTOing its STREAM payload there;
+// from the client's POV the connection goes silent, with no outbound
+// stream activity to refresh the simulator's NAT entry. Without this
+// keep-alive, the only thing the client emits during the stall is
+// useless Handshake-level PTO probes (which the server, per RFC 9001
+// §4.9.2, has already discarded keys for and drops as `invalid`).
+//
+// 250 ms is well above the simulator's per-packet RTT (~30 ms) so
+// the keep-alive doesn't compete with steady-state stream traffic,
+// but tight enough to bridge the runner's 5 s rebind interval inside
+// a single PTO window. A PING-only 1-RTT packet is ~30 bytes — call
+// it 1 KB/s of overhead at this rate, which is below the noise
+// floor of the cells we care about (10+ Mbps transfers).
+const endpoint_client_keepalive_period_us: u64 = 250_000;
+
 // IPv4 + IPv6 addresses the runner statically assigns to the SERVER
 // container on the rightnet bridge (per `docker-compose.yml`). The
 // `connectionmigration` testcase needs the server's `preferred_address`
@@ -1872,6 +1894,12 @@ fn runClientConnection(
     // currently permits (typically 1 after each retire).
     var client_cid_lifetime_issued: u8 = 0;
 
+    // Last time we emitted an unsolicited keep-alive PING (or saw an
+    // outbound 1-RTT datagram). Reset on every successful poll so
+    // the keep-alive only fires when the path stalls. See
+    // `endpoint_client_keepalive_period_us` for the rationale.
+    var last_outbound_app_us: u64 = 0;
+
     while ((!allDownloadsComplete(downloads) or !ticketRequirementMet(conn_opts.wait_for_ticket)) and !conn.isClosed()) {
         var now_us = qnsNowUs(io, start);
         var progressed = false;
@@ -2099,9 +2127,41 @@ fn runClientConnection(
                 return err;
             };
             if (conn.handshakeDone()) datagrams_sent_since_handshake +|= 1;
+            // Stamp every outbound 1-RTT datagram so the keep-alive
+            // gate below only fires when the application path has
+            // genuinely stalled. Long-header packets (Initial,
+            // Handshake) don't keep the simulator's NAT entry warm
+            // for steady-state app traffic — the runner's `rebind`
+            // scenario rewrites at L3 and rebound paths only carry
+            // short-header data — so we filter them out here.
+            if (!long) last_outbound_app_us = now_us;
             progressed = true;
         }
         try conn.tick(now_us);
+
+        // Application-layer keep-alive (RFC 9000 §10.1.2 ¶3): once
+        // the handshake is confirmed and a download is in flight, if
+        // the application path has been outbound-silent for longer
+        // than `endpoint_client_keepalive_period_us`, queue a 1-RTT
+        // PING via the public `requestPing` API so the next
+        // `pollDatagram` flushes a probe out the socket. Targeted at
+        // the runner's `rebind-addr` cell against slower servers
+        // (see the constant's docblock); harmless against fast
+        // servers because the steady stream of outbound ACKs keeps
+        // `last_outbound_app_us` fresh.
+        if (conn.handshakeDone() and !allDownloadsComplete(downloads)) {
+            const since_outbound = now_us -| last_outbound_app_us;
+            if (last_outbound_app_us != 0 and since_outbound >= endpoint_client_keepalive_period_us) {
+                conn.requestPing();
+                // Pre-stamp `last_outbound_app_us` so the gate
+                // doesn't re-arm before the next `pollDatagram`
+                // actually drains the PING. Without this, the
+                // condition stays true on the next iteration and
+                // we'd queue a fresh PING every microsecond until
+                // the socket flushed.
+                last_outbound_app_us = now_us;
+            }
+        }
 
         if (progressed) {
             last_progress_us = now_us;
@@ -3733,4 +3793,45 @@ test "ServerConn.last_recv_socket defaults to main on init" {
         .last_activity_us = 0,
     };
     try std.testing.expectEqual(@as(u8, 0), sc.last_recv_socket);
+}
+
+test "client keep-alive period bridges interop rebind window" {
+    // The qns client emits a 1-RTT PING when the application path
+    // has been outbound-silent for `endpoint_client_keepalive_period_us`.
+    // The runner's `rebind-addr` cell has rebinds at a fixed 5 s
+    // frequency — once we've gone silent for longer than that, the
+    // server's binding has shifted and our subsequent stream traffic
+    // would never reach it. This test pins the constant well below
+    // the 5 s ceiling so any well-behaved keep-alive bridges the
+    // gap inside a single rebind window.
+    const max_rebind_period_us: u64 = 5_000_000;
+    try std.testing.expect(endpoint_client_keepalive_period_us < max_rebind_period_us);
+    // Lower-bound: a too-aggressive keep-alive would compete with
+    // legitimate stream-ack traffic. A typical ns-3 sim RTT is ~30
+    // ms; we want the keep-alive to be at least an order of magnitude
+    // beyond that so the steady-state outbound-stamping path
+    // suppresses the gate during a healthy transfer.
+    const min_useful_us: u64 = 100_000;
+    try std.testing.expect(endpoint_client_keepalive_period_us >= min_useful_us);
+}
+
+test "Connection.requestPing arms the application-level pending PING" {
+    // The qns client's keep-alive logic calls `requestPing` when the
+    // application path goes silent. This test pins the public-API
+    // surface we depend on: `requestPing` must flip
+    // `pendingPingForLevel(.application)` true (so the next
+    // `pollDatagram` flushes a PING-only short-header packet) and
+    // be safe to call without prerequisites beyond `initClient`.
+    // Failure here would silently regress the keep-alive — the
+    // higher-level loop test would still type-check but never
+    // actually emit a probe.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try quic_zig.Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    try std.testing.expect(!conn.primaryPath().pending_ping);
+    conn.requestPing();
+    try std.testing.expect(conn.primaryPath().pending_ping);
 }
