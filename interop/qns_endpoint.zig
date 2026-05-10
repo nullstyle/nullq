@@ -1256,8 +1256,23 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
     }
 
     const sc = server_conn.?;
-    sc.peer = msg.from;
     sc.last_activity_us = now_us;
+    // NOTE: `sc.peer` is intentionally NOT updated here. Stamping it
+    // pre-handle would mirror the bug 5ab3b89 fixed in the public-API
+    // `Server.feed` path: a peer-initiated migration that the
+    // connection refuses (most commonly: the rebind tuple arrives
+    // before the handshake confirms, and `handlePeerAddressChange`
+    // rejects the change per RFC 9000 §9.6) must NOT shift our
+    // outbound routing hint. Otherwise the next outbound packet flies
+    // toward the un-validated tuple carrying ACK + STREAM frames and
+    // no PATH_CHALLENGE — exactly the failure mode the runner's
+    // `rebind-addr` checker catches as "server moved without
+    // validating", and the cell that quiche fails on (its handshake
+    // confirms slightly later than quic-go's, so the rebind window
+    // overlaps the pre-handshake gate). The post-handle resync below
+    // reads `activePath().peerAddress()` — the canonical, migration-
+    // aware source — so a refused migration leaves `sc.peer` pinned
+    // to the previously-validated tuple, matching the spec.
     // Detect a server-side preferred-address migration: the qns
     // tracks `last_recv_socket` for outbound routing, and a flip
     // (from primary 0 to alt-port 1+) means the client just
@@ -1422,6 +1437,33 @@ fn dispatchInbound(ctx: DispatchInboundCtx) !void {
     // The next outbound `poll` will seal the response under the
     // chosen-version keys. Idempotent / no-op when nothing pending.
     _ = sc.conn.applyPendingVersionUpgrade();
+    // Re-sync the qns endpoint's outbound routing hint from the
+    // connection's active path (RFC 9000 §9 / §9.6). The public-API
+    // `Server.feed` path runs the same projection in its
+    // `dispatchToSlot` epilogue (commit 5ab3b89); the qns endpoint
+    // mirrors it here so embedded scenarios that drive
+    // `dispatchInbound` directly get the same migration-aware
+    // routing semantics. When `handlePeerAddressChange` refused the
+    // peer-initiated change (handshake not yet confirmed,
+    // anti-replay, or `migration_callback` deny), `peerAddress()` on
+    // the active path stays at the previously-validated tuple even
+    // when `msg.from` carries a new one — the next outbound `poll`
+    // and its `out_sock.send(..., &sc.peer, ...)` call route to the
+    // old tuple, NOT the rebound one. When the migration was
+    // accepted (post-handshake rebind, peer-initiated migration on a
+    // fresh peer CID), `peerAddress()` reflects the new tuple and
+    // outbound follows. Bootstrap fallback for the brand-new
+    // connection case where `peer_addr_set` hasn't latched yet
+    // (unreachable in practice — `acceptInitial` runs before this
+    // line and stamps the path's peer address — but cheap to defend
+    // against).
+    if (sc.conn.activePath().peerAddress()) |path_peer| {
+        if (pathAddressToNetAddress(path_peer)) |net_peer| {
+            sc.peer = net_peer;
+        }
+    } else {
+        sc.peer = msg.from;
+    }
 }
 
 fn runClient(

@@ -536,3 +536,134 @@ test "Server <-> Client: peer-side rebind after handshake arms PATH_CHALLENGE on
     }
     try std.testing.expect(post_rebind_outbound > 0);
 }
+
+test "Server.feed: pre-handshake peer rebind keeps slot routing on the validated tuple" {
+    // Regression coverage for `server × quiche × rebind-addr`. Mirrors
+    // the public-API postlogue commit 5ab3b89 added to `Server.feed`
+    // (and that this branch's qns endpoint counterpart applies in
+    // `dispatchInbound`): a peer-initiated 4-tuple rotation observed
+    // BEFORE the server's handshake confirms must NOT shift the
+    // slot's outbound routing hint (`slot.peer_addr`). The connection
+    // already enforces "no migration before handshake confirmation"
+    // (RFC 9000 §9.6 / `recordAuthenticatedDatagramAddress`'s
+    // pre_handshake gate, pinned by `_state_tests.zig`'s
+    // "pre-handshake migration: peer-address change is dropped"
+    // test); without the slot-postlogue pairing, the next outbound
+    // packet would still fly toward the un-validated tuple carrying
+    // ACK + STREAM frames and no PATH_CHALLENGE — the failure shape
+    // the runner reports as "First server packet on new path did not
+    // contain a PATH_CHALLENGE frame". Quiche's handshake confirms
+    // slightly later than quic-go's / ngtcp2's on the rebind-addr
+    // ladder, so the rebind window deterministically overlaps the
+    // pre-handshake gate for that peer, which is why the cell stayed
+    // red even after `fb267f6` and `5ab3b89` fixed adjacent issues.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = common.test_cert_pem,
+        .tls_key_pem = common.test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+    });
+    defer srv.deinit();
+
+    var cli = try quic_zig.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+    });
+    defer cli.deinit();
+
+    var rx: [4096]u8 = undefined;
+    const old_peer_addr: quic_zig.conn.path.Address = .{
+        .bytes = .{ 4, 10, 0, 0, 1, 0x10, 0x00 } ++ @as([15]u8, @splat(0)),
+    };
+    const new_peer_addr: quic_zig.conn.path.Address = .{
+        .bytes = .{ 4, 192, 0, 2, 99, 0xab, 0xcd } ++ @as([15]u8, @splat(0)),
+    };
+    try std.testing.expect(!quic_zig.conn.path.Address.eql(old_peer_addr, new_peer_addr));
+
+    // Phase 1: ship the FIRST Initial through the original tuple so
+    // the server opens a slot. We deliberately do NOT pump
+    // server→client afterwards — the client's slot exists, the
+    // server has the ClientHello, but the server's handshake state
+    // is "Initial CRYPTO accepted, waiting to drive my own response".
+    // `handshakeDone()` is false. This is the window we want to
+    // exercise: peer-tuple swap arrives mid-handshake.
+    try cli.conn.advance();
+    const initial_now_us: u64 = 1_000;
+    const initial_inbound = try pumpClientToServer(&cli, &srv, &rx, old_peer_addr, initial_now_us);
+    try std.testing.expect(initial_inbound > 0);
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+    const slot = srv.iterator()[0];
+
+    // Pre-condition: handshake is in flight, NOT confirmed on the
+    // server side. Without this the test would degenerate into
+    // post-handshake territory (already pinned by the prior
+    // peer-side-rebind test).
+    try std.testing.expect(!slot.conn.handshakeDone());
+
+    // Capture pre-rebind slot routing state.
+    const slot_peer_before = slot.peer_addr;
+    try std.testing.expect(slot_peer_before != null);
+    try std.testing.expect(quic_zig.conn.path.Address.eql(slot_peer_before.?, old_peer_addr));
+    const path_peer_before = slot.conn.primaryPathConst().path.peer_addr;
+    try std.testing.expect(quic_zig.conn.path.Address.eql(path_peer_before, old_peer_addr));
+
+    // Phase 2: deliver another inbound from the SAME client through
+    // the NEW peer address, while the server's handshake is still
+    // mid-flight. The simulator's mid-handshake source-address
+    // rewrite (which quiche hits on the rebind-addr ladder) lands
+    // here. The public-API gate refuses; the slot postlogue must
+    // mirror that refusal in the routing hint.
+    //
+    // Coax the client into emitting a retransmit by ticking past
+    // its first-Initial PTO; the resulting datagram is at Initial
+    // level, decrypts fine on the server (same Initial-key keying
+    // material), and triggers the migration gate when fed in
+    // through `new_peer_addr`. PTO at the client's defaults sits
+    // around 1s of in-process time; we step the client clock
+    // forward by 2s of microseconds to be sure the retx fires.
+    const rebind_now_us: u64 = 2_000_000_000;
+    try cli.conn.tick(rebind_now_us);
+    var rebound_inbound: u32 = 0;
+    while (try cli.conn.poll(&rx, rebind_now_us)) |len| {
+        const outcome = try srv.feed(rx[0..len], new_peer_addr, rebind_now_us);
+        try std.testing.expectEqual(quic_zig.Server.FeedOutcome.routed, outcome);
+        rebound_inbound += 1;
+    }
+    try std.testing.expect(rebound_inbound > 0);
+
+    // Connection-level invariant: handshake still not confirmed (we
+    // never pumped server→client), so the gate's `handshakeDone()`
+    // check returns false and `recordAuthenticatedDatagramAddress`
+    // emits `migration_path_failed / pre_handshake` and returns
+    // without queueing a PATH_CHALLENGE.
+    try std.testing.expect(!slot.conn.handshakeDone());
+    try std.testing.expect(slot.conn.pending_frames.path_challenge == null);
+
+    // Path-level invariant: peer_addr stays at the validated tuple
+    // (already pinned by `_state_tests.zig`'s pre-handshake test;
+    // re-asserted here as the precondition for the slot-routing
+    // assertion below).
+    const path_peer_after = slot.conn.primaryPathConst().path.peer_addr;
+    try std.testing.expect(quic_zig.conn.path.Address.eql(path_peer_after, old_peer_addr));
+
+    // Slot-routing invariant — THE assertion this test exists for:
+    // `Server.feed`'s postlogue reads `activePath().peer_addr` AFTER
+    // `dispatchToSlot`, so a refused migration leaves `slot.peer_addr`
+    // pinned to the previously-validated tuple. Without 5ab3b89 (or
+    // with the equivalent qns endpoint regression), this would now
+    // be `new_peer_addr` and the next `runUdpServer` outbound drain
+    // would fly ACK + handshake-completion frames toward the
+    // un-validated tuple — what the runner observes as "first server
+    // packet on new path lacks PATH_CHALLENGE".
+    try std.testing.expect(slot.peer_addr != null);
+    try std.testing.expect(quic_zig.conn.path.Address.eql(
+        slot.peer_addr.?,
+        old_peer_addr,
+    ));
+}

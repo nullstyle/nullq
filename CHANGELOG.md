@@ -30,6 +30,35 @@ breaking changes; see notes per release.
 
 ### Fixed
 
+- **qns endpoint: outbound routing hint follows the connection's
+  validated peer_addr, not the inbound datagram source.** Mirrors
+  the public-API `Server.feed` postlogue 5ab3b89 added — without the
+  qns counterpart, the runner's `server × quiche × rebind-addr`
+  cell still failed even after the public-API fix because the
+  interop binary at `interop/qns_endpoint.zig` runs its own
+  `dispatchInbound` loop and was stamping `sc.peer = msg.from`
+  BEFORE handing the datagram to the connection. Quiche's
+  rebind-addr ladder rebinds the client's source 4-tuple at t=1s,
+  precisely overlapping with quiche's slightly-later TLS Finished
+  flight: `Connection.recordAuthenticatedDatagramAddress` ran on the
+  Initial packet (per-datagram, before `drainInboxIntoTls` processes
+  the trailing Handshake's Finished), saw `!handshakeDone()`, and
+  refused the implied migration per RFC 9000 §9.6. The connection's
+  `path.peer_addr` correctly stayed on the validated tuple, but the
+  qns endpoint's `sc.peer` had ALREADY been moved to the new tuple
+  and the next `out_sock.send(io, &sc.peer, ...)` flew handshake-
+  completion frames (HANDSHAKE_DONE / NEW_TOKEN / CRYPTO=session
+  ticket / STREAM data) toward the un-validated tuple — exactly the
+  pcap signature the runner's `verify_first_packet_on_new_path`
+  check reports as "First server packet on new path did not contain
+  a PATH_CHALLENGE frame". `dispatchInbound` now re-syncs `sc.peer`
+  AFTER `handleWithEcn` from `activePath().peerAddress()`, mirroring
+  the public-API contract. New regression test in
+  `tests/e2e/server_client_handshake.zig` ("Server.feed:
+  pre-handshake peer rebind keeps slot routing on the validated
+  tuple") pins the public-API contract against the qns endpoint's
+  mirrored fix.
+
 - **Slot routing hint follows the connection's validated peer_addr, not
   the inbound datagram source** — `Server.feed`'s existing-slot path
   used to stamp `slot.peer_addr = from` BEFORE handing the datagram to
