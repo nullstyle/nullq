@@ -11,6 +11,26 @@ breaking changes; see notes per release.
 
 ### Fixed
 
+- **Slot routing hint follows the connection's validated peer_addr, not
+  the inbound datagram source** — `Server.feed`'s existing-slot path
+  used to stamp `slot.peer_addr = from` BEFORE handing the datagram to
+  the connection. If the connection then refused the implied migration
+  (most commonly: peer rebound its 4-tuple before the handshake
+  confirmed, and `Connection.handlePeerAddressChange` rejected the
+  pre-handshake address change per RFC 9000 §9.6), the slot's outbound
+  routing hint was already pointing at the un-validated tuple. The
+  `runUdpServer` drain consequently emitted ACK + STREAM frames to
+  the new tuple WITHOUT a PATH_CHALLENGE — exactly the failure mode
+  the runner's `connectionmigration` / `rebind-addr` checkers report
+  as "server moved without validating". The hint is now re-synced
+  AFTER `dispatchToSlot` from `Connection.activePath().path.peer_addr`
+  (the canonical, migration-aware view); a refused migration leaves
+  the slot routing to the previously-validated tuple, matching the
+  spec. Targets `server × quiche × rebind-addr` specifically (quic-go
+  / ngtcp2 happen not to expose the bug because their handshakes
+  confirm before the runner's first rebind fires; quiche's slightly
+  later confirmation overlaps the rebind window).
+
 - **`reassembleClientHello` accepts out-of-order CRYPTO frames in a single
   Initial** — ngtcp2 emits the ClientHello as a sequence of small,
   non-monotonic-offset CRYPTO frames within one Initial packet. The

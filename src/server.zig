@@ -1893,7 +1893,6 @@ pub const Server = struct {
         // Existing connection? Hash table lookup, O(1).
         if (self.findSlotForDatagram(bytes)) |slot| {
             slot.last_activity_us = now_us;
-            if (from) |addr| slot.peer_addr = addr;
             // RFC 9368 §6: when a multi-Initial fragmented ClientHello
             // is in flight, the upgrade decision lands on a later
             // Initial than the slot-creating one. Try to advance the
@@ -1910,6 +1909,39 @@ pub const Server = struct {
                 self.advancePendingUpgrade(slot, bytes);
             }
             try self.dispatchToSlot(slot, bytes, from, now_us);
+            // Re-sync the slot's outbound routing hint from the
+            // connection's active path — RFC 9000 §9 / §9.6: the
+            // server MUST NOT respond to a peer-initiated migration
+            // before the handshake is confirmed, and the
+            // `Connection.handlePeerAddressChange` gate enforces
+            // that. If the gate refused (handshake incomplete /
+            // anti-replay etc.), `activePath().path.peer_addr`
+            // stays at the previously-validated tuple even when
+            // `from` carries a new one. Reading the slot's
+            // `peer_addr` from the canonical path AFTER dispatch
+            // (rather than blindly stamping `from` BEFORE dispatch)
+            // means the loop's outbound drain doesn't follow a
+            // peer's pre-handshake rebind that the connection
+            // refused — which was the failure mode behind
+            // `server × quiche × rebind-addr`: quiche's first
+            // datagram on the post-rebind tuple was authentic
+            // (CID match), so we accepted it, but its handshake
+            // had not yet confirmed; the connection refused the
+            // migration; yet the slot's `peer_addr` had already
+            // been moved to the new tuple, so the next outbound
+            // packet went there carrying ACK + STREAM data with
+            // no PATH_CHALLENGE — quiche's interop checker reads
+            // that as "server moved without validating" and fails.
+            const ap = slot.conn.activePath();
+            if (ap.peer_addr_set) {
+                slot.peer_addr = ap.path.peer_addr;
+            } else if (from) |addr| {
+                // First-ever authenticated datagram: the connection
+                // hasn't latched a peer_addr yet (`peer_addr_set` is
+                // false). Use the inbound source as the routing hint
+                // until the next datagram makes it canonical.
+                slot.peer_addr = addr;
+            }
             try self.resyncSlotCids(slot);
             // RFC 9000 §8.1.3: once the handshake is confirmed, the
             // server MAY issue NEW_TOKEN frames usable on the peer's
