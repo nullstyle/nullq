@@ -9,6 +9,25 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Notes
+
+- **`server × quiche × multiplexing` stall — diagnosed as a quiche
+  client scheduler bug, not a quic-zig bug.** Reproducible against
+  the matrix logs at
+  `interop/logs.server-final/quic-zig_quiche/multiplexing/`: quiche's
+  client opens 1999 parallel bidi streams, receives 1977 responses,
+  then its `conn.send()` returns `Done` with stream data still
+  pending — quiche's writable-streams iterator stops yielding the
+  remaining 22 streams. The connection idles for 30s, then quiche
+  hits its idle timeout. quic-zig's server-side flow control
+  (MAX_DATA, MAX_STREAM_DATA) is healthy throughout the trace and
+  the watermark fix in `40b44d6` correctly fires MAX_STREAMS as
+  expected. No server-side change in this repo can wake quiche's
+  send loop once it's parked. Tracking upstream; if the test ever
+  needs a green here a server-emitted PING-on-idle workaround
+  could trigger quiche's recv → send cycle, but that's a per-cell
+  workaround masking a peer-side defect rather than a real fix.
+
 ### Fixed
 
 - **Slot routing hint follows the connection's validated peer_addr, not
