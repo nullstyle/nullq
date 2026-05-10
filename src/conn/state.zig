@@ -1230,6 +1230,25 @@ pub const Connection = struct {
     /// any subsequent Initial-level packet can't be sealed/opened
     /// with re-derived keys. RFC 9001 §5.7 ¶3.
     initial_keys_discarded: bool = false,
+    /// Latched true when `discardHandshakeKeys` fires. RFC 9001 §4.9.2:
+    /// "An endpoint MUST discard its handshake keys when the TLS
+    /// handshake is confirmed (Section 4.1.2)." For the client, that
+    /// confirmation event is receipt of HANDSHAKE_DONE (RFC 9001
+    /// §4.1.2 ¶2); for the server, it is delivery of the client's
+    /// Finished message (which equals `handshakeDone()` returning
+    /// true). Once latched, `pnSpaceForLevel(.handshake)` and
+    /// `sentForLevel(.handshake)` are dead — `tick` skips them and
+    /// `packetKeys(.handshake, ...)` returns null because the
+    /// per-level secret material has been zeroed.
+    handshake_keys_discarded: bool = false,
+    /// Latched true on the client when a HANDSHAKE_DONE frame is
+    /// processed (RFC 9001 §4.1.2 ¶2). Drives `discardHandshakeKeys`
+    /// in `applyPostFrameProcessing` and short-circuits any further
+    /// Handshake-level activity (PTO, loss detection, retransmit).
+    /// Server-side this stays false — the equivalent latch is
+    /// `inner.handshakeDone()`, which already covers the §4.9.2
+    /// "TLS handshake is confirmed" trigger for the server role.
+    received_handshake_done: bool = false,
     /// Sequence number of the locally-issued CID the next-handled
     /// datagram was addressed to, or `null` when unknown. Set by
     /// `Server` from its routing table before each `Connection.handle`
@@ -2975,6 +2994,62 @@ pub const Connection = struct {
         self.initial_keys_read = null;
         self.initial_keys_write = null;
         self.initial_keys_discarded = true;
+    }
+
+    /// RFC 9001 §4.9.2: "An endpoint MUST discard its handshake keys
+    /// when the TLS handshake is confirmed." Mirrors `discardInitialKeys`
+    /// but operates on the Handshake-level slot in `levels` and the
+    /// connection-level Handshake sent tracker (`sent[1]`).
+    ///
+    /// The trigger differs per role: clients latch on HANDSHAKE_DONE
+    /// (RFC 9001 §4.1.2 ¶2), servers latch on `handshakeDone()`
+    /// returning true (which equals "received client Finished" — the
+    /// server's confirmation event). Both paths land here.
+    ///
+    /// Effect:
+    ///   - Securely zeros the read+write traffic-secret material in
+    ///     `levels[handshake.idx()]` and clears both slots, so
+    ///     `packetKeys(.handshake, …)` returns null. Any subsequent
+    ///     inbound Handshake-level packet is dropped at the receiver
+    ///     as `keys_unavailable`; no further Handshake-level packet
+    ///     can be sealed by the send path either.
+    ///   - Clears the connection-level Handshake sent tracker. RFC
+    ///     9002 §6.4 ¶1: "If a packet number space is discarded, then
+    ///     all in-flight packets in that space MUST be removed from
+    ///     bytes_in_flight." Without this, `firePtoAtLevel(.handshake)`
+    ///     would keep retransmitting phantom Finished CRYPTO frames
+    ///     forever — exactly the failure mode that quiche's strict
+    ///     `dropped invalid packet` response made fatal in the
+    ///     `rebind-addr` interop testcase (the post-rebind 1-RTT
+    ///     stall left no fresh ACK source, so the only thing the
+    ///     client kept emitting was useless Handshake-PTO probes).
+    ///   - Resets the Handshake-level `pto_count` and `pending_ping`
+    ///     so a stale latch can't immediately re-fire.
+    ///
+    /// Idempotent: the `handshake_keys_discarded` latch makes a
+    /// second call a no-op.
+    /// INTERNAL: pub for `_state_tests.zig` to drive the discard
+    /// directly without the surrounding `handleWithEcn` /
+    /// `drainInboxIntoTls` machinery. Embedders never need this —
+    /// the gate is purely an internal RFC 9001 §4.9.2 invariant.
+    pub fn discardHandshakeKeys(self: *Connection) void {
+        if (self.handshake_keys_discarded) return;
+        const hsk_lvl_idx = EncryptionLevel.handshake.idx();
+        if (self.levels[hsk_lvl_idx].read) |*material| {
+            std.crypto.secureZero(u8, &material.secret);
+        }
+        if (self.levels[hsk_lvl_idx].write) |*material| {
+            std.crypto.secureZero(u8, &material.secret);
+        }
+        self.levels[hsk_lvl_idx].read = null;
+        self.levels[hsk_lvl_idx].write = null;
+        // Initial uses idx 0 in connPnIdx mapping; Handshake is idx 1.
+        // See `connPnIdx` for the rationale (the array indices ride
+        // the connection-level PN-space layout, not `EncryptionLevel.idx`).
+        self.clearSentTracker(&self.sent[1]);
+        self.pto_count[1] = 0;
+        self.pending_ping[1] = false;
+        self.handshake_keys_discarded = true;
     }
 
     pub fn ensureInitialKeys(self: *Connection) Error!void {
@@ -5711,27 +5786,39 @@ pub const Connection = struct {
         if (self.lifecycle.closed) return null;
 
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
-            const tracker = &self.pnSpaceForLevelConst(lvl).received;
-            if (self.ackDelayDeadlineUs(tracker)) |at_us| {
-                considerDeadline(&best, .{
-                    .kind = .ack_delay,
-                    .at_us = at_us,
-                    .level = lvl,
-                });
-            }
-            if (self.lossDeadlineForLevel(lvl)) |at_us| {
-                considerDeadline(&best, .{
-                    .kind = .loss_detection,
-                    .at_us = at_us,
-                    .level = lvl,
-                });
-            }
-            if (self.ptoDeadlineForLevel(lvl)) |at_us| {
-                considerDeadline(&best, .{
-                    .kind = .pto,
-                    .at_us = at_us,
-                    .level = lvl,
-                });
+            // Twin of the `tick` gate: a discarded space contributes
+            // no scheduling deadlines. Without this, `nextDeadline`
+            // would surface a stale Handshake PTO timestamp from the
+            // last unACKed Finished CRYPTO and an embedder polling
+            // loop would wake repeatedly for a no-op `tick`.
+            const space_active = switch (lvl) {
+                .initial => !self.initial_keys_discarded,
+                .handshake => !self.handshake_keys_discarded,
+                else => false,
+            };
+            if (space_active) {
+                const tracker = &self.pnSpaceForLevelConst(lvl).received;
+                if (self.ackDelayDeadlineUs(tracker)) |at_us| {
+                    considerDeadline(&best, .{
+                        .kind = .ack_delay,
+                        .at_us = at_us,
+                        .level = lvl,
+                    });
+                }
+                if (self.lossDeadlineForLevel(lvl)) |at_us| {
+                    considerDeadline(&best, .{
+                        .kind = .loss_detection,
+                        .at_us = at_us,
+                        .level = lvl,
+                    });
+                }
+                if (self.ptoDeadlineForLevel(lvl)) |at_us| {
+                    considerDeadline(&best, .{
+                        .kind = .pto,
+                        .at_us = at_us,
+                        .level = lvl,
+                    });
+                }
             }
         }
         for (self.paths.paths.items) |*path| {
@@ -7235,6 +7322,19 @@ pub const Connection = struct {
             try self.drainInboxIntoTls();
         }
         if (self.cryptoInboxQueued() and !self.closingAttributionOnly()) try self.drainInboxIntoTls();
+        // RFC 9001 §4.1.2 ¶2 + §4.9.2: client confirms the handshake
+        // when it processes a HANDSHAKE_DONE frame, and an endpoint
+        // MUST discard its handshake keys at confirmation. We latch
+        // the receipt in the frame switch above (so the `handshake_done`
+        // arm stays a small enum-tag write); the actual discard runs
+        // here, after the datagram's frames are dispatched, so a late
+        // ACK in the same datagram still credits the Handshake-level
+        // sent tracker before we tear it down. `discardHandshakeKeys`
+        // is idempotent — the latch + the function-local guard makes
+        // a re-entry on a second HANDSHAKE_DONE a no-op.
+        if (self.received_handshake_done and !self.handshake_keys_discarded) {
+            self.discardHandshakeKeys();
+        }
         // RFC 9000 §10.2.1 ¶3: when in the closing state and an
         // attributed inbound packet arrived during this datagram,
         // re-arm a CONNECTION_CLOSE retransmit (subject to the SHOULD
@@ -7892,7 +7992,22 @@ pub const Connection = struct {
                 return;
             }
             switch (f) {
-                .padding, .ping, .handshake_done => {},
+                .padding, .ping => {},
+                .handshake_done => {
+                    // RFC 9001 §4.1.2 ¶2: client confirms the handshake
+                    // on receipt of HANDSHAKE_DONE. The validity gate
+                    // above already rejected this frame on the server
+                    // role with PROTOCOL_VIOLATION, so we know we're
+                    // the client. RFC 9001 §4.9.2 then mandates the
+                    // Handshake-key discard. Latching the receipt here
+                    // (rather than at end-of-datagram) keeps the gate
+                    // and the discard atomic with respect to ACK
+                    // processing — the ACK arm below uses
+                    // `handshake_keys_discarded` to short-circuit a
+                    // late peer ACK that arrives after we've cleaned
+                    // the sent tracker.
+                    self.received_handshake_done = true;
+                },
                 .ack => |a| {
                     if (self.exceedsIncomingAckRangeCap(a.range_count)) continue;
                     try self.handleAckAtLevel(lvl, a, now_us);
@@ -8540,6 +8655,16 @@ pub const Connection = struct {
         // idempotent.
         if (self.inner.handshakeDone() and !self.initial_keys_discarded) {
             self.discardInitialKeys();
+        }
+        // RFC 9001 §4.1.2 ¶1 / §4.9.2: the server's "TLS handshake
+        // confirmed" event coincides with TLS handshake completion
+        // (i.e. processing the client's Finished). The matching key
+        // discard runs immediately. The client takes the symmetrical
+        // path on receipt of HANDSHAKE_DONE — see the
+        // `received_handshake_done` arm in the frame switch above and
+        // the `handleWithEcn` post-loop discard.
+        if (self.role == .server and self.inner.handshakeDone() and !self.handshake_keys_discarded) {
+            self.discardHandshakeKeys();
         }
         try self.refreshEarlyDataStatus();
     }
@@ -9357,22 +9482,35 @@ pub const Connection = struct {
         }
 
         inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |lvl| {
-            self.promoteDueAckDelay(&self.pnSpaceForLevel(lvl).received, now_us);
+            // RFC 9001 §4.9.2: a discarded packet number space MUST
+            // NOT continue to drive timers. The Initial latch lives
+            // in `initial_keys_discarded`; the Handshake latch in
+            // `handshake_keys_discarded`. Both are one-way, so the
+            // gates below stay consistent with the corresponding
+            // `levels[…]` and `sent[…]` shutdown.
+            const space_active = switch (lvl) {
+                .initial => !self.initial_keys_discarded,
+                .handshake => !self.handshake_keys_discarded,
+                else => false,
+            };
+            if (space_active) {
+                self.promoteDueAckDelay(&self.pnSpaceForLevel(lvl).received, now_us);
+            }
         }
         for (self.paths.paths.items) |*path| {
             if (path.path.state == .failed) continue;
             self.promoteDueAckDelay(&path.app_pn_space.received, now_us);
         }
 
-        try self.detectLossesByTimeThresholdAtLevel(.initial, now_us);
-        try self.detectLossesByTimeThresholdAtLevel(.handshake, now_us);
+        if (!self.initial_keys_discarded) try self.detectLossesByTimeThresholdAtLevel(.initial, now_us);
+        if (!self.handshake_keys_discarded) try self.detectLossesByTimeThresholdAtLevel(.handshake, now_us);
         for (self.paths.paths.items) |*path| {
             if (path.path.state == .failed) continue;
             try self.detectLossesByTimeThresholdOnApplicationPath(path, now_us);
         }
 
-        try self.fireDuePtoAtLevel(.initial, now_us);
-        try self.fireDuePtoAtLevel(.handshake, now_us);
+        if (!self.initial_keys_discarded) try self.fireDuePtoAtLevel(.initial, now_us);
+        if (!self.handshake_keys_discarded) try self.fireDuePtoAtLevel(.handshake, now_us);
         for (self.paths.paths.items) |*path| {
             if (path.path.state == .failed) continue;
             try self.fireDuePtoOnApplicationPath(path, now_us);

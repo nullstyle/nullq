@@ -30,6 +30,61 @@ breaking changes; see notes per release.
 
 ### Fixed
 
+- **Client-side: discard Handshake keys at HANDSHAKE_DONE [RFC 9001
+  §4.9.2 / §4.1.2 ¶2]** — a quic-zig client kept its Handshake-level
+  secrets and sent-tracker alive forever after the TLS handshake
+  completed, because the `.handshake_done` arm in the application-
+  level frame switch was a pure no-op. RFC 9001 §4.1.2 ¶2 says the
+  client confirms the handshake on receipt of HANDSHAKE_DONE; §4.9.2
+  then mandates discarding handshake keys at confirmation. Without
+  the discard, any client Handshake CRYPTO Finished that went unACKed
+  at Handshake level (the typical case — quic-go, quiche, and ngtcp2
+  servers all drop their own Handshake send keys before they can ACK
+  the client's Hsk packet, conveying confirmation only via the
+  HANDSHAKE_DONE frame in 1-RTT) drove an unbounded chain of
+  Handshake-level PTO probes. In the QUIC interop `client × quiche ×
+  rebind-addr` cell those probes were the ONLY thing the client
+  emitted during the post-rebind stall, and quiche's strict §4.9.2
+  server-side discard meant the probes were dropped as `invalid
+  packet` — never reaching the path-validation code that would have
+  unstuck the connection. The fix adds a `discardHandshakeKeys`
+  helper alongside the existing `discardInitialKeys`: zeros the
+  Handshake-level secret material in `levels[handshake.idx()]`,
+  clears the connection-level Handshake sent tracker (`sent[1]`),
+  and resets the matching `pto_count` / `pending_ping`. Latched
+  via `handshake_keys_discarded`; gated in `tick` and `nextDeadline`
+  so a discarded space contributes neither timers nor PTO probes.
+  The server-side gate fires on `inner.handshakeDone()` (RFC 9001
+  §4.1.2 ¶1: "TLS handshake is considered confirmed at the server
+  when the handshake completes"). Pinned by three new tests in
+  `src/conn/_state_tests.zig`: a client-role HANDSHAKE_DONE round-trip
+  through `dispatchFrames`, a server-role direct-call invariant, and
+  a `tick`-level gate test that proves a stale tracker cannot drive
+  PTO once the latch is set.
+
+- **qns client: 1-RTT keep-alive PING during stalled downloads** —
+  `interop/qns_endpoint.zig`'s `runClient` loop now emits a 1-RTT
+  PING via the public `Connection.requestPing` API whenever a
+  download is in progress, the handshake is confirmed, and the
+  application path has been outbound-silent for longer than
+  `endpoint_client_keepalive_period_us = 250 ms`. Targets the
+  `client × quiche × rebind-addr` cell specifically: the runner's
+  rebind moves the client's source address in the simulator at a
+  fixed 5 s frequency, and against the (slower) quiche server the
+  transfer doesn't finish before the third rebind catches it
+  mid-stream. The simulator drops every server packet still
+  addressed to the old binding; from the client's POV the
+  connection goes silent with no outbound stream activity to
+  refresh the simulator's NAT entry. Without the keep-alive, the
+  only outbound was Handshake-level PTO probes (now gone, see
+  the §4.9.2 fix above) which the server discarded as
+  `invalid packet`. The keep-alive PING is encrypted under 1-RTT
+  keys, refreshes the simulator binding, AND triggers quiche's
+  path-validation code so the server swings its destination tuple
+  to the new path. Pinned by two new tests in `qns_endpoint.zig`
+  ("client keep-alive period bridges interop rebind window" plus a
+  `requestPing` invariant pin).
+
 - **Slot routing hint follows the connection's validated peer_addr, not
   the inbound datagram source** — `Server.feed`'s existing-slot path
   used to stamp `slot.peer_addr = from` BEFORE handing the datagram to

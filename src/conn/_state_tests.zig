@@ -7330,3 +7330,176 @@ test "server validatePeerTransportRole accepts when initial_wire_version is unse
 
     try std.testing.expect(conn.lifecycle.pending_close == null);
 }
+
+// -- HANDSHAKE_DONE → discard handshake keys (RFC 9001 §4.9.2) -------
+//
+// Failure mode (pre-fix): a quic_zig client kept its Handshake-level
+// secrets and sent tracker alive forever after the TLS handshake
+// completed. If the client's last Handshake-CRYPTO Finished went
+// unACKed (typical: peers like quic-go and quiche discard their own
+// Handshake send keys before sending an ACK at Handshake level, then
+// only emit the implicit confirmation via HANDSHAKE_DONE), the client
+// would PTO the Handshake space indefinitely. In the QUIC interop
+// `rebind-addr` cell against the (slower) quiche server those PTO
+// probes were the ONLY thing the client emitted during the post-rebind
+// stall — and quiche's strict §4.9.2 server-side discard meant the
+// probes were dropped as `invalid packet`, never reaching the path-
+// validation code that would have unstuck the connection.
+//
+// The fix is RFC-mandated: §4.1.2 ¶2 says the client confirms the
+// handshake on receipt of HANDSHAKE_DONE, and §4.9.2 says an endpoint
+// MUST discard its handshake keys at confirmation. The three tests
+// below pin the behavior at three abstraction levels.
+
+test "client discards Handshake keys when HANDSHAKE_DONE arrives [RFC9001 §4.9.2]" {
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Plant Handshake-level secret material so we can observe the
+    // discard zeroing it out. The cipher protocol id matches the
+    // existing `installTestApplicationWriteSecret` helper — both are
+    // synthetic; we only inspect post-discard state, never run real
+    // crypto here.
+    const hsk_idx = EncryptionLevel.handshake.idx();
+    var hsk_material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
+    hsk_material.secret_len = 32;
+    @memset(hsk_material.secret[0..32], 0x42);
+    conn.levels[hsk_idx].read = hsk_material;
+    conn.levels[hsk_idx].write = hsk_material;
+    // Plant a phantom unACKed Handshake-level packet so we can pin
+    // the post-discard sent-tracker invariant.
+    const packet: sent_packets_mod.SentPacket = .{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 36,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    try conn.sentForLevel(.handshake).record(packet);
+    try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.handshake).count);
+    conn.pto_count[1] = 3;
+    conn.pending_ping[1] = true;
+
+    // Build a 1-RTT payload carrying just HANDSHAKE_DONE; route it
+    // through the application-level frame dispatcher, then run the
+    // post-frame discard the same way `handleWithEcn` does in prod.
+    var payload: [4]u8 = undefined;
+    const payload_len = try frame_mod.encode(payload[0..], .{ .handshake_done = .{} });
+    try conn.dispatchFrames(.application, payload[0..payload_len], 1_000_000);
+    try std.testing.expect(conn.received_handshake_done);
+    // The discard runs at the end of `handleWithEcn`; mimic it here.
+    if (conn.received_handshake_done and !conn.handshake_keys_discarded) {
+        conn.discardHandshakeKeys();
+    }
+
+    try std.testing.expect(conn.handshake_keys_discarded);
+    try std.testing.expect(conn.levels[hsk_idx].read == null);
+    try std.testing.expect(conn.levels[hsk_idx].write == null);
+    // packetKeys returning null is the receive-path gate that drops
+    // any further inbound Handshake packet as `keys_unavailable`.
+    try std.testing.expect((try conn.packetKeys(.handshake, .read)) == null);
+    try std.testing.expect((try conn.packetKeys(.handshake, .write)) == null);
+    // Sent tracker must be empty so PTO/loss detection can't replay
+    // phantom CRYPTO frames forever.
+    try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.handshake).count);
+    try std.testing.expectEqual(@as(u64, 0), conn.sentForLevel(.handshake).bytes_in_flight);
+    try std.testing.expectEqual(@as(u32, 0), conn.pto_count[1]);
+    try std.testing.expectEqual(false, conn.pending_ping[1]);
+}
+
+test "server discards Handshake keys at handshake-complete [RFC9001 §4.1.2 ¶1]" {
+    // Server-side: the §4.1.2 ¶1 confirmation event is "TLS handshake
+    // complete" (i.e. processing the client's Finished). We can't
+    // exercise the full TLS path in a unit test, so we plant the
+    // Handshake material + a phantom in-flight packet, then call the
+    // same `drainInboxIntoTls` post-loop block that triggers the
+    // discard in production. The branch we cover is the
+    // `if (self.role == .server and self.inner.handshakeDone() …)`
+    // gate added alongside the §5.7 ¶3 Initial-key discard.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initServer(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initServer(allocator, ctx);
+    defer conn.deinit();
+
+    const hsk_idx = EncryptionLevel.handshake.idx();
+    var material: SecretMaterial = .{ .cipher_protocol_id = 0x1301 };
+    material.secret_len = 32;
+    conn.levels[hsk_idx].read = material;
+    conn.levels[hsk_idx].write = material;
+
+    const packet: sent_packets_mod.SentPacket = .{
+        .pn = 1,
+        .sent_time_us = 0,
+        .bytes = 700,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    try conn.sentForLevel(.handshake).record(packet);
+
+    // Direct call (the server-role gate in `drainInboxIntoTls` is
+    // what fires `discardHandshakeKeys` in the production path; we
+    // call the function directly here to avoid driving the full
+    // TLS state machine).
+    conn.discardHandshakeKeys();
+
+    try std.testing.expect(conn.handshake_keys_discarded);
+    try std.testing.expect(conn.levels[hsk_idx].read == null);
+    try std.testing.expect(conn.levels[hsk_idx].write == null);
+    try std.testing.expectEqual(@as(u32, 0), conn.sentForLevel(.handshake).count);
+}
+
+test "tick skips handshake-level PTO once handshake_keys_discarded latches" {
+    // Regression for the failure mode: pre-fix, every PTO tick after
+    // handshake completion would re-fire `firePtoAtLevel(.handshake)`
+    // and replay the unACKed Finished CRYPTO. With the discard latch,
+    // `tick` MUST treat the Handshake space as dead.
+    const allocator = std.testing.allocator;
+    var ctx = try boringssl.tls.Context.initClient(.{});
+    defer ctx.deinit();
+    var conn = try Connection.initClient(allocator, ctx, "x");
+    defer conn.deinit();
+
+    // Stage a pre-discard packet to confirm the gate flips correctly:
+    // record an in-flight ack-eliciting Handshake packet that would
+    // otherwise drive a PTO, then set the latch (mimicking
+    // post-discard state) and verify `tick` does NOT touch the
+    // tracker. We don't attach a retransmit frame — the
+    // `ack_eliciting + in_flight` combination is enough to make
+    // `ptoDeadlineForLevel(.handshake)` return non-null pre-fix and
+    // arm a PTO. Post-fix, the latch makes `tick` skip the level
+    // entirely so the deadline never fires.
+    const packet: sent_packets_mod.SentPacket = .{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 36,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    try conn.sentForLevel(.handshake).record(packet);
+
+    // Latch the discard but DON'T call `discardHandshakeKeys` itself —
+    // we want to observe `tick` honoring the latch even if the sent
+    // tracker still has stale entries (defensive: the latch is the
+    // single source of truth for "this space is dead").
+    conn.handshake_keys_discarded = true;
+
+    // PTO would normally fire well after `ptoDurationForLevel` from
+    // sent_time_us=0; pick a `now_us` deep into that future.
+    const pto_us = conn.ptoDurationForLevel(.handshake);
+    try conn.tick(pto_us +| 10 * pto_us);
+
+    // No PTO firing means the retransmit frames stay in the sent
+    // tracker (we didn't actually clear it), and `pending_ping[1]`
+    // never flips true.
+    try std.testing.expect(!conn.pending_ping[1]);
+    // The phantom packet is still tracked because we didn't call
+    // discardHandshakeKeys; that's intentional for this test (it
+    // pins the gate's runtime check, not the helper's clear path).
+    // `Connection.deinit` will deinit the planted entry alongside
+    // the rest of `sent[1]`, so no manual cleanup is needed.
+    try std.testing.expectEqual(@as(u32, 1), conn.sentForLevel(.handshake).count);
+}
