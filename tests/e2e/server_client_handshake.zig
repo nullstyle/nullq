@@ -355,3 +355,184 @@ test "Server <-> Client: handshake completes via Retry round-trip" {
     try std.testing.expectEqualStrings("hq-test", cli.conn.inner.alpnSelected().?);
     try std.testing.expectEqualStrings("hq-test", srv.iterator()[0].conn.inner.alpnSelected().?);
 }
+
+test "Server <-> Client: peer-side rebind after handshake arms PATH_CHALLENGE on existing slot" {
+    // Regression coverage for `server × {ngtcp2, quic-go, quiche} × rebind-addr`
+    // (the runner's mid-transfer source-address rewrite). Symmetric server-
+    // role counterpart to the client-side `pollDatagram` migration test in
+    // `_state_tests.zig`'s "client peer-address rebind" — that one pinned
+    // the client's view of a server-tuple swap; this one pins the server's
+    // view of a CLIENT-tuple swap routed through `Server.feed`.
+    //
+    // The runner's network simulator rewrites the client's source IP/port
+    // mid-connection. Once the handshake is confirmed, the server's
+    // existing-slot `feed` path:
+    //
+    //   1. Routes the post-rebind datagram via `findSlotForDatagram`
+    //      (CID-keyed — the wire DCID is unchanged so the routing table
+    //      hits the same slot), updates `slot.peer_addr` to the new tuple.
+    //   2. Dispatches into `Connection.handleWithEcn`, which sees a
+    //      different `from` than the active path's `peer_addr` and
+    //      arms `peerAddressChangeCandidate`.
+    //   3. Authenticated decrypt → `recordAuthenticatedDatagramAddress`
+    //      → `handlePeerAddressChange` queues PATH_CHALLENGE on the
+    //      primary path, snapshots rollback state, and (per the
+    //      `fb267f6` fix) emits PATH_CHALLENGE as the FIRST frame on
+    //      the next outbound datagram.
+    //
+    // Without this contract, peer-initiated NAT rebinding mid-transfer
+    // looks like a fresh connection and the runner declares the test
+    // failed because the server either drops the rebound datagram
+    // (no migration arming) or burns through PTO retransmits to the
+    // old (unreachable) tuple.
+    const allocator = std.testing.allocator;
+    const protos = [_][]const u8{"hq-test"};
+
+    var srv = try quic_zig.Server.init(.{
+        .allocator = allocator,
+        .tls_cert_pem = common.test_cert_pem,
+        .tls_key_pem = common.test_key_pem,
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+    });
+    defer srv.deinit();
+
+    var cli = try quic_zig.Client.connect(.{
+        .allocator = allocator,
+        .server_name = "localhost",
+        .alpn_protocols = &protos,
+        .transport_params = common.defaultParams(),
+    });
+    defer cli.deinit();
+
+    var rx: [4096]u8 = undefined;
+    // Pre-rebind peer address — the tuple the client appears to come
+    // from before the simulator rewrites the source. The first byte
+    // is a `path.Address` family tag (4 = IPv4); the actual layout
+    // doesn't matter for `peerAddressChangeCandidate`'s `Address.eql`
+    // check, only that old/new compare unequal byte-for-byte.
+    const old_peer_addr: quic_zig.conn.path.Address = .{
+        .bytes = .{ 4, 10, 0, 0, 1, 0x10, 0x00 } ++ @as([15]u8, @splat(0)),
+    };
+    try cli.conn.advance();
+
+    // Phase 1: full handshake completes. We need handshakeDone() on
+    // both sides because `recordAuthenticatedDatagramAddress` gates
+    // peer-initiated migration on handshake confirmation (RFC 9000
+    // §9.6 / hardening guide §4.8).
+    var step: u32 = 0;
+    while (step < 32) : (step += 1) {
+        const now_us: u64 = @as(u64, step) * 1_000;
+        _ = try pumpClientToServer(&cli, &srv, &rx, old_peer_addr, now_us);
+        while (srv.drainStatelessResponse()) |_| {}
+        _ = try pumpServerToClient(&srv, &cli, &rx, now_us);
+        try srv.tick(now_us);
+        try cli.conn.tick(now_us);
+        if (cli.conn.handshakeDone() and srv.iterator().len > 0 and
+            srv.iterator()[0].conn.handshakeDone()) break;
+    }
+    try std.testing.expect(cli.conn.handshakeDone());
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+    const slot = srv.iterator()[0];
+    try std.testing.expect(slot.conn.handshakeDone());
+
+    // Drain any post-handshake outbound traffic (HANDSHAKE_DONE, ACKs,
+    // NEW_CONNECTION_ID flights) so the slot starts the rebind window
+    // with an empty outbox. Otherwise the per-slot poll below could
+    // emit pre-migration packets first and mask the assertion that
+    // PATH_CHALLENGE leads the FIRST outbound on the new tuple.
+    var drain_step: u32 = 0;
+    while (drain_step < 8) : (drain_step += 1) {
+        const now_us: u64 = @as(u64, 100 + drain_step) * 1_000;
+        _ = try pumpServerToClient(&srv, &cli, &rx, now_us);
+        _ = try pumpClientToServer(&cli, &srv, &rx, old_peer_addr, now_us);
+        try srv.tick(now_us);
+        try cli.conn.tick(now_us);
+    }
+
+    // Capture pre-rebind path state for post-conditions.
+    const path_before = slot.conn.primaryPathConst();
+    try std.testing.expect(quic_zig.conn.path.Address.eql(path_before.path.peer_addr, old_peer_addr));
+    try std.testing.expect(path_before.path.isValidated());
+    try std.testing.expect(slot.conn.pending_frames.path_challenge == null);
+
+    // Phase 2: simulate the runner's mid-transfer source-address
+    // rewrite. Pump the client's next 1-RTT packet through `feed`
+    // with a brand-new peer address. The packet bytes are unchanged
+    // — only the `from` tuple rotates.
+    const new_peer_addr: quic_zig.conn.path.Address = .{
+        .bytes = .{ 4, 192, 0, 2, 99, 0xab, 0xcd } ++ @as([15]u8, @splat(0)),
+    };
+    try std.testing.expect(!quic_zig.conn.path.Address.eql(old_peer_addr, new_peer_addr));
+
+    // Coax the client into emitting an ack-eliciting 1-RTT packet so
+    // the server has something authenticated to record against the
+    // new tuple. A queued PING via `pendingPing` is the minimum
+    // authenticated-frame footprint.
+    cli.conn.primaryPath().pending_ping = true;
+
+    var rebound_inbound: u32 = 0;
+    var path_challenge_observed = false;
+    var migration_arm_step: u32 = 0;
+    while (migration_arm_step < 4) : (migration_arm_step += 1) {
+        const now_us: u64 = @as(u64, 200 + migration_arm_step) * 1_000;
+        // Client→server through the NEW tuple. Per-iteration cap
+        // matches `pumpClientToServer`'s shape but feeds with
+        // `new_peer_addr`.
+        while (try cli.conn.poll(&rx, now_us)) |len| {
+            const outcome = try srv.feed(rx[0..len], new_peer_addr, now_us);
+            try std.testing.expectEqual(quic_zig.Server.FeedOutcome.routed, outcome);
+            rebound_inbound += 1;
+            // First authenticated rebound datagram should arm the
+            // migration: PATH_CHALLENGE queued on the active path
+            // and the slot's `peer_addr` swung to the new tuple.
+            if (slot.conn.pending_frames.path_challenge != null) {
+                path_challenge_observed = true;
+            }
+        }
+        try srv.tick(now_us);
+        try cli.conn.tick(now_us);
+        if (path_challenge_observed) break;
+    }
+    try std.testing.expect(rebound_inbound > 0);
+    try std.testing.expect(path_challenge_observed);
+
+    // Per-slot post-conditions: server saw the new tuple AND the
+    // primary path is in the migration-pending window (anti-amp
+    // counters reset, validator pending, rollback snapshotted).
+    const path_after = slot.conn.primaryPathConst();
+    try std.testing.expect(quic_zig.conn.path.Address.eql(path_after.path.peer_addr, new_peer_addr));
+    try std.testing.expect(path_after.pending_migration_reset);
+    try std.testing.expectEqual(@as(u32, 0), slot.conn.pending_frames.path_challenge_path_id);
+
+    // Slot-level routing post-condition: the slot's `peer_addr` hint
+    // (used by `runUdpServer`'s outbound drain to pick the receiving
+    // socket) tracked the rebind. The connection itself doesn't
+    // depend on this for correctness, but a divergence here would
+    // mean outbound packets land on the wrong socket post-rebind.
+    try std.testing.expect(slot.peer_addr != null);
+    try std.testing.expect(quic_zig.conn.path.Address.eql(slot.peer_addr.?, new_peer_addr));
+
+    // No second slot was opened — `findSlotForDatagram` matched the
+    // existing one via the unchanged DCID. A fresh slot here would
+    // mean `Server.feed` routed the post-rebind datagram into a new
+    // connection, the failure mode the runner sees as "Expected
+    // exactly 1 handshake. Got: 2".
+    try std.testing.expectEqual(@as(usize, 1), srv.connectionCount());
+
+    // Outbound shape: the next datagram the slot emits must lead
+    // with PATH_CHALLENGE per `fb267f6` (otherwise quiche / similar
+    // implementations stall path validation and the rebind never
+    // completes). Drive one poll under the post-rebind clock and
+    // confirm a non-empty outbound was produced. We don't decrypt
+    // here — the existing `_state_tests.zig` "peer-initiated
+    // migration emits PATH_CHALLENGE as the first frame" pins the
+    // frame ordering at the connection level; this test pins that
+    // the server-wrapper end-to-end path actually reaches it.
+    const post_rebind_now: u64 = @as(u64, 300) * 1_000;
+    var post_rebind_outbound: u32 = 0;
+    while (try slot.conn.poll(&rx, post_rebind_now)) |_| {
+        post_rebind_outbound += 1;
+    }
+    try std.testing.expect(post_rebind_outbound > 0);
+}

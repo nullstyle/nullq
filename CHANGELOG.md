@@ -22,6 +22,31 @@ breaking changes; see notes per release.
   testcase-name gating fix so a future rename of the gate cannot
   regress the runner's `v2` cell silently.
 
+- **Regression pin: server-wrapper end-to-end peer-side rebind-addr
+  arms PATH_CHALLENGE on the existing slot** — a new e2e test in
+  `tests/e2e/server_client_handshake.zig` ("Server <-> Client:
+  peer-side rebind after handshake arms PATH_CHALLENGE on existing
+  slot") drives a full Server.feed-routed handshake to completion,
+  drains post-handshake outbound, then injects the client's next
+  ack-eliciting 1-RTT datagram through `Server.feed` with a
+  brand-new `from` tuple to simulate the runner's mid-transfer
+  source-address rewrite. Pins (a) `Server.feed` returns
+  `FeedOutcome.routed` (the new tuple's datagram still routes via
+  CID match to the same slot, no second slot opens), (b)
+  `slot.conn.pending_frames.path_challenge != null` on the active
+  app path, (c) `path.path.peer_addr` swung to the new tuple, (d)
+  `path.pending_migration_reset` latched, and (e) the slot's
+  `peer_addr` routing hint (consulted by `runUdpServer`'s outbound
+  drain) tracks the rebind. Symmetric server-role counterpart to
+  the client-side `_state_tests.zig` "client peer-address rebind:
+  pollDatagram exposes the new server tuple after migration" pin
+  shipped in `f596d80`. Investigation of the matrix-run report
+  showing `server × ngtcp2 × rebind-addr` regressed between
+  `8e65ef2` and `d2c6b6b` could not narrow the regression to a
+  single in-tree commit — the test passes at both endpoints — so
+  the test is documented as defensive coverage rather than a
+  fix-pinning regression.
+
 - **Regression pin: qns `Connection.acceptInitial` code path preserves
   `preferred_address` end-to-end** — a new e2e test in
   `tests/e2e/server_smoke.zig` ("Connection.acceptInitial: qns code path
