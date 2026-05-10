@@ -8111,11 +8111,44 @@ pub const Connection = struct {
                 .stream => |s| try self.handleStream(lvl, s),
                 .reset_stream => |rs| try self.handleResetStream(rs),
                 .datagram => |dg| try self.handleDatagram(lvl, dg),
-                .path_challenge => |pc| self.queuePathResponseOnPath(
-                    self.current_incoming_path_id,
-                    pc.data,
-                    self.current_incoming_addr,
-                ),
+                .path_challenge => |pc| {
+                    self.queuePathResponseOnPath(
+                        self.current_incoming_path_id,
+                        pc.data,
+                        self.current_incoming_addr,
+                    );
+                    // RFC 9000 §5.1.2 ¶1: an endpoint MUST NOT use the
+                    // same connection ID on different paths. If our
+                    // peer sent us a PATH_CHALLENGE on the current
+                    // active path, the peer believes it has detected
+                    // a peer-initiated migration on our end (e.g. the
+                    // runner's `rebind-addr` simulator rewrites the
+                    // client's source IP transparently — the kernel
+                    // socket is unchanged so we never observe the
+                    // migration locally, but the server sees a new
+                    // 4-tuple and probes it). Match the peer's view
+                    // by rotating to a fresh peer-issued CID for
+                    // subsequent outbound packets. Without this,
+                    // quiche's server-side §5.1.2 enforcement logs
+                    // "Peer reused cid seq 0 ... on (new tuple)" and
+                    // the `client × quiche × rebind-addr` cell fails
+                    // because the runner's pcap check rejects the
+                    // CID reuse.
+                    //
+                    // No-op if no fresh peer CID is available — the
+                    // peer hasn't issued NEW_CONNECTION_ID beyond
+                    // what we're already using on this path. The
+                    // PATH_RESPONSE we just queued still ships under
+                    // the existing DCID, which preserves liveness.
+                    const path = self.pathForId(self.current_incoming_path_id);
+                    if (self.consumeFreshPeerCidForMigration(path)) |fresh_cid| {
+                        path.path.peer_cid = fresh_cid;
+                        if (path.id == 0) {
+                            self.peer_dcid = fresh_cid;
+                            self.peer_dcid_set = true;
+                        }
+                    }
+                },
                 .path_response => |pr| self.recordPathResponse(self.current_incoming_path_id, pr.data),
                 .new_connection_id => |nc| try self.handleNewConnectionId(nc),
                 .stop_sending => |ss| try self.handleStopSending(ss),
