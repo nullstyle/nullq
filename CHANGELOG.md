@@ -9,6 +9,32 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Tests
+
+- **Regression pin: qns `Connection.acceptInitial` code path preserves
+  `preferred_address` end-to-end** — a new e2e test in
+  `tests/e2e/server_smoke.zig` ("Connection.acceptInitial: qns code path
+  preserves preferred_address through to client") mirrors the
+  `interop/qns_endpoint.zig` sequencing precisely (`Connection.initServer`
+  → `bind` → `setLocalScid` → `replenishConnectionIds(seq=1 alt-CID)`
+  → `acceptInitial` with PA-bearing params, then `setEarlyDataContextForParams`)
+  and drives a full mock-transport handshake to completion. Pins that
+  the client's `peerTransportParams()` contains the configured
+  `preferred_address` value (IPv4/IPv6 addr+port, alt-CID, stateless
+  reset token) byte-for-byte. Investigation of the
+  `server × {quic-go, ngtcp2, quiche} × connectionmigration` matrix
+  cell (FAIL on 2026-05-09) confirmed via tshark+keylog that the
+  server's EncryptedExtensions blob already carries the
+  `preferred_address` parameter (codepoint 0x0d, length 49) with the
+  expected fields, so the qns encode path is correct; the matrix cell
+  failures have separate root causes (quiche has a TODO to decode PA;
+  quic-go's connection.go explicitly states "We don't support
+  connection migration yet … no use for the preferred_address";
+  ngtcp2's failure is a missing server-issued `PATH_CHALLENGE` on the
+  alt-port path, separate from PA encoding). The new test prevents
+  future regressions in the qns code path even though no PA-encoding
+  bug was found.
+
 ### Added
 
 - **External-interop wrapper testcase aliases** — `tools/external_interop.zig`
