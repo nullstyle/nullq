@@ -25,6 +25,15 @@ ENV PATH="/opt/zig:${PATH}"
 COPY quic-zig /src/quic-zig
 COPY boringssl-zig /src/boringssl-zig
 
+# Pre-populate the zig package cache from the host's
+# ~/.cache/zig/p/ if the wrapper staged it. Without this, the build
+# step below tries to fetch boringssl-zig over HTTPS from
+# github.com — which is flaky enough during interop iteration that
+# transient `HttpConnectionClosing` errors abort the matrix run.
+# When the staged cache is absent (e.g. fresh checkout), zig falls
+# back to the URL fetch.
+COPY zig-cache-p* /root/.cache/zig/p/
+
 WORKDIR /src/quic-zig
 RUN zig build qns-endpoint -Doptimize=ReleaseSafe
 

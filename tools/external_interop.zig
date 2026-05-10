@@ -42,6 +42,7 @@ const Config = struct {
     repo: []const u8,
     workspace: []const u8,
     path_env: []const u8 = "",
+    home_env: []const u8 = "",
     image: []const u8 = default_image,
     zig_version: []const u8 = default_zig_version,
     dry_run: bool = false,
@@ -78,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
         .repo = repo,
         .workspace = workspace,
         .path_env = init.environ_map.get("PATH") orelse "",
+        .home_env = init.environ_map.get("HOME") orelse "",
     };
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -284,6 +286,27 @@ fn buildImage(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     const staged_boringssl = try std.fs.path.join(allocator, &.{ docker_context, "boringssl-zig" });
     try copyTree(allocator, io, cfg.repo, staged_quic_zig);
     try copyTree(allocator, io, try std.fs.path.join(allocator, &.{ cfg.workspace, "boringssl-zig" }), staged_boringssl);
+
+    // Stage the host's zig package cache (~/.cache/zig/p/) into the docker
+    // context if available. The Dockerfile copies this into the
+    // container's cache so `zig build` finds the boringssl-zig
+    // dependency tarball locally and never hits github.com — robust
+    // against transient `HttpConnectionClosing` from the github CDN
+    // during interop iteration cycles.
+    const host_cache_p: ?[]const u8 = if (cfg.home_env.len == 0)
+        null
+    else
+        try std.fs.path.join(allocator, &.{ cfg.home_env, ".cache", "zig", "p" });
+    if (host_cache_p) |src| {
+        if (pathExists(io, src)) {
+            const staged_cache_p = try std.fs.path.join(allocator, &.{ docker_context, "zig-cache-p" });
+            // Best-effort: if copyTree fails (e.g., permissions), continue —
+            // the container will fall back to the URL fetch.
+            copyTree(allocator, io, src, staged_cache_p) catch |err| {
+                std.debug.print("note: skipping zig cache stage ({s}); container will fetch from URL\n", .{@errorName(err)});
+            };
+        }
+    }
 
     const cmd = [_][]const u8{
         "docker",
