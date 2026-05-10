@@ -12,6 +12,7 @@ __pycache__/
 
 # Interop wrapper artifacts
 interop/logs/
+interop/logs.*/
 interop/results/
 
 # OS detritus
