@@ -162,10 +162,14 @@ const ServerOptions = struct {
     /// the `version_information` (codepoint 0x11) transport parameter
     /// for RFC 9368 §6 compatible-version-negotiation upgrade. Defaults
     /// to v1-only so legacy interop testcases keep their historical
-    /// posture; `TESTCASE=versionnegotiation` flips this to
-    /// `[QUIC_V2, QUIC_V1]` so the server advertises v2 as preferred
-    /// and upgrades any v1-wire ClientHello whose `version_information`
-    /// includes v2.
+    /// posture; `TESTCASE=versionnegotiation` or `TESTCASE=v2` flips
+    /// this to `[QUIC_V2, QUIC_V1]` so the server advertises v2 as
+    /// preferred and upgrades any v1-wire ClientHello whose
+    /// `version_information` includes v2. The runner's actual testcase
+    /// name for compatible-version-negotiation is `v2` (per
+    /// `quic-interop-runner/testcases_quic.py:TestCaseV2`); the
+    /// `versionnegotiation` value is kept for parity with internal
+    /// scripts that pre-date the runner's renaming.
     versions: []const u32 = &.{quic_zig.QUIC_VERSION_1},
 };
 
@@ -182,20 +186,27 @@ const ClientOptions = struct {
     /// are alternates emitted in the `version_information` (codepoint
     /// 0x11) transport parameter (RFC 9368 §5) so a multi-version
     /// server can pick the highest-priority overlap and upgrade.
-    /// Defaults to v1-only; `TESTCASE=versionnegotiation` flips this
-    /// to `[QUIC_V1, QUIC_V2]` so the client sends a v1 wire Initial
-    /// while advertising v2 as a compatible upgrade target.
+    /// Defaults to v1-only; `TESTCASE=versionnegotiation` or
+    /// `TESTCASE=v2` flips this to `[QUIC_V1, QUIC_V2]` so the client
+    /// sends a v1 wire Initial while advertising v2 as a compatible
+    /// upgrade target. The runner's actual testcase name for the
+    /// compatible-version-negotiation cell is `v2`.
     versions: []const u32 = &.{quic_zig.QUIC_VERSION_1},
 };
 
 /// Pick the QUIC wire-format version list for the server role given a
 /// runner-supplied `TESTCASE` value. Returns `[QUIC_V2, QUIC_V1]` for
-/// `versionnegotiation` (server prefers v2; if the client offers v2 in
-/// `version_information`, the server upgrades), and the v1-only default
-/// otherwise. The caller is expected to pass the env-var contents
-/// verbatim — empty string maps to "default".
+/// `versionnegotiation` and `v2` (server prefers v2; if the client
+/// offers v2 in `version_information`, the server upgrades), and the
+/// v1-only default otherwise. The caller is expected to pass the
+/// env-var contents verbatim — empty string maps to "default".
+///
+/// The runner's compatible-version-negotiation testcase name is `v2`
+/// (`quic-interop-runner/testcases_quic.py:TestCaseV2`); the
+/// `versionnegotiation` alias is preserved because it pre-dates the
+/// runner rename and is still referenced by internal scripts.
 fn serverVersionsForTestcase(testcase: []const u8) []const u32 {
-    if (std.mem.eql(u8, testcase, "versionnegotiation")) {
+    if (isVersionNegotiationTestcase(testcase)) {
         return &qns_versions_v2_first;
     }
     return &.{quic_zig.QUIC_VERSION_1};
@@ -203,17 +214,30 @@ fn serverVersionsForTestcase(testcase: []const u8) []const u32 {
 
 /// Pick the QUIC wire-format version list for the client role given a
 /// runner-supplied `TESTCASE` value. Returns `[QUIC_V1, QUIC_V2]` for
-/// `versionnegotiation` (client sends a v1 wire Initial but advertises
-/// v2 as a compatible target via `version_information`), and the v1-only
-/// default otherwise. Note the inverse ordering vs.
+/// `versionnegotiation` and `v2` (client sends a v1 wire Initial but
+/// advertises v2 as a compatible target via `version_information`),
+/// and the v1-only default otherwise. Note the inverse ordering vs.
 /// `serverVersionsForTestcase`: the first entry is the wire version,
 /// not the preferred version, so `[v1, v2]` keeps the wire compatible
 /// with v1-only servers while letting a multi-version server upgrade.
+///
+/// See `serverVersionsForTestcase` for the rationale on why both
+/// `versionnegotiation` and `v2` are accepted.
 fn clientVersionsForTestcase(testcase: []const u8) []const u32 {
-    if (std.mem.eql(u8, testcase, "versionnegotiation")) {
+    if (isVersionNegotiationTestcase(testcase)) {
         return &qns_versions_v1_first;
     }
     return &.{quic_zig.QUIC_VERSION_1};
+}
+
+/// Is this `TESTCASE` value the runner's compatible-version-negotiation
+/// cell? The runner ships it as `v2` (per
+/// `quic-interop-runner/testcases_quic.py:TestCaseV2`); the historical
+/// `versionnegotiation` alias is also accepted so this binary keeps
+/// working with internal harnesses that pre-date the runner's name.
+inline fn isVersionNegotiationTestcase(testcase: []const u8) bool {
+    return std.mem.eql(u8, testcase, "v2") or
+        std.mem.eql(u8, testcase, "versionnegotiation");
 }
 
 /// Module-level constant slices so the `versionsForTestcase` helpers
@@ -739,11 +763,13 @@ pub fn main(init: std.process.Init) !void {
         var opts: ServerOptions = .{};
         if (init.environ_map.get("SSLKEYLOGFILE")) |path| opts.keylog_file = path;
         if (init.environ_map.get("QLOGDIR")) |path| opts.qlog_dir = path;
-        // RFC 9368 §6 opt-in for `TESTCASE=versionnegotiation`: the
+        // RFC 9368 §6 opt-in for the runner's compatible-version-
+        // negotiation cell (`TESTCASE=v2`; `versionnegotiation` also
+        // accepted for backwards compat with internal scripts). The
         // runner doesn't pass `-testcase` to the server side via
         // `interop/qns/run_endpoint.sh`, so we read the env var
-        // directly. Any non-versionnegotiation value (or unset)
-        // leaves `opts.versions` at its v1-only default.
+        // directly. Any unrelated value (or unset) leaves
+        // `opts.versions` at its v1-only default.
         if (init.environ_map.get("TESTCASE")) |testcase| {
             opts.versions = serverVersionsForTestcase(testcase);
         }
@@ -778,12 +804,14 @@ pub fn main(init: std.process.Init) !void {
         if (init.environ_map.get("REQUESTS")) |requests| opts.requests = requests;
         if (init.environ_map.get("TESTCASE")) |testcase| {
             opts.testcase = testcase;
-            // RFC 9368 §5 opt-in for `TESTCASE=versionnegotiation`:
-            // the env-var value flows through both the existing
-            // `opts.testcase` (which still drives 0-RTT / resumption /
-            // keyupdate / chacha20 mode selection elsewhere) and the
-            // new `opts.versions` slot consulted by `runClientConnection`
-            // when building the transport parameters.
+            // RFC 9368 §5 opt-in for the runner's compatible-version-
+            // negotiation cell (`TESTCASE=v2`; `versionnegotiation`
+            // also accepted for backwards compat). The env-var value
+            // flows through both the existing `opts.testcase` (which
+            // still drives 0-RTT / resumption / keyupdate / chacha20
+            // mode selection elsewhere) and the new `opts.versions`
+            // slot consulted by `runClientConnection` when building
+            // the transport parameters.
             opts.versions = clientVersionsForTestcase(testcase);
         }
         if (init.environ_map.get("SSLKEYLOGFILE")) |path| opts.keylog_file = path;
@@ -2878,9 +2906,9 @@ test "QNS client mode follows TESTCASE" {
 }
 
 test "QNS server/client versions follow TESTCASE=versionnegotiation" {
-    // Default (TESTCASE unset or any non-`versionnegotiation` value):
-    // both roles fall back to v1-only so legacy interop testcases keep
-    // their historical wire posture.
+    // Default (TESTCASE unset or any non-`versionnegotiation`/`v2`
+    // value): both roles fall back to v1-only so legacy interop
+    // testcases keep their historical wire posture.
     const default_server = serverVersionsForTestcase("");
     try std.testing.expectEqual(@as(usize, 1), default_server.len);
     try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, default_server[0]);
@@ -2919,6 +2947,34 @@ test "QNS server/client versions follow TESTCASE=versionnegotiation" {
     try std.testing.expectEqual(@as(usize, 2), vn_client.len);
     try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, vn_client[0]);
     try std.testing.expectEqual(quic_zig.QUIC_VERSION_2, vn_client[1]);
+
+    // `v2`: this is the runner's actual testcase name for the
+    // compatible-version-negotiation cell
+    // (`quic-interop-runner/testcases_quic.py:TestCaseV2`). Both roles
+    // must pick the multi-version posture identical to
+    // `versionnegotiation` so the runner's wire-trace check sees the
+    // server emit a v2 Initial and the post-handshake versions
+    // converge on v2. Earlier qns endpoints fired only on
+    // `versionnegotiation`, which left the server replying with a v1
+    // Initial — the runner then logged "Wrong version in server
+    // Initial. Expected 0x6b3343cf, got {'0x1'}" and failed the cell.
+    const v2_server = serverVersionsForTestcase("v2");
+    try std.testing.expectEqual(@as(usize, 2), v2_server.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_2, v2_server[0]);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, v2_server[1]);
+
+    const v2_client = clientVersionsForTestcase("v2");
+    try std.testing.expectEqual(@as(usize, 2), v2_client.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, v2_client[0]);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_2, v2_client[1]);
+
+    // Defensive: a value that *contains* `v2` as a substring but isn't
+    // exactly `v2` (e.g. a hypothetical future `v2+something` testcase)
+    // must NOT trip the multi-version posture, since
+    // `isVersionNegotiationTestcase` uses exact-equality matching.
+    const not_v2_server = serverVersionsForTestcase("v22");
+    try std.testing.expectEqual(@as(usize, 1), not_v2_server.len);
+    try std.testing.expectEqual(quic_zig.QUIC_VERSION_1, not_v2_server[0]);
 }
 
 test "isVersionSupported scans the configured list" {

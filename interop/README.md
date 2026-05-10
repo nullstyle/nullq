@@ -168,7 +168,8 @@ version-negotiation testcase, so `V` is an alias for `v2`.
   `src/conn/_state_tests.zig` pin the new ordering and the
   non-migration packet-size invariant. **Re-running the interop
   matrix is needed to confirm the cell actually flips PASS.**
-- **Server `versionnegotiation`** — fix landed in two stages.
+- **`v2` (compatible-version-negotiation) cell** — fix landed in
+  three stages.
   Stage 1 on `followup-vneg-upgrade` (2026-05-09): the library now
   implements the RFC 9368 §6 compatible-version-negotiation upgrade
   on the server side (see `Server.Config.versions` /
@@ -176,21 +177,35 @@ version-negotiation testcase, so `V` is an alias for `v2`.
   `Connection.applyPendingVersionUpgrade`). Stage 2 on
   `followup-qns-vneg` (2026-05-09): `interop/qns_endpoint.zig` now
   reads `TESTCASE` from the env on both roles and flips its wire-
-  format version lists when `TESTCASE=versionnegotiation` —
-  `[QUIC_V2, QUIC_V1]` for the server (so v2 is advertised as
-  preferred and the inbound v1 Initial gets upgraded), `[QUIC_V1,
-  QUIC_V2]` for the client (wire stays v1, `version_information`
-  offers v2 as a compatible target). The qns server replicates the
-  Server-side pre-parse via the public `quic_zig.wire.vneg_preparse`
-  helpers, sets `params.setCompatibleVersions(...)`, calls
+  format version lists to `[QUIC_V2, QUIC_V1]` for the server (so v2
+  is advertised as preferred and the inbound v1 Initial gets
+  upgraded) and `[QUIC_V1, QUIC_V2]` for the client (wire stays v1,
+  `version_information` offers v2 as a compatible target). Stage 3 on
+  `followup-client-vneg` (2026-05-09) added the parallel client-side
+  upgrade consumption (`Connection.clientAcceptCompatibleVersion`
+  re-derives Initial keys when the server responds at v2), with
+  RFC 9368 §6 ¶6/¶7 downgrade-attack guards on both sides. **Stage 4
+  on `followup-v2-investigation` (2026-05-09) closed the last gap**:
+  the runner's actual testcase name is `v2`, not `versionnegotiation`
+  (per `quic-interop-runner/testcases_quic.py:TestCaseV2`), so the
+  qns endpoint's testcase-name gate fired only on
+  `versionnegotiation` and left the `v2` cell at the v1-only default.
+  Symptom: the runner logged "Wrong version in server Initial.
+  Expected 0x6b3343cf, got {'0x1'}" for both
+  `server × ngtcp2 × v2` and `client × ngtcp2 × v2`. Fix:
+  `serverVersionsForTestcase` and `clientVersionsForTestcase` now
+  fire on either `v2` or `versionnegotiation` (the legacy alias is
+  preserved for internal scripts that pre-date the runner's name).
+  The qns server still replicates the server-side pre-parse via the
+  public `quic_zig.wire.vneg_preparse` helpers, sets
+  `params.setCompatibleVersions(...)`, calls
   `Connection.setPendingVersionUpgrade(...)`, and applies the flip
   after `handleWithEcn` returns — same shape as the high-level
-  `Server.dispatchToSlot` flow. **The interop cell will only flip
-  PASS once the parallel client-side upgrade-consumption branch
-  lands**; until then the qns client sends `[v1, v2]` and the
-  server upgrades to v2, but the client cannot yet consume the v2
-  Initial response. The server-role half of the cell is now
-  end-to-end ready against any peer client that already speaks v2.
+  `Server.dispatchToSlot` flow. **Re-running the interop matrix is
+  needed to confirm the `server × ngtcp2 × v2` and
+  `client × ngtcp2 × v2` cells flip PASS.** The other peer images
+  in the matrix (`quic-go`, `quiche`) report `v2` as unsupported in
+  their interop builds, so those cells stay marked accordingly.
 
 **Build infra note**: the qns Dockerfile (`interop/qns/Dockerfile`)
 is now pinned to `ARG ZIG_VERSION=0.17.0-dev.269+ebff43698`, matching

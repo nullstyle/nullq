@@ -11,6 +11,17 @@ breaking changes; see notes per release.
 
 ### Tests
 
+- **`v2` testcase-name coverage in the qns version-selection unit test**
+  — the existing test "QNS server/client versions follow
+  `TESTCASE=versionnegotiation`" in `interop/qns_endpoint.zig` now
+  also asserts that `serverVersionsForTestcase("v2")` and
+  `clientVersionsForTestcase("v2")` return the same multi-version
+  postures as the `versionnegotiation` legacy alias, plus a
+  defensive `v22` case to lock the exact-equality matching of the
+  shared `isVersionNegotiationTestcase` helper. Pins the
+  testcase-name gating fix so a future rename of the gate cannot
+  regress the runner's `v2` cell silently.
+
 - **Regression pin: qns `Connection.acceptInitial` code path preserves
   `preferred_address` end-to-end** — a new e2e test in
   `tests/e2e/server_smoke.zig` ("Connection.acceptInitial: qns code path
@@ -226,6 +237,35 @@ breaking changes; see notes per release.
   through `Params.encode` / `Params.decode`.
 
 ### Fixed
+
+- **Interop `v2` cell × ngtcp2 (server + client)** — `serverVersionsForTestcase`
+  and `clientVersionsForTestcase` in `interop/qns_endpoint.zig` now fire on
+  `TESTCASE=v2` in addition to `TESTCASE=versionnegotiation`. The runner's
+  compatible-version-negotiation cell ships as `v2` (per
+  `quic-interop-runner/testcases_quic.py:TestCaseV2`), but the qns endpoint's
+  testcase-name gate previously fired only on the legacy
+  `versionnegotiation` value, leaving the multi-version posture
+  off and the server replying with a v1 Initial. The runner then
+  failed the cell with `Wrong version in server Initial. Expected
+  0x6b3343cf, got {'0x1'}` for both `server × ngtcp2 × v2` and
+  `client × ngtcp2 × v2`. Fix: extracted a shared
+  `isVersionNegotiationTestcase` helper that exact-matches either
+  `v2` or `versionnegotiation` (the legacy alias is preserved for
+  internal scripts). The underlying RFC 9368 §6 transport machinery —
+  server-side upgrade (`5258d56`), client-side consumption
+  (`6f74ae3`), downgrade-attack guards on both sides
+  (`6f74ae3` + `a3db9da`), and the `[v2,v1]` server e2e in
+  `tests/e2e/quic_v2_handshake.zig` — was already correct; this
+  patch is purely a one-line gate widening at the qns endpoint
+  layer. The unit test "QNS server/client versions follow
+  TESTCASE=versionnegotiation" in `interop/qns_endpoint.zig` now
+  also covers `TESTCASE=v2` and a defensive `v22`-style substring
+  case to lock the exact-equality semantics. The other peer images
+  in the matrix (`quic-go`, `quiche`) advertise no v2 support in
+  their interop builds, so those `v2` cells stay marked
+  `unsupported (peer)` and are excluded from regression tracking.
+  **Pending matrix re-run** to confirm the two ngtcp2 cells flip
+  FAIL → PASS.
 
 - **Interop server × `connectionmigration` × {quic-go, ngtcp2, quiche}** —
   the qns endpoint (`interop/qns_endpoint.zig`) now advertises a
