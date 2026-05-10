@@ -83,75 +83,31 @@ pub const ClientVersionInfo = struct {
 };
 
 /// Reassemble the ClientHello bytes from a decrypted Initial payload.
-/// Walks the frame stream looking for CRYPTO frames; collects them by
-/// offset; returns the contiguous slice covering `[0, total_len)`.
+/// Walks the frame stream looking for CRYPTO frames; merges them by
+/// offset; returns the contiguous slice covering `[0, total_len)` if
+/// the assembled prefix covers the declared ClientHello length.
 ///
-/// Single-Initial ClientHellos are the overwhelming common case (and
-/// the hard requirement here). When the ClientHello is fragmented
-/// across multiple Initials — or when the frame stream is malformed,
-/// has overlapping fragments, or starts with a gap at offset > 0 —
-/// the function returns `null`. The caller treats `null` as "skip the
-/// upgrade and continue with the wire version", which is spec-
-/// compliant via §6's graceful-fallback clause.
+/// Single-Initial ClientHellos are the overwhelming common case. The
+/// CRYPTO frames inside that Initial may arrive in any order — some
+/// stacks (notably ngtcp2) emit a CH split across many small CRYPTO
+/// frames at non-monotonic offsets within a single packet. We use the
+/// same segment-merge engine as `ChReassembler` so a single Initial
+/// whose CH is fully present (regardless of frame order) is accepted.
+///
+/// When the ClientHello is fragmented across multiple Initials — or
+/// when the frame stream is malformed, has overlapping fragments, or
+/// starts with a gap at offset > 0 — the function returns `null`. The
+/// caller treats `null` as "skip the upgrade and continue with the
+/// wire version", which is spec-compliant via §6's graceful-fallback
+/// clause.
 ///
 /// `dst` must be at least `max_client_hello_bytes` long. The returned
 /// slice borrows into `dst`.
 pub fn reassembleClientHello(dst: []u8, payload: []const u8) ?[]const u8 {
     if (dst.len < max_client_hello_bytes) return null;
-
-    // Track which bytes of the prefix have been written. We only care
-    // about the contiguous prefix starting at offset 0; once the
-    // contiguous frontier covers enough bytes to hold the declared
-    // ClientHello length, we return that prefix.
-    var contig_end: usize = 0;
-    var have_first_frame = false;
-    var declared_len: ?usize = null;
-
-    var pos: usize = 0;
-    while (pos < payload.len) {
-        const decoded = frame_decode.decode(payload[pos..]) catch return null;
-        pos += decoded.bytes_consumed;
-        switch (decoded.frame) {
-            .crypto => |cr| {
-                const off: u64 = cr.offset;
-                const data = cr.data;
-                if (data.len == 0) continue;
-                // Bound check: refuse to grow beyond `dst`.
-                const end_off = std.math.add(u64, off, @intCast(data.len)) catch return null;
-                if (end_off > @as(u64, dst.len)) return null;
-                const off_usize: usize = @intCast(off);
-                @memcpy(dst[off_usize .. off_usize + data.len], data);
-                if (off == 0) have_first_frame = true;
-                // Advance the contiguous frontier.
-                if (off <= contig_end and end_off > contig_end) {
-                    contig_end = @intCast(end_off);
-                }
-                // Once we have enough bytes to read the TLS Handshake
-                // length prefix, lock in the declared length.
-                if (declared_len == null and have_first_frame and contig_end >= 4) {
-                    if (dst[0] != tls_msg_type_client_hello) return null;
-                    const u24_len = (@as(usize, dst[1]) << 16) |
-                        (@as(usize, dst[2]) << 8) |
-                        @as(usize, dst[3]);
-                    const total = u24_len + 4;
-                    if (total > dst.len) return null;
-                    declared_len = total;
-                }
-            },
-            // Initials carry CRYPTO + ACK + PING + PADDING. Any of
-            // those are fine to skip.
-            .padding, .ping, .ack, .path_ack => {},
-            // Any other frame type in an Initial is a peer protocol
-            // violation; the proper handler will catch it. We just
-            // bail out of the pre-parse so the upgrade falls back.
-            else => return null,
-        }
-    }
-
-    if (!have_first_frame) return null;
-    const want = declared_len orelse return null;
-    if (contig_end < want) return null;
-    return dst[0..want];
+    var rc = ChReassembler.init(dst);
+    const got = rc.feed(payload) catch return null;
+    return got;
 }
 
 /// Streaming offset-based ClientHello reassembler.
@@ -718,6 +674,52 @@ test "reassembleClientHello: bails on missing offset 0 frame (fragmented)" {
         @as(?[]const u8, null),
         reassembleClientHello(&dst, payload_buf[0 .. 4 + body.len]),
     );
+}
+
+test "reassembleClientHello: ngtcp2-style out-of-order CRYPTO in single Initial" {
+    // Regression for the ngtcp2 × v2 interop FAIL: ngtcp2 emits the
+    // ClientHello inside a single Initial as a sequence of small
+    // non-monotonic CRYPTO frames. The earlier frontier-only walk
+    // never advanced past the first frame's high offset, so the
+    // assembler returned null even though the CH was fully present —
+    // skipping the §6 upgrade decision and locking the connection
+    // onto the wire version.
+    //
+    // The frame layout below mirrors the actual offsets observed in
+    // `interop/logs.server-final/quic-zig_ngtcp2/v2/sim/trace_node_left.pcap`
+    // (CH total = 279 bytes split across 11 disjoint CRYPTO frames).
+    var ch_storage: [max_client_hello_bytes]u8 = undefined;
+    const ch = buildSyntheticCh(&ch_storage, 279);
+
+    const Frag = struct { offset: u64, len: usize };
+    const frags = [_]Frag{
+        .{ .offset = 215, .len = 4 },
+        .{ .offset = 119, .len = 59 },
+        .{ .offset = 230, .len = 8 },
+        .{ .offset = 238, .len = 20 },
+        .{ .offset = 268, .len = 11 },
+        .{ .offset = 178, .len = 30 },
+        .{ .offset = 208, .len = 7 },
+        .{ .offset = 219, .len = 4 },
+        .{ .offset = 258, .len = 10 },
+        .{ .offset = 223, .len = 7 },
+        .{ .offset = 0, .len = 119 },
+    };
+
+    var payload_buf: [1500]u8 = undefined;
+    var p: usize = 0;
+    inline for (frags) |f| {
+        const off_usize: usize = @intCast(f.offset);
+        const wrote = frame_encode.encode(payload_buf[p..], .{ .crypto = .{
+            .offset = f.offset,
+            .data = ch[off_usize .. off_usize + f.len],
+        } }) catch unreachable;
+        p += wrote;
+    }
+
+    var dst: [max_client_hello_bytes]u8 = undefined;
+    const got = reassembleClientHello(&dst, payload_buf[0..p]) orelse return error.TestExpectedSome;
+    try std.testing.expectEqualSlices(u8, ch, got);
 }
 
 // -- ChReassembler test helpers ----------------------------------------

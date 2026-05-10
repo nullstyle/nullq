@@ -9,6 +9,26 @@ breaking changes; see notes per release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`reassembleClientHello` accepts out-of-order CRYPTO frames in a single
+  Initial** — ngtcp2 emits the ClientHello as a sequence of small,
+  non-monotonic-offset CRYPTO frames within one Initial packet. The
+  previous "frontier-only" walker advanced `contig_end` only when each
+  successive frame's offset was at-or-before the existing frontier, so
+  a frame at a high offset arriving before a low-offset frame caused
+  the walker to abort with `null` ("CH incomplete") even though the
+  full CH bytes were present in the payload. Skipping the upgrade
+  silently locked the connection onto the wire version, which is why
+  `server × ngtcp2 × v2` interop cell failed (`Wrong version in server
+  Initial. Expected 0x6b3343cf, got {'0x1'}`). The reassembler now
+  delegates to the existing `ChReassembler` segment-merge engine so
+  any single-Initial-CH frame ordering produces the same result as the
+  multi-Initial path. New regression test in
+  `src/wire/vneg_preparse.zig` reproduces ngtcp2's exact 11-frame
+  out-of-order layout decoded from
+  `interop/logs.server-final/quic-zig_ngtcp2/v2/sim/trace_node_left.pcap`.
+
 ### Tests
 
 - **`v2` testcase-name coverage in the qns version-selection unit test**
