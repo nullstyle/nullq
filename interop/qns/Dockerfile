@@ -23,7 +23,6 @@ RUN case "$TARGETPLATFORM" in \
 ENV PATH="/opt/zig:${PATH}"
 
 COPY quic-zig /src/quic-zig
-COPY boringssl-zig /src/boringssl-zig
 
 # Pre-populate the zig package cache from the host's
 # ~/.cache/zig/p/ if the wrapper staged it. Without this, the build
@@ -32,10 +31,13 @@ COPY boringssl-zig /src/boringssl-zig
 # transient `HttpConnectionClosing` errors abort the matrix run.
 # When the staged cache is absent (e.g. fresh checkout), zig falls
 # back to the URL fetch.
-COPY zig-cache-p* /root/.cache/zig/p/
+COPY zig-cache-p/ /root/.cache/zig/p/
 
 WORKDIR /src/quic-zig
-RUN zig build qns-endpoint -Doptimize=ReleaseSafe
+# Build for the architecture's baseline CPU. Without this, Zig defaults to
+# native and BoringSSL can compile hardware checks as compile-time true on the
+# build host, then SIGILL on a less capable deployment CPU.
+RUN zig build qns-endpoint -Doptimize=ReleaseSafe -Dcpu=baseline
 
 FROM martenseemann/quic-network-simulator-endpoint:latest
 

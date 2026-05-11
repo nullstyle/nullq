@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const default_image = "quic-zig-interop:local";
-const default_zig_version = "0.16.0";
+const default_image = "quic-zig-qns:local";
+const default_zig_version = "0.17.0-dev.269+ebff43698";
 const default_runner_python = "3.12";
 const default_wireshark_image = "quic-zig-interop-wireshark:local";
 
@@ -43,6 +43,7 @@ const Config = struct {
     workspace: []const u8,
     path_env: []const u8 = "",
     home_env: []const u8 = "",
+    zig_global_cache_env: []const u8 = "",
     image: []const u8 = default_image,
     zig_version: []const u8 = default_zig_version,
     dry_run: bool = false,
@@ -80,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
         .workspace = workspace,
         .path_env = init.environ_map.get("PATH") orelse "",
         .home_env = init.environ_map.get("HOME") orelse "",
+        .zig_global_cache_env = init.environ_map.get("ZIG_GLOBAL_CACHE_DIR") orelse "",
     };
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -119,8 +121,8 @@ pub fn main(init: std.process.Init) !void {
 fn usage() void {
     std.debug.print(
         \\usage:
-        \\  zig build external-interop -- preflight [--image quic-zig-interop:local] [--dry-run]
-        \\  zig build external-interop -- build-image [--image quic-zig-interop:local] [--zig-version 0.16.0] [--dry-run]
+        \\  zig build external-interop -- preflight [--image quic-zig-qns:local] [--dry-run]
+        \\  zig build external-interop -- build-image [--image quic-zig-qns:local] [--zig-version 0.17.0-dev.269+ebff43698] [--dry-run]
         \\  zig build external-interop -- runner [--role server|client] [--build-image] [--runner-dir ../quic-interop-runner] [--clients quic-go,ngtcp2,quiche] [--servers quic-go,ngtcp2,quiche] [--tests core+retry] [--scenario "drop-rate ..."] [--python 3.12] [--wireshark-image quic-zig-interop-wireshark:local] [--dry-run]
         \\
     , .{});
@@ -265,7 +267,6 @@ fn parseCommonAt(args: []const []const u8, i: *usize, cfg: *Config) !bool {
 }
 
 fn preflight(allocator: std.mem.Allocator, io: std.Io, cfg: Config, runner: bool) !void {
-    try expectPath(allocator, io, try std.fs.path.join(allocator, &.{ cfg.workspace, "boringssl-zig" }));
     try expectPath(allocator, io, try std.fs.path.join(allocator, &.{ cfg.repo, "interop", "qns", "Dockerfile" }));
 
     if (!cfg.dry_run) {
@@ -283,24 +284,22 @@ fn buildImage(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
     try recreateDir(io, docker_context);
 
     const staged_quic_zig = try std.fs.path.join(allocator, &.{ docker_context, "quic-zig" });
-    const staged_boringssl = try std.fs.path.join(allocator, &.{ docker_context, "boringssl-zig" });
     try copyTree(allocator, io, cfg.repo, staged_quic_zig);
-    try copyTree(allocator, io, try std.fs.path.join(allocator, &.{ cfg.workspace, "boringssl-zig" }), staged_boringssl);
 
-    // Stage the host's zig package cache (~/.cache/zig/p/) into the docker
-    // context if available. The Dockerfile copies this into the
-    // container's cache so `zig build` finds the boringssl-zig
-    // dependency tarball locally and never hits github.com — robust
-    // against transient `HttpConnectionClosing` from the github CDN
-    // during interop iteration cycles.
-    const host_cache_p: ?[]const u8 = if (cfg.home_env.len == 0)
-        null
-    else
-        try std.fs.path.join(allocator, &.{ cfg.home_env, ".cache", "zig", "p" });
+    // Always create the package-cache directory so the Dockerfile can
+    // COPY it whether or not the host has a populated Zig cache.
+    const staged_cache_p = try std.fs.path.join(allocator, &.{ docker_context, "zig-cache-p" });
+    try std.Io.Dir.cwd().createDirPath(io, staged_cache_p);
+
+    // Stage the host's Zig package cache into the docker context if
+    // available. The Dockerfile copies this into the container's cache
+    // so `zig build` can find URL+hash dependencies locally when the
+    // host has already fetched them, while fresh CI remains able to
+    // fetch from the pins in build.zig.zon.
+    const host_cache_p = try hostZigPackageCachePath(allocator, cfg);
     if (host_cache_p) |src| {
         if (pathExists(io, src)) {
-            const staged_cache_p = try std.fs.path.join(allocator, &.{ docker_context, "zig-cache-p" });
-            // Best-effort: if copyTree fails (e.g., permissions), continue —
+            // Best-effort: if copyTree fails (e.g., permissions), continue;
             // the container will fall back to the URL fetch.
             copyTree(allocator, io, src, staged_cache_p) catch |err| {
                 std.debug.print("note: skipping zig cache stage ({s}); container will fetch from URL\n", .{@errorName(err)});
@@ -320,6 +319,16 @@ fn buildImage(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
         ".",
     };
     try runCommand(io, &cmd, docker_context, cfg.dry_run);
+}
+
+fn hostZigPackageCachePath(allocator: std.mem.Allocator, cfg: Config) !?[]const u8 {
+    if (cfg.zig_global_cache_env.len != 0) {
+        return try std.fs.path.join(allocator, &.{ cfg.zig_global_cache_env, "p" });
+    }
+    if (cfg.home_env.len != 0) {
+        return try std.fs.path.join(allocator, &.{ cfg.home_env, ".cache", "zig", "p" });
+    }
+    return null;
 }
 
 fn runRunner(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !void {
@@ -812,6 +821,20 @@ test "runner client role defaults to client result path" {
     try std.testing.expectEqual(RunnerRole.client, cfg.role);
     try std.testing.expectEqualStrings("quic-go", cfg.servers);
     try std.testing.expect(std.mem.endsWith(u8, cfg.json_path.?, "interop/results/quic-zig-client.json"));
+}
+
+test "host Zig package cache honors ZIG_GLOBAL_CACHE_DIR first" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .repo = "/tmp/quic_zig",
+        .workspace = "/tmp",
+        .home_env = "/home/user",
+        .zig_global_cache_env = "/tmp/quic_zig/.zig-global-cache",
+    };
+    const cache = (try hostZigPackageCachePath(allocator, cfg)).?;
+    defer allocator.free(cache);
+
+    try std.testing.expectEqualStrings("/tmp/quic_zig/.zig-global-cache/p", cache);
 }
 
 test "copy ignore filters generated trees" {

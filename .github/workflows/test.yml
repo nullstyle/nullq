@@ -6,10 +6,9 @@ on:
   pull_request:
     branches: [main]
 
-# quic-zig pins Zig 0.16.0 via mise (mise.toml). The official Zig
-# downloads index doesn't list 0.16.0 — it's installed from mise's
-# registry — so we use jdx/mise-action to install the same toolchain
-# CI as local. boringssl-zig is a URL+hash dep, so Zig fetches it
+# quic-zig tracks the project toolchain via mise.toml, so CI uses
+# jdx/mise-action to install the same Zig and helper tools as local
+# development. boringssl-zig is a URL+hash dep, so Zig fetches it
 # itself during build.
 jobs:
   build-test:
@@ -22,7 +21,7 @@ jobs:
       - name: Checkout quic-zig
         uses: actions/checkout@v4
 
-      - name: Set up mise (zig 0.16.0 + project tools)
+      - name: Set up mise (project tools)
         uses: jdx/mise-action@v2
         with:
           install: true

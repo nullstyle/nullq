@@ -32,17 +32,25 @@ Client role:
 - Tools installed through `mise install`.
 - Wireshark/tshark new enough for the runner trace checks.
 
-The wrapper creates throwaway state under `.zig-cache/` and writes
-runner outputs under ignored `interop/logs*` and `interop/results/`
-directories.
+The wrapper creates throwaway state under `.zig-cache/`, builds the
+QNS image from this repository, and writes runner outputs under ignored
+`interop/logs*` and `interop/results/` directories. No standalone
+`quic-zig-qns` checkout is required.
 
 ## Build
 
 ```sh
 mise install
 zig build qns-endpoint -Doptimize=ReleaseSafe
-zig build external-interop -- runner --build-image
+zig build external-interop -- build-image --image quic-zig-qns:local
 ```
+
+The image build stages the current checkout under
+`.zig-cache/interop-docker-context/` and uses the URL+hash pins in
+`build.zig.zon` for dependencies. If the host already has a Zig package
+cache, the helper stages it into the Docker context as a best-effort
+speed and reliability hint; fresh CI machines can still build without
+a sibling `boringssl-zig` checkout.
 
 ## Run
 
@@ -69,6 +77,21 @@ Use a non-adjacent runner checkout:
 ```sh
 zig build external-interop -- runner --runner-dir /path/to/quic-interop-runner --clients quic-go --tests H,D
 ```
+
+`just` exposes the common local and remote workflows:
+
+```sh
+just interop-build-image
+just interop
+just interop-client
+just interop-features
+just interop-remote-mainstream
+```
+
+The published QNS image workflow lives in
+`.github/workflows/qns-image.yml` and publishes
+`ghcr.io/nullstyle/quic-zig-qns` with the source commit in the
+`commit_id` label.
 
 ## Test Selectors
 

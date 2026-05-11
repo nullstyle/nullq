@@ -10,7 +10,7 @@ on:
       tests:
         description: "QNS test letters (comma-separated)"
         required: false
-        default: "H,DC,M"
+        default: "H,D,C,M"
       clients:
         description: "Client matrix"
         required: false
@@ -27,20 +27,13 @@ jobs:
     timeout-minutes: 90
     env:
       QUIC_ZIG_IMAGE: quic-zig-qns:local
-      TESTS: ${{ github.event.inputs.tests || 'H,DC,M' }}
+      TESTS: ${{ github.event.inputs.tests || 'H,D,C,M' }}
       CLIENTS: ${{ github.event.inputs.clients || 'quic-go,quiche,ngtcp2' }}
     steps:
       - name: Checkout quic-zig
         uses: actions/checkout@v4
         with:
           path: quic-zig
-
-      - name: Checkout quic-zig-qns
-        uses: actions/checkout@v4
-        with:
-          repository: nullstyle/quic-zig-qns
-          ref: main
-          path: quic-zig-qns
 
       - name: Checkout quic-interop-runner
         uses: actions/checkout@v4
@@ -49,7 +42,7 @@ jobs:
           ref: master
           path: quic-interop-runner
 
-      - name: Set up mise (zig 0.16.0, python 3.12, uv, just)
+      - name: Set up mise (project tools)
         uses: jdx/mise-action@v2
         with:
           install: true
@@ -63,17 +56,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build quic-zig-qns image
-        working-directory: quic-zig-qns
-        env:
-          QUIC_ZIG_DIR: ${{ github.workspace }}/quic-zig
+      - name: Build QNS image from quic-zig
+        working-directory: quic-zig
         run: |
-          # `make build-local` archives quic-zig and feeds it in as a
-          # Docker build context (see quic-zig-qns/Makefile and
-          # Dockerfile.local). Zig fetches boringssl-zig from the
-          # URL+hash pin in quic-zig's build.zig.zon during the
-          # in-Docker build. LOCALTAG=local matches QUIC_ZIG_IMAGE.
-          make build-local LOCALTAG=local
+          zig build external-interop -- build-image --image "${QUIC_ZIG_IMAGE}"
 
       - name: Run QNS interop (server role)
         working-directory: quic-zig
