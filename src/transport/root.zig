@@ -1,14 +1,14 @@
-//! quic_zig.transport — UDP socket plumbing.
+//! quic_zig.transport - UDP socket plumbing.
 //!
 //! quic_zig is transport-agnostic at the protocol layer: connections
 //! consume and produce datagrams, and *something* shuttles those
-//! datagrams to a UDP socket. This module collects helpers for
-//! that "something" — for now, just socket-option tuning that any
-//! production server (the QNS endpoint or otherwise) will want.
+//! datagrams to a UDP socket. This module collects helpers for that
+//! layer: socket-option tuning, ECN cmsg helpers, and opinionated
+//! `std.Io` UDP loops for the high-level `Server` and `Client`
+//! wrappers.
 //!
-//! Future additions: `recvmmsg` / `sendmmsg` / GSO wrappers,
-//! `IP_PKTINFO` / `IPV6_RECVPKTINFO` for path tracking, ECN
-//! marking helpers.
+//! Future additions may include `recvmmsg` / `sendmmsg` / GSO wrappers
+//! and richer platform-specific path-tracking helpers.
 
 /// Submodule of UDP socket-option helpers (`SO_RCVBUF`, `SO_SNDBUF`).
 pub const socket_opts = @import("socket_opts.zig");

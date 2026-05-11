@@ -102,9 +102,8 @@ pub const LbConfig = struct {
     /// Number of nonce bytes, `min_nonce_len..max_nonce_len`.
     nonce_len: u8,
     /// AES-128 key that selects an encrypted mode, or null for the
-    /// plaintext mode of draft §5.2. LB-1 ships only the plaintext
-    /// mode; encrypted-mode `mint` returns `error.UnsupportedMode`
-    /// until LB-2 / LB-3 land.
+    /// plaintext mode of draft §5.2. Single-pass and four-pass
+    /// encrypted modes are both implemented.
     key: ?Key = null,
     /// When true, the low 5 bits of the first octet hold `cid_len - 1`
     /// so the LB can self-describe the CID length on short headers.

@@ -81,21 +81,18 @@ pub const Error = error{
 };
 
 /// CID-generation algorithm selected by an `LbConfig`. The draft maps
-/// (key presence, combined length) to one of three encrypted modes
-/// plus the plaintext mode. LB-1 ships only `.plaintext`; the other
-/// variants exist so the dispatch is forward-compatible with LB-2 / LB-3.
+/// key presence and combined server-id/nonce length to plaintext,
+/// single-pass AES, or four-pass Feistel mode.
 pub const Mode = enum {
     /// Draft §5.2: write `server_id || nonce` directly. Selected when
     /// `LbConfig.key` is null.
     plaintext,
     /// Draft §5.3: AES-128-ECB over the full plaintext block. Selected
     /// when `key != null` and `server_id_len + nonce_len == 16`.
-    /// Returns `error.UnsupportedMode` from `mint` until LB-2 lands.
     aes_single_pass,
     /// Draft §5.4: 4-round Feistel network with AES-128-ECB as the
     /// round function. Selected when `key != null` and
-    /// `server_id_len + nonce_len != 16`. Returns
-    /// `error.UnsupportedMode` from `mint` until LB-3 lands.
+    /// `server_id_len + nonce_len != 16`.
     aes_four_pass,
 };
 

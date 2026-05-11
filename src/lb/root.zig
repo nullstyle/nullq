@@ -1,11 +1,10 @@
-//! `quic_zig.lb` — server-side QUIC-LB connection-ID generation.
+//! `quic_zig.lb` - QUIC-LB connection-ID generation.
 //!
 //! Implements the server-side surface of
 //! [draft-ietf-quic-load-balancers-21][draft]: encoding routing
 //! identity into connection IDs that an external layer-4 load balancer
-//! can decode. The LB-side decode path is intentionally out of scope
-//! for now (an LB is not a server); a future stretch goal may ship one
-//! for ops tooling and round-trip tests.
+//! can decode. The module also exposes the LB-side decoder used by
+//! tooling and round-trip tests.
 //!
 //! [draft]: https://datatracker.ietf.org/doc/draft-ietf-quic-load-balancers/
 //!
@@ -51,10 +50,8 @@ pub const mintUnroutable = cid.mintUnroutable;
 pub const min_unroutable_cid_len = cid.min_unroutable_cid_len;
 
 /// LB-side decoder. Recovers `(config_id, server_id, nonce)` from a
-/// minted CID. Plaintext (§5.5) and four-pass Feistel (§5.5.2) are
-/// implemented; single-pass §5.5.1 returns
-/// `Decoded.Error.SinglePassDecodeNotImplemented` until a
-/// `boringssl-zig` AES-128-ECB-decrypt wrapper lands.
+/// minted CID. Plaintext, single-pass AES, and four-pass Feistel modes
+/// are implemented.
 pub const decode = decode_mod.decode;
 pub const Decoded = decode_mod.Decoded;
 pub const DecodeError = decode_mod.Error;

@@ -1,4 +1,4 @@
-//! quic_zig — a Zig-first IETF QUIC v1 implementation.
+//! quic_zig - a Zig-first IETF QUIC transport implementation.
 //!
 //! This module is the public API surface. It re-exports the namespace
 //! modules (`wire`, `frame`, `tls`, `conn`, `transport`) plus the
@@ -36,9 +36,10 @@ pub const quic_lb_draft_version: u32 = 21;
 /// Public Alternative Server Address target.
 /// `frame.types.AlternativeV4Address` / `AlternativeV6Address` and the
 /// 0xff0969d85c transport parameter follow
-/// draft-munizaga-quic-alternative-server-address-00. The current
-/// drop ships only the codec; receive-side state-machine integration
-/// is pending. Bumping this is a deliberate scoped change.
+/// draft-munizaga-quic-alternative-server-address-00. quic_zig exposes
+/// codec support, transport-parameter negotiation, server emit helpers,
+/// typed receive events, and embedder helpers under `alt_addr`.
+/// Bumping this is a deliberate scoped change.
 pub const alt_server_address_draft_version: u32 = 0;
 
 /// Pure-Zig wire-format encoders and decoders (varints, packet
@@ -74,11 +75,10 @@ pub const transport = @import("transport/root.zig");
 pub const lb = @import("lb/root.zig");
 
 /// Embedder helpers for the alternative-server-address extension
-/// (draft-munizaga-quic-alternative-server-address-00). Today the
-/// only export is `recommendedMigrationDelayMs`, the §9 thundering-
-/// herd mitigation. The on-wire codec lives in `frame`, the
-/// transport-parameter codec lives in `tls.transport_params`, and
-/// the connection-level emit / receive APIs live on `Connection`.
+/// (draft-munizaga-quic-alternative-server-address-00). The on-wire
+/// codec lives in `frame`, the transport-parameter codec lives in
+/// `tls.transport_params`, connection-level emit / receive APIs live
+/// on `Connection`, and delay / address-book helpers live here.
 pub const alt_addr = @import("alt_addr/root.zig");
 
 /// High-level convenience wrapper for embedding quic_zig as a QUIC
@@ -232,7 +232,7 @@ pub const RetryTokenKey = conn.RetryTokenKey;
 pub const RetryTokenValidationResult = conn.RetryTokenValidationResult;
 
 pub fn version() []const u8 {
-    return "0.0.0";
+    return "0.2.0";
 }
 
 test {
@@ -252,7 +252,7 @@ test "phase 0: builds and links against boringssl-zig" {
     const digest = try boringssl.crypto.hash.Sha256.hash("quic_zig");
     try std.testing.expectEqual(@as(usize, 32), digest.len);
 
-    try std.testing.expectEqualStrings("0.0.0", version());
+    try std.testing.expectEqualStrings("0.2.0", version());
     try std.testing.expectEqual(@as(u32, 1), QUIC_VERSION_1);
     try std.testing.expectEqual(@as(u32, 0x6b3343cf), QUIC_VERSION_2);
 }

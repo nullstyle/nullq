@@ -532,13 +532,10 @@ const ConfigImpl = struct {
     /// on the wire" default (README §"On by default"). Treat the
     /// load balancer as the trust boundary; in plaintext mode (no
     /// `LbConfig.key`) any on-path observer between LB and peer can
-    /// read `server_id` directly. Encrypted modes (LB-2, LB-3) raise
-    /// the bar to "linkability without key" but do not protect
-    /// against attackers between LB and server.
-    ///
-    /// LB-1 ships only the plaintext mode (`LbConfig.key == null`).
-    /// Encrypted modes return `error.UnsupportedMode` from the
-    /// minter until LB-2 / LB-3 land.
+    /// read `server_id` directly. Encrypted modes raise the bar to
+    /// "linkability without key" but do not protect against attackers
+    /// between LB and server. Plaintext, single-pass AES, and
+    /// four-pass Feistel modes are implemented.
     ///
     /// When set in plaintext mode, `Server.init` also auto-enables
     /// `transport_params.disable_active_migration` per the draft

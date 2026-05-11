@@ -1,27 +1,45 @@
 # Embedding quic-zig
 
-quic-zig is a Zig-first IETF QUIC v1 transport library. This guide shows the two
-common embed paths (server / client) and the raw `Connection` API for
-embedders writing custom event loops.
+This guide covers the stable embedding surfaces:
 
-> **Pre-1.0.** The public API may churn before 1.0. See
-> [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CHANGELOG.md`](CHANGELOG.md) for
-> migration notes.
+- `quic_zig.Server` for accepting QUIC connections.
+- `quic_zig.Client` for dialing QUIC peers.
+- `quic_zig.transport.runUdpServer` and `runUdpClient` for simple
+  `std.Io` UDP loops.
+- `quic_zig.Connection` for custom event loops, batched I/O, qlog
+  routing, and application-specific scheduling.
 
-## Example 1: server with `transport.runUdpServer`
+quic-zig is pre-1.0, so APIs may change between 0.x releases. The
+module name in Zig code is `quic_zig`.
 
-The fastest path to a working QUIC server. `runUdpServer` binds the UDP
-socket, applies `SO_RCVBUF` / `SO_SNDBUF` tuning, drives a 5 ms
-receive/feed/poll/tick cadence, and exits cleanly when the supplied
-shutdown flag flips.
+## Package Setup
 
-`runUdpServer` does **not** take an application-level callback (see "API
-awkwardness" below). Embedders run their per-stream logic on a separate
-thread that walks `server.iterator()`, or hand-roll the loop (next section).
+In a consuming `build.zig`, import the module from the package
+dependency:
+
+```zig
+const quic_zig_dep = b.dependency("quic_zig", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("quic_zig", quic_zig_dep.module("quic_zig"));
+```
+
+Application code then uses:
+
+```zig
+const quic_zig = @import("quic_zig");
+```
+
+## Server Wrapper
+
+`Server` owns TLS context setup, per-connection state, CID routing, Retry
+validation, Version Negotiation, and the connection table. The embedder
+chooses the socket model and application protocol behavior.
 
 ```zig
 const std = @import("std");
-const quic-zig = @import("quic-zig");
+const quic_zig = @import("quic_zig");
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -32,10 +50,10 @@ pub fn run(
 ) !void {
     const protos = [_][]const u8{"h3"};
 
-    var retry_key: quic-zig.RetryTokenKey = undefined;
-    try std.crypto.random.bytes(&retry_key); // see "Production checklist"
+    var retry_key: quic_zig.RetryTokenKey = undefined;
+    std.crypto.random.bytes(&retry_key);
 
-    var server = try quic-zig.Server.init(.{
+    var server = try quic_zig.Server.init(.{
         .allocator = allocator,
         .tls_cert_pem = cert_pem,
         .tls_key_pem = key_pem,
@@ -56,37 +74,40 @@ pub fn run(
     });
     defer server.deinit();
 
-    // Application logic runs in a separate worker that walks
-    // server.iterator() each tick. See "Roll your own loop" if you want
-    // ingress and app logic on the same thread.
-    try quic-zig.transport.runUdpServer(&server, .{
-        .listen = "0.0.0.0:443",
+    try quic_zig.transport.runUdpServer(&server, .{
+        .listen = "0.0.0.0:4433",
         .io = io,
         .shutdown_flag = shutdown,
     });
 }
 ```
 
-## Example 2: client with `Client`
+`runUdpServer` binds the UDP socket, applies socket tuning, receives
+datagrams, feeds the server, drains outbound packets, ticks connection
+timers, and exits after the shutdown flag flips. Per-stream application
+work can run in a cooperating task that walks `server.iterator()`, or you
+can use a custom loop.
 
-`Client.connect` builds a TLS-1.3-only client context, mints random
-DCID/SCID per RFC 9000 §7.2, calls `Connection.initClient`, and hands back
-a `*Connection` ready for the first `advance()`. There is no
-`runUdpClient` helper today — embedders own the I/O loop.
+## Client Wrapper
+
+`Client.connect` owns the client-side TLS setup and initial connection
+ID generation. The returned `client.conn` is the full
+`*quic_zig.Connection`.
 
 ```zig
 const std = @import("std");
-const quic-zig = @import("quic-zig");
+const quic_zig = @import("quic_zig");
 
 pub fn dial(
     allocator: std.mem.Allocator,
-    sock: anytype, // your UDP socket, already bound
-    server_addr: anytype,
+    io: std.Io,
+    target: []const u8,
     server_name: []const u8,
+    shutdown: *const std.atomic.Value(bool),
 ) !void {
     const protos = [_][]const u8{"h3"};
 
-    var client = try quic-zig.Client.connect(.{
+    var client = try quic_zig.Client.connect(.{
         .allocator = allocator,
         .server_name = server_name,
         .alpn_protocols = &protos,
@@ -103,52 +124,30 @@ pub fn dial(
     });
     defer client.deinit();
 
-    try client.conn.advance(); // emit first Initial
-
-    var rx: [64 * 1024]u8 = undefined;
-    var tx: [1500]u8 = undefined;
-    var sent_request = false;
-
-    while (!client.conn.isClosed()) {
-        const now_us = monotonicNowUs();
-
-        if (try sock.recv(&rx)) |msg| {
-            try client.conn.handle(msg.bytes, null, now_us);
-        }
-
-        if (client.conn.handshakeDone() and !sent_request) {
-            const stream_id: u64 = 0; // first client-initiated bidi
-            _ = try client.conn.openBidi(stream_id);
-            _ = try client.conn.streamWrite(stream_id, "GET /\r\n");
-            try client.conn.streamFinish(stream_id);
-            sent_request = true;
-        }
-
-        while (try client.conn.poll(&tx, now_us)) |n| {
-            try sock.send(server_addr, tx[0..n]);
-        }
-        try client.conn.tick(now_us);
-    }
+    try quic_zig.transport.runUdpClient(&client, .{
+        .target = target,
+        .io = io,
+        .shutdown_flag = shutdown,
+    });
 }
 ```
 
-## Raw `Connection` API
+`runUdpClient` binds an ephemeral UDP socket by default, applies socket
+tuning, advances the handshake, polls outbound packets, receives inbound
+packets, and ticks timers until the connection closes or the shutdown
+flag flips. If you need DNS resolution, fixed source tuples, custom
+packet pacing, or single-threaded application logic, use the raw
+connection cycle below.
 
-`Connection` is the I/O-agnostic state machine `Server` and `Client` wrap.
-Reach for it directly when you need batched I/O (`recvmmsg`, GSO),
-deterministic CIDs, qlog file rotation, or any other custom loop. The
-embedder owns the UDP socket *and* the wall clock.
+## Raw Connection Cycle
 
-The four-call cycle:
+`Connection` is the I/O-agnostic state machine under both wrappers. A
+custom loop repeats four operations:
 
-1. **`conn.handle(buf, from, now_us)`** — feed inbound bytes (one UDP
-   datagram). Errors are non-fatal at the transport level; closed
-   connections are no-ops.
-2. **`conn.poll(dst, now_us)`** — drain one outbound packet. Loop until it
-   returns `null`.
-3. **`conn.tick(now_us)`** — drive PTO, loss detection, and idle timeout.
-4. **`conn.nextTimerDeadline(now_us)`** — earliest microsecond your event
-   loop should wake at. Park your loop on this between datagrams.
+1. Feed inbound datagrams with `conn.handle` or `conn.handleWithEcn`.
+2. Drain outbound datagrams with `conn.pollDatagram`.
+3. Drive timers with `conn.tick`.
+4. Sleep until `conn.nextTimerDeadline(now_us)` or the next socket event.
 
 ```zig
 while (!conn.isClosed()) {
@@ -158,21 +157,21 @@ while (!conn.isClosed()) {
         try conn.handle(msg.bytes, msg.from, now_us);
     }
 
-    while (try conn.poll(&tx, now_us)) |n| {
-        try sock.send(peer_addr, tx[0..n]);
+    while (try conn.pollDatagram(&tx, now_us)) |out| {
+        const dst = out.to orelse peer_addr;
+        try sock.send(dst, tx[0..out.len]);
     }
+
     try conn.tick(now_us);
 
-    // Drain stream / connection events.
     while (conn.pollEvent()) |ev| switch (ev) {
-        .close => |c| std.log.info("close: {}", .{c}),
-        .flow_blocked => {},
-        .connection_ids_needed => {},
-        .datagram_acked, .datagram_lost => {},
+        .close => |c| handleClose(c),
+        .flow_blocked => handleFlowBlocked(),
+        .connection_ids_needed => |info| provideConnectionIds(info),
+        .datagram_acked, .datagram_lost => |info| updateDatagramState(info),
+        .alternative_server_address => |addr| scheduleAltAddress(addr),
     };
 
-    // Open or read application streams (here: read every stream that
-    // has data).
     var it = conn.streamIterator();
     while (it.next()) |entry| {
         const stream_id = entry.key_ptr.*;
@@ -185,149 +184,108 @@ while (!conn.isClosed()) {
 }
 ```
 
-This is the same cycle `Server` runs internally per-slot; the QNS endpoint
-in `interop/qns_endpoint.zig` is a 3 kLOC bespoke loop over `Connection`.
+Servers using the raw loop should also drain stateless responses queued
+by `Server.feed`:
 
-## Required configuration knobs
+```zig
+while (server.drainStatelessResponse()) |resp| {
+    try sock.send(resp.dst, resp.slice());
+}
+```
 
-`Server.Config` ships secure-by-default for the knobs the hardening guide
-calls out, but a handful require explicit values for any internet-facing
-deployment:
+## Required Configuration
 
-- **`tls_cert_pem` / `tls_key_pem`** — no defaults. PEM-encoded leaf cert
-  chain + matching private key. Owned by the caller; outlive the server.
-- **`alpn_protocols`** — required (QUIC mandates ALPN per RFC 9001 §8.1).
-  Set per peer expectations, e.g. `&.{ "h3" }` for HTTP/3.
-- **`transport_params.max_idle_timeout_ms`** — set explicitly. quic-zig's
-  default `0` means no idle timeout, which is rarely what you want;
-  30_000 (30 s) is a sensible production value.
-- **`retry_token_key: ?RetryTokenKey`** — 32-byte HMAC key for stateless
-  Retry (RFC 9000 §8.1.2). Operator MUST randomize at startup
-  (`std.crypto.random.bytes`) and persist across restarts so in-flight
-  Retries validate after a graceful restart. Without this, every Initial
-  earns a slot; with it, peers must echo a token first.
-- **`early_data_anti_replay: ?*tls.AntiReplayTracker`** — required if
-  `enable_0rtt = true` on the auto-built TLS context. See "0-RTT" below.
-- **`max_concurrent_connections: u32 = 1000`** — slot table size. Cap your
-  DoS exposure; pair with monitoring on
-  `MetricsSnapshot.feeds_table_full`.
-- **`max_initials_per_source_per_window: ?u32 = null`** — per-source
-  Initial-acceptance cap. Recommended ~32 for open internet. Off by
-  default for dev/interop ergonomics.
-- **`preferred_address: ?PreferredAddressConfig = null`** — RFC 9000
-  §18.2 / §5.1.1 server-preferred-address advertisement. When set,
-  every accepted connection's outbound transport parameters carry a
-  `preferred_address` value pointing at the configured IPv4 / IPv6
-  address pair; the seq-1 alt-CID + matching stateless-reset token
-  are minted per-connection through `mintLocalScid` +
-  `conn.stateless_reset.derive`. `runUdpServer` consults the same
-  field to bind alt listener socket(s) on the configured port(s),
-  poll all listeners per iteration, and route outbound replies
-  through the listener the slot most recently received on.
-  **Requires `stateless_reset_key`** (the deterministic token
-  derivation is the only path quic-zig exposes for the seq-1 reset
-  token); `Server.init` returns `InvalidConfig` if you forget. At
-  least one of `ipv4` / `ipv6` must be non-null. Embedders driving
-  their own loop still get the codec auto-build — only the multi-
-  socket plumbing is `runUdpServer`-specific.
+Set these deliberately for any deployed server:
 
-## 0-RTT security checklist
+- `tls_cert_pem` and `tls_key_pem`: PEM leaf certificate chain and
+  matching private key.
+- `alpn_protocols`: required by QUIC. For HTTP/3, pass `&.{"h3"}`.
+- `transport_params.max_idle_timeout_ms`: the default `0` means no idle
+  timeout.
+- `transport_params.initial_max_*`: stream and connection flow-control
+  limits for your application workload.
+- `max_concurrent_connections`: slot-table cap.
+- `max_connection_memory`: aggregate per-connection cap for peer-driven
+  buffers.
+- `max_initials_per_source_per_window`, `max_vn_per_source_per_window`,
+  `max_datagrams_per_window`, and `max_bytes_per_window`: tune to your
+  deployment envelope.
+- `retry_token_key`: enables stateless Retry before allocating a
+  connection slot.
+- `new_token_key`: enables NEW_TOKEN issuance for returning clients.
+- `stateless_reset_key`: required when the server auto-issues CIDs that
+  need reset tokens, including preferred-address and QUIC-LB rotation.
 
-0-RTT replay protection is the embedder's responsibility. Enabling 0-RTT
-without the steps below is a **known security hole** per RFC 9001 §5.6 /
-RFC 8446 §8.
+Persist Retry, NEW_TOKEN, and stateless-reset keys across graceful
+restarts when continuity matters. Rotating them is a deployment event:
+old Retry and NEW_TOKEN values stop validating, and old stateless-reset
+tokens stop matching previously issued CIDs.
 
-- **Instantiate `tls.AntiReplayTracker`** and wire it via
-  `Server.Config.early_data_anti_replay`. quic-zig installs the BoringSSL
-  `allow_early_data` callback automatically when both `enable_0rtt` and
-  this field are set. See `src/tls/anti_replay.zig` for sizing
-  (`max_entries`, `max_age_us`).
-- **Verify request idempotency at the application layer.** quic-zig labels
-  bytes via `Connection.streamArrivedInEarlyData(id)`; treat any non-GET
-  / non-idempotent request that arrives `true` as suspect.
-- **Persist session tickets only when replay protection is active.** A
-  ticket cached on disk without an active tracker is a replay window.
-- **Default is OFF.** `Server.Config.enable_0rtt` defaults to `false`.
-  Flip it on only after wiring the tracker.
+## 0-RTT
 
-## Production deployment checklist
+0-RTT is off by default. To enable it safely:
 
-- **Build with `-Doptimize=ReleaseSafe`** (mandatory). `ReleaseFast` /
-  `ReleaseSmall` are forbidden for the network-input parser surface — the
-  documented `unreachable` paths in `wire/`, `frame/`, and `conn/` are
-  trapped only when runtime safety is on. See the policy block at the top
-  of `build.zig`.
-- **Tune the UDP socket.** `runUdpServer` does this automatically; raw
-  loops should call `transport.applyServerTuning(sock, .{})` after bind.
-  See `src/transport/socket_opts.zig` for `SO_RCVBUF` / `SO_SNDBUF`
-  sizing.
-- **Set up qlog output for incident response** via
-  `Connection.setQlogCallback` (or `Server.Config.qlog_callback` to apply
-  to every accepted slot). **Known gap:** event coverage is incomplete in
-  the current release — packet-level events (sent/received) and many
-  recovery transitions are not yet emitted. Treat current qlog output as
-  best-effort.
-- **Persist `NEW_TOKEN` values across restarts** if you want returning
-  clients to skip the Retry round-trip. Set `Config.new_token_key` to a
-  stable 32-byte AES-GCM-256 key (distinct from `retry_token_key` —
-  different rotation cadences).
-- **Persist the stateless-reset key across restarts.** Without it, live
-  connections through a restart are inadvertently reset by their old
-  CIDs. **TODO:** the stateless-reset key derivation surface is currently
-  per-Connection internal; verify the persistence story before relying on
-  it in production.
+- Set `Server.Config.enable_0rtt = true`.
+- Allocate `quic_zig.tls.AntiReplayTracker` and pass it through
+  `Server.Config.early_data_anti_replay`.
+- Bind tickets to replay-relevant transport and application settings
+  with `Connection.setEarlyDataContextForParams`.
+- Treat bytes where `Connection.streamArrivedInEarlyData(id)` is true as
+  replayable. Only idempotent application actions should be accepted.
 
-## What's not in this guide
+Client session tickets are re-exported as `quic_zig.Session`:
 
-- **HTTP/3 / QPACK.** Out of scope — quic-zig is transport-only. Layer your
-  own H3 implementation on top of `Connection` streams.
-- **Multipath QUIC.** quic-zig tracks `draft-ietf-quic-multipath-21`; expect
-  API churn until the spec is published as an RFC. The draft is in the
-  RFC Editor queue (IESG-approved) so the codepoints are stable.
-- **Alternative server addresses
-  (`draft-munizaga-quic-alternative-server-address-00`).** Codec,
-  transport-parameter negotiation, server emit, and a typed receive
-  surface ship today via `Connection.advertiseAlternative*Address`,
-  `ConnectionEvent.alternative_server_address`, and the `quic_zig.alt_addr`
-  helper namespace. The `alt_addr/root.zig` module-level docstring
-  walks through the recommended embedder integration shape (address
-  book + Preferred-driven migration with the §9 random-delay helper);
-  `examples/alt_addr_embedder.zig` ships a runnable reference
-  implementation with `AddressBook`, `MigrationScheduler`, and
-  `Embedder.pump` types embedders can copy or import. Driver-level
-  path-opening on receipt remains embedder policy.
-- **QUIC-LB connection-ID generation
-  (`draft-ietf-quic-load-balancers-21`).** Server-side helpers ship via
-  `quic_zig.lb` and `Server.Config.quic_lb` for embedders deploying
-  behind a coordinated load balancer; the IETF draft itself is
-  expired and pinned indefinitely at -21, so the codepoints are a
-  private agreement between server and LB rather than a path to
-  formal IANA allocation.
-- **Tuning recv/send buffers for 100k+ connections.** Not yet documented;
-  the `transport.ServerTuning` defaults (4 MiB each) target a 10k-conn
-  workload.
-- **Linux GSO / `recvmmsg` integration.** Not wired into `runUdpServer`
-  yet; embedders needing batched I/O hand-roll the loop directly against
-  `Connection.handle` / `Connection.pollDatagram`.
+```zig
+var resumed = try quic_zig.Session.fromBytes(client_ctx, ticket_bytes);
+defer resumed.deinit();
+try conn.setSession(resumed);
+conn.setEarlyDataEnabled(true);
+```
 
-## API awkwardness (notes for future smoothing)
+## Diagnostics
 
-- **`runUdpServer` has no application callback.** The embedder runs
-  per-stream / per-event logic on a separate thread that walks
-  `server.iterator()`, which makes the "minimal complete server" example
-  more cognitively expensive than it should be. A `Handler`-style hook
-  fired after each `feed`/`poll`/`tick` would close the gap.
-- **`runUdpClient` shares `runUdpServer`'s callback-less shape.**
-  The opinionated `quic_zig.transport.runUdpClient` is the dialing
-  mirror to `runUdpServer`: same `bind` / `tune` / `poll` / `recv` /
-  `tick` loop, same threading model, same lack of an application
-  callback. Embedders running per-stream logic still drive
-  `client.conn` from a separate thread. A `Handler`-style hook
-  would close the same gap on both sides.
-- **Stream IDs are caller-allocated.** `openBidi(id)` / `openUni(id)`
-  require the embedder to track the next legal id for their role per RFC
-  9000 §2.1. A `nextLocalBidiId()` / `openNextBidi()` helper would remove
-  the bit-fiddling.
-- **`Connection.streamIterator` semantics.** Iteration is invalidated by
-  any `openBidi` / `openUni` call due to HashMap rehash; an embedder
-  reading and writing in the same loop must collect IDs first.
+TLS key logging is available through `boringssl-zig` and re-exported as
+`quic_zig.KeylogCallback`:
+
+```zig
+try tls_ctx.setKeylogCallback(onKeylogLine);
+```
+
+Connection lifecycle, packet, congestion, migration, loss, and key-update
+events are surfaced through the qlog-style callback:
+
+```zig
+conn.setQlogCallback(onQlogEvent, app_state);
+conn.setQlogPacketEvents(true);
+
+fn onQlogEvent(user_data: ?*anyopaque, event: quic_zig.QlogEvent) void {
+    _ = user_data;
+    recordEvent(event);
+}
+```
+
+Packet sent/received events are opt-in through
+`setQlogPacketEvents(true)` so embedders can keep high-volume telemetry
+off in low-overhead deployments.
+
+## Extension Surfaces
+
+- QUIC v2 is available through `Server.Config.versions`,
+  `Client.Config.preferred_version`, and
+  `Client.Config.compatible_versions`.
+- Multipath tracks draft 21 through `initial_max_path_id`,
+  path-specific CID provisioning, and `Connection.pollDatagram`.
+- Preferred Address is configured with `Server.Config.preferred_address`;
+  `runUdpServer` binds the alternate listener sockets for that config.
+- QUIC-LB draft 21 is exposed as `quic_zig.lb` and
+  `Server.Config.quic_lb`. Plaintext, single-pass AES, and four-pass
+  Feistel modes are implemented. Enabling it intentionally embeds routing
+  information in server-issued CIDs.
+- Alternative Server Address draft 00 exposes codec support, server emit,
+  typed receive events, and helper functions through `quic_zig.alt_addr`
+  and `examples/alt_addr_embedder.zig`.
+
+## Out Of Scope
+
+quic-zig does not implement HTTP/3, QPACK, WebTransport, MASQUE, FIPS
+validation, BBR, or a platform support guarantee for Windows.

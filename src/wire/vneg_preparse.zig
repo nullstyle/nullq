@@ -685,9 +685,8 @@ test "reassembleClientHello: ngtcp2-style out-of-order CRYPTO in single Initial"
     // skipping the §6 upgrade decision and locking the connection
     // onto the wire version.
     //
-    // The frame layout below mirrors the actual offsets observed in
-    // `interop/logs.server-final/quic-zig_ngtcp2/v2/sim/trace_node_left.pcap`
-    // (CH total = 279 bytes split across 11 disjoint CRYPTO frames).
+    // The frame layout below mirrors the observed ngtcp2 interop shape:
+    // CH total = 279 bytes split across 11 disjoint CRYPTO frames.
     var ch_storage: [max_client_hello_bytes]u8 = undefined;
     const ch = buildSyntheticCh(&ch_storage, 279);
 

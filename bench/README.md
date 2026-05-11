@@ -1,60 +1,48 @@
 # quic-zig microbenchmarks
 
-Wire/frame-level microbenchmarks for the hot paths every QUIC packet
-exercises. Built and run via:
+The benchmark harness measures low-level QUIC hot paths that are useful
+to track across parser, frame, packet, and crypto-adjacent changes.
 
 ```sh
 zig build bench
 ```
 
-The build step always pins `ReleaseFast` for the bench binary
-(plus a separate ReleaseFast-built BoringSSL link), regardless of
-the project's `-Doptimize` flag. Debug-mode numbers are not
-useful and would be misleading.
+The benchmark binary is always built with `ReleaseFast` in an isolated
+benchmark-only build. That exception is deliberate: benchmark numbers
+from `Debug` are not useful, while production networking builds must use
+`ReleaseSafe`.
 
-## What's covered
+## Output
 
-Each benchmark prints one line:
+Each benchmark prints:
 
-```
+```text
 name: <ns/op> ns/op (<ops/sec> ops/sec, <iters> iterations)
 ```
 
-| Benchmark                  | Measures                                                |
-| -------------------------- | ------------------------------------------------------- |
-| `varint_encode`            | RFC 9000 §16 varint encode, cycling 1/2/4/8-byte inputs |
-| `varint_decode`            | Same lengths, decode-only                               |
-| `frame_stream_encode_100b` | STREAM frame with 100-byte payload, OFF+LEN flags       |
-| `frame_stream_decode_100b` | Decode the same                                         |
-| `frame_ack_encode_5ranges` | ACK with 5 subsequent gap/length ranges                 |
-| `frame_ack_decode_5ranges` | Decode the same                                         |
-| `short_header_encode`      | 1-RTT header, 8-byte DCID, 4-byte PN                    |
-| `short_header_decode`      | Parse the same                                          |
-| `cid_generate_8bytes`      | `boringssl.crypto.rand.fillBytes` for 8 random bytes    |
+The harness auto-tunes each benchmark to roughly 100 ms of wall time,
+then reports the average.
 
-Each benchmark auto-tunes its iteration count to roughly 100 ms of
-wall time, then reports the average.
+## Covered
 
-## What's not covered (yet)
+| Benchmark | Measures |
+| --- | --- |
+| `varint_encode` | RFC 9000 varint encode across 1/2/4/8-byte inputs |
+| `varint_decode` | Varint decode across the same lengths |
+| `frame_stream_encode_100b` | STREAM frame encode with 100-byte payload |
+| `frame_stream_decode_100b` | STREAM frame decode for the same payload |
+| `frame_ack_encode_5ranges` | ACK encode with five gap/length ranges |
+| `frame_ack_decode_5ranges` | ACK decode for the same ranges |
+| `short_header_encode` | 1-RTT short header encode |
+| `short_header_decode` | 1-RTT short header parse |
+| `cid_generate_8bytes` | 8-byte CSPRNG CID generation |
 
-These need fixtures and AEAD setup that don't exist in the
-benchmark harness:
+## Extending
 
-- Initial / Handshake long-header packet build (header + AEAD seal)
-- 1-RTT packet protect / unprotect (header protection + AEAD)
-- Connection lifecycle (`Connection.handle` / `pollDatagram`)
-- TLS handshake throughput (BoringSSL handshake)
-- Stream reassembly / send-stream chunking under load
+Add benchmarks when a change affects a parser, frame codec, packet
+builder, crypto path, stream scheduler, or connection lifecycle path that
+is expected to run for most packets. Keep fixtures reusable so AEAD and
+packet-key setup can be shared across related benchmarks.
 
-These are listed as TODO in `bench/main.zig` and should land in a
-follow-up that builds shared crypto fixtures (Initial keys, packet
-keys) so multiple AEAD-touching benchmarks can reuse them.
-
-## Notes
-
-- The bench harness is dependency-free: pure `std.c.clock_gettime`
-  for timing, `std.mem.doNotOptimizeAway` to defeat dead-code
-  elimination.
-- Benchmarks run sequentially, single-threaded, no warmup beyond
-  the auto-tuning calibration loop. Run on a quiet machine for
-  stable numbers.
+Benchmarks run sequentially and single-threaded. Run on a quiet machine
+for stable comparisons.

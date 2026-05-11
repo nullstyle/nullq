@@ -88,16 +88,12 @@ const endpoint_uni_stream_limit: u64 = 64;
 const endpoint_active_connection_id_limit: u64 = 8;
 const endpoint_server_cid_desired_last_seq: u8 = 1;
 
-// Stalled-peer keepalive (W1 in `docs/quiche-interop-notes.md`). Targets
-// the `server × quiche × multiplexing` cell: quiche's client
+// Stalled-peer keepalive for the `server x quiche x multiplexing` cell:
+// quiche's client
 // `conn.send()` returns `Done` with stream data still pending after the
-// ~1979th of 1999 streams gets responded to (verified in
-// `interop/logs.server-final2/quic-zig_quiche/multiplexing/client/log.txt`,
-// last 30s show only ACK-only packets crossing in either direction
-// before quiche's `idle timeout expired`). Sending an ack-eliciting
-// packet from the server wakes quiche's `conn.recv()` → `conn.send()`
-// cycle, which re-iterates writable streams and (in upstream's testing)
-// flushes the parked ones.
+// bulk of the streams get responses. Sending an ack-eliciting packet
+// from the server wakes quiche's `conn.recv()` -> `conn.send()` cycle,
+// which re-iterates writable streams and flushes the parked ones.
 //
 // Detection rule, per connection: handshake confirmed AND
 // `streamCount > 0` AND we have not put a packet on the wire for at
@@ -2996,19 +2992,16 @@ fn maybeIssueNewToken(sc: *ServerConn, now_us: u64) void {
     sc.new_token_emitted = true;
 }
 
-/// Stalled-peer keepalive (`server × quiche × multiplexing` workaround).
+/// Stalled-peer keepalive (`server x quiche x multiplexing` workaround).
 ///
 /// Quiche's `conn.send()` returns `Done` with stream data still pending
 /// after responding to the ~1979th of 1999 streams in the runner's
 /// `multiplexing` testcase: its writable-streams iterator parks the
 /// remaining ~20 streams, the connection idles in both directions for
 /// ~30 seconds, and quiche's idle-timeout finally tears down the
-/// connection (verified end-to-end in
-/// `interop/logs.server-final2/quic-zig_quiche/multiplexing/client/log.txt`).
-/// Per `docs/quiche-interop-notes.md` the upstream-reproduced workaround
-/// is a server-emitted ack-eliciting probe that wakes quiche's
-/// `recv()` → `send()` cycle, which re-iterates writable streams and
-/// flushes the parked ones.
+/// connection. The workaround is a server-emitted ack-eliciting probe
+/// that wakes quiche's `recv()` -> `send()` cycle, which re-iterates
+/// writable streams and flushes the parked ones.
 ///
 /// Detection rule (must hold ALL three on a single tick):
 ///   1. Handshake is confirmed — pre-handshake the runtime has its own

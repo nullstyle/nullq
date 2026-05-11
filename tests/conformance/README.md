@@ -1,175 +1,139 @@
 # quic-zig RFC-traceable conformance suites
 
-These suites are **conformance** tests, not behaviour tests. Each test
-asserts a specific normative requirement from an RFC, named with the
-BCP 14 keyword the RFC uses, and cited back to its section. The shape
-follows the [RFC-traceable ZSpec testing
-guide](../../../zspec-rfc-testing.md), adapted to plain `std.testing`
-(no third-party runner).
+These are conformance tests, not general behavior tests. Each test names
+one normative requirement, uses the BCP 14 keyword from the RFC, and
+cites the relevant section in the test name.
 
 ## Run
 
 ```sh
-zig build conformance                                          # whole suite
-zig build conformance -Dconformance-filter='RFC9000 §17'       # one section
-zig build conformance -Dconformance-filter='MUST NOT'          # one keyword across all RFCs
-zig build test                                                 # full suite (also runs conformance)
+zig build conformance
+zig build conformance -Dconformance-filter='RFC9000 §17'
+zig build conformance -Dconformance-filter='MUST NOT'
+zig build test
 ```
 
-`-Dconformance-filter` is a compile-time substring filter — Zig's
-default test runner has no runtime filtering. The filter participates
-in the compile cache key, so changing it does a fast incremental rebuild.
+`-Dconformance-filter` is a compile-time substring filter. Changing it
+participates in Zig's compile cache key, so narrow reruns are still fast.
 
-## Test-name grammar
+## Test Name Grammar
 
+```text
+<KEYWORD> <observable behavior> [RFC#### §section ¶paragraph]
 ```
-<KEYWORD> <observable behaviour> [RFC#### §section ¶paragraph]
-```
 
-| Keyword                         | Meaning                                                                                               |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `MUST`, `REQUIRED`, `SHALL`     | Implementation is non-conforming if this fails. Hard pass/fail assertion.                             |
-| `MUST NOT`, `SHALL NOT`         | Implementation is non-conforming if it permits this. Assert rejection / absence — never "doesn't crash". |
-| `SHOULD`, `RECOMMENDED`         | Test the recommended default; document any accepted deviation alongside.                              |
-| `SHOULD NOT`, `NOT RECOMMENDED` | Test the avoided behaviour; deviation needs an explicit reason.                                       |
-| `MAY`, `OPTIONAL`               | Only if implemented; also test interop with peers that omit it.                                       |
-| `NORMATIVE`                     | Normative RFC text that does **not** use a BCP 14 keyword. Don't fake `MUST`.                         |
+| Keyword | Meaning |
+| --- | --- |
+| `MUST`, `REQUIRED`, `SHALL` | Non-conformance if this fails |
+| `MUST NOT`, `SHALL NOT` | Assert rejection or absence |
+| `SHOULD`, `RECOMMENDED` | Test the recommended default and document deviations |
+| `SHOULD NOT`, `NOT RECOMMENDED` | Test the avoided behavior and document deviations |
+| `MAY`, `OPTIONAL` | Test only when implemented |
+| `NORMATIVE` | Normative text that does not use BCP 14 keywords |
 
 Examples:
 
 ```zig
 test "MUST reject a v1 long-header packet whose Version field is 0 [RFC9000 §17.2.1 ¶1]" {}
-test "MUST NOT shorten a 4-tuple-validated path's anti-amplification limit on migration [RFC9000 §9.4 ¶2]" {}
+test "MUST NOT shorten a validated path's anti-amplification limit on migration [RFC9000 §9.4 ¶2]" {}
 test "SHOULD set the Reserved Bits to 0 on transmit [RFC9000 §17.2 ¶8]" {}
 test "MAY include the active_connection_id_limit transport parameter [RFC9000 §18.2 ¶12]" {}
 ```
 
-### Skipping (visible conformance debt)
+## Visible Conformance Debt
 
-Use `skip_` as a name prefix **and** return `error.SkipZigTest` from the
-body. The name keeps the gap visible in the test list; the body keeps
-the test green:
+Skipped requirements must stay visible. Prefix the test name with
+`skip_`, cite the requirement, and return `error.SkipZigTest`.
 
 ```zig
-test "skip_MUST reject messages signed with a revoked key [RFC9000 §X.Y ¶N]" {
-    // TODO(issue-456): revocation list not implemented yet.
+test "skip_MUST reject unsupported example frames [RFC9000 §X.Y ¶N]" {
     return error.SkipZigTest;
 }
 ```
 
 Never use `skip_` to imply that an optional `MAY` feature is required.
 
-## File layout
+## File Layout
 
-```
+```text
 tests/
-  conformance.zig                            # entry point (sibling of tests/root.zig)
+  conformance.zig
   conformance/
-    README.md                                # this file
-    _initial_fixture.zig                     # shared "send malicious Initial to a Server" helper
-    rfc8999_invariants.zig                   # canonical example
-    rfc9000_varint.zig                       # §16
-    rfc9000_packet_headers.zig               # §17
-    rfc9000_transport_params.zig             # §18
-    rfc9000_frames.zig                       # §19
-    rfc9000_streams_flow.zig                 # §3, §4, §5, §10
-    rfc9000_negotiation_validation.zig       # §6, §8, §9
-    rfc9000_packetization.zig                # §13, §14, §20
-    rfc9001_tls.zig                          # RFC 9001
-    rfc9002_loss_recovery.zig                # RFC 9002
-    rfc9221_datagram.zig                     # RFC 9221
+    README.md
+    _initial_fixture.zig
+    _handshake_fixture.zig
+    rfc8999_invariants.zig
+    rfc9000_varint.zig
+    rfc9000_packet_headers.zig
+    rfc9000_transport_params.zig
+    rfc9000_frames.zig
+    rfc9000_streams_flow.zig
+    rfc9000_negotiation_validation.zig
+    rfc9000_packetization.zig
+    rfc9000_ecn.zig
+    rfc9001_tls.zig
+    rfc9002_loss_recovery.zig
+    rfc9221_datagram.zig
+    rfc9287_grease_quic_bit.zig
+    rfc9368_quic_v2.zig
+    quic_lb_draft21.zig
+    draft_munizaga_alt_addr_00.zig
 ```
 
-The entry point lives at `tests/conformance.zig` (one level up) instead
-of `tests/conformance/root.zig` so the Zig package boundary widens to
-`tests/`. Suites that need a real `Server` fixture (for receiver-side
-gates that fire post-AEAD, e.g. RFC 9000 §17.2.1 or §12.4) can then
-`@embedFile("../data/test_cert.pem")` cleanly. See
-`_initial_fixture.zig` for the shared Server-fixture helper.
+The entry point lives at `tests/conformance.zig` so suites can embed
+fixtures from `tests/data/`.
 
-## Suite skeleton
+## Suite Skeleton
 
-Tests live at **file scope** (Zig's default test runner only walks
-top-level `test` blocks in compiled files; tests nested inside `pub
-const Foo = struct {}` are not discovered). Use comment dividers and
-the citation in the test name itself for grouping.
+Tests live at file scope. The default Zig test runner only discovers
+top-level `test` blocks.
 
 ```zig
-//! RFC 9000 §17 — Packet formats.
-//!
-//! ## Coverage
+//! RFC 9000 §17 - Packet formats.
 //!
 //! Covered:
 //!   RFC9000 §17.2.1 ¶1  MUST   reject Version 0 in v1 long header
-//!   ...
 //!
 //! Visible debt:
 //!   RFC9000 §X.Y ¶N     MUST   ...
 //!
-//! Out of scope here:
-//!   RFC9000 §6  negotiation lives in rfc9000_negotiation_validation.zig
+//! Out of scope:
+//!   RFC9000 §6 negotiation lives in rfc9000_negotiation_validation.zig
 
 const std = @import("std");
-const quic-zig = @import("quic-zig");
-
-// ---------------------------------------------------------------- §17.2 long header
+const quic_zig = @import("quic_zig");
 
 test "MUST reject a v1 long-header packet whose Version field is 0 [RFC9000 §17.2.1 ¶1]" {
-    // ... arrange / act / assert one observable behaviour ...
-}
-
-test "skip_MUST <unimplemented requirement> [RFC9000 §X.Y ¶N]" {
-    return error.SkipZigTest;
-}
-
-// ---------------------------------------------------------------- §17.3 short header
-
-test "MUST set the Fixed Bit (bit 6) to 1 on every QUIC v1 short-header packet [RFC9000 §17.3 ¶?]" {
-    // ...
+    _ = quic_zig;
+    // Arrange, act, and assert one observable behavior.
 }
 ```
 
-There's no `tests:before/after` hook mechanism in `std.testing`; use
-local helper fns and `defer` instead.
+Use local helper functions and `defer` for setup and cleanup.
 
-## Author checklist (review gate)
+## Author Checklist
 
-- [ ] Every test name starts with a BCP 14 keyword (or `NORMATIVE` /
-      `skip_` prefix).
-- [ ] Keyword strength matches the RFC — no upgrading `SHOULD` to `MUST`.
-- [ ] Citation is precise: `[RFC#### §X.Y ¶N]` or `[RFC#### §X.Y]`.
-- [ ] One observable behaviour per test.
-- [ ] `MUST NOT` tests assert rejection/absence/error — never just
-      "did not crash".
-- [ ] **Test exercises a quic-zig surface — not stdlib arithmetic, not a
-      file-local helper standing in as the oracle.** Every non-skipped
-      conformance test must call into `quic-zig.*` (or a fixture that
-      does) at least once. If you find yourself asserting `5 & 0b11`
-      or `std.crypto.timing_safe.eql(...)` directly, you're testing
-      the spec table or the standard library, not quic-zig — route
-      through the relevant quic-zig function (`Connection.openBidi`,
-      `quic-zig.conn.stateless_reset.eql`, `header.encode`, etc.) or
-      add a small public wrapper to quic-zig if the path is currently
-      private. File-local raw-byte builders (e.g.
-      `rawLongHeaderInput` in `rfc8999_invariants.zig`) are fine
-      ONLY as parser-input fixtures — feed them to `header.parse`,
-      never assert against their own output.
-- [ ] Coverage block at the top lists Covered / Visible debt / Out of
-      scope (where applicable).
-- [ ] Tests run cleanly: `zig build conformance`.
-- [ ] `zig build conformance -- --test-filter 'RFC#### §X.Y'` runs a
-      meaningful subset.
+- Every test name starts with a BCP 14 keyword, `NORMATIVE`, or
+  `skip_`.
+- Keyword strength matches the RFC text.
+- Citation is precise enough for an auditor to find the requirement.
+- Each test asserts one observable behavior.
+- `MUST NOT` tests assert rejection, absence, or a specific error.
+- Every non-skipped test exercises a quic-zig surface directly or
+  through a fixture.
+- File-local raw-byte builders are only fixtures. Feed them through a
+  quic-zig parser or state-machine API rather than asserting against the
+  builder itself.
+- The file-level coverage block lists covered requirements, visible
+  debt, and out-of-scope requirements where useful.
+- `zig build conformance` passes.
+- Narrow filters use
+  `zig build conformance -Dconformance-filter='RFC#### §X.Y'`.
 
-## What to test
+## What To Test
 
-For a clean-room implementation of RFC #### the requirements that
-matter most are: receive-side parsing/validation (`MUST reject`,
-`MUST NOT accept`), encoding constraints (`MUST set`, `MUST NOT emit`),
-state-machine invariants, and bounded-resource limits. Skip purely
-internal details (cache shape, struct layout) — they are not RFC
-requirements.
-
-When the implementation already enforces a `MUST` via a unit test
-inside `src/`, **don't delete it** — duplicate it as a conformance
-test here. The conformance suite is the auditor-facing artifact; the
-unit tests remain the developer-facing regression net.
+Prioritize receive-side parsing and validation, encoding constraints,
+state-machine invariants, and bounded-resource limits. Duplicate
+important RFC requirements from lower-level unit tests into this suite:
+the unit tests are the developer regression net, while the conformance
+suite is the auditor-facing artifact.

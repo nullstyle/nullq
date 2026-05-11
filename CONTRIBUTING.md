@@ -2,67 +2,66 @@
 
 Thanks for your interest in quic-zig.
 
-## Project status
+quic-zig is pre-1.0. It is a QUIC transport library for embedding,
+interop work, and implementation research; 0.x releases may include
+breaking API changes.
 
-quic-zig is **pre-1.0**. It currently completes QUIC v1 handshakes and
-passes the official QUIC interop runner against `quic-go`, `quiche`,
-and `ngtcp2` for the handshake and transfer matrix, but the public
-API may still churn. Treat 0.x releases as potentially breaking.
+## Local Setup
 
-See [`README.md`](README.md) for an overview, [`CHANGELOG.md`](CHANGELOG.md)
-for what has shipped, and [`INTEROP_STATUS.md`](INTEROP_STATUS.md) for
-the current external interop matrix.
-
-## Building
-
-quic-zig pins its toolchain via [`mise`](https://mise.jdx.dev/). The
-project file at [`mise.toml`](mise.toml) installs Zig 0.16.0,
-Python 3.12, `uv`, and `just`.
+The repository pins its toolchain with [`mise`](https://mise.jdx.dev/).
 
 ```sh
 mise install
 zig build
 ```
 
-`zig build` produces `qns-endpoint` (the QUIC interop-runner binary)
-and `quic-zig-external-interop` (the interop gate wrapper).
+`zig build` produces the QNS endpoint and the external interop helper.
 
 ## Tests
 
 ```sh
 zig build test
+zig build conformance
+zig build conformance -Dconformance-filter='RFC9000'
+zig build bench
 ```
 
-This runs the unit, integration, QNS endpoint, and external-interop
-test suites, plus deterministic fuzz smokes for varints, frames,
-transport parameters, packet headers, ACK ranges, and CRYPTO/STREAM
-reassembly.
+`zig build test` runs unit, integration, conformance, QNS endpoint, and
+deterministic fuzz-smoke coverage. `zig build conformance` runs the
+auditor-facing RFC corpus directly. `zig build bench` runs the
+microbenchmark harness.
 
 ## Interop
 
-External interop runs the official
-[`quic-interop-runner`](https://github.com/quic-interop/quic-interop-runner)
-against the `quic-zig-qns` Docker image:
+The external interop wrapper drives the official
+[`quic-interop-runner`](https://github.com/quic-interop/quic-interop-runner).
 
 ```sh
-# Build the local Docker image (from sibling quic-zig-qns checkout):
-make build-local
-
-# Run the matrix (server role by default):
-zig build external-interop -- runner --tests H,DC,M
+zig build external-interop -- runner --dry-run
+zig build external-interop -- runner --build-image
+zig build external-interop -- runner --clients quic-go --tests H,D
+zig build external-interop -- runner --role client --servers quic-go --tests H,D
 ```
 
-See [`interop/README.md`](interop/README.md) for the full set of flags
-and the supported test letters.
+See [interop/README.md](interop/README.md) for the full command surface
+and generated-artifact locations.
 
-## Commits
+## Style
 
-- One-line summary, imperative mood, ~72 chars or less.
-- Optional body explains the *why*, wrapped at ~72 chars.
-- Reference issues / RFCs in the body when relevant
-  (e.g. `RFC 9000 §17.2.1`).
 - Keep one logical change per commit.
+- Prefer existing module boundaries and helper APIs.
+- Keep tests proportional to risk. Shared behavior, public APIs, and
+  protocol invariants deserve focused regression coverage.
+- Use RFC references in tests and comments when the behavior is driven by
+  normative text.
+- Keep public docs stable and usage-oriented. Investigation notes, local
+  matrix snapshots, and scratch output should stay out of tracked docs.
 
-## Pull requests
+## Pull Requests
 
-- Don't.  This is extensively vibe-coded at the moment and probably shouldn't be used by anyone but me.
+Pull requests should include:
+
+- A concise summary of behavior changed.
+- The tests or interop commands run.
+- Any known gaps or follow-up work.
+- Notes about public API or wire-format compatibility when relevant.

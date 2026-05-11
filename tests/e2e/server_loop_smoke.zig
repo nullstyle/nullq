@@ -18,9 +18,8 @@
 //! What we can't easily verify here:
 //!   - End-to-end handshake against a real peer. Driving that
 //!     requires a second quic_zig client (or quic-go) on a known port,
-//!     which is what `interop/qns_endpoint.zig` is for. The QNS
-//!     interop matrix in `INTEROP_STATUS.md` is the canonical
-//!     end-to-end gate.
+//!     which is what `interop/qns_endpoint.zig` and the commands in
+//!     `interop/README.md` are for.
 //!   - Behavior under socket errors, signal-driven shutdown, or
 //!     load. Those would need a fault-injection `std.Io` shim that
 //!     is out of scope for this smoke test.
