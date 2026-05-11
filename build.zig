@@ -207,6 +207,20 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run quic_zig microbenchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const bench_tests_mod = b.createModule(.{
+        .root_source_file = b.path("bench/root.zig"),
+        .target = target,
+        .optimize = bench_optimize,
+    });
+    bench_tests_mod.addImport("quic_zig", bench_quic_zig_mod);
+    bench_tests_mod.addImport("boringssl", bench_boringssl_mod);
+    const bench_tests = b.addTest(.{ .root_module = bench_tests_mod });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+    test_step.dependOn(&run_bench_tests.step);
+
+    const bench_test_step = b.step("bench-test", "Run benchmark helper fixture tests");
+    bench_test_step.dependOn(&run_bench_tests.step);
+
     // Coverage-guided fuzzing of the wire / frame / server
     // header-peek parsers. The `std.testing.fuzz` callbacks in
     // `src/wire/varint.zig`, `src/wire/header.zig`,

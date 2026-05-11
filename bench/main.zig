@@ -1,31 +1,35 @@
 //! quic_zig microbenchmarks.
 //!
-//! Wire/frame-level only. We measure the hot codecs that every
-//! sent or received packet exercises:
+//! Measures hot paths that every sent or received packet exercises:
 //!  - varint encode/decode (every length field)
 //!  - frame encode/decode (STREAM, ACK)
 //!  - short-header pure parse/serialize (no AEAD)
 //!  - connection ID generation (BoringSSL CSPRNG)
+//!  - packet protection, AEAD, and header protection
+//!  - stream send/receive state and reassembly
+//!  - ACK range, loss recovery, PTO, and DATAGRAM event surfaces
 //!
 //! Each benchmark auto-tunes its iteration count to roughly
 //! `target_ms` of wall time, then prints one line:
 //!
 //!     name: <ns/op> ns/op (<ops/sec> ops/sec, <iters> iterations)
 //!
-//! Run with: `zig build bench`. The build wires this binary at
+//! Run with: `zig build bench`, or `zig build bench -- --json path`
+//! for a machine-readable report. The build wires this binary at
 //! ReleaseFast; Debug numbers are not useful.
 //!
-//! Out of scope (need fixtures + AEAD setup, deferred to a later
-//! pass):
-//!  - Initial / Handshake long-header packet build with AEAD
-//!  - 1-RTT short-header packet protect / unprotect (header
-//!    protection + AEAD seal/open)
+//! Out of scope:
 //!  - Full Connection.handle / pollDatagram lifecycle
 //!  - TLS handshake throughput
 
 const std = @import("std");
+const builtin = @import("builtin");
 const quic_zig = @import("quic_zig");
 const boringssl = @import("boringssl");
+const connection_datagram_bench = @import("connection_datagram.zig");
+const loss_ack_bench = @import("loss_ack.zig");
+const packet_crypto_bench = @import("packet_crypto.zig");
+const stream_bench = @import("stream_reassembly.zig");
 
 const varint = quic_zig.wire.varint;
 const header = quic_zig.wire.header;
@@ -36,6 +40,7 @@ const ack_range = frame.ack_range;
 /// Approximate per-benchmark wall budget. We grow the iteration
 /// count until elapsed >= this.
 const target_ns: u64 = 100 * std.time.ns_per_ms;
+const max_bench_results: usize = 64;
 
 /// Lower bound so very fast benchmarks (sub-ns/op) still produce
 /// stable numbers.
@@ -58,9 +63,73 @@ fn nowNanos() u64 {
     return sec *% std.time.ns_per_s +% nsec;
 }
 
+fn unixNanos() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const sec: u64 = @intCast(ts.sec);
+    const nsec: u64 = @intCast(ts.nsec);
+    return sec *% std.time.ns_per_s +% nsec;
+}
+
+fn hostnameSlice(buf: *[std.posix.HOST_NAME_MAX]u8) ?[]const u8 {
+    return std.posix.gethostname(buf) catch null;
+}
+
+fn shortSha(sha: ?[]const u8) ?[]const u8 {
+    const s = sha orelse return null;
+    return s[0..@min(s.len, 12)];
+}
+
+fn appendSanitizedToken(out: *std.ArrayList(u8), allocator: std.mem.Allocator, token: []const u8) !void {
+    var wrote = false;
+    for (token) |c| {
+        const safe = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => c,
+            else => '-',
+        };
+        try out.append(allocator, safe);
+        wrote = true;
+    }
+    if (!wrote) try out.appendSlice(allocator, "unknown");
+}
+
+fn buildReportPath(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    generated_unix_ns: u64,
+    machine_id: []const u8,
+    github_sha: ?[]const u8,
+    github_run_id: ?[]const u8,
+) ![]const u8 {
+    out.clearRetainingCapacity();
+    try out.appendSlice(allocator, dir);
+    if (dir.len > 0 and dir[dir.len - 1] != std.fs.path.sep) {
+        try out.append(allocator, std.fs.path.sep);
+    }
+    try out.appendSlice(allocator, "quic-zig-bench-");
+    try out.print(allocator, "{d}-", .{generated_unix_ns});
+    try appendSanitizedToken(out, allocator, machine_id);
+    try out.append(allocator, '-');
+    if (shortSha(github_sha)) |sha| {
+        try appendSanitizedToken(out, allocator, sha);
+    } else {
+        try out.appendSlice(allocator, "local");
+    }
+    try out.append(allocator, '-');
+    if (github_run_id) |run_id| {
+        try appendSanitizedToken(out, allocator, run_id);
+    } else {
+        try out.appendSlice(allocator, "manual");
+    }
+    try out.appendSlice(allocator, ".json");
+    return out.items;
+}
+
 const BenchResult = struct {
     name: []const u8,
     iters: u64,
+    total_ns: u64,
     ns_per_op: f64,
     ops_per_sec: f64,
 };
@@ -80,7 +149,7 @@ fn benchmark(
     comptime Ctx: type,
     ctx: Ctx,
     comptime runOnce: fn (Ctx, u64) u64,
-) void {
+) BenchResult {
     // Warmup + calibration: start small and double until we cross
     // ~10ms, then extrapolate to target_ns.
     var iters: u64 = min_iters;
@@ -121,12 +190,183 @@ fn benchmark(
     else
         @as(f64, @floatFromInt(iters)) * 1e9 / @as(f64, @floatFromInt(total_ns));
 
-    report(.{
+    const result: BenchResult = .{
         .name = name,
         .iters = iters,
+        .total_ns = total_ns,
         .ns_per_op = ns_per_op,
         .ops_per_sec = ops_per_sec,
-    });
+    };
+    report(result);
+    return result;
+}
+
+fn recordBenchmark(
+    results: *[max_bench_results]BenchResult,
+    result_count: *usize,
+    name: []const u8,
+    comptime Ctx: type,
+    ctx: Ctx,
+    comptime runOnce: fn (Ctx, u64) u64,
+) void {
+    results[result_count.*] = benchmark(name, Ctx, ctx, runOnce);
+    result_count.* += 1;
+}
+
+fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        '\r' => try out.appendSlice(allocator, "\\r"),
+        '\t' => try out.appendSlice(allocator, "\\t"),
+        0x00...0x08, 0x0b...0x0c, 0x0e...0x1f => try out.print(
+            allocator,
+            "\\u{x:0>4}",
+            .{c},
+        ),
+        else => try out.append(allocator, c),
+    };
+    try out.append(allocator, '"');
+}
+
+fn appendNullableJsonString(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    maybe: ?[]const u8,
+) !void {
+    if (maybe) |s| {
+        try appendJsonString(out, allocator, s);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+}
+
+fn appendNullableU64(out: *std.ArrayList(u8), allocator: std.mem.Allocator, maybe: ?u64) !void {
+    if (maybe) |value| {
+        try out.print(allocator, "{d}", .{value});
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+}
+
+fn ensureParentDir(io: std.Io, path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    try std.Io.Dir.cwd().createDirPath(io, parent);
+}
+
+fn writeReportFile(io: std.Io, path: []const u8, data: []const u8) !void {
+    try ensureParentDir(io, path);
+    if (std.fs.path.isAbsolute(path)) {
+        var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, data);
+    } else {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+    }
+}
+
+fn writeJsonReport(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    generated_unix_ns: u64,
+    machine_id: []const u8,
+    hostname: ?[]const u8,
+    results: []const BenchResult,
+    github_sha: ?[]const u8,
+    github_run_id: ?[]const u8,
+    github_ref_name: ?[]const u8,
+) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\n");
+    try out.print(allocator, "  \"schema_version\": 2,\n", .{});
+    try out.appendSlice(allocator, "  \"suite\": \"quic_zig.microbench\",\n");
+    try out.print(allocator, "  \"generated_unix_ns\": {d},\n", .{generated_unix_ns});
+    try out.print(allocator, "  \"target_ns_per_benchmark\": {d},\n", .{target_ns});
+    try out.print(allocator, "  \"min_iters\": {d},\n", .{min_iters});
+    try out.print(allocator, "  \"max_iters\": {d},\n", .{max_iters});
+    try out.appendSlice(allocator, "  \"optimize\": \"ReleaseFast\",\n");
+    try out.appendSlice(allocator, "  \"report_path\": ");
+    try appendJsonString(&out, allocator, path);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "  \"quic_zig_version\": ");
+    try appendJsonString(&out, allocator, quic_zig.version());
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "  \"zig_version\": ");
+    try appendJsonString(&out, allocator, builtin.zig_version_string);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "  \"target\": {\n");
+    try out.appendSlice(allocator, "    \"arch\": ");
+    try appendJsonString(&out, allocator, @tagName(builtin.target.cpu.arch));
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"os\": ");
+    try appendJsonString(&out, allocator, @tagName(builtin.target.os.tag));
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"abi\": ");
+    try appendJsonString(&out, allocator, @tagName(builtin.target.abi));
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"cpu_model\": ");
+    try appendJsonString(&out, allocator, builtin.target.cpu.model.name);
+    try out.appendSlice(allocator, "\n  },\n");
+    const logical_cpu_count: ?u64 = if (std.Thread.getCpuCount()) |n| @intCast(n) else |_| null;
+    const total_memory_bytes: ?u64 = if (std.process.totalSystemMemory()) |n| n else |_| null;
+    const uts = std.posix.uname();
+    try out.appendSlice(allocator, "  \"system\": {\n");
+    try out.appendSlice(allocator, "    \"machine_id\": ");
+    try appendJsonString(&out, allocator, machine_id);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"hostname\": ");
+    try appendNullableJsonString(&out, allocator, hostname);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"logical_cpu_count\": ");
+    try appendNullableU64(&out, allocator, logical_cpu_count);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"total_memory_bytes\": ");
+    try appendNullableU64(&out, allocator, total_memory_bytes);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"uname\": {\n");
+    try out.appendSlice(allocator, "      \"sysname\": ");
+    try appendJsonString(&out, allocator, std.mem.sliceTo(&uts.sysname, 0));
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "      \"release\": ");
+    try appendJsonString(&out, allocator, std.mem.sliceTo(&uts.release, 0));
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "      \"version\": ");
+    try appendJsonString(&out, allocator, std.mem.sliceTo(&uts.version, 0));
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "      \"machine\": ");
+    try appendJsonString(&out, allocator, std.mem.sliceTo(&uts.machine, 0));
+    try out.appendSlice(allocator, "\n    }\n");
+    try out.appendSlice(allocator, "  },\n");
+    try out.appendSlice(allocator, "  \"github\": {\n");
+    try out.appendSlice(allocator, "    \"sha\": ");
+    try appendNullableJsonString(&out, allocator, github_sha);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"run_id\": ");
+    try appendNullableJsonString(&out, allocator, github_run_id);
+    try out.appendSlice(allocator, ",\n");
+    try out.appendSlice(allocator, "    \"ref_name\": ");
+    try appendNullableJsonString(&out, allocator, github_ref_name);
+    try out.appendSlice(allocator, "\n  },\n");
+    try out.appendSlice(allocator, "  \"benchmarks\": [\n");
+    for (results, 0..) |r, i| {
+        try out.appendSlice(allocator, "    {\n");
+        try out.appendSlice(allocator, "      \"name\": ");
+        try appendJsonString(&out, allocator, r.name);
+        try out.appendSlice(allocator, ",\n");
+        try out.print(allocator, "      \"iterations\": {d},\n", .{r.iters});
+        try out.print(allocator, "      \"total_ns\": {d},\n", .{r.total_ns});
+        try out.print(allocator, "      \"ns_per_op\": {d:.6},\n", .{r.ns_per_op});
+        try out.print(allocator, "      \"ops_per_sec\": {d:.6}\n", .{r.ops_per_sec});
+        try out.appendSlice(allocator, if (i + 1 == results.len) "    }\n" else "    },\n");
+    }
+    try out.appendSlice(allocator, "  ]\n}\n");
+
+    try writeReportFile(io, path, out.items);
 }
 
 // -- varint --------------------------------------------------------------
@@ -330,11 +570,62 @@ fn runCidGenerate(ctx: CidCtx, iters: u64) u64 {
 
 // -- entry point ---------------------------------------------------------
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    var json_path: ?[]const u8 = null;
+    var json_dir: ?[]const u8 = null;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--json")) {
+            i += 1;
+            if (i >= args.len) return error.MissingJsonPath;
+            if (json_dir != null) return error.DuplicateJsonTarget;
+            json_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--json-dir")) {
+            i += 1;
+            if (i >= args.len) return error.MissingJsonDir;
+            if (json_path != null) return error.DuplicateJsonTarget;
+            json_dir = args[i];
+        } else {
+            std.debug.print("unknown benchmark argument: {s}\n", .{args[i]});
+            return error.UnknownArgument;
+        }
+    }
+
+    const generated_unix_ns = unixNanos();
+    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname = hostnameSlice(&hostname_buf);
+    const machine_id = init.environ_map.get("BENCH_MACHINE_ID") orelse hostname orelse "unknown";
+    const github_sha = init.environ_map.get("GITHUB_SHA");
+    const github_run_id = init.environ_map.get("GITHUB_RUN_ID");
+    const github_ref_name = init.environ_map.get("GITHUB_REF_NAME");
+    var generated_report_path: std.ArrayList(u8) = .empty;
+    defer generated_report_path.deinit(allocator);
+    const report_path: ?[]const u8 = if (json_path) |path|
+        path
+    else if (json_dir) |dir|
+        try buildReportPath(
+            &generated_report_path,
+            allocator,
+            dir,
+            generated_unix_ns,
+            machine_id,
+            github_sha,
+            github_run_id,
+        )
+    else
+        null;
+
     std.debug.print("quic_zig microbenchmarks (target ~{d}ms each, ReleaseFast)\n", .{
         target_ns / std.time.ns_per_ms,
     });
     std.debug.print("---------------------------------------------------------------\n", .{});
+
+    var results: [max_bench_results]BenchResult = undefined;
+    var result_count: usize = 0;
 
     // varint
     const varint_ctx: VarintCtx = .{ .inputs = .{
@@ -343,14 +634,14 @@ pub fn main() !void {
         0x3FFF_FFFF,
         0x3FFF_FFFF_FFFF_FFFF,
     } };
-    benchmark("varint_encode", VarintCtx, varint_ctx, runVarintEncode);
-    benchmark("varint_decode", VarintCtx, varint_ctx, runVarintDecode);
+    recordBenchmark(&results, &result_count, "varint_encode", VarintCtx, varint_ctx, runVarintEncode);
+    recordBenchmark(&results, &result_count, "varint_decode", VarintCtx, varint_ctx, runVarintDecode);
 
     // STREAM frame
     var stream_ctx: StreamCtx = .{ .payload = undefined };
     for (&stream_ctx.payload, 0..) |*b, idx| b.* = @intCast(idx & 0xff);
-    benchmark("frame_stream_encode_100b", *const StreamCtx, &stream_ctx, runStreamEncode);
-    benchmark("frame_stream_decode_100b", *const StreamCtx, &stream_ctx, runStreamDecode);
+    recordBenchmark(&results, &result_count, "frame_stream_encode_100b", *const StreamCtx, &stream_ctx, runStreamEncode);
+    recordBenchmark(&results, &result_count, "frame_stream_decode_100b", *const StreamCtx, &stream_ctx, runStreamDecode);
 
     // ACK frame with 5 ranges
     var ack_ctx: AckCtx = .{
@@ -369,8 +660,8 @@ pub fn main() !void {
         ack_ctx.ranges_len = try ack_range.writeRanges(&ack_ctx.ranges_buf, &ranges);
         ack_ctx.ranges_bytes = ack_ctx.ranges_buf[0..ack_ctx.ranges_len];
     }
-    benchmark("frame_ack_encode_5ranges", *const AckCtx, &ack_ctx, runAckEncode);
-    benchmark("frame_ack_decode_5ranges", *const AckCtx, &ack_ctx, runAckDecode);
+    recordBenchmark(&results, &result_count, "frame_ack_encode_5ranges", *const AckCtx, &ack_ctx, runAckEncode);
+    recordBenchmark(&results, &result_count, "frame_ack_decode_5ranges", *const AckCtx, &ack_ctx, runAckDecode);
 
     // Short-header packet (no AEAD; pure header bytes)
     var short_ctx: ShortHdrCtx = .{
@@ -378,12 +669,147 @@ pub fn main() !void {
         .pn_truncated = 0x12345678,
     };
     _ = &short_ctx;
-    benchmark("short_header_encode", *const ShortHdrCtx, &short_ctx, runShortEncode);
-    benchmark("short_header_decode", *const ShortHdrCtx, &short_ctx, runShortDecode);
+    recordBenchmark(&results, &result_count, "short_header_encode", *const ShortHdrCtx, &short_ctx, runShortEncode);
+    recordBenchmark(&results, &result_count, "short_header_decode", *const ShortHdrCtx, &short_ctx, runShortDecode);
 
     // Connection ID generation (BoringSSL CSPRNG, 8-byte CID)
-    benchmark("cid_generate_8bytes", CidCtx, .{ .cid_len = 8 }, runCidGenerate);
+    recordBenchmark(&results, &result_count, "cid_generate_8bytes", CidCtx, .{ .cid_len = 8 }, runCidGenerate);
+
+    // Packet protection and AEAD paths
+    const hp_ctx = try packet_crypto_bench.initHpMaskAes128CachedCtx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "hp_mask_aes128_cached",
+        *const packet_crypto_bench.HpMaskAes128CachedCtx,
+        &hp_ctx,
+        packet_crypto_bench.runHpMaskAes128Cached,
+    );
+    var aead_seal_ctx = try packet_crypto_bench.initAeadAes128Seal1200bCtx();
+    defer aead_seal_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "aead_aes128_seal_1200b",
+        *const packet_crypto_bench.AeadAes128Seal1200bCtx,
+        &aead_seal_ctx,
+        packet_crypto_bench.runAeadAes128Seal1200b,
+    );
+    var aead_open_ctx = try packet_crypto_bench.initAeadAes128Open1200bCtx();
+    defer aead_open_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "aead_aes128_open_1200b",
+        *const packet_crypto_bench.AeadAes128Open1200bCtx,
+        &aead_open_ctx,
+        packet_crypto_bench.runAeadAes128Open1200b,
+    );
+    const packet_1rtt_seal_ctx = try packet_crypto_bench.initPacket1RttSeal100bAes128Ctx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "packet_1rtt_seal_100b_aes128",
+        *const packet_crypto_bench.Packet1RttSeal100bAes128Ctx,
+        &packet_1rtt_seal_ctx,
+        packet_crypto_bench.runPacket1RttSeal100bAes128,
+    );
+    const packet_1rtt_open_ctx = try packet_crypto_bench.initPacket1RttOpen100bAes128Ctx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "packet_1rtt_open_100b_aes128",
+        *const packet_crypto_bench.Packet1RttOpen100bAes128Ctx,
+        &packet_1rtt_open_ctx,
+        packet_crypto_bench.runPacket1RttOpen100bAes128,
+    );
+    const initial_seal_ctx = try packet_crypto_bench.initPacketInitialSeal1200bRfc9001Ctx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "packet_initial_seal_1200b_rfc9001",
+        *const packet_crypto_bench.PacketInitialSeal1200bRfc9001Ctx,
+        &initial_seal_ctx,
+        packet_crypto_bench.runPacketInitialSeal1200bRfc9001,
+    );
+    var initial_open_ctx = try packet_crypto_bench.initPacketInitialOpen1200bRfc9001Ctx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "packet_initial_open_1200b_rfc9001",
+        *packet_crypto_bench.PacketInitialOpen1200bRfc9001Ctx,
+        &initial_open_ctx,
+        packet_crypto_bench.runPacketInitialOpen1200bRfc9001,
+    );
+
+    // Stream send/receive state machines
+    var stream_send_ctx = try stream_bench.initStreamSendAckLossRequeueCtx(allocator);
+    defer stream_send_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        stream_bench.stream_send_ack_loss_requeue_name,
+        *const stream_bench.StreamSendAckLossRequeueCtx,
+        &stream_send_ctx,
+        stream_bench.runStreamSendAckLossRequeue,
+    );
+    var stream_recv_ctx = try stream_bench.initStreamRecvReassemblySparse64kCtx(allocator);
+    defer stream_recv_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        stream_bench.stream_recv_reassembly_sparse_64k_name,
+        *const stream_bench.StreamRecvReassemblySparse64kCtx,
+        &stream_recv_ctx,
+        stream_bench.runStreamRecvReassemblySparse64k,
+    );
+
+    // ACK range and loss recovery primitives
+    const pn_ack_ctx = loss_ack_bench.initPnSpaceRecordAckRangesCtx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        loss_ack_bench.pn_space_record_ack_ranges_name,
+        *const loss_ack_bench.PnSpaceRecordAckRangesCtx,
+        &pn_ack_ctx,
+        loss_ack_bench.runPnSpaceRecordAckRanges,
+    );
+    const loss_pto_ctx = loss_ack_bench.initLossPtoTickCtx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        loss_ack_bench.loss_pto_tick_name,
+        *const loss_ack_bench.LossPtoTickCtx,
+        &loss_pto_ctx,
+        loss_ack_bench.runLossPtoTick,
+    );
+
+    // Connection-adjacent DATAGRAM ACK/loss event queue
+    const datagram_event_ctx = connection_datagram_bench.initDatagramEventCtx();
+    recordBenchmark(
+        &results,
+        &result_count,
+        "conn_datagram_send_ack_loss_events",
+        *const connection_datagram_bench.DatagramEventCtx,
+        &datagram_event_ctx,
+        connection_datagram_bench.runConnDatagramSendAckLossEvents,
+    );
 
     std.debug.print("---------------------------------------------------------------\n", .{});
-    std.debug.print("done. {d} benchmarks ran.\n", .{9});
+    if (report_path) |path| {
+        try writeJsonReport(
+            allocator,
+            io,
+            path,
+            generated_unix_ns,
+            machine_id,
+            hostname,
+            results[0..result_count],
+            github_sha,
+            github_run_id,
+            github_ref_name,
+        );
+        std.debug.print("wrote benchmark JSON report: {s}\n", .{path});
+    }
+    std.debug.print("done. {d} benchmarks ran.\n", .{result_count});
 }

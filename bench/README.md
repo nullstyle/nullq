@@ -23,6 +23,39 @@ name: <ns/op> ns/op (<ops/sec> ops/sec, <iters> iterations)
 The harness auto-tunes each benchmark to roughly 100 ms of wall time,
 then reports the average.
 
+For durable local or CI reports, ask the benchmark binary to write JSON:
+
+```sh
+zig build bench -- --json benchmark-report.json
+```
+
+For reports that can be rsynced from many machines into one aggregate
+directory without name collisions, use directory mode:
+
+```sh
+BENCH_MACHINE_ID=workstation-a zig build bench -- --json-dir benchmark-reports
+```
+
+Directory mode writes a file named from the generation timestamp, machine
+id, commit, and GitHub run id when available. If `BENCH_MACHINE_ID` is
+not set, the local hostname is used.
+
+The JSON report includes a stable schema version, toolchain and target
+metadata, basic system metadata, GitHub run metadata when available, and
+the per-benchmark iteration count, total time, ns/op, and ops/sec values.
+The `system` block records `machine_id`, hostname, logical CPU count,
+total memory, `uname`, and the compile target CPU model. The scheduled
+GitHub Actions workflow runs the directory-mode command weekly and on
+manual dispatch, then uploads `benchmark-reports/*.json` and
+`benchmark-output.txt` as artifacts for trend inspection.
+
+To collect local runs from several machines:
+
+```sh
+rsync -a host-a:/path/to/quic-zig/benchmark-reports/ aggregate-benchmarks/
+rsync -a host-b:/path/to/quic-zig/benchmark-reports/ aggregate-benchmarks/
+```
+
 ## Covered
 
 | Benchmark | Measures |
@@ -36,13 +69,31 @@ then reports the average.
 | `short_header_encode` | 1-RTT short header encode |
 | `short_header_decode` | 1-RTT short header parse |
 | `cid_generate_8bytes` | 8-byte CSPRNG CID generation |
+| `hp_mask_aes128_cached` | AES-128 header-protection mask using a cached key schedule |
+| `aead_aes128_seal_1200b` | Raw AES-128-GCM seal over a 1200-byte QUIC payload fixture |
+| `aead_aes128_open_1200b` | Raw AES-128-GCM open over the same fixture |
+| `packet_1rtt_seal_100b_aes128` | Full 1-RTT short-header seal with a 100-byte payload |
+| `packet_1rtt_open_100b_aes128` | Full 1-RTT short-header open for the same fixture |
+| `packet_initial_seal_1200b_rfc9001` | RFC 9001-derived Initial seal padded to a 1200-byte datagram |
+| `packet_initial_open_1200b_rfc9001` | RFC 9001-derived Initial open for the same fixture |
+| `stream_send_ack_loss_requeue` | Send-stream ACK, loss, retransmit, and ACK-floor advancement |
+| `stream_recv_reassembly_sparse_64k` | Receive-stream sparse 64 KiB reassembly and in-order read |
+| `pn_space_record_ack_ranges` | Received-PN insertion, ACK range construction, and ACK range iteration |
+| `loss_pto_tick` | ACK processing, threshold loss detection, PTO calculation, and probe selection |
+| `conn_datagram_send_ack_loss_events` | DATAGRAM ACK/loss event snapshot and bounded event queue behavior |
 
 ## Extending
 
 Add benchmarks when a change affects a parser, frame codec, packet
-builder, crypto path, stream scheduler, or connection lifecycle path that
-is expected to run for most packets. Keep fixtures reusable so AEAD and
-packet-key setup can be shared across related benchmarks.
+builder, crypto path, stream scheduler, recovery primitive, or connection
+event path that is expected to run for most packets. Keep fixtures
+reusable so AEAD, packet-key, stream, and recovery setup can be shared
+across related benchmarks.
 
 Benchmarks run sequentially and single-threaded. Run on a quiet machine
 for stable comparisons.
+
+Use `zig build bench-test` to run the benchmark helper fixture tests.
+That build step uses the same module wiring as `zig build bench`, so
+crypto helpers that depend on BoringSSL's generated C module do not need
+ad hoc `zig test` command-line wiring.

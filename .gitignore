@@ -15,6 +15,11 @@ interop/logs/
 interop/logs.*/
 interop/results/
 
+# Local benchmark reports
+benchmark-report.json
+benchmark-output.txt
+benchmark-reports/
+
 # OS detritus
 .DS_Store
 Thumbs.db

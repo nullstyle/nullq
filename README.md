@@ -17,8 +17,9 @@ internet traffic without the production checklist in
   loss recovery, NewReno congestion feedback, ECN, and DPLPMTUD.
 - High-level `Server` and `Client` wrappers for embedders that want
   quic-zig to own TLS context setup and connection state.
-- Optional `std.Io` UDP loops through `quic_zig.transport.runUdpServer`
-  and `quic_zig.transport.runUdpClient`.
+- Basic `std.Io` loop helpers in `quic_zig.transport.runUdpServer`
+  and `quic_zig.transport.runUdpClient`, allowing integrators to avoid
+  rolling their own UDP loop.
 - Stateless Retry, NEW_TOKEN, stateless reset token helpers, 0-RTT with
   anti-replay hooks, qlog-style callbacks, and key logging support.
 - Version Negotiation, Retry validation, QUIC v2 compatible version
@@ -38,13 +39,16 @@ The repository pins its toolchain with `mise`.
 mise install
 zig build test
 zig build conformance
+zig build bench-test
 zig build bench
 ```
 
 `zig build test` runs unit, integration, conformance, QNS endpoint, and
 deterministic fuzz-smoke tests. `zig build conformance` runs only the
 RFC-traceable conformance corpus. `zig build bench` runs microbenchmarks
-under `ReleaseFast` in a separate benchmark-only build.
+under `ReleaseFast` in a separate benchmark-only build. `zig build
+bench-test` runs the benchmark fixture tests through the same build
+graph, including BoringSSL C-module wiring.
 
 Production or internet-facing builds must use:
 

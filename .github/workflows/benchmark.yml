@@ -1,0 +1,44 @@
+name: benchmark
+
+on:
+  schedule:
+    # Monday 08:00 UTC. Keep benchmark runs weekly on one stable runner
+    # so report history stays comparable.
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout quic-zig
+        uses: actions/checkout@v4
+
+      - name: Set up mise (pinned project tools)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Print toolchain
+        run: |
+          zig version
+          uname -a
+
+      - name: Run benchmarks
+        shell: bash
+        run: |
+          set -o pipefail
+          zig build bench -- --json-dir benchmark-reports 2>&1 | tee benchmark-output.txt
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark-reports/*.json
+            benchmark-output.txt
+          if-no-files-found: warn
+          retention-days: 90
