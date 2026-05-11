@@ -2,9 +2,6 @@
 // §6. Free-function siblings of `Connection`'s `queuePath*` /
 // `pendingPathCidsBlocked` / `clearPendingPathCidsBlocked` API; the
 // methods on `Connection` are thin wrappers that delegate here.
-//
-// Extracted from `conn/state.zig` to keep the connection state-machine
-// monolith from growing further. No behavior change.
 
 const std = @import("std");
 const state_mod = @import("state.zig");

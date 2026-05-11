@@ -141,15 +141,8 @@ test "Iterator: only First ACK Range, no subsequent ranges" {
 
 test "Iterator: multi-range descent" {
     // Acked: [95..100], [88..92], [80..82]
-    //   First range covers 100 down to 95 (length 5).
-    //   Gap 0=2 (skip 93, 94 — 2 unacked PNs strictly between 95 and 92), length 0=4 → 88..92
-    //   Gap 1=4 (skip 83..87 — wait, between 88 and 82 there are 5 unacked: 83,84,85,86,87; gap counts those minus the first one below the smallest of previous, so... let me work the spec arithmetic)
-    //
-    //   §19.3.1: largest_in_this = previous_smallest - gap - 2
-    //   For range [88..92]: previous_smallest = 95, so 92 = 95 - gap - 2 → gap = 1.
-    //                       length = 92 - 88 = 4.
-    //   For range [80..82]: previous_smallest = 88, so 82 = 88 - gap - 2 → gap = 4.
-    //                       length = 82 - 80 = 2.
+    // First range covers [95..100]; gap=1,len=4 -> [88..92];
+    // gap=4,len=2 -> [80..82].
     var ranges_buf: [8]u8 = undefined;
     const ranges = [_]AckRange{
         .{ .gap = 1, .length = 4 },

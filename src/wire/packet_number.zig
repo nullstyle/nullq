@@ -165,17 +165,9 @@ test "decode: candidate snaps forward by a window when too far behind" {
 }
 
 test "decode: candidate snaps backward by a window when too far ahead" {
-    // largest = 1023; truncated = 0xff with 1 byte.
-    // Expected = 1024; candidate = (1024 & ~0xff) | 0xff = 1023.
-    // Wait — 1023 isn't > expected + 128 (1152). Actually let's pick
-    // a clearer case: largest = 1024, truncated = 0x00.
-    // Expected = 1025; candidate = (1025 & ~0xff) | 0x00 = 1024.
-    // 1024 isn't > 1025 + 128 = 1153 either. The "subtract pn_win"
-    // branch only fires when the wrap would push candidate near the
-    // top of a window above expected. Try largest = 1280, truncated = 0xff.
-    // Expected = 1281; candidate = (1281 & ~0xff) | 0xff = 1280 | 0xff = wait,
-    // 1281 = 0x501; 1281 & ~0xff = 0x500 = 1280; | 0xff = 1535.
-    // Check: 1535 > 1281 + 128 = 1409? YES. And 1535 >= 256? YES. Result: 1535 - 256 = 1279.
+    // largest = 1280; truncated = 0xff with 1 byte.
+    // Expected = 1281; candidate = 1535 exceeds the half-window, so
+    // the decoder subtracts 256 and recovers 1279.
     const recovered = try decode(0xff, 1, 1280);
     try std.testing.expectEqual(@as(u64, 1279), recovered);
 }

@@ -795,8 +795,8 @@ const ConfigImpl = struct {
     /// connection. The default config (1200 floor, 1452 ceiling,
     /// 64-byte step, 3-strike threshold, enabled) matches the
     /// QUIC v1 minimum-MTU floor and the typical 1500-byte internet
-    /// MTU. Set `enable = false` to keep the historical static-MTU
-    /// behaviour (PMTU stays at `initial_mtu`).
+    /// MTU. Set `enable = false` to keep the static-MTU behaviour
+    /// (PMTU stays at `initial_mtu`).
     pmtud: conn_mod.PmtudConfig = .{},
 
     /// RFC 9000 §18.2 / §5.1.1 server preferred-address advertisement.
@@ -1102,16 +1102,8 @@ pub const Server = struct {
 
     allocator: std.mem.Allocator,
     tls_ctx: boringssl.tls.Context,
-    /// True if the TLS context was built by `Server.init` and must
-    /// be torn down on `deinit`. False if the embedder supplied
-    /// `tls_context_override`. `replaceTlsContext` updates this in
-    /// step with the swap: a `.pem` reload produces an owned new
-    /// context (`owns_tls = true`), an `.override` reload adopts the
-    /// caller-supplied context as owned (`owns_tls = true`) — once
-    /// the caller hands the context to the Server, the Server is
-    /// responsible for the eventual `deinit`. The pre-swap context's
-    /// owned/borrowed status is preserved by only moving it into
-    /// `draining_tls_contexts` when it was previously owned.
+    /// True when `tls_ctx` is Server-owned and must be torn down by
+    /// Server lifecycle paths.
     owns_tls: bool,
     /// Borrowed ALPN list captured from `Config.alpn_protocols` at
     /// `init` time. Used by `replaceTlsContext({.pem = ...})` to
@@ -1919,16 +1911,11 @@ pub const Server = struct {
             // (rather than blindly stamping `from` BEFORE dispatch)
             // means the loop's outbound drain doesn't follow a
             // peer's pre-handshake rebind that the connection
-            // refused — which was the failure mode behind
-            // `server × quiche × rebind-addr`: quiche's first
-            // datagram on the post-rebind tuple was authentic
-            // (CID match), so we accepted it, but its handshake
-            // had not yet confirmed; the connection refused the
-            // migration; yet the slot's `peer_addr` had already
-            // been moved to the new tuple, so the next outbound
-            // packet went there carrying ACK + STREAM data with
-            // no PATH_CHALLENGE — quiche's interop checker reads
-            // that as "server moved without validating" and fails.
+            // refused. The routing hint must keep pointing at the
+            // last validated tuple until the connection's migration
+            // gate accepts the new one; otherwise the next outbound
+            // packet could carry ACK + STREAM data on an unvalidated
+            // path instead of first proving it with PATH_CHALLENGE.
             const ap = slot.conn.activePath();
             if (ap.peer_addr_set) {
                 slot.peer_addr = ap.path.peer_addr;
@@ -2261,6 +2248,11 @@ pub const Server = struct {
     /// and stops handing it to new slots. The draining list is
     /// always purely Server-owned.
     ///
+    /// The new context is Server-owned after a successful swap. A
+    /// `.pem` reload builds that context internally; an `.override`
+    /// reload adopts the caller-supplied context, so the caller must
+    /// not deinit it after handing it over.
+    ///
     /// **Resumption note**: BoringSSL mints session tickets under
     /// the SSL_CTX's per-context ticket key, so a ticket issued
     /// before this swap cannot be decrypted under the new context
@@ -2331,8 +2323,6 @@ pub const Server = struct {
         self.tls_ctx = new_ctx;
         self.owns_tls = true;
         self.current_generation +%= 1;
-        // `errdefer new_ctx.deinit()` no longer applies after the
-        // assignment above; everything that could fail has run.
     }
 
     // -- internals ------------------------------------------------------

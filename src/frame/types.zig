@@ -1,8 +1,7 @@
 //! QUIC frame type definitions (RFC 9000 §19).
 //!
-//! Covers all 20 frame types in the v1 spec — 18 fixed-shape frames
-//! plus ACK (with range encoding) and STREAM (with FIN/LEN/OFF flags
-//! in the type byte).
+//! Covers the RFC 9000 v1 frame set plus DATAGRAM (RFC 9221),
+//! draft-21 multipath frames, and alternative-address draft frames.
 
 const wire_header = @import("../wire/header.zig");
 
@@ -160,8 +159,8 @@ pub const Ack = struct {
     largest_acked: u64,
     /// Encoded ack delay in microseconds, scaled by the peer's
     /// `ack_delay_exponent` transport parameter (RFC 9000 §13.2.5).
-    /// quic_zig's wire layer doesn't apply the exponent — that's the
-    /// state machine's job in Phase 5.
+    /// quic_zig's wire layer doesn't apply the exponent; transport
+    /// parameter scaling is the state machine's job.
     ack_delay: u64,
     /// Length of the contiguous run [largest_acked - first_range,
     /// largest_acked]. So `first_range + 1` packets are acked at the top.

@@ -266,9 +266,8 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
     defer for (listeners) |l| l.sock.close(options.io);
 
     // Tune + ECN-mark every bound socket identically. Tuning failures
-    // surface from the primary only (mirrors the historical
-    // single-socket behavior); alt-listener tuning failures degrade
-    // silently to the kernel default. ECN setup is per-socket so a
+    // surface from the primary listener; alt-listener tuning failures
+    // degrade silently to the kernel default. ECN setup is per-socket so a
     // kernel that rejects IPV6_TCLASS on one family but not the
     // other still gets ECN on the accepting socket.
     if (options.tune_socket) {
@@ -362,14 +361,14 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
             }
         }
 
-        // Receive (or timeout) on each listener in turn. We do NOT
-        // break on the first listener that returns a datagram —
-        // with `max_datagrams_per_loop_iteration = 1` we still cap
-        // the total at one feed per iteration, but we let each
-        // listener get a fair recv-timeout slice so a hot listener
-        // can't starve a quiet one. Sub-second-scale priority
-        // inversion is fine; QUIC's PTO timer fires on millisecond-
-        // ish granularity anyway.
+        // Receive (or timeout) on each listener in turn. The loop
+        // checks every listener on each pass:
+        // `max_datagrams_per_loop_iteration = 1` caps each listener
+        // at one feed per iteration, so a multi-listener server may
+        // feed once per listener. Each listener still gets a fair
+        // recv-timeout slice so a hot listener can't starve a quiet
+        // one. Sub-second-scale priority inversion is fine; QUIC's
+        // PTO timer fires on millisecond-ish granularity anyway.
         for (listeners, 0..) |l, sock_idx| {
             var maybe_msg: ?Net.IncomingMessage = null;
             var ecn: socket_opts.EcnCodepoint = .not_ect;
@@ -409,9 +408,10 @@ pub fn runUdpServer(server: *Server, options: RunUdpOptions) RunError!void {
 
             const msg = maybe_msg orelse continue;
             const from_addr = ipAddressToPathAddress(msg.from);
-            // `feed` swallows per-connection errors internally; only
-            // OutOfMemory propagates out, and that's already a hard
-            // failure for the loop. The FeedOutcome is informational —
+            // `feed` swallows per-connection errors internally;
+            // OutOfMemory and rarely RandFailed propagate out, and
+            // either is already a hard failure for the loop. The
+            // FeedOutcome is informational —
             // production embedders may want to plumb it into a metrics
             // counter, but the default loop just lets it ride.
             const outcome = try server.feedWithEcn(msg.data, from_addr, ecn, now_us);
@@ -539,10 +539,9 @@ fn drainSlot(
     }
 }
 
-/// Convert the loop's monotonic-clock origin into a microsecond
-/// offset suitable for `Server.feed` / `Server.tick`. Mirrors the
-/// QNS endpoint's `qnsNowUs` so the two stay numerically consistent
-/// when both are running. Also reused by `runUdpClient`.
+/// Convert the loop's monotonic-clock origin into a non-negative
+/// microsecond offset suitable for `Server.feed` / `Server.tick`.
+/// Also reused by `runUdpClient`.
 pub fn monotonicNowUs(io: std.Io, start: std.Io.Timestamp) u64 {
     const now = std.Io.Timestamp.now(io, .awake);
     const delta = start.durationTo(now).toMicroseconds();
@@ -551,8 +550,7 @@ pub fn monotonicNowUs(io: std.Io, start: std.Io.Timestamp) u64 {
 }
 
 /// Project a `std.Io.net.IpAddress` into quic_zig's bag-of-bytes
-/// `path.Address`. Mirrors the QNS endpoint's `netAddressToPathAddress`.
-/// Also reused by `runUdpClient`.
+/// `path.Address` layout. Also reused by `runUdpClient`.
 pub fn ipAddressToPathAddress(addr: Net.IpAddress) Address {
     var out: Address = .{};
     switch (addr) {

@@ -25,7 +25,8 @@ pub const max_ranges: u8 = 255;
 pub const Error = error{
     /// `toAckFrame*` was called with no PNs recorded.
     Empty,
-    /// The encode buffer was too small to hold the requested ranges.
+    /// FIXME(audit): `BufferTooSmall` is never returned by any
+    /// builder in this file — drop the variant (code change).
     BufferTooSmall,
 } || varint.Error;
 

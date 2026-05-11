@@ -34,10 +34,9 @@
 //!
 //! Decrypt runs the same four passes in reverse order, also using
 //! AES-128-*encrypt* (Feistel only needs the round function to be
-//! deterministic, never invertible). The implementation is the LB-side
-//! decoder gated as test/advanced — the embedder-facing API ships the
-//! encrypt direction for the server, and `decrypt` is exposed so
-//! round-trip property tests and ops tooling can recover the plaintext.
+//! deterministic, never invertible). The embedder-facing server path
+//! uses `encrypt`; `decrypt` is public so round-trip property tests and
+//! operations tooling can recover the plaintext.
 
 const std = @import("std");
 const boringssl = @import("boringssl");

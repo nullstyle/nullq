@@ -1,9 +1,9 @@
 //! Connection close/draining lifecycle state.
 //!
-//! Owns the close-related fields and pure transitions extracted from
-//! `Connection`. The Connection still wraps these calls to layer in
-//! side effects (clearing recovery state, emitting qlog state-change
-//! events) that aren't pure lifecycle concerns.
+//! Owns the close-related fields and the pure state transitions.
+//! `Connection` wraps these calls to layer in side effects (clearing
+//! recovery state, emitting qlog state-change events) that aren't
+//! pure lifecycle concerns.
 //!
 //! RFC 9000 §10 defines the lifecycle: open → closing → draining → closed.
 

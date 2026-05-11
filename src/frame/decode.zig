@@ -1,4 +1,5 @@
-//! Frame decoder for the 18 fixed-shape QUIC frame types (RFC 9000 §19).
+//! Frame decoder for RFC 9000 v1 frames plus DATAGRAM (RFC 9221),
+//! draft-21 multipath, and alternative-address draft frames.
 //!
 //! `decode(src)` reads one frame from the start of `src` and returns
 //! the typed value plus the number of bytes consumed. Callers
@@ -809,20 +810,8 @@ test "decode rejects PATH_ACK frames whose range_count exceeds max_incoming_ack_
 }
 
 test "decode rejects ACK with overlapping ranges" {
-    // largest_acked = 100, first_range = 5 → first interval [95..100].
-    // A well-formed second range with gap=0 would land at
-    // new_largest = 95 - 0 - 2 = 93 → interval [93 - length .. 93].
-    // To force overlap into the *first* range we'd need new_largest
-    // ≥ 95, i.e. cursor=95, gap=0 and 95 - 0 - 2 = 93 — never reaches
-    // back into the prior interval.
-    //
-    // Overlap in PN-space is therefore expressible only by
-    // arithmetic underflow: e.g. cursor = 95, but gap is encoded so
-    // that gap + 2 > 95. With first_range = 5 and largest_acked = 5
-    // the first interval is [0..5], and a gap=10 makes
-    // new_largest = 0 - 10 - 2 → underflow. That underflow IS the
-    // overlap signature for a peer that tried to claim a range
-    // already covered by the descending walk.
+    // First range covers [0..5]; gap=10 would move the descending
+    // cursor below zero, which is rejected as overlapping range math.
     const bytes = [_]u8{
         0x02, // ACK (no ECN)
         0x05, // largest_acked = 5
@@ -972,8 +961,9 @@ test "fuzz: frame decode single-frame property" {
             "\x05\x00\x00\x00\x30\xde\xad\xbe\xef",
             // DATAGRAM (LEN-prefixed): len=4 + 4 bytes
             "\x06\x00\x00\x00\x31\x04\xde\xad\xbe\xef",
-            // PATH_ACK (multipath, 2-byte varint type 0x3e): path_id=0,
-            // largest=0, ack_delay=0, range_count=0, first_range=0
+            // PATH_ACK (multipath, type 0x3e encoded here with a
+            // non-minimal 2-byte varint): path_id=0, largest=0,
+            // ack_delay=0, range_count=0, first_range=0
             "\x06\x00\x00\x00\x40\x3e\x00\x00\x00\x00",
             // ALTERNATIVE_V4_ADDRESS: 4-byte type varint(0x1d5845e2),
             // flags=0x80 (Preferred), seq=0, addr=192.0.2.1, port=4433.

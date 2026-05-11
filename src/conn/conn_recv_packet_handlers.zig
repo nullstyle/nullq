@@ -7,9 +7,6 @@
 // `Connection`'s public method-style handlers; the methods on
 // `Connection` are thin thunks that delegate here.
 //
-// Extracted from src/conn/state.zig to keep the connection state-
-// machine monolith from growing further. No behavior change.
-//
 // `Connection.handleOnePacket` (the long-header type dispatcher) stays
 // in state.zig — it's the orchestrator that picks which of these six
 // handlers to invoke based on the first byte / version field.

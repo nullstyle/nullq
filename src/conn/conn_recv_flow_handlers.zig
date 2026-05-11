@@ -3,9 +3,6 @@
 // STREAM_DATA_BLOCKED, STREAMS_BLOCKED. Free-function siblings of
 // `Connection`'s public method-style handlers; the methods on
 // `Connection` are thin thunks that delegate here.
-//
-// Extracted from src/conn/state.zig to keep the connection state-
-// machine monolith from growing further. No behavior change.
 
 const std = @import("std");
 const state_mod = @import("state.zig");

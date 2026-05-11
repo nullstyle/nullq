@@ -2,9 +2,6 @@
 // NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, NEW_TOKEN. Free-function
 // siblings of `Connection`'s public method-style handlers; the methods
 // on `Connection` are thin thunks that delegate here.
-//
-// Extracted from src/conn/state.zig to keep the connection state-
-// machine monolith from growing further. No behavior change.
 
 const std = @import("std");
 const state_mod = @import("state.zig");
@@ -80,7 +77,7 @@ pub fn handleRetireConnectionId(
 /// legal at application encryption level (filtered upstream by
 /// the level-allowed-frames check). Servers MUST NOT receive
 /// NEW_TOKEN; if a peer-acting-as-server sends it to us we
-/// silently drop the bytes. Clients hand the borrowed slice
+/// raise PROTOCOL_VIOLATION. Clients hand the borrowed slice
 /// straight to the embedder callback if one is installed.
 pub fn handleNewToken(self: *Connection, nt: frame_types.NewToken) void {
     if (self.role != .client) {
@@ -92,10 +89,7 @@ pub fn handleNewToken(self: *Connection, nt: frame_types.NewToken) void {
         return;
     }
     if (nt.token.len == 0) {
-        // Zero-length NEW_TOKEN is FRAME_ENCODING_ERROR per
-        // §19.7. We could emit a more specific code; quic_zig
-        // already wires PROTOCOL_VIOLATION for parse-shape
-        // issues so reuse it.
+        // Zero-length NEW_TOKEN is FRAME_ENCODING_ERROR per §19.7.
         self.close(true, transport_error_frame_encoding, "zero-length new_token");
         return;
     }

@@ -5,10 +5,8 @@
 // public method-style handlers; the methods on `Connection` are
 // thin thunks that delegate here.
 //
-// These are the inbound counterparts of the queuePath* methods in
-// `path_frame_queue.zig`. Extracted from src/conn/state.zig to keep
-// the connection state-machine monolith from growing further.
-// No behavior change.
+// These are the inbound counterparts of the `queuePath*` methods in
+// `path_frame_queue.zig`.
 
 const std = @import("std");
 const state_mod = @import("state.zig");

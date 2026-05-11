@@ -58,7 +58,7 @@ pub fn encodeFixed(dst: []u8, value: u64, length: u8) Error!usize {
         2 => (1 << 14) - 1,
         4 => (1 << 30) - 1,
         8 => max_value,
-        // invariant: the prior switch (line 48) returns InvalidLength
+        // invariant: the prior switch above returns InvalidLength
         // for any other value, so we never reach this arm. Not
         // peer-reachable; `length` is a local that the caller
         // already validated above.

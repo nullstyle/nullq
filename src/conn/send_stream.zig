@@ -58,8 +58,8 @@ pub const State = enum {
 /// Half-open interval `[offset, end)` of stream bytes.
 pub const Range = struct {
     offset: u64,
-    /// Inclusive end. A 0-length range cannot be represented; use
-    /// the `pending` list's `count == 0` instead.
+    /// One past the last byte (half-open). A 0-length range cannot
+    /// be represented; check `pending.items.len == 0` instead.
     end: u64,
 
     /// Length of the range in bytes.
@@ -92,12 +92,12 @@ pub const ResetInfo = struct {
 /// Default ceiling on `SendStream.bytes` length — i.e. how many
 /// app-written bytes can sit in the per-stream send queue before
 /// `write` short-writes (returning < data.len) to apply local
-/// back-pressure. Hardening guide §8 calls for `max_send_queue_bytes`;
-/// the previous behavior (no cap) let an embedder calling
-/// `streamWrite` faster than the peer could ACK push the buffer to
-/// arbitrary size. 1 MiB matches the default per-stream receive
-/// window, so the steady-state queue fills by one round-trip's worth
-/// of data before back-pressure kicks in.
+/// back-pressure. The cap (hardening guide §8 `max_send_queue_bytes`)
+/// prevents an embedder calling `streamWrite` faster than the peer
+/// can ACK from pushing the buffer to arbitrary size. 1 MiB matches
+/// the default per-stream receive window, so the steady-state queue
+/// fills by one round-trip's worth of data before back-pressure
+/// kicks in.
 pub const default_max_buffered_send: usize = 1 * 1024 * 1024;
 
 /// Byte buffer whose public `.items` slice is always the live stream

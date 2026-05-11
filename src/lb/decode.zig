@@ -8,7 +8,8 @@
 //!   * Round-trip property tests in the conformance suite.
 //!   * Operations tooling that needs to inspect what a server
 //!     would mint (e.g. the QNS harness, future LB tooling).
-//!   * Future stretch work that ships an actual LB-side decoder.
+//!   * External load balancer tooling that needs the recovered
+//!     routing identity.
 //!
 //! ## Coverage
 //!
@@ -16,9 +17,8 @@
 //!
 //!   * **§5.5 plaintext** — direct extraction of `server_id || nonce`.
 //!   * **§5.5.1 single-pass** — runs `AES-128-ECB decrypt` over the
-//!     16-byte body to recover `server_id || nonce` (added once
-//!     boringssl-zig 0.6.0 shipped `Aes128.initDecrypt` /
-//!     `decryptBlock`).
+//!     16-byte body to recover `server_id || nonce` via
+//!     `Aes128.initDecrypt` / `decryptBlock`.
 //!   * **§5.5.2 four-pass Feistel** — runs `feistel.decrypt`, which
 //!     uses AES-128-ECB *encrypt* as the round function (Feistel only
 //!     needs the round function to be deterministic, never invertible).
@@ -101,9 +101,8 @@ pub fn decode(cid: []const u8, cfg: LbConfig) Error!Decoded {
         if (combined == 16) {
             // §5.5.1 single-pass: invert the §5.4.1
             // AES-128-ECB(key, server_id || nonce) the server applied
-            // when minting. boringssl-zig 0.6.0+ ships
-            // `Aes128.initDecrypt` / `decryptBlock` for this; the
-            // forward `init` would silently produce garbage because
+            // when minting. Use `Aes128.initDecrypt` / `decryptBlock`;
+            // the forward `init` would silently produce garbage because
             // AES uses different schedules for encrypt vs decrypt.
             const aes = Aes128.initDecrypt(&key) catch return Error.AesKeyInvalid;
             var pt_block: [16]u8 = undefined;

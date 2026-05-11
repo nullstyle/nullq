@@ -1,5 +1,5 @@
-//! End-to-end seal/open for long-header QUIC packets — Initial
-//! (RFC 9000 §17.2.2) and Handshake (§17.2.4).
+//! Long-header QUIC packet helpers: Initial (RFC 9000 §17.2.2),
+//! 0-RTT (§17.2.3), Handshake (§17.2.4), and Retry (§17.2.5).
 //!
 //! Long-header packets carry a varint Length field that frames
 //! their PN+payload+tag region; this lets multiple long-header
@@ -483,10 +483,8 @@ pub fn retryIntegrityTag(version: u32, original_dcid: []const u8, retry_without_
     defer aead.deinit();
     var out: [16]u8 = undefined;
     const n = try aead.seal(&out, retryIntegrityNonceFor(version), pseudo[0..pos], "");
-    // BoringSSL contract: AesGcm128.seal with empty plaintext writes
-    // exactly the 16-byte tag. Reachable from peer-input via Retry
-    // integrity validation; surface as a typed error rather than
-    // assert so a misbehaving AEAD library can't panic the process.
+    // Empty-plaintext AEAD should write exactly the 16-byte tag;
+    // report a typed error instead of asserting if it does not.
     if (n != out.len) return Error.OutputTooSmall;
     return out;
 }
@@ -559,7 +557,7 @@ fn openLongHeader(
 
     // Walk the unprotected header structure manually; the PN bytes
     // are still HP-masked, so we ignore the parser's pn_length /
-    // pn_truncated for now and re-derive them after HP is removed.
+    // pn_truncated and re-derive them after HP is removed.
     var pos: usize = 1;
     pos += 4; // version
 
@@ -683,8 +681,9 @@ fn pnLengthFromInt(pn_len: u8) header.PnLength {
         2 => .two,
         3 => .three,
         4 => .four,
-        // invariant: this helper is only fed by chooseLongPnLength,
-        // which returns 1..=4 by construction. Not peer-reachable.
+        // invariant: callers validate with the
+        // `pn_len < 1 or pn_len > 4` check before converting.
+        // Not peer-reachable.
         else => unreachable,
     };
 }

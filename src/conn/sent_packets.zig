@@ -282,10 +282,9 @@ pub const SentPacketTracker = struct {
     }
 
     /// Error-aware sibling of `removeRangeWith`. If `on_remove`
-    /// fails, packets already handed to the callback, including the
-    /// failing packet, are removed and compacted; remaining packets
-    /// in `[start, end)` stay tracked. This mirrors callers that
-    /// previously did `removeAt` before running fallible dispatch.
+    /// fails, packets already handed to the callback (including the
+    /// failing packet) are removed and compacted; remaining packets
+    /// in `[start, end)` stay tracked.
     pub fn removeRangeWithError(
         self: *SentPacketTracker,
         start: u32,

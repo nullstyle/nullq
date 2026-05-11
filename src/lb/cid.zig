@@ -144,6 +144,7 @@ pub const Factory = struct {
         var f: Factory = .{ .cfg = cfg };
         if (cfg.key) |key| {
             f.aes = Aes128.init(&key) catch return Error.AesKeyInvalid;
+            // FIXME(audit): errdefer body is a no-op; remove?
             errdefer if (f.aes) |*a| {
                 _ = a;
                 // BoringSSL's AES_KEY is opaque key-schedule state.

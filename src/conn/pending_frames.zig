@@ -1,17 +1,11 @@
 //! Pending control-frame queues — the per-connection backlog of QUIC
-//! control frames the sender owes the peer. Extracted from
-//! `Connection` to keep the state machine focused on lifecycle and
-//! routing while this module owns the FIFO/coalesced bookkeeping.
+//! control frames the sender owes the peer. Owns the FIFO/coalesced
+//! bookkeeping that `Connection` drains from `pollLevel`.
 //!
 //! Ownership model: every list is allocator-backed and stored
 //! directly here. `Connection` calls `deinit(allocator)` when it
 //! tears down. Methods that mutate the queues take an allocator
 //! argument because the lists are unmanaged.
-//!
-//! This is a code-motion refactor — semantics are identical to the
-//! pre-extraction inline fields in `state.zig`. The drain order in
-//! `pollLevel` still walks each queue in the same sequence; this
-//! module just provides typed homes for the fields.
 
 const std = @import("std");
 

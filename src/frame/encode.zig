@@ -1,4 +1,5 @@
-//! Frame encoder for the 18 fixed-shape QUIC frame types (RFC 9000 §19).
+//! Frame encoder for RFC 9000 v1 frames plus DATAGRAM (RFC 9221),
+//! draft-21 multipath, and alternative-address draft frames.
 //!
 //! `encode(dst, frame)` writes the wire bytes for a `Frame` and
 //! returns the number of bytes written. `encodedLen(frame)` returns

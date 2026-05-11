@@ -185,8 +185,7 @@ const ConfigImpl = struct {
     /// `Connection`. The default (1200 floor, 1452 ceiling, 64-byte
     /// step, 3-strike threshold, enabled) matches the QUIC v1
     /// minimum-MTU floor and the typical 1500-byte internet MTU.
-    /// Set `enable = false` to keep the historical static-MTU
-    /// behaviour.
+    /// Set `enable = false` to keep the static-MTU behaviour.
     pmtud: conn_mod.PmtudConfig = .{},
 };
 

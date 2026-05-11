@@ -28,10 +28,10 @@
 //!    embedder closed it, peer-initiated close, idle timeout, etc.),
 //!    OR
 //!  - `RunUdpClientOptions.shutdown_flag` flips to true. The loop
-//!    then calls `client.conn.close(.application, 0, "")` to queue
-//!    a CONNECTION_CLOSE on the wire and continues polling for up
-//!    to `shutdown_grace_us` so the close actually reaches the
-//!    server before the socket goes away.
+//!    then calls `client.conn.close(false, options.shutdown_error_code,
+//!    "")` to queue a CONNECTION_CLOSE on the wire and continues
+//!    polling for up to `shutdown_grace_us` so the close actually
+//!    reaches the server before the socket goes away.
 //!
 //! Embedder cooperation
 //! --------------------

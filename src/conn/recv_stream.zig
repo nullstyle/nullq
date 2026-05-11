@@ -8,8 +8,9 @@
 //! Storage is a single contiguous buffer indexed by absolute
 //! offset minus `read_offset`. The set of valid byte ranges is
 //! tracked in `ranges` (sorted, disjoint); bytes outside any range
-//! are allocated but undefined. As the app consumes bytes via
-//! `read`, the prefix is dropped and the buffer shrinks.
+//! are allocated and zero-filled (slack is `@memset(slack, 0)`-ed
+//! on grow). As the app consumes bytes via `read`, the prefix is
+//! dropped and the buffer shrinks.
 //!
 //! Stream-level flow control (§4) is enforced *outside* this
 //! module by `flow_control.StreamData`; the recv buffer surfaces
@@ -28,8 +29,9 @@ pub const Error = error{
     /// is below the highest offset we've already received bytes for
     /// (RFC 9000 §4.5 / FINAL_SIZE_ERROR).
     FinalSizeChanged,
-    /// The frame would force the reassembly buffer to cover an
-    /// implementation-defined, peer-controlled span.
+    /// The frame would force the reassembly buffer to span more
+    /// bytes than `max_buffered_span` permits (default
+    /// `default_max_buffered_span` = 16 MiB).
     BufferLimitExceeded,
 } || std.mem.Allocator.Error;
 
@@ -39,9 +41,12 @@ pub const Error = error{
 /// guard against sparse offsets before fuller stream windows land.
 pub const default_max_buffered_span: u64 = 16 * 1024 * 1024;
 
-/// State of the receive half (RFC 9000 §3.2):
-/// recv → size_known → data_recvd → data_read
-///                          ↘ reset_recvd → reset_read
+/// State of the receive half (RFC 9000 §3.2). A RESET_STREAM from
+/// the peer can fire from any `recv` / `size_known` / `data_recvd`
+/// state — the reset transition replaces the in-flight chain:
+///   recv ──→ size_known ──→ data_recvd ──→ data_read
+///     │           │              │
+///     └───────────┴──────────────┴─────→ reset_recvd ──→ reset_read
 pub const State = enum {
     recv,
     size_known,

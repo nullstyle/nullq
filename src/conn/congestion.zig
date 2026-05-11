@@ -182,8 +182,7 @@ test "initial window honors RFC 9002 §7.2 (max 10 MSS, min(2 MSS, 14720))" {
     try std.testing.expectEqual(@as(u64, 12000), cfg.initialWindow());
 
     const big: Config = .{ .max_datagram_size = 1500 };
-    // 10 * 1500 = 15000; max(3000, 14720) = 15000; min(15000, 15000) = 15000.
-    // Wait — 14720 vs 3000: max is 14720. min(15000, 14720) = 14720.
+    // 10 * 1500 = 15000; max(2 * 1500, 14720) = 14720; min(15000, 14720) = 14720.
     try std.testing.expectEqual(@as(u64, 14720), big.initialWindow());
 }
 

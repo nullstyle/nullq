@@ -3,9 +3,6 @@
 // re-queues control frames RFC 9002 has declared lost. Free-function
 // siblings of `Connection`'s public method-style handlers; the
 // methods on `Connection` are thin thunks that delegate here.
-//
-// Extracted from src/conn/state.zig to keep the connection state-
-// machine monolith from growing further. No behavior change.
 
 const std = @import("std");
 const state_mod = @import("state.zig");
@@ -175,8 +172,8 @@ pub fn handleAckAtLevel(
     //   1. every open SendStream (application level only),
     //   2. the per-level SentPacketTracker.
     //
-    // Phase 5b v1 walks streams brute-force per PN; a per-PN
-    // side-table is the obvious next optimization.
+    // FIXME(audit): O(streams × PNs) per ACK — a per-PN side-table
+    // would make this O(1).
     const pn_space = self.pnSpaceForLevel(lvl);
     const sent = self.sentForLevel(lvl);
     // The path that owns 1-RTT in-flight bookkeeping. For Initial /

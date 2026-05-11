@@ -363,7 +363,7 @@ pub const SealOptions = struct {
     keys: *const PacketKeys,
     /// Force a specific PN length (1..4). Must accommodate `pn`.
     pn_length_override: ?u8 = null,
-    /// Spin / key_phase bits — Phase 5 always uses 0.
+    /// Spin / key_phase bits are caller-controlled; default 0.
     spin_bit: bool = false,
     key_phase: bool = false,
     /// Short-header Reserved Bits (bits 4-3 of the first byte). RFC
@@ -429,8 +429,9 @@ pub fn seal1Rtt(dst: []u8, opts: SealOptions) Error!usize {
         2 => .two,
         3 => .three,
         4 => .four,
-        // invariant: line 331 returns InvalidPnLength for any pn_len
-        // outside [1, 4]. Not peer-reachable.
+        // invariant: the `pn_len < 1 or pn_len > 4` check above
+        // returns InvalidPnLength for any pn_len outside [1, 4].
+        // Not peer-reachable.
         else => unreachable,
     };
     const truncated = packetNumberTruncated(opts.pn, pn_len);

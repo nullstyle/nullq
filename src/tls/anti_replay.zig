@@ -122,7 +122,7 @@ const Entry = struct {
 };
 
 /// Bounded single-use cache. Not thread-safe — callers serialize on
-/// their own (typical: the same goroutine that runs the QUIC server
+/// their own (typical: the same thread that runs the QUIC server
 /// loop also calls `consume`).
 pub const AntiReplayTracker = struct {
     allocator: std.mem.Allocator,

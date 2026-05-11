@@ -7,9 +7,8 @@
 //! container that backs each buffer.
 //!
 //! The current container uses a fixed array plus `copyForwards` shift on
-//! pop (O(n) per pop). The architecture audit flagged this — switching to
-//! a true ring buffer is a follow-up; this module keeps the existing
-//! semantics so the extraction is a pure code-motion refactor.
+//! pop (O(n) per pop). FIXME(audit): switch to a true ring buffer; pop
+//! is the hot path for embedder event drains.
 
 const std = @import("std");
 
@@ -171,11 +170,8 @@ pub fn datagramEventFromPacket(packet: *const sent_packets_mod.SentPacket) ?Data
 
 /// Fixed-capacity FIFO of `T` with drop-oldest-on-overflow semantics and
 /// O(n) pop (`copyForwards` shift). Backs the per-connection event buffers
-/// surfaced via `Connection.pollEvent`.
-///
-/// The shift-on-pop pattern is intentional and matches the previous
-/// inline implementation; switching to a true ring buffer is a follow-up
-/// flagged by the architecture audit but out of scope for this refactor.
+/// surfaced via `Connection.pollEvent`. See module-level `FIXME(audit)`
+/// — pop should move to a true ring buffer.
 pub fn EventQueue(comptime T: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();

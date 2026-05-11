@@ -215,8 +215,8 @@ pub const PerLevelState = struct {
 
 /// One QUIC stream — bundles the send and receive halves with a
 /// stable `id`. Bidi or uni is a property of the id (RFC 9000 §2.1
-/// stream IDs encode direction in the low two bits); for Phase 5
-/// the Connection treats every stream as bidi.
+/// stream IDs encode direction in the low two bits); `streamIsUni` /
+/// `streamIsBidi` decode the direction.
 pub const Stream = struct {
     id: u64,
     send: SendStream,
@@ -251,8 +251,8 @@ pub const Stream = struct {
 };
 
 /// Default datagram budget for outgoing 1-RTT packets. RFC 9000 §14
-/// mandates at least 1200 bytes path MTU; PMTU discovery (Phase 11)
-/// can lift this.
+/// mandates at least 1200 bytes path MTU; DPLPMTUD (RFC 8899) can
+/// lift this per path.
 pub const default_mtu: usize = 1200;
 pub const transport_error_protocol_violation: u64 = 0x0a;
 pub const transport_error_flow_control: u64 = 0x03;
@@ -933,10 +933,10 @@ const ApplicationOpenResult = struct {
     slot: ApplicationReadKeySlot,
 };
 
-/// Fixed-size CRYPTO frame buffer per encryption level. The
-/// handshake fits comfortably in 16 KiB even for large cert chains;
-/// we'll revisit (and bound via `SSL_quic_max_handshake_flight_len`)
-/// in Phase 5.
+/// Fixed-size CRYPTO frame buffer per encryption level. 16 KiB fits
+/// a handshake comfortably, even with large cert chains.
+/// FIXME(audit): wire `SSL_quic_max_handshake_flight_len` so the
+/// bound is enforced by BoringSSL rather than the fixed array size.
 pub const CryptoBuffer = struct {
     buf: [16384]u8 = undefined,
     len: usize = 0,
@@ -985,8 +985,7 @@ pub const Connection = struct {
 
     /// Peer pointer for the in-process mock transport tests; real
     /// deployments don't set this (they ship CRYPTO bytes via QUIC
-    /// packets through a `transport.Transport`, which lives in
-    /// Phase 6).
+    /// packets through a `transport.Transport` — see `src/transport/`).
     peer: ?*Connection = null,
 
     /// Last alert byte received via the `send_alert` callback, if
@@ -1121,8 +1120,7 @@ pub const Connection = struct {
 
     /// Per-encryption-level outbox of CRYPTO bytes the TLS bridge
     /// has handed us via `add_handshake_data`. `poll` packs these
-    /// into outgoing CRYPTO frames at the matching level. Replaces
-    /// the Phase-4 in-process `peer.inbox` shortcut.
+    /// into outgoing CRYPTO frames at the matching level.
     outbox: [4]CryptoBuffer = .{ .{}, .{}, .{}, .{} },
     /// Highest CRYPTO offset we've handed to the peer at each level.
     /// Used to set the `offset` field on the next CRYPTO frame.
@@ -1347,8 +1345,8 @@ pub const Connection = struct {
     /// RFC 8899 DPLPMTUD configuration. Threaded onto every
     /// `PathState` at creation time. The Connection-level field
     /// defaults to `enable = false` so direct `Connection.initClient
-    /// / initServer` callers (mainly internal test fixtures) keep
-    /// the historical static-MTU behaviour. The public `Server.Config
+    /// / initServer` callers (mainly internal test fixtures) keep the
+    /// static-MTU behaviour. The public `Server.Config
     /// .pmtud` and `Client.Config.pmtud` wrappers default to enabled
     /// (`PmtudConfig{}` with `enable = true`) and call
     /// `setPmtudConfig` after `initClient` / `initServer`, so
@@ -1411,9 +1409,9 @@ pub const Connection = struct {
     closing_state_attribution_observed: bool = false,
 
     /// Peer-issued connection IDs we've stashed via NEW_CONNECTION_ID.
-    /// Phase 9 (migration) will pull from this set; for now, the
-    /// stash is just bookkeeping (and a place where a peer's
-    /// `active_connection_id_limit` violation would surface).
+    /// `consumeFreshPeerCidForMigration` draws from this set; it is
+    /// also where a peer's `active_connection_id_limit` violation
+    /// surfaces (§5.1.1).
     peer_cids: std.ArrayList(IssuedCid) = .empty,
     /// Locally-issued connection IDs, keyed by path, used to map
     /// incoming short-header DCIDs back to draft multipath path IDs.
@@ -2575,8 +2573,7 @@ pub const Connection = struct {
         return if (self.initial_source_cid_set) self.initial_source_cid else self.local_scid;
     }
 
-    // INTERNAL: pub for refactor; not part of embedder API. Cascade
-    // dependency of `_internal.rememberLocalCid`.
+    // Pub for `_internal.zig` (subsystem-private). Called from `_internal.rememberLocalCid`.
     pub fn retireLocalCidsPriorTo(
         self: *Connection,
         path_id: u32,
@@ -2734,8 +2731,7 @@ pub const Connection = struct {
         self.current_incoming_local_cid_seq = seq;
     }
 
-    // INTERNAL: pub for refactor; not part of embedder API. Cascade
-    // dependency of `_internal.ensureCanIssueLocalCid`.
+    // Pub for `_internal.zig` (subsystem-private). Called from `_internal.ensureCanIssueLocalCid`.
     pub fn localCidSequenceExists(
         self: *const Connection,
         path_id: u32,
@@ -2803,8 +2799,7 @@ pub const Connection = struct {
         return self.localConnectionIdIssueBudgetAfterRetirePriorTo(path_id, 0);
     }
 
-    // INTERNAL: pub for refactor; not part of embedder API. Cascade
-    // dependency of `_internal.ensureCanIssueLocalCid`.
+    // Pub for `_internal.zig` (subsystem-private). Called from `_internal.ensureCanIssueLocalCid`.
     pub fn localConnectionIdIssueBudgetAfterRetirePriorTo(
         self: *const Connection,
         path_id: u32,
@@ -3785,8 +3780,7 @@ pub const Connection = struct {
         return self.connectionIdReplenishInfoFor(path_id, .retired, null);
     }
 
-    // INTERNAL: pub for refactor; not part of embedder API. Cascade
-    // dependency of `_internal.refreshConnectionIdEventsForPath`.
+    // Pub for `_internal.zig` (subsystem-private). Called from `_internal.refreshConnectionIdEventsForPath`.
     pub fn connectionIdReplenishInfoFor(
         self: *const Connection,
         path_id: u32,
@@ -3822,8 +3816,7 @@ pub const Connection = struct {
         self.connection_id_events.push(info);
     }
 
-    // INTERNAL: pub for refactor; not part of embedder API. Cascade
-    // dependency of `_internal.refreshConnectionIdEventsForPath`.
+    // Pub for `_internal.zig` (subsystem-private). Called from `_internal.refreshConnectionIdEventsForPath`.
     pub fn connectionIdEventStillNeeded(self: *const Connection, path_id: u32) bool {
         if (self.localConnectionIdIssueBudget(path_id) > 0) return true;
         if (self.pendingPathCidsBlocked()) |blocked| {
@@ -4325,9 +4318,11 @@ pub const Connection = struct {
         return @intCast(byte[0] & 0x01);
     }
 
-    /// Register a new application path. Full draft-21 frame exchange is
-    /// still staged behind this, but the path already owns independent
-    /// Application PN, sent, RTT, congestion, validation, and PTO state.
+    /// Register a new application path. The path owns independent
+    /// Application PN, sent, RTT, congestion, validation, and PTO
+    /// state; the multipath control frames are emitted from
+    /// `emitPendingMultipathFrames` and the receive switch dispatches
+    /// the inbound side (see `conn_recv_multipath_handlers.zig`).
     pub fn openPath(
         self: *Connection,
         peer_addr: Address,
@@ -6869,7 +6864,7 @@ pub const Connection = struct {
             }
         }
 
-        // 2c) STOP_SENDING (one per packet for now — application only).
+        // 2c) STOP_SENDING (at most one per packet — application only).
         if (!app_control_blocked and lvl == .application and self.pending_frames.stop_sending.items.len > 0) {
             const item = self.pending_frames.stop_sending.items[0];
             const overhead_ss: usize = 1 + varint.encodedLen(item.stream_id) + varint.encodedLen(item.application_error_code);
@@ -6957,8 +6952,8 @@ pub const Connection = struct {
         }
 
         // 2e) RESET_STREAM frames for streams in reset_sent state
-        //     whose RESET hasn't been queued yet. Emit at most one
-        //     per packet; the loop handles all eventually.
+        //     whose RESET hasn't been queued yet. At most one per
+        //     packet; remaining resets ride subsequent packets.
         if (!path_response_used_addr_override and !congestion_blocked and lvl == .application) {
             var rs_it = self.streams.iterator();
             while (rs_it.next()) |entry| {
@@ -7080,9 +7075,9 @@ pub const Connection = struct {
                 .payload = pl_buf[0..pl_pos],
                 .keys = &keys,
                 // Pad client first-flight Initials to 1200 bytes
-                // (RFC 9000 §14). We over-pad on every Initial here
-                // for simplicity; tightening to "first flight only"
-                // is a future scope.
+                // (RFC 9000 §14). FIXME(audit): we over-pad on every
+                // client Initial here for simplicity; should be
+                // tightened to first-flight only.
                 .pad_to = if (self.role == .client) 1200 else 0,
                 .quic_bit = quic_bit,
             }),
@@ -8477,7 +8472,7 @@ pub const Connection = struct {
     /// legal at application encryption level (filtered upstream by
     /// the level-allowed-frames check). Servers MUST NOT receive
     /// NEW_TOKEN; if a peer-acting-as-server sends it to us we
-    /// silently drop the bytes. Clients hand the borrowed slice
+    /// raise PROTOCOL_VIOLATION. Clients hand the borrowed slice
     /// straight to the embedder callback if one is installed.
     pub fn handleNewToken(self: *Connection, nt: frame_types.NewToken) void { return conn_recv_cid_token_handlers.handleNewToken(self, nt); }
 
@@ -9765,9 +9760,10 @@ pub const Connection = struct {
         if (self.inner.handshakeDone()) try self.cachePeerTransportParams();
         self.queueHandshakeDoneIfReady();
         try self.refreshEarlyDataStatus();
-        // Phase-4 in-process compatibility: shuttle outbox→peer.inbox
-        // so the existing handshake test still works while the real
-        // datagram-driven path is being built up.
+        // In-process test shim: shuttle outbox→peer.inbox so mock-
+        // transport handshake tests can run without a UDP socket.
+        // Active only when `peer` is set (production paths leave it
+        // null and go through the datagram-driven transport).
         if (self.peer) |peer| try self.shuttleOutboxToPeer(peer);
         if (self.alert) |_| return error.PeerAlerted;
     }
@@ -9862,9 +9858,9 @@ fn addHandshakeData(
     const lvl = EncryptionLevel.fromBoringssl(@enumFromInt(level));
     // Buffer outgoing CRYPTO bytes per level. `poll` packs them into
     // CRYPTO frames inside Initial/Handshake/1-RTT packets — that's
-    // the wire-level handshake path. The legacy in-process Phase-4
-    // test path additionally has `advance` shuttle outbox→peer.inbox
-    // when `peer` is set.
+    // the wire-level handshake path. The in-process mock-transport
+    // shim additionally has `advance` shuttle outbox→peer.inbox when
+    // `peer` is set.
     conn.outbox[lvl.idx()].append(data[0..len]) catch return 0;
     return 1;
 }

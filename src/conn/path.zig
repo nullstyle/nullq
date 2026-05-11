@@ -70,9 +70,10 @@ pub const ConnectionId = struct {
     }
 };
 
-/// Placeholder address. Holds enough bytes for an IPv6 sockaddr
-/// (16-byte address + 2-byte port + 4-byte scope/flow). Phase 6
-/// will replace this with `std.net.Address`.
+/// Path-tuple address. Holds enough bytes for an IPv6 sockaddr
+/// (16-byte address + 2-byte port + 4-byte scope/flow). FIXME(audit):
+/// migrate to `std.net.Address` once the transport layer is ready
+/// to round-trip scope/flow through it.
 pub const Address = struct {
     bytes: [22]u8 = @splat(0),
 
@@ -113,8 +114,8 @@ pub const Scheduler = enum {
 };
 
 /// One QUIC path: a 4-tuple plus the per-path state (CIDs, anti-amp,
-/// validator, RTT, congestion). Most connections have one Path; phase
-/// 9/10 add more for migration and multipath.
+/// validator, RTT, congestion). Most connections have one Path;
+/// migration and multipath (draft-ietf-quic-multipath-21) attach more.
 pub const Path = struct {
     peer_addr: Address,
     local_addr: Address,
@@ -179,7 +180,8 @@ pub const Path = struct {
     }
 
     /// Record that we received a UDP datagram of `n` bytes. Lifts
-    /// the anti-amp ceiling and (Phase 5) keeps the path live.
+    /// the anti-amp ceiling and keeps the path live (transitions
+    /// `.fresh` → `.active`).
     pub fn onDatagramReceived(self: *Path, n: u64) void {
         self.bytes_received += n;
         if (self.state == .fresh) self.state = .active;
@@ -218,7 +220,7 @@ pub const Path = struct {
 /// RFC 8899 §5.2 DPLPMTUD configuration. Threaded onto every
 /// `Connection` via `Server.Config.pmtud` / `Client.Config.pmtud`. The
 /// transport applies these values at connection creation time and per
-/// path; embedders can flip `enable=false` to keep the historical
+/// path; embedders can flip `enable=false` to opt back into the
 /// static-MTU behaviour.
 ///
 /// **Field semantics**:
@@ -248,7 +250,8 @@ pub const PmtudConfig = struct {
     /// the upper bound, AND the consecutive-regular-loss threshold
     /// before black-hole detection halves the PMTU (RFC 8899 §4.4).
     probe_threshold: u16 = 3,
-    /// Master switch. False keeps the historical static-MTU path.
+    /// Master switch. False disables probes and pins the PMTU at
+    /// `initial_mtu` (static-MTU mode).
     enable: bool = true,
 };
 

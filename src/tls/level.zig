@@ -22,7 +22,8 @@ pub const EncryptionLevel = enum(u8) {
 
     /// Convert from the BoringSSL enum without going through an
     /// explicit `switch`. The numeric values are kept in sync with
-    /// `boringssl.tls.quic.EncryptionLevel` so a bitcast is valid.
+    /// `boringssl.tls.quic.EncryptionLevel` so
+    /// `@enumFromInt(@intFromEnum(...))` round-trips.
     pub fn fromBoringssl(lvl: boringssl.tls.quic.EncryptionLevel) EncryptionLevel {
         return @enumFromInt(@intFromEnum(lvl));
     }
