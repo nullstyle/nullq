@@ -795,6 +795,16 @@ pub fn main(init: std.process.Init) !void {
         &loss_pto_ctx,
         loss_ack_bench.runLossPtoTick,
     );
+    var connection_ack_loss_ctx = try loss_ack_bench.initConnectionAckLossDispatchCtx(allocator);
+    defer connection_ack_loss_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        loss_ack_bench.connection_ack_loss_dispatch_name,
+        *const loss_ack_bench.ConnectionAckLossDispatchCtx,
+        &connection_ack_loss_ctx,
+        loss_ack_bench.runConnectionAckLossDispatch,
+    );
 
     // Connection-adjacent DATAGRAM ACK/loss event queue
     const datagram_event_ctx = connection_datagram_bench.initDatagramEventCtx();

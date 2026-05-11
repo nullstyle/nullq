@@ -67,6 +67,104 @@ fn ceDelta(
     return c.ecn_ce - prev_ce;
 }
 
+const LevelAckDispatchCtx = struct {
+    self: *Connection,
+    lvl: EncryptionLevel,
+    ack: frame_types.Ack,
+    now_us: u64,
+    ack_path: *PathState,
+    largest_acked_send_time_us: *?u64,
+    largest_acked_ack_eliciting: *bool,
+    any_ack_eliciting_newly_acked: *bool,
+    in_flight_bytes_acked: *u64,
+    newest_acked_sent_time_us: *u64,
+    pmtud_probe_acked: *bool,
+    any_regular_acked: *bool,
+};
+
+fn dispatchAckedAtLevel(
+    ctx: *LevelAckDispatchCtx,
+    acked: *sent_packets_mod.SentPacket,
+) Error!void {
+    defer acked.deinit(ctx.self.allocator);
+    if (acked.pn == ctx.ack.largest_acked) {
+        ctx.largest_acked_send_time_us.* = acked.sent_time_us;
+        ctx.largest_acked_ack_eliciting.* = acked.ack_eliciting;
+    }
+    if (acked.ack_eliciting) ctx.any_ack_eliciting_newly_acked.* = true;
+    if (acked.in_flight) {
+        ctx.in_flight_bytes_acked.* += acked.bytes;
+        if (acked.sent_time_us > ctx.newest_acked_sent_time_us.*) {
+            ctx.newest_acked_sent_time_us.* = acked.sent_time_us;
+        }
+    }
+    // RFC 8899 §5.1 probe-vs-regular ack classification —
+    // 1-RTT only.
+    if (ctx.lvl == .application) {
+        if (ctx.ack_path.pmtu_probe_pn) |probe_pn| {
+            if (probe_pn == acked.pn) {
+                ctx.pmtud_probe_acked.* = true;
+            } else {
+                ctx.any_regular_acked.* = true;
+            }
+        } else {
+            ctx.any_regular_acked.* = true;
+        }
+        ctx.self.onApplicationPacketAckedForKeys(acked, ctx.now_us);
+        try ctx.self.dispatchAckedPacketToStreams(acked);
+    }
+    ctx.self.discardSentCryptoForPacket(ctx.lvl, acked.pn);
+    ctx.self.dispatchAckedControlFrames(acked);
+    ctx.self.recordDatagramAcked(acked);
+}
+
+const PathAckDispatchCtx = struct {
+    self: *Connection,
+    path: *PathState,
+    ack: frame_types.Ack,
+    now_us: u64,
+    largest_acked_send_time_us: *?u64,
+    largest_acked_ack_eliciting: *bool,
+    any_ack_eliciting_newly_acked: *bool,
+    in_flight_bytes_acked: *u64,
+    newest_acked_sent_time_us: *u64,
+    pmtud_probe_acked: *bool,
+    any_regular_acked: *bool,
+};
+
+fn dispatchAckedOnPath(
+    ctx: *PathAckDispatchCtx,
+    acked: *sent_packets_mod.SentPacket,
+) Error!void {
+    defer acked.deinit(ctx.self.allocator);
+    if (acked.pn == ctx.ack.largest_acked) {
+        ctx.largest_acked_send_time_us.* = acked.sent_time_us;
+        ctx.largest_acked_ack_eliciting.* = acked.ack_eliciting;
+    }
+    if (acked.ack_eliciting) ctx.any_ack_eliciting_newly_acked.* = true;
+    if (acked.in_flight) {
+        ctx.in_flight_bytes_acked.* += acked.bytes;
+        if (acked.sent_time_us > ctx.newest_acked_sent_time_us.*) {
+            ctx.newest_acked_sent_time_us.* = acked.sent_time_us;
+        }
+    }
+    // RFC 8899 §5.1 probe-vs-regular ack classification.
+    if (ctx.path.pmtu_probe_pn) |probe_pn| {
+        if (probe_pn == acked.pn) {
+            ctx.pmtud_probe_acked.* = true;
+        } else {
+            ctx.any_regular_acked.* = true;
+        }
+    } else {
+        ctx.any_regular_acked.* = true;
+    }
+    try ctx.self.dispatchAckedPacketToStreams(acked);
+    ctx.self.onApplicationPacketAckedForKeys(acked, ctx.now_us);
+    ctx.self.discardSentCryptoForPacket(.application, acked.pn);
+    ctx.self.dispatchAckedControlFrames(acked);
+    ctx.self.recordDatagramAcked(acked);
+}
+
 pub fn handleAckAtLevel(
     self: *Connection,
     lvl: EncryptionLevel,
@@ -117,6 +215,20 @@ pub fn handleAckAtLevel(
     // RFC 8899 DPLPMTUD probe-ack vs regular-ack tracking.
     var pmtud_probe_acked = false;
     var any_regular_acked = false;
+    var dispatch_ctx: LevelAckDispatchCtx = .{
+        .self = self,
+        .lvl = lvl,
+        .ack = a,
+        .now_us = now_us,
+        .ack_path = ack_path,
+        .largest_acked_send_time_us = &largest_acked_send_time_us,
+        .largest_acked_ack_eliciting = &largest_acked_ack_eliciting,
+        .any_ack_eliciting_newly_acked = &any_ack_eliciting_newly_acked,
+        .in_flight_bytes_acked = &in_flight_bytes_acked,
+        .newest_acked_sent_time_us = &newest_acked_sent_time_us,
+        .pmtud_probe_acked = &pmtud_probe_acked,
+        .any_regular_acked = &any_regular_acked,
+    };
 
     var ack_it = ack_range_mod.iter(a);
     while (try ack_it.next()) |interval| {
@@ -130,40 +242,10 @@ pub fn handleAckAtLevel(
         // the tracker is O(K log N) where K = packets matched
         // and N = tracker size, both bounded by our own send
         // rate × CWND.
-        while (sent.lowerBound(interval.smallest)) |idx| {
-            if (sent.packets[idx].pn > interval.largest) break;
-            var acked = sent.removeAt(idx);
-            defer acked.deinit(self.allocator);
-            if (acked.pn == a.largest_acked) {
-                largest_acked_send_time_us = acked.sent_time_us;
-                largest_acked_ack_eliciting = acked.ack_eliciting;
-            }
-            if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
-            if (acked.in_flight) {
-                in_flight_bytes_acked += acked.bytes;
-                if (acked.sent_time_us > newest_acked_sent_time_us) {
-                    newest_acked_sent_time_us = acked.sent_time_us;
-                }
-            }
-            // RFC 8899 §5.1 probe-vs-regular ack classification —
-            // 1-RTT only.
-            if (lvl == .application) {
-                if (ack_path.pmtu_probe_pn) |probe_pn| {
-                    if (probe_pn == acked.pn) {
-                        pmtud_probe_acked = true;
-                    } else {
-                        any_regular_acked = true;
-                    }
-                } else {
-                    any_regular_acked = true;
-                }
-                self.onApplicationPacketAckedForKeys(&acked, now_us);
-                self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
-            }
-            self.discardSentCryptoForPacket(lvl, acked.pn);
-            self.dispatchAckedControlFrames(&acked);
-            self.recordDatagramAcked(&acked);
-        }
+        const start = sent.lowerBound(interval.smallest) orelse continue;
+        var end = start;
+        while (end < sent.count and sent.packets[end].pn <= interval.largest) : (end += 1) {}
+        try sent.removeRangeWithError(start, end, &dispatch_ctx, dispatchAckedAtLevel);
     }
     // Fold PMTUD ack outcomes back into path state.
     if (lvl == .application) {
@@ -255,43 +337,29 @@ pub fn handleApplicationAckOnPath(
     // `handleAckAtLevel` for the matching code path on the primary.
     var pmtud_probe_acked = false;
     var any_regular_acked = false;
+    var dispatch_ctx: PathAckDispatchCtx = .{
+        .self = self,
+        .path = path,
+        .ack = a,
+        .now_us = now_us,
+        .largest_acked_send_time_us = &largest_acked_send_time_us,
+        .largest_acked_ack_eliciting = &largest_acked_ack_eliciting,
+        .any_ack_eliciting_newly_acked = &any_ack_eliciting_newly_acked,
+        .in_flight_bytes_acked = &in_flight_bytes_acked,
+        .newest_acked_sent_time_us = &newest_acked_sent_time_us,
+        .pmtud_probe_acked = &pmtud_probe_acked,
+        .any_regular_acked = &any_regular_acked,
+    };
 
     var ack_it = ack_range_mod.iter(a);
     while (try ack_it.next()) |interval| {
         // See `handleAckAtLevel` above for the rationale; this
         // is the per-application-path twin walk and uses the
         // same tracker-bounded iteration.
-        while (path.sent.lowerBound(interval.smallest)) |idx| {
-            if (path.sent.packets[idx].pn > interval.largest) break;
-            var acked = path.sent.removeAt(idx);
-            defer acked.deinit(self.allocator);
-            if (acked.pn == a.largest_acked) {
-                largest_acked_send_time_us = acked.sent_time_us;
-                largest_acked_ack_eliciting = acked.ack_eliciting;
-            }
-            if (acked.ack_eliciting) any_ack_eliciting_newly_acked = true;
-            if (acked.in_flight) {
-                in_flight_bytes_acked += acked.bytes;
-                if (acked.sent_time_us > newest_acked_sent_time_us) {
-                    newest_acked_sent_time_us = acked.sent_time_us;
-                }
-            }
-            // RFC 8899 §5.1 probe-vs-regular ack classification.
-            if (path.pmtu_probe_pn) |probe_pn| {
-                if (probe_pn == acked.pn) {
-                    pmtud_probe_acked = true;
-                } else {
-                    any_regular_acked = true;
-                }
-            } else {
-                any_regular_acked = true;
-            }
-            self.dispatchAckedPacketToStreams(&acked) catch |e| return e;
-            self.onApplicationPacketAckedForKeys(&acked, now_us);
-            self.discardSentCryptoForPacket(.application, acked.pn);
-            self.dispatchAckedControlFrames(&acked);
-            self.recordDatagramAcked(&acked);
-        }
+        const start = path.sent.lowerBound(interval.smallest) orelse continue;
+        var end = start;
+        while (end < path.sent.count and path.sent.packets[end].pn <= interval.largest) : (end += 1) {}
+        try path.sent.removeRangeWithError(start, end, &dispatch_ctx, dispatchAckedOnPath);
     }
     if (pmtud_probe_acked) {
         _ = path.pmtudOnProbeAcked(

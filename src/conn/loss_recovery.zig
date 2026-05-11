@@ -12,6 +12,7 @@ const frame_types = @import("../frame/types.zig");
 
 const PnSpace = @import("pn_space.zig").PnSpace;
 const SentPacketTracker = @import("sent_packets.zig").SentPacketTracker;
+const SentPacket = @import("sent_packets.zig").SentPacket;
 const RttEstimator = @import("rtt.zig").RttEstimator;
 const granularity_us = @import("rtt.zig").granularity_us;
 
@@ -44,6 +45,23 @@ pub const AckProcessing = struct {
     any_ack_eliciting_newly_acked: bool = false,
 };
 
+const AckRangeContext = struct {
+    result: *AckProcessing,
+    largest_acked: u64,
+};
+
+fn collectAckedPacket(ctx: *AckRangeContext, packet: *SentPacket) void {
+    ctx.result.newly_acked_count += 1;
+    ctx.result.bytes_acked += packet.bytes;
+    if (packet.in_flight) ctx.result.in_flight_bytes_acked += packet.bytes;
+    if (packet.ack_eliciting) ctx.result.any_ack_eliciting_newly_acked = true;
+    if (packet.pn == ctx.largest_acked) {
+        ctx.result.largest_acked_newly_acked = true;
+        ctx.result.largest_acked_send_time_us = packet.sent_time_us;
+        ctx.result.largest_acked_ack_eliciting = packet.ack_eliciting;
+    }
+}
+
 /// Walk the ACK frame and remove tracked packets that the ACK covers.
 /// Returns metadata for downstream RTT and CC updates.
 pub fn processAck(
@@ -54,32 +72,21 @@ pub fn processAck(
     pn_space.onAckReceived(ack.largest_acked);
 
     var result: AckProcessing = .{};
+    var ctx: AckRangeContext = .{
+        .result = &result,
+        .largest_acked = ack.largest_acked,
+    };
 
     var it = ack_range.iter(ack);
     while (try it.next()) |interval| {
         // Walk tracker entries whose PN ∈ [interval.smallest, interval.largest].
         // The tracker is sorted ascending; lowerBound finds the first
-        // candidate; we then remove forward-walking, but since
-        // `removeAt` shifts everything down, we don't increment `i`
-        // when we remove.
-        // `i` doesn't move forward in this loop: each iteration
-        // either removes the packet at position `i` (which shifts
-        // subsequent entries down so `i` now points at the next
-        // candidate) or doesn't remove and breaks. So const works.
-        const i = tracker.lowerBound(interval.smallest) orelse continue;
-        while (i < tracker.count and tracker.packets[i].pn <= interval.largest) {
-            const removed_pn = tracker.packets[i].pn;
-            const removed = tracker.removeAt(i);
-            result.newly_acked_count += 1;
-            result.bytes_acked += removed.bytes;
-            if (removed.in_flight) result.in_flight_bytes_acked += removed.bytes;
-            if (removed.ack_eliciting) result.any_ack_eliciting_newly_acked = true;
-            if (removed_pn == ack.largest_acked) {
-                result.largest_acked_newly_acked = true;
-                result.largest_acked_send_time_us = removed.sent_time_us;
-                result.largest_acked_ack_eliciting = removed.ack_eliciting;
-            }
-        }
+        // candidate. Adjacent covered tracker entries are removed as a
+        // span so the surviving tail moves once for the whole ACK range.
+        const start = tracker.lowerBound(interval.smallest) orelse continue;
+        var end = start;
+        while (end < tracker.count and tracker.packets[end].pn <= interval.largest) : (end += 1) {}
+        tracker.removeRangeWith(start, end, &ctx, collectAckedPacket);
     }
 
     return result;
@@ -99,6 +106,25 @@ pub const LossResult = struct {
     /// Number of packets declared lost.
     count: u32 = 0,
 };
+
+const LossContext = struct {
+    result: *LossResult,
+};
+
+fn collectLostPacket(ctx: *LossContext, packet: *SentPacket) void {
+    ctx.result.count += 1;
+    ctx.result.bytes_lost += packet.bytes;
+    if (packet.in_flight) ctx.result.in_flight_bytes_lost += packet.bytes;
+    if (packet.sent_time_us > ctx.result.largest_lost_send_time_us) {
+        ctx.result.largest_lost_send_time_us = packet.sent_time_us;
+    }
+}
+
+fn isLost(packet: *const SentPacket, largest_acked: u64, lost_send_time_cutoff: u64) bool {
+    const packet_thresh_lost = (largest_acked - packet.pn) >= packet_threshold;
+    const time_thresh_lost = packet.sent_time_us < lost_send_time_cutoff;
+    return packet_thresh_lost or time_thresh_lost;
+}
 
 /// Detect and remove lost packets per RFC 9002 §6.1.
 ///
@@ -129,34 +155,27 @@ pub fn detectLosses(
         0;
 
     var result: LossResult = .{};
+    var ctx: LossContext = .{ .result = &result };
 
-    // Scan in-flight tracked packets. We walk forward; when we
-    // find a lost one we remove it (which shifts subsequent
-    // entries down, so we don't advance `i`).
+    // Scan tracked packets up through largest_acked. Contiguous lost
+    // runs are removed as spans so the array tail is compacted once
+    // per run instead of once per packet.
     var i: u32 = 0;
     while (i < tracker.count) {
-        const p = tracker.packets[i];
-        if (p.pn > largest_acked) {
-            // Above largest_acked → not eligible for loss detection.
+        if (tracker.packets[i].pn > largest_acked) break;
+        if (!isLost(&tracker.packets[i], largest_acked, lost_send_time_cutoff)) {
             i += 1;
             continue;
         }
 
-        const packet_thresh_lost = (largest_acked - p.pn) >= packet_threshold;
-        const time_thresh_lost = p.sent_time_us < lost_send_time_cutoff;
-
-        if (packet_thresh_lost or time_thresh_lost) {
-            const removed = tracker.removeAt(i);
-            result.count += 1;
-            result.bytes_lost += removed.bytes;
-            if (removed.in_flight) result.in_flight_bytes_lost += removed.bytes;
-            if (removed.sent_time_us > result.largest_lost_send_time_us) {
-                result.largest_lost_send_time_us = removed.sent_time_us;
-            }
-            // Do not advance `i`: subsequent entries have shifted down.
-            continue;
-        }
+        const start = i;
         i += 1;
+        while (i < tracker.count and
+            tracker.packets[i].pn <= largest_acked and
+            isLost(&tracker.packets[i], largest_acked, lost_send_time_cutoff)) : (i += 1)
+        {}
+        tracker.removeRangeWith(start, i, &ctx, collectLostPacket);
+        i = start;
     }
 
     return result;
@@ -242,6 +261,29 @@ test "processAck handles an ACK with multiple ranges" {
     try std.testing.expect(result.largest_acked_newly_acked);
 }
 
+test "processAck removes a tracked span with mixed in-flight packets" {
+    var tr: SentPacketTracker = .{};
+    try tr.record(.{ .pn = 0, .sent_time_us = 0, .bytes = 100, .ack_eliciting = true, .in_flight = true });
+    try tr.record(.{ .pn = 2, .sent_time_us = 20, .bytes = 200, .ack_eliciting = true, .in_flight = true });
+    try tr.record(.{ .pn = 3, .sent_time_us = 30, .bytes = 300, .ack_eliciting = false, .in_flight = false });
+    try tr.record(.{ .pn = 4, .sent_time_us = 40, .bytes = 400, .ack_eliciting = true, .in_flight = true });
+    try tr.record(.{ .pn = 7, .sent_time_us = 70, .bytes = 700, .ack_eliciting = true, .in_flight = true });
+    var space: PnSpace = .{};
+    space.next_pn = 8;
+
+    const result = try processAck(&tr, &space, buildAck(4, 2));
+    try std.testing.expectEqual(@as(u32, 3), result.newly_acked_count);
+    try std.testing.expectEqual(@as(u64, 900), result.bytes_acked);
+    try std.testing.expectEqual(@as(u64, 600), result.in_flight_bytes_acked);
+    try std.testing.expect(result.largest_acked_newly_acked);
+    try std.testing.expectEqual(@as(u64, 40), result.largest_acked_send_time_us);
+    try std.testing.expectEqual(@as(u32, 2), tr.count);
+    try std.testing.expectEqual(@as(u64, 0), tr.packets[0].pn);
+    try std.testing.expectEqual(@as(u64, 7), tr.packets[1].pn);
+    try std.testing.expectEqual(@as(u64, 800), tr.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 800), tr.ack_eliciting_in_flight);
+}
+
 test "detectLosses by packet threshold" {
     var tr: SentPacketTracker = .{};
     var pn: u64 = 0;
@@ -319,6 +361,33 @@ test "detectLosses skips packets above largest_acked" {
     try std.testing.expectEqual(@as(u32, 2), tr.count);
     try std.testing.expectEqual(@as(u64, 5), tr.packets[0].pn);
     try std.testing.expectEqual(@as(u64, 6), tr.packets[1].pn);
+}
+
+test "detectLosses batches non-contiguous lost runs" {
+    var tr: SentPacketTracker = .{};
+    try tr.record(.{ .pn = 0, .sent_time_us = 0, .bytes = 100, .ack_eliciting = true, .in_flight = true });
+    try tr.record(.{ .pn = 1, .sent_time_us = 9_000, .bytes = 200, .ack_eliciting = true, .in_flight = true });
+    try tr.record(.{ .pn = 2, .sent_time_us = 1_000, .bytes = 300, .ack_eliciting = true, .in_flight = true });
+    try tr.record(.{ .pn = 3, .sent_time_us = 0, .bytes = 400, .ack_eliciting = true, .in_flight = true });
+    try tr.record(.{ .pn = 4, .sent_time_us = 0, .bytes = 500, .ack_eliciting = true, .in_flight = true });
+
+    var space: PnSpace = .{};
+    space.largest_acked_sent = 2;
+    var rtt_est: RttEstimator = .{};
+    rtt_est.smoothed_rtt_us = 10_000;
+    rtt_est.latest_rtt_us = 10_000;
+    rtt_est.first_sample_taken = true;
+
+    const result = detectLosses(&tr, &space, &rtt_est, 20_000);
+    try std.testing.expectEqual(@as(u32, 2), result.count);
+    try std.testing.expectEqual(@as(u64, 400), result.bytes_lost);
+    try std.testing.expectEqual(@as(u64, 400), result.in_flight_bytes_lost);
+    try std.testing.expectEqual(@as(u64, 1_000), result.largest_lost_send_time_us);
+    try std.testing.expectEqual(@as(u32, 3), tr.count);
+    try std.testing.expectEqual(@as(u64, 1), tr.packets[0].pn);
+    try std.testing.expectEqual(@as(u64, 3), tr.packets[1].pn);
+    try std.testing.expectEqual(@as(u64, 4), tr.packets[2].pn);
+    try std.testing.expectEqual(@as(u64, 1_100), tr.bytes_in_flight);
 }
 
 test "detectLosses with no largest_acked_sent is a no-op" {

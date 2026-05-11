@@ -4,9 +4,12 @@
 
 const std = @import("std");
 const quic_zig = @import("quic_zig");
+const boringssl = @import("boringssl");
 
 const ack_range = quic_zig.frame.ack_range;
 const frame_types = quic_zig.frame.types;
+const congestion = quic_zig.conn.congestion;
+const Connection = quic_zig.Connection;
 const loss_recovery = quic_zig.conn.loss_recovery;
 const pn_space_mod = quic_zig.conn.pn_space;
 const rtt_mod = quic_zig.conn.rtt;
@@ -19,6 +22,7 @@ const SentPacketTracker = sent_packets.SentPacketTracker;
 
 pub const pn_space_record_ack_ranges_name = "pn_space_record_ack_ranges";
 pub const loss_pto_tick_name = "loss_pto_tick";
+pub const connection_ack_loss_dispatch_name = "connection_ack_loss_dispatch";
 
 const ack_range_pn_count: usize = 24;
 const default_ack_range_pns: [ack_range_pn_count]u64 = .{
@@ -239,6 +243,135 @@ fn firePtoIfDue(
     return null;
 }
 
+const connection_ack_ranges_count: u64 = 3;
+
+/// Real `Connection.handleAckAtLevel` fixture for ACK range walking,
+/// per-packet dispatch hooks, and packet-threshold loss detection. It
+/// intentionally carries no STREAM/control/DATAGRAM payload ownership;
+/// this isolates the connection-level tracker and dispatch loop shape
+/// from application-specific requeue work.
+pub const ConnectionAckLossDispatchCtx = struct {
+    allocator: std.mem.Allocator,
+    tls_ctx: boringssl.tls.Context,
+    conn: *Connection,
+    packet_count: u8 = 64,
+    sent_start_us: u64 = 0,
+    sent_spacing_us: u64 = 1_000,
+    bytes: u64 = 1_200,
+    now_us: u64 = 120_000,
+    ack_largest: u64 = 63,
+    ack_first_range: u64 = 3,
+    ack_delay_scaled: u64 = 0,
+    ack_ranges_buf: [32]u8 = undefined,
+    ack_ranges_len: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator) !ConnectionAckLossDispatchCtx {
+        var tls_ctx = try boringssl.tls.Context.initClient(.{});
+        errdefer tls_ctx.deinit();
+
+        const conn = try allocator.create(Connection);
+        errdefer allocator.destroy(conn);
+        conn.* = try Connection.initClient(allocator, tls_ctx, "bench.invalid");
+        errdefer conn.deinit();
+
+        var ctx: ConnectionAckLossDispatchCtx = .{
+            .allocator = allocator,
+            .tls_ctx = tls_ctx,
+            .conn = conn,
+        };
+        ctx.ack_ranges_len = ack_range.writeRanges(&ctx.ack_ranges_buf, &.{
+            // ACK [60..63], then [48..51], [32..35], [16..18].
+            .{ .gap = 7, .length = 3 },
+            .{ .gap = 11, .length = 3 },
+            .{ .gap = 12, .length = 2 },
+        }) catch unreachable;
+        return ctx;
+    }
+
+    pub fn deinit(self: *ConnectionAckLossDispatchCtx) void {
+        self.conn.deinit();
+        self.allocator.destroy(self.conn);
+        self.tls_ctx.deinit();
+        self.* = undefined;
+    }
+
+    fn ackFrame(self: *const ConnectionAckLossDispatchCtx) frame_types.Ack {
+        return .{
+            .largest_acked = self.ack_largest,
+            .ack_delay = self.ack_delay_scaled,
+            .first_range = self.ack_first_range,
+            .range_count = connection_ack_ranges_count,
+            .ranges_bytes = self.ack_ranges_buf[0..self.ack_ranges_len],
+            .ecn_counts = null,
+        };
+    }
+};
+
+pub fn initConnectionAckLossDispatchCtx(
+    allocator: std.mem.Allocator,
+) !ConnectionAckLossDispatchCtx {
+    return ConnectionAckLossDispatchCtx.init(allocator);
+}
+
+fn resetConnectionAckLossDispatch(ctx: *const ConnectionAckLossDispatchCtx) void {
+    const path = ctx.conn.primaryPath();
+    path.sent = .{};
+    path.app_pn_space = .{};
+    path.app_pn_space.next_pn = ctx.packet_count;
+    path.path.rtt = .{
+        .latest_rtt_us = 20 * rtt_mod.ms,
+        .smoothed_rtt_us = 20 * rtt_mod.ms,
+        .rtt_var_us = 5 * rtt_mod.ms,
+        .min_rtt_us = 20 * rtt_mod.ms,
+        .first_sample_taken = true,
+    };
+    path.path.cc = congestion.NewReno.init(.{});
+    path.pto_count = 3;
+    path.pending_ping = false;
+    path.pmtu_probe_pn = null;
+    path.pmtu_probes_in_flight = 0;
+    ctx.conn.qlog_packets_lost = 0;
+}
+
+fn seedConnectionSentPackets(ctx: *const ConnectionAckLossDispatchCtx) void {
+    const sent = ctx.conn.sentForLevel(.application);
+    var pn: u64 = 0;
+    while (pn < ctx.packet_count) : (pn += 1) {
+        sent.record(.{
+            .pn = pn,
+            .sent_time_us = ctx.sent_start_us + pn * ctx.sent_spacing_us,
+            .bytes = ctx.bytes + (pn & 7) * 8,
+            .ack_eliciting = true,
+            .in_flight = true,
+        }) catch unreachable;
+    }
+}
+
+/// One operation runs the production ACK handler over a fixture that
+/// ACKs several ranges and declares the remaining lower packets lost.
+pub fn runConnectionAckLossDispatch(
+    ctx: *const ConnectionAckLossDispatchCtx,
+    iters: u64,
+) u64 {
+    var sum: u64 = 0;
+    var i: u64 = 0;
+    while (i < iters) : (i += 1) {
+        resetConnectionAckLossDispatch(ctx);
+        seedConnectionSentPackets(ctx);
+
+        ctx.conn.handleAckAtLevel(.application, ctx.ackFrame(), ctx.now_us) catch unreachable;
+
+        const path = ctx.conn.primaryPath();
+        sum +%= path.app_pn_space.largest_acked_sent.?;
+        sum +%= path.sent.count;
+        sum +%= path.sent.bytes_in_flight;
+        sum +%= path.pto_count;
+        sum +%= path.path.cc.cwnd;
+        sum +%= ctx.conn.qlog_packets_lost;
+    }
+    return sum;
+}
+
 test "pn_space_record_ack_ranges fixture emits the expected range shape" {
     const ctx = PnSpaceRecordAckRangesCtx.init();
     try std.testing.expect(runPnSpaceRecordAckRanges(&ctx, 1) != 0);
@@ -289,4 +422,17 @@ test "loss_pto_tick fixture reaches ack loss and pto paths" {
     );
     try std.testing.expect(fired != null);
     try std.testing.expectEqual(@as(u32, 1), pto_count);
+}
+
+test "connection_ack_loss_dispatch fixture drains acked and lost packets" {
+    var ctx = try ConnectionAckLossDispatchCtx.init(std.testing.allocator);
+    defer ctx.deinit();
+
+    try std.testing.expect(runConnectionAckLossDispatch(&ctx, 1) != 0);
+    try std.testing.expectEqual(@as(u32, 0), ctx.conn.sentForLevel(.application).count);
+    try std.testing.expectEqual(
+        ctx.ack_largest,
+        ctx.conn.pnSpaceForLevel(.application).largest_acked_sent.?,
+    );
+    try std.testing.expect(ctx.conn.qlog_packets_lost > 0);
 }

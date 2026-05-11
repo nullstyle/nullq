@@ -242,6 +242,94 @@ pub const SentPacketTracker = struct {
         return p;
     }
 
+    /// Remove the half-open index range `[start, end)` and call
+    /// `on_remove` for each packet before compacting the surviving tail.
+    /// Packet ownership is transferred to the callback.
+    pub fn removeRangeWith(
+        self: *SentPacketTracker,
+        start: u32,
+        end: u32,
+        context: anytype,
+        comptime on_remove: fn (@TypeOf(context), *SentPacket) void,
+    ) void {
+        std.debug.assert(start <= end);
+        std.debug.assert(end <= self.count);
+        if (start == end) return;
+
+        var i = start;
+        while (i < end) : (i += 1) {
+            const packet = &self.packets[i];
+            if (packet.in_flight) {
+                self.bytes_in_flight -= packet.bytes;
+                if (packet.ack_eliciting) self.ack_eliciting_in_flight -= packet.bytes;
+            }
+            on_remove(context, packet);
+        }
+
+        const old_count = self.count;
+        const removed_count = end - start;
+        const new_count = old_count - removed_count;
+        const start_usize: usize = @intCast(start);
+        const end_usize: usize = @intCast(end);
+        const old_count_usize: usize = @intCast(old_count);
+        const new_count_usize: usize = @intCast(new_count);
+        std.mem.copyForwards(
+            SentPacket,
+            self.packets[start_usize..new_count_usize],
+            self.packets[end_usize..old_count_usize],
+        );
+        self.count = new_count;
+    }
+
+    /// Error-aware sibling of `removeRangeWith`. If `on_remove`
+    /// fails, packets already handed to the callback, including the
+    /// failing packet, are removed and compacted; remaining packets
+    /// in `[start, end)` stay tracked. This mirrors callers that
+    /// previously did `removeAt` before running fallible dispatch.
+    pub fn removeRangeWithError(
+        self: *SentPacketTracker,
+        start: u32,
+        end: u32,
+        context: anytype,
+        comptime on_remove: anytype,
+    ) !void {
+        std.debug.assert(start <= end);
+        std.debug.assert(end <= self.count);
+        if (start == end) return;
+
+        var processed_end = start;
+        while (processed_end < end) {
+            const packet = &self.packets[processed_end];
+            if (packet.in_flight) {
+                self.bytes_in_flight -= packet.bytes;
+                if (packet.ack_eliciting) self.ack_eliciting_in_flight -= packet.bytes;
+            }
+            on_remove(context, packet) catch |err| {
+                processed_end += 1;
+                self.compactRemovedRange(start, processed_end);
+                return err;
+            };
+            processed_end += 1;
+        }
+        self.compactRemovedRange(start, end);
+    }
+
+    fn compactRemovedRange(self: *SentPacketTracker, start: u32, end: u32) void {
+        const old_count = self.count;
+        const removed_count = end - start;
+        const new_count = old_count - removed_count;
+        const start_usize: usize = @intCast(start);
+        const end_usize: usize = @intCast(end);
+        const old_count_usize: usize = @intCast(old_count);
+        const new_count_usize: usize = @intCast(new_count);
+        std.mem.copyForwards(
+            SentPacket,
+            self.packets[start_usize..new_count_usize],
+            self.packets[end_usize..old_count_usize],
+        );
+        self.count = new_count;
+    }
+
     /// Find the index of the tracked packet with the given PN.
     /// Returns null if no match. O(log N) binary search.
     pub fn indexOf(self: *const SentPacketTracker, pn: u64) ?u32 {
@@ -325,6 +413,111 @@ test "non-in-flight packets don't update bytes_in_flight" {
     try std.testing.expectEqual(@as(u64, 0), t.bytes_in_flight);
     _ = t.removeAt(0);
     try std.testing.expectEqual(@as(u64, 0), t.bytes_in_flight);
+}
+
+const RemovedRangeStats = struct {
+    count: u32 = 0,
+    pn_sum: u64 = 0,
+    bytes: u64 = 0,
+};
+
+fn recordRemovedPacket(stats: *RemovedRangeStats, packet: *SentPacket) void {
+    stats.count += 1;
+    stats.pn_sum += packet.pn;
+    stats.bytes += packet.bytes;
+}
+
+test "removeRangeWith compacts once and preserves sorted survivors" {
+    var t: SentPacketTracker = .{};
+    var pn: u64 = 0;
+    while (pn < 6) : (pn += 1) {
+        try t.record(.{
+            .pn = pn,
+            .sent_time_us = pn,
+            .bytes = 100 + pn,
+            .ack_eliciting = pn != 2,
+            .in_flight = pn != 3,
+        });
+    }
+
+    var stats: RemovedRangeStats = .{};
+    t.removeRangeWith(1, 5, &stats, recordRemovedPacket);
+
+    try std.testing.expectEqual(@as(u32, 4), stats.count);
+    try std.testing.expectEqual(@as(u64, 10), stats.pn_sum);
+    try std.testing.expectEqual(@as(u64, 410), stats.bytes);
+    try std.testing.expectEqual(@as(u32, 2), t.count);
+    try std.testing.expectEqual(@as(u64, 0), t.packets[0].pn);
+    try std.testing.expectEqual(@as(u64, 5), t.packets[1].pn);
+    try std.testing.expectEqual(@as(u64, 205), t.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 205), t.ack_eliciting_in_flight);
+}
+
+fn deinitRemovedPacket(allocator: std.mem.Allocator, packet: *SentPacket) void {
+    packet.deinit(allocator);
+}
+
+test "removeRangeWith transfers owned packet fields to callback" {
+    var t: SentPacketTracker = .{};
+    var packet: SentPacket = .{
+        .pn = 0,
+        .sent_time_us = 0,
+        .bytes = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+    };
+    try packet.addRetransmitFrame(std.testing.allocator, .{ .max_data = .{ .maximum_data = 4096 } });
+    try packet.addStreamKey(std.testing.allocator, 42);
+    try packet.addStreamKey(std.testing.allocator, 43);
+    try t.record(packet);
+
+    t.removeRangeWith(0, 1, std.testing.allocator, deinitRemovedPacket);
+    try std.testing.expectEqual(@as(u32, 0), t.count);
+    try std.testing.expectEqual(@as(u64, 0), t.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), t.ack_eliciting_in_flight);
+}
+
+const FallibleRemovedRangeStats = struct {
+    fail_on_pn: u64,
+    count: u32 = 0,
+    pn_sum: u64 = 0,
+};
+
+fn recordRemovedPacketFallible(
+    stats: *FallibleRemovedRangeStats,
+    packet: *SentPacket,
+) error{StopHere}!void {
+    stats.count += 1;
+    stats.pn_sum += packet.pn;
+    if (packet.pn == stats.fail_on_pn) return error.StopHere;
+}
+
+test "removeRangeWithError keeps packets after failing callback" {
+    var t: SentPacketTracker = .{};
+    var pn: u64 = 0;
+    while (pn < 6) : (pn += 1) {
+        try t.record(.{
+            .pn = pn,
+            .sent_time_us = pn,
+            .bytes = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+    }
+
+    var stats: FallibleRemovedRangeStats = .{ .fail_on_pn = 3 };
+    try std.testing.expectError(
+        error.StopHere,
+        t.removeRangeWithError(1, 5, &stats, recordRemovedPacketFallible),
+    );
+
+    try std.testing.expectEqual(@as(u32, 3), stats.count);
+    try std.testing.expectEqual(@as(u64, 1 + 2 + 3), stats.pn_sum);
+    try std.testing.expectEqual(@as(u32, 3), t.count);
+    try std.testing.expectEqual(@as(u64, 0), t.packets[0].pn);
+    try std.testing.expectEqual(@as(u64, 4), t.packets[1].pn);
+    try std.testing.expectEqual(@as(u64, 5), t.packets[2].pn);
+    try std.testing.expectEqual(@as(u64, 300), t.bytes_in_flight);
 }
 
 test "SentPacket stores retransmittable control frames" {

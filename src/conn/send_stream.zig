@@ -100,6 +100,124 @@ pub const ResetInfo = struct {
 /// of data before back-pressure kicks in.
 pub const default_max_buffered_send: usize = 1 * 1024 * 1024;
 
+/// Byte buffer whose public `.items` slice is always the live stream
+/// data, while ACKed prefix bytes are discarded by sliding the slice
+/// start within the allocation. This preserves callers' existing
+/// `.items.len` accounting without memmoving the live tail on every
+/// ACK floor advance.
+const SendByteBuffer = struct {
+    pub const empty: SendByteBuffer = .{};
+
+    items: []u8 = &.{},
+    capacity: usize = 0,
+
+    allocation: []u8 = &.{},
+    start: usize = 0,
+
+    fn deinit(self: *SendByteBuffer, allocator: std.mem.Allocator) void {
+        if (self.allocation.len > 0) allocator.free(self.allocation);
+        self.* = .empty;
+    }
+
+    fn appendSlice(
+        self: *SendByteBuffer,
+        allocator: std.mem.Allocator,
+        data: []const u8,
+    ) std.mem.Allocator.Error!void {
+        if (data.len == 0) return;
+        try self.ensureUnusedCapacity(allocator, data.len);
+
+        const old_len = self.items.len;
+        const new_len = old_len + data.len;
+        @memcpy(self.allocation[self.start + old_len .. self.start + new_len], data);
+        self.items = self.allocation[self.start .. self.start + new_len];
+    }
+
+    pub fn ensureTotalCapacity(
+        self: *SendByteBuffer,
+        allocator: std.mem.Allocator,
+        new_capacity: usize,
+    ) std.mem.Allocator.Error!void {
+        if (self.capacity >= new_capacity) return;
+
+        if (self.start > 0 and self.allocation.len >= new_capacity) {
+            self.compactLiveBytes();
+            return;
+        }
+
+        try self.reallocate(allocator, growCapacity(self.allocation.len, new_capacity) catch return error.OutOfMemory);
+    }
+
+    pub fn clearRetainingCapacity(self: *SendByteBuffer) void {
+        self.start = 0;
+        self.items = self.allocation[0..0];
+        self.capacity = self.allocation.len;
+    }
+
+    fn discardPrefix(self: *SendByteBuffer, n: usize) void {
+        std.debug.assert(n <= self.items.len);
+        if (n == 0) return;
+
+        const new_len = self.items.len - n;
+        if (new_len == 0) {
+            self.start = 0;
+            self.items = self.allocation[0..0];
+        } else {
+            self.start += n;
+            self.items = self.allocation[self.start .. self.start + new_len];
+        }
+        self.capacity = self.allocation.len - self.start;
+    }
+
+    fn ensureUnusedCapacity(
+        self: *SendByteBuffer,
+        allocator: std.mem.Allocator,
+        extra: usize,
+    ) std.mem.Allocator.Error!void {
+        const needed_len = std.math.add(usize, self.items.len, extra) catch return error.OutOfMemory;
+        if (self.capacity >= needed_len) return;
+
+        if (self.start > 0 and self.allocation.len >= needed_len) {
+            self.compactLiveBytes();
+            return;
+        }
+
+        const new_capacity = growCapacity(self.allocation.len, needed_len) catch return error.OutOfMemory;
+        try self.reallocate(allocator, new_capacity);
+    }
+
+    fn compactLiveBytes(self: *SendByteBuffer) void {
+        std.mem.copyForwards(u8, self.allocation[0..self.items.len], self.items);
+        self.start = 0;
+        self.items = self.allocation[0..self.items.len];
+        self.capacity = self.allocation.len;
+    }
+
+    fn reallocate(
+        self: *SendByteBuffer,
+        allocator: std.mem.Allocator,
+        new_capacity: usize,
+    ) std.mem.Allocator.Error!void {
+        const new_allocation = try allocator.alloc(u8, new_capacity);
+        const old_len = self.items.len;
+        @memcpy(new_allocation[0..old_len], self.items);
+        if (self.allocation.len > 0) allocator.free(self.allocation);
+        self.allocation = new_allocation;
+        self.start = 0;
+        self.items = self.allocation[0..old_len];
+        self.capacity = self.allocation.len;
+    }
+
+    fn growCapacity(old_capacity: usize, minimum: usize) error{Overflow}!usize {
+        var new_capacity = if (old_capacity == 0) @max(@as(usize, 64), minimum) else old_capacity;
+        while (new_capacity < minimum) {
+            const bump = new_capacity / 2 + 8;
+            new_capacity = try std.math.add(usize, new_capacity, bump);
+        }
+        return new_capacity;
+    }
+};
+
 /// One stream's send half: app-side write queue, in-flight tracking,
 /// FIN/RESET state machine.
 pub const SendStream = struct {
@@ -107,7 +225,7 @@ pub const SendStream = struct {
 
     /// Bytes the app has written but not yet had fully-prefix-acked.
     /// `bytes.items[0]` is at absolute offset `base_offset`.
-    bytes: std.ArrayList(u8) = .empty,
+    bytes: SendByteBuffer = .empty,
     /// Soft cap on `bytes.items.len`. `write` short-writes when
     /// `bytes.items.len + data.len` would exceed this. Set by
     /// `Connection` from `default_max_buffered_send` (or an embedder
@@ -374,15 +492,7 @@ pub const SendStream = struct {
         std.debug.assert(new_floor <= self.write_offset);
         const drop_n: usize = @intCast(new_floor - self.base_offset);
         if (drop_n == 0) return;
-        // Shift the live tail down. For a v1 implementation this is
-        // O(N) per advance; a ring buffer is a future optimization.
-        const live_len = self.bytes.items.len - drop_n;
-        std.mem.copyForwards(
-            u8,
-            self.bytes.items[0..live_len],
-            self.bytes.items[drop_n..],
-        );
-        self.bytes.shrinkRetainingCapacity(live_len);
+        self.bytes.discardPrefix(drop_n);
         self.base_offset = new_floor;
     }
 
@@ -487,6 +597,21 @@ test "ack of in-order chunk advances base_offset and drops bytes" {
     try testing.expectEqual(@as(u64, 5), s.ackedFloor());
     try testing.expectEqual(@as(usize, 5), s.bytes.items.len);
     try testing.expectEqualStrings("56789", s.bytes.items);
+}
+
+test "ack floor advance slides the live byte slice" {
+    var s = SendStream.init(test_alloc);
+    defer s.deinit();
+    _ = try s.write("0123456789");
+    const before_ptr = @intFromPtr(s.bytes.items.ptr);
+
+    try s.recordSent(0, .{ .offset = 0, .length = 4, .fin = false });
+    try s.onPacketAcked(0);
+
+    try testing.expectEqual(@as(u64, 4), s.ackedFloor());
+    try testing.expectEqual(@as(usize, 6), s.bytes.items.len);
+    try testing.expectEqual(before_ptr + 4, @intFromPtr(s.bytes.items.ptr));
+    try testing.expectEqualStrings("456789", s.bytes.items);
 }
 
 test "out-of-order ACK is held until the gap closes" {

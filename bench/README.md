@@ -88,6 +88,7 @@ rsync -a host-b:/path/to/quic-zig/benchmark-reports/ aggregate-benchmarks/
 | `stream_recv_reassembly_sparse_64k` | Receive-stream sparse 64 KiB reassembly and in-order read |
 | `pn_space_record_ack_ranges` | Received-PN insertion, ACK range construction, and ACK range iteration |
 | `loss_pto_tick` | ACK processing, threshold loss detection, PTO calculation, and probe selection |
+| `connection_ack_loss_dispatch` | Production `Connection.handleAckAtLevel` ACK dispatch and packet-threshold loss detection |
 | `conn_datagram_send_ack_loss_events` | DATAGRAM ACK/loss event snapshot and bounded event queue behavior |
 | `transport_params_encode_common` | Transport-parameter encode over common QUIC v1 limits |
 | `transport_params_decode_common` | Transport-parameter decode over common QUIC v1 limits |

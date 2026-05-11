@@ -9317,26 +9317,48 @@ pub const Connection = struct {
 
         var i: u32 = 0;
         var stats: LossStats = .{};
-        while (i < sent.count) {
-            const p = sent.packets[i];
-            if (p.pn <= largest_acked and (largest_acked - p.pn) >= threshold) {
-                var lost = sent.removeAt(i);
-                defer lost.deinit(self.allocator);
-                self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .packet_threshold);
-                const is_probe = lvl == .application and
-                    self.pmtudHandleProbeLossIfMatches(path, &lost);
+        const PacketThresholdCtx = struct {
+            self: *Connection,
+            lvl: EncryptionLevel,
+            path: *PathState,
+            stats: *LossStats,
+
+            fn handle(ctx: *@This(), lost: *sent_packets_mod.SentPacket) Error!void {
+                defer lost.deinit(ctx.self.allocator);
+                ctx.self.emitPacketLost(ctx.lvl, lost.pn, @intCast(lost.bytes), .packet_threshold);
+                const is_probe = ctx.lvl == .application and
+                    ctx.self.pmtudHandleProbeLossIfMatches(ctx.path, lost);
                 // Always requeue stream / control frames so a probe
                 // that coalesced legitimate payload still progresses.
-                _ = try self.requeueLostPacket(lvl, &lost);
+                _ = try ctx.self.requeueLostPacket(ctx.lvl, lost);
                 if (is_probe) {
                     // RFC 8899 §4.4: probe loss MUST NOT trigger CC
                     // reactions. Skip the LossStats add so neither
                     // cwnd nor persistent-congestion fires for the
                     // probe's bytes.
-                    continue;
+                    return;
                 }
-                stats.add(lost);
-                if (lvl == .application) self.pmtudHandleRegularLoss(path);
+                ctx.stats.add(lost.*);
+                if (ctx.lvl == .application) ctx.self.pmtudHandleRegularLoss(ctx.path);
+            }
+        };
+        var ctx: PacketThresholdCtx = .{
+            .self = self,
+            .lvl = lvl,
+            .path = path,
+            .stats = &stats,
+        };
+        while (i < sent.count) {
+            const p = sent.packets[i];
+            if (p.pn <= largest_acked and (largest_acked - p.pn) >= threshold) {
+                const start = i;
+                i += 1;
+                while (i < sent.count) : (i += 1) {
+                    const next = sent.packets[i];
+                    if (next.pn > largest_acked or (largest_acked - next.pn) < threshold) break;
+                }
+                try sent.removeRangeWithError(start, i, &ctx, PacketThresholdCtx.handle);
+                i = start;
                 continue;
             }
             i += 1;
@@ -9358,17 +9380,37 @@ pub const Connection = struct {
 
         var i: u32 = 0;
         var stats: LossStats = .{};
+        const PathPacketThresholdCtx = struct {
+            self: *Connection,
+            path: *PathState,
+            stats: *LossStats,
+
+            fn handle(ctx: *@This(), lost: *sent_packets_mod.SentPacket) Error!void {
+                defer lost.deinit(ctx.self.allocator);
+                ctx.self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .packet_threshold);
+                const is_probe = ctx.self.pmtudHandleProbeLossIfMatches(ctx.path, lost);
+                _ = try ctx.self.requeueLostPacketOnPath(.application, lost, ctx.path.id);
+                if (is_probe) return;
+                ctx.stats.add(lost.*);
+                ctx.self.pmtudHandleRegularLoss(ctx.path);
+            }
+        };
+        var ctx: PathPacketThresholdCtx = .{
+            .self = self,
+            .path = path,
+            .stats = &stats,
+        };
         while (i < path.sent.count) {
             const p = path.sent.packets[i];
             if (p.pn <= largest_acked and (largest_acked - p.pn) >= threshold) {
-                var lost = path.sent.removeAt(i);
-                defer lost.deinit(self.allocator);
-                self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .packet_threshold);
-                const is_probe = self.pmtudHandleProbeLossIfMatches(path, &lost);
-                _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
-                if (is_probe) continue;
-                stats.add(lost);
-                self.pmtudHandleRegularLoss(path);
+                const start = i;
+                i += 1;
+                while (i < path.sent.count) : (i += 1) {
+                    const next = path.sent.packets[i];
+                    if (next.pn > largest_acked or (largest_acked - next.pn) < threshold) break;
+                }
+                try path.sent.removeRangeWithError(start, i, &ctx, PathPacketThresholdCtx.handle);
+                i = start;
                 continue;
             }
             i += 1;
@@ -9400,19 +9442,42 @@ pub const Connection = struct {
 
         var i: u32 = 0;
         var stats: LossStats = .{};
+        const TimeThresholdCtx = struct {
+            self: *Connection,
+            lvl: EncryptionLevel,
+            path: *PathState,
+            stats: *LossStats,
+
+            fn handle(ctx: *@This(), lost: *sent_packets_mod.SentPacket) Error!void {
+                defer lost.deinit(ctx.self.allocator);
+                ctx.self.emitPacketLost(ctx.lvl, lost.pn, @intCast(lost.bytes), .time_threshold);
+                const is_probe = ctx.lvl == .application and
+                    ctx.self.pmtudHandleProbeLossIfMatches(ctx.path, lost);
+                _ = try ctx.self.requeueLostPacket(ctx.lvl, lost);
+                if (is_probe) return;
+                ctx.stats.add(lost.*);
+                if (ctx.lvl == .application) ctx.self.pmtudHandleRegularLoss(ctx.path);
+            }
+        };
+        var ctx: TimeThresholdCtx = .{
+            .self = self,
+            .lvl = lvl,
+            .path = path,
+            .stats = &stats,
+        };
         while (i < sent.count) {
             const p = sent.packets[i];
             const eligible = if (largest_acked_opt) |la| p.pn <= la else false;
             if (eligible and p.sent_time_us < cutoff) {
-                var lost = sent.removeAt(i);
-                defer lost.deinit(self.allocator);
-                self.emitPacketLost(lvl, lost.pn, @intCast(lost.bytes), .time_threshold);
-                const is_probe = lvl == .application and
-                    self.pmtudHandleProbeLossIfMatches(path, &lost);
-                _ = try self.requeueLostPacket(lvl, &lost);
-                if (is_probe) continue;
-                stats.add(lost);
-                if (lvl == .application) self.pmtudHandleRegularLoss(path);
+                const start = i;
+                i += 1;
+                while (i < sent.count) : (i += 1) {
+                    const next = sent.packets[i];
+                    const next_eligible = if (largest_acked_opt) |la| next.pn <= la else false;
+                    if (!next_eligible or next.sent_time_us >= cutoff) break;
+                }
+                try sent.removeRangeWithError(start, i, &ctx, TimeThresholdCtx.handle);
+                i = start;
                 continue;
             }
             i += 1;
@@ -9441,18 +9506,39 @@ pub const Connection = struct {
 
         var i: u32 = 0;
         var stats: LossStats = .{};
+        const PathTimeThresholdCtx = struct {
+            self: *Connection,
+            path: *PathState,
+            stats: *LossStats,
+
+            fn handle(ctx: *@This(), lost: *sent_packets_mod.SentPacket) Error!void {
+                defer lost.deinit(ctx.self.allocator);
+                ctx.self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .time_threshold);
+                const is_probe = ctx.self.pmtudHandleProbeLossIfMatches(ctx.path, lost);
+                _ = try ctx.self.requeueLostPacketOnPath(.application, lost, ctx.path.id);
+                if (is_probe) return;
+                ctx.stats.add(lost.*);
+                ctx.self.pmtudHandleRegularLoss(ctx.path);
+            }
+        };
+        var ctx: PathTimeThresholdCtx = .{
+            .self = self,
+            .path = path,
+            .stats = &stats,
+        };
         while (i < path.sent.count) {
             const p = path.sent.packets[i];
             const eligible = if (largest_acked_opt) |la| p.pn <= la else false;
             if (eligible and p.sent_time_us < cutoff) {
-                var lost = path.sent.removeAt(i);
-                defer lost.deinit(self.allocator);
-                self.emitPacketLost(.application, lost.pn, @intCast(lost.bytes), .time_threshold);
-                const is_probe = self.pmtudHandleProbeLossIfMatches(path, &lost);
-                _ = try self.requeueLostPacketOnPath(.application, &lost, path.id);
-                if (is_probe) continue;
-                stats.add(lost);
-                self.pmtudHandleRegularLoss(path);
+                const start = i;
+                i += 1;
+                while (i < path.sent.count) : (i += 1) {
+                    const next = path.sent.packets[i];
+                    const next_eligible = if (largest_acked_opt) |la| next.pn <= la else false;
+                    if (!next_eligible or next.sent_time_us >= cutoff) break;
+                }
+                try path.sent.removeRangeWithError(start, i, &ctx, PathTimeThresholdCtx.handle);
+                i = start;
                 continue;
             }
             i += 1;
@@ -9832,4 +9918,3 @@ const method: boringssl.tls.quic.Method = .{
 comptime {
     _ = @import("_state_tests.zig");
 }
-
