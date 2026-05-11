@@ -16,7 +16,8 @@
 //!
 //! Run with: `zig build bench`, or `zig build bench -- --json path`
 //! for a machine-readable report. The build wires this binary at
-//! ReleaseFast; Debug numbers are not useful.
+//! ReleaseSafe by default; use `-Dbench-unsafe-release-fast=true` for
+//! unsafe ReleaseFast measurements.
 //!
 //! Out of scope:
 //!  - Full Connection.handle / pollDatagram lifecycle
@@ -29,7 +30,10 @@ const boringssl = @import("boringssl");
 const connection_datagram_bench = @import("connection_datagram.zig");
 const loss_ack_bench = @import("loss_ack.zig");
 const packet_crypto_bench = @import("packet_crypto.zig");
+const path_flow_bench = @import("path_flow.zig");
 const stream_bench = @import("stream_reassembly.zig");
+const tokens_lb_bench = @import("tokens_lb.zig");
+const transport_params_bench = @import("transport_params.zig");
 
 const varint = quic_zig.wire.varint;
 const header = quic_zig.wire.header;
@@ -289,7 +293,14 @@ fn writeJsonReport(
     try out.print(allocator, "  \"target_ns_per_benchmark\": {d},\n", .{target_ns});
     try out.print(allocator, "  \"min_iters\": {d},\n", .{min_iters});
     try out.print(allocator, "  \"max_iters\": {d},\n", .{max_iters});
-    try out.appendSlice(allocator, "  \"optimize\": \"ReleaseFast\",\n");
+    try out.appendSlice(allocator, "  \"optimize\": ");
+    try appendJsonString(&out, allocator, @tagName(builtin.mode));
+    try out.appendSlice(allocator, ",\n");
+    try out.print(
+        allocator,
+        "  \"bench_unsafe_release_fast\": {},\n",
+        .{builtin.mode == .ReleaseFast},
+    );
     try out.appendSlice(allocator, "  \"report_path\": ");
     try appendJsonString(&out, allocator, path);
     try out.appendSlice(allocator, ",\n");
@@ -619,8 +630,9 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    std.debug.print("quic_zig microbenchmarks (target ~{d}ms each, ReleaseFast)\n", .{
+    std.debug.print("quic_zig microbenchmarks (target ~{d}ms each, {s})\n", .{
         target_ns / std.time.ns_per_ms,
+        @tagName(builtin.mode),
     });
     std.debug.print("---------------------------------------------------------------\n", .{});
 
@@ -793,6 +805,112 @@ pub fn main(init: std.process.Init) !void {
         *const connection_datagram_bench.DatagramEventCtx,
         &datagram_event_ctx,
         connection_datagram_bench.runConnDatagramSendAckLossEvents,
+    );
+
+    // Transport-parameter codec paths
+    var tp_encode_ctx = try transport_params_bench.initTransportParamsEncodeCommonCtx();
+    defer tp_encode_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        transport_params_bench.transport_params_encode_common_name,
+        *const transport_params_bench.TransportParamsEncodeCommonCtx,
+        &tp_encode_ctx,
+        transport_params_bench.runTransportParamsEncodeCommon,
+    );
+    var tp_decode_ctx = try transport_params_bench.initTransportParamsDecodeCommonCtx();
+    defer tp_decode_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        transport_params_bench.transport_params_decode_common_name,
+        *const transport_params_bench.TransportParamsDecodeCommonCtx,
+        &tp_decode_ctx,
+        transport_params_bench.runTransportParamsDecodeCommon,
+    );
+    var tp_extensions_ctx = try transport_params_bench.initTransportParamsDecodeExtensionsCtx();
+    defer tp_extensions_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        transport_params_bench.transport_params_decode_extensions_name,
+        *const transport_params_bench.TransportParamsDecodeExtensionsCtx,
+        &tp_extensions_ctx,
+        transport_params_bench.runTransportParamsDecodeExtensions,
+    );
+
+    // Token, stateless-reset, and QUIC-LB helpers
+    var retry_token_ctx = tokens_lb_bench.initRetryTokenMintValidateCtx();
+    defer retry_token_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        tokens_lb_bench.retry_token_mint_validate_name,
+        *const tokens_lb_bench.RetryTokenMintValidateCtx,
+        &retry_token_ctx,
+        tokens_lb_bench.runRetryTokenMintValidate,
+    );
+    var new_token_ctx = tokens_lb_bench.initNewTokenMintValidateCtx();
+    defer new_token_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        tokens_lb_bench.new_token_mint_validate_name,
+        *const tokens_lb_bench.NewTokenMintValidateCtx,
+        &new_token_ctx,
+        tokens_lb_bench.runNewTokenMintValidate,
+    );
+    var reset_token_ctx = tokens_lb_bench.initStatelessResetTokenDeriveCtx();
+    defer reset_token_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        tokens_lb_bench.stateless_reset_token_derive_name,
+        *const tokens_lb_bench.StatelessResetTokenDeriveCtx,
+        &reset_token_ctx,
+        tokens_lb_bench.runStatelessResetTokenDerive,
+    );
+    var quic_lb_ctx = try tokens_lb_bench.initQuicLbCidGenerateCtx();
+    defer quic_lb_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        tokens_lb_bench.quic_lb_cid_generate_name,
+        *const tokens_lb_bench.QuicLbCidGenerateCtx,
+        &quic_lb_ctx,
+        tokens_lb_bench.runQuicLbCidGenerate,
+    );
+
+    // Flow-control, path-validation, and path scheduling helpers
+    var flow_control_ctx = path_flow_bench.initFlowControlCreditUpdateCtx();
+    defer flow_control_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        path_flow_bench.flow_control_credit_update_name,
+        *const path_flow_bench.FlowControlCreditUpdateCtx,
+        &flow_control_ctx,
+        path_flow_bench.runFlowControlCreditUpdate,
+    );
+    var path_validator_ctx = path_flow_bench.initPathValidatorChallengeResponseCtx();
+    defer path_validator_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        path_flow_bench.path_validator_challenge_response_name,
+        *const path_flow_bench.PathValidatorChallengeResponseCtx,
+        &path_validator_ctx,
+        path_flow_bench.runPathValidatorChallengeResponse,
+    );
+    var path_set_ctx = try path_flow_bench.initPathSetScheduleRoundRobinCtx(allocator);
+    defer path_set_ctx.deinit();
+    recordBenchmark(
+        &results,
+        &result_count,
+        path_flow_bench.path_set_schedule_round_robin_name,
+        *const path_flow_bench.PathSetScheduleRoundRobinCtx,
+        &path_set_ctx,
+        path_flow_bench.runPathSetScheduleRoundRobin,
     );
 
     std.debug.print("---------------------------------------------------------------\n", .{});

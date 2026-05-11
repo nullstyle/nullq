@@ -46,9 +46,11 @@ zig build bench
 `zig build test` runs unit, integration, conformance, QNS endpoint, and
 deterministic fuzz-smoke tests. `zig build conformance` runs only the
 RFC-traceable conformance corpus. `zig build bench` runs microbenchmarks
-under `ReleaseFast` in a separate benchmark-only build. `zig build
-bench-test` runs the benchmark fixture tests through the same build
-graph, including BoringSSL C-module wiring.
+under `ReleaseSafe` in a separate benchmark-only build. Use
+`zig build bench -Dbench-unsafe-release-fast=true` only for explicit
+unsafe `ReleaseFast` measurements. `zig build bench-test` runs the
+benchmark fixture tests through the same build graph, including BoringSSL
+C-module wiring.
 
 Production or internet-facing builds must use:
 

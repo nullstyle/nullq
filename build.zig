@@ -10,17 +10,16 @@ const std = @import("std");
 // out-of-bounds slicing, optional unwrap, `unreachable`,
 // `@setRuntimeSafety` toggles) while optimizing.
 //
-// `ReleaseFast` and `ReleaseSmall` are forbidden for the network-
-// input parser surface. Both compile out runtime safety, which means
-// the residual `unreachable` paths in `wire/`, `frame/`, and
-// `conn/state.zig` (documented as non-peer-reachable invariants)
+// `ReleaseFast` and `ReleaseSmall` are forbidden by default for the
+// network-input parser surface. Both compile out runtime safety,
+// which means the residual `unreachable` paths in `wire/`, `frame/`,
+// and `conn/state.zig` (documented as non-peer-reachable invariants)
 // stop being trapped — `unreachable` becomes "the optimizer assumes
-// this is impossible". An adversarial input that reaches one of
-// those sites in `ReleaseFast` produces undefined behavior instead
-// of a controlled panic. The benchmark harness below explicitly
-// re-instantiates the tree under `ReleaseFast` because bench numbers
-// in `Debug` are meaningless, but bench is internal-only and never
-// touches peer input.
+// this is impossible". An adversarial input that reaches one of those
+// sites in `ReleaseFast` produces undefined behavior instead of a
+// controlled panic. The benchmark harness below defaults to
+// `ReleaseSafe`; use `-Dbench-unsafe-release-fast=true` only when you
+// intentionally want unsafe peak-speed measurements.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -169,14 +168,22 @@ pub fn build(b: *std.Build) void {
     const external_interop_step = b.step("external-interop", "Run the external QUIC interop gate helper");
     external_interop_step.dependOn(&run_interop_tool.step);
 
-    // Microbenchmarks. Always built with ReleaseFast (Debug-mode
-    // numbers are meaningless), regardless of the user's
-    // -Doptimize choice for the rest of the tree.
+    // Microbenchmarks. Built with ReleaseSafe by default, regardless
+    // of the user's -Doptimize choice for the rest of the tree. This
+    // keeps benchmark fixtures aligned with the production safety
+    // policy while still avoiding Debug-mode noise.
     //
-    // We re-instantiate the quic_zig and boringssl modules under
-    // ReleaseFast because BoringSSL compiled in Debug links UBSan
-    // runtime symbols that the ReleaseFast linker won't resolve.
-    const bench_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+    // Opt into ReleaseFast only with an explicit unsafe flag, since
+    // that mode disables runtime safety checks on parser surfaces.
+    const bench_unsafe_release_fast = b.option(
+        bool,
+        "bench-unsafe-release-fast",
+        "Build benchmarks with ReleaseFast instead of the default ReleaseSafe; disables runtime safety checks",
+    ) orelse false;
+    const bench_optimize: std.builtin.OptimizeMode = if (bench_unsafe_release_fast)
+        .ReleaseFast
+    else
+        .ReleaseSafe;
     const bench_boringssl_dep = b.dependency("boringssl_zig", .{
         .target = target,
         .optimize = bench_optimize,

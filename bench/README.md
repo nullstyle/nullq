@@ -7,10 +7,16 @@ to track across parser, frame, packet, and crypto-adjacent changes.
 zig build bench
 ```
 
-The benchmark binary is always built with `ReleaseFast` in an isolated
-benchmark-only build. That exception is deliberate: benchmark numbers
-from `Debug` are not useful, while production networking builds must use
-`ReleaseSafe`.
+The benchmark binary is built with `ReleaseSafe` by default in an
+isolated benchmark-only build. That keeps benchmark fixtures aligned with
+the production safety policy while avoiding `Debug`-mode noise.
+
+For peak-speed comparisons that deliberately disable runtime safety
+checks, opt into unsafe `ReleaseFast`:
+
+```sh
+zig build bench -Dbench-unsafe-release-fast=true
+```
 
 ## Output
 
@@ -43,6 +49,8 @@ not set, the local hostname is used.
 The JSON report includes a stable schema version, toolchain and target
 metadata, basic system metadata, GitHub run metadata when available, and
 the per-benchmark iteration count, total time, ns/op, and ops/sec values.
+The `optimize` field records the actual benchmark build mode and
+`bench_unsafe_release_fast` is true only for the explicit unsafe mode.
 The `system` block records `machine_id`, hostname, logical CPU count,
 total memory, `uname`, and the compile target CPU model. The scheduled
 GitHub Actions workflow runs the directory-mode command weekly and on
@@ -81,6 +89,16 @@ rsync -a host-b:/path/to/quic-zig/benchmark-reports/ aggregate-benchmarks/
 | `pn_space_record_ack_ranges` | Received-PN insertion, ACK range construction, and ACK range iteration |
 | `loss_pto_tick` | ACK processing, threshold loss detection, PTO calculation, and probe selection |
 | `conn_datagram_send_ack_loss_events` | DATAGRAM ACK/loss event snapshot and bounded event queue behavior |
+| `transport_params_encode_common` | Transport-parameter encode over common QUIC v1 limits |
+| `transport_params_decode_common` | Transport-parameter decode over common QUIC v1 limits |
+| `transport_params_decode_extensions` | Transport-parameter decode with DATAGRAM, versions, preferred address, multipath, and draft extension flags |
+| `retry_token_mint_validate` | Stateless Retry token mint and validation |
+| `new_token_mint_validate` | NEW_TOKEN mint and validation |
+| `stateless_reset_token_derive` | Stateless reset token derivation over fixed CID fixtures |
+| `quic_lb_cid_generate` | QUIC-LB plaintext, AES single-pass, and four-pass CID generation |
+| `flow_control_credit_update` | Connection, stream, and stream-count credit update state transitions |
+| `path_validator_challenge_response` | PATH_CHALLENGE/PATH_RESPONSE match, stray response, and timeout transitions |
+| `path_set_schedule_round_robin` | Public path-set round-robin scheduling with skipped non-sendable paths |
 
 ## Extending
 
